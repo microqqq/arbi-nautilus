@@ -1,5 +1,6 @@
 """PY000 NautilusTrader strategies."""
 
+from py000_nautilus.strategies.maker import MakerStrategy
 from py000_nautilus.strategies.taker import TakerStrategy
 
-__all__ = ["TakerStrategy"]
+__all__ = ["MakerStrategy", "TakerStrategy"]

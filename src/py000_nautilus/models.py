@@ -55,6 +55,27 @@ class HedgeAccount:
 
 
 @dataclass(frozen=True, slots=True)
+class MakerAccount:
+    account_id: AccountId
+    client_id: ClientId | None
+    position_ounces: Decimal
+    max_long_ounces: Decimal
+    max_short_ounces: Decimal
+
+
+@dataclass(frozen=True, slots=True)
+class MakerQuote:
+    direction: SourceDirection
+    source_account: SourceAccount
+    hedge_account: MakerAccount
+    source_price_usdt: Decimal
+    hedge_reference_price_usd: Decimal
+    quantity_ounces: Decimal
+    adjusted_spread: Decimal
+    leverage: int
+
+
+@dataclass(frozen=True, slots=True)
 class Opportunity:
     direction: SourceDirection
     source_account: SourceAccount

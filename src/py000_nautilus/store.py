@@ -3,6 +3,7 @@
 import json
 import os
 import tempfile
+from copy import deepcopy
 from dataclasses import asdict, dataclass, replace
 from decimal import Decimal
 from hashlib import sha256
@@ -18,6 +19,10 @@ class SourceOrderRecord:
     client_order_id: str
     side: BusinessOrderSide
     quantity_ounces: Decimal
+    source_account_id: str | None = None
+    source_client_id: str | None = None
+    hedge_account_id: str | None = None
+    hedge_client_id: str | None = None
     filled_ounces: Decimal = Decimal(0)
     status: str = "SUBMITTING"
 
@@ -31,6 +36,7 @@ class StoreState:
     hedge_intents: dict[str, HedgeIntent]
     net_unhedged_ounces: Decimal
     halt_reason: str | None
+    source_freeze_reason: str | None
 
 
 class JsonStateStore:
@@ -50,6 +56,7 @@ class JsonStateStore:
             hedge_intents={},
             net_unhedged_ounces=Decimal(0),
             halt_reason=None,
+            source_freeze_reason=None,
         )
 
     @property
@@ -57,7 +64,21 @@ class JsonStateStore:
         return self._state.halt_reason
 
     @property
+    def source_freeze_reason(self) -> str | None:
+        return self._state.source_freeze_reason
+
+    @property
     def net_unhedged_ounces(self) -> Decimal:
+        outstanding = self._state.net_unhedged_ounces
+        for intent in self._state.hedge_intents.values():
+            remaining = intent.hedge_quantity_ounces - intent.hedge_filled_ounces
+            sign = Decimal(1) if intent.source_side is BusinessOrderSide.BUY else Decimal(-1)
+            outstanding += sign * remaining
+        return outstanding
+
+    @property
+    def rounding_residual_ounces(self) -> Decimal:
+        """Signed fill residual not yet large enough to become a hedge obligation."""
         return self._state.net_unhedged_ounces
 
     @property
@@ -67,12 +88,49 @@ class JsonStateStore:
     def can_submit_source(self) -> bool:
         return (
             self._state.halt_reason is None
+            and self._state.source_freeze_reason is None
             and self._state.active_source_order_id is None
+            and self.net_unhedged_ounces == 0
             and all(
                 intent.status is ObligationStatus.COMPLETED
                 for intent in self._state.hedge_intents.values()
             )
         )
+
+    def has_unresolved_hedges(self) -> bool:
+        return any(
+            intent.status is not ObligationStatus.COMPLETED
+            for intent in self._state.hedge_intents.values()
+        )
+
+    def freeze_source_submissions(self, reason: str) -> None:
+        """Persist a Maker-wide hold without inventing an order terminal state."""
+        if not reason:
+            raise ValueError("freeze reason must not be empty")
+        if self._state.source_freeze_reason is not None:
+            return
+        self._state.source_freeze_reason = reason
+        self._persist()
+
+    def cycle_evidence_complete(self) -> bool:
+        terminal = {"FILLED", "DENIED", "REJECTED", "CANCELED", "EXPIRED"}
+        return (
+            self._state.halt_reason is None
+            and self._state.active_source_order_id is None
+            and all(record.status in terminal for record in self._state.source_orders.values())
+            and all(
+                intent.status is ObligationStatus.COMPLETED
+                for intent in self._state.hedge_intents.values()
+            )
+            and self.rounding_residual_ounces == 0
+            and self.net_unhedged_ounces == 0
+        )
+
+    def clear_source_freeze(self) -> None:
+        if not self.cycle_evidence_complete():
+            raise RuntimeError("Maker cycle evidence is incomplete")
+        self._state.source_freeze_reason = None
+        self._persist()
 
     def recover_for_start(self) -> str | None:
         """Turn any crash-surviving in-flight work into an explicit stop."""
@@ -106,18 +164,37 @@ class JsonStateStore:
         client_order_id: str,
         side: BusinessOrderSide,
         quantity_ounces: Decimal,
+        *,
+        source_account_id: str | None = None,
+        source_client_id: str | None = None,
+        hedge_account_id: str | None = None,
+        hedge_client_id: str | None = None,
     ) -> None:
         if not self.can_submit_source():
             raise RuntimeError("source submission blocked by persisted state")
         if quantity_ounces <= 0:
             raise ValueError("source quantity must be positive")
-        record = SourceOrderRecord(client_order_id, side, quantity_ounces)
+        record = SourceOrderRecord(
+            client_order_id=client_order_id,
+            side=side,
+            quantity_ounces=quantity_ounces,
+            source_account_id=source_account_id,
+            source_client_id=source_client_id,
+            hedge_account_id=hedge_account_id,
+            hedge_client_id=hedge_client_id,
+        )
         self._state.source_orders[client_order_id] = record
         self._state.active_source_order_id = client_order_id
         self._persist()
 
     def knows_source_order(self, client_order_id: str) -> bool:
         return client_order_id in self._state.source_orders
+
+    def has_seen_source_fill(self, fill_key: str) -> bool:
+        return fill_key in self._state.seen_source_fills
+
+    def source_order(self, client_order_id: str) -> SourceOrderRecord | None:
+        return self._state.source_orders.get(client_order_id)
 
     def update_source_status(self, client_order_id: str, status: str) -> None:
         record = self._state.source_orders.get(client_order_id)
@@ -171,6 +248,7 @@ class JsonStateStore:
         if fill_ounces <= 0:
             raise ValueError("fill quantity must be positive")
 
+        previous_state = deepcopy(self._state)
         self._state.seen_source_fills.add(fill_key)
         filled = record.filled_ounces + fill_ounces
         status = "FILLED" if filled >= record.quantity_ounces else "PARTIALLY_FILLED"
@@ -188,7 +266,7 @@ class JsonStateStore:
         self._state.net_unhedged_ounces += signed_fill
         rounded_ounces = round_hedge_ounces(self._state.net_unhedged_ounces)
         if rounded_ounces == 0:
-            self._persist()
+            self._persist_source_reservation(previous_state)
             return None
 
         self._state.net_unhedged_ounces -= Decimal(rounded_ounces)
@@ -208,7 +286,7 @@ class JsonStateStore:
             hedge_quantity_ounces=hedge_ounces,
         )
         self._state.hedge_intents[intent.intent_id] = intent
-        self._persist()
+        self._persist_source_reservation(previous_state)
         return intent
 
     def bind_hedge_order(self, intent_id: str, client_order_id: str) -> None:
@@ -293,6 +371,13 @@ class JsonStateStore:
             temporary_path = Path(handle.name)
         os.replace(temporary_path, self.path)
 
+    def _persist_source_reservation(self, previous_state: StoreState) -> None:
+        try:
+            self._persist()
+        except Exception:
+            self._state = previous_state
+            raise
+
     def _to_payload(self) -> dict[str, object]:
         return {
             "schema_version": 1,
@@ -309,6 +394,7 @@ class JsonStateStore:
             },
             "net_unhedged_ounces": str(self._state.net_unhedged_ounces),
             "halt_reason": self._state.halt_reason,
+            "source_freeze_reason": self._state.source_freeze_reason,
         }
 
     def _load(self) -> StoreState:
@@ -322,6 +408,10 @@ class JsonStateStore:
                 client_order_id=str(value["client_order_id"]),
                 side=BusinessOrderSide(str(value["side"])),
                 quantity_ounces=Decimal(str(value["quantity_ounces"])),
+                source_account_id=_optional_string(value.get("source_account_id")),
+                source_client_id=_optional_string(value.get("source_client_id")),
+                hedge_account_id=_optional_string(value.get("hedge_account_id")),
+                hedge_client_id=_optional_string(value.get("hedge_client_id")),
                 filled_ounces=Decimal(str(value["filled_ounces"])),
                 status=str(value["status"]),
             )
@@ -351,6 +441,7 @@ class JsonStateStore:
             hedge_intents=hedge_intents,
             net_unhedged_ounces=Decimal(str(raw["net_unhedged_ounces"])),
             halt_reason=_optional_string(raw["halt_reason"]),
+            source_freeze_reason=_optional_string(raw.get("source_freeze_reason")),
         )
 
 

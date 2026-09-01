@@ -1,4 +1,4 @@
-"""Credential-free two-venue backtest for the first Taker slice."""
+"""Credential-free two-venue backtests for the Taker and Maker slices."""
 
 import argparse
 import tempfile
@@ -13,6 +13,7 @@ from nautilus_trader.config import BacktestEngineConfig
 from nautilus_trader.model.currencies import USD, USDT
 from nautilus_trader.model.data import QuoteTick
 from nautilus_trader.model.enums import AccountType, AssetClass, OmsType
+from nautilus_trader.model.events import OrderUpdated
 from nautilus_trader.model.identifiers import AccountId, InstrumentId, Symbol, Venue
 from nautilus_trader.model.instruments import Cfd, CryptoPerpetual
 from nautilus_trader.model.objects import Currency, Money, Price, Quantity
@@ -20,6 +21,10 @@ from nautilus_trader.model.objects import Currency, Money, Price, Quantity
 from py000_nautilus.config import (
     CarryConfig,
     FxConfig,
+    HedgeAccountRoute,
+    MakerEconomicsConfig,
+    MakerSideConfig,
+    MakerStrategyConfig,
     RiskConfig,
     SourceAccountRoute,
     TakerEconomicsConfig,
@@ -27,6 +32,7 @@ from py000_nautilus.config import (
 )
 from py000_nautilus.models import ObligationStatus
 from py000_nautilus.store import JsonStateStore
+from py000_nautilus.strategies.maker import MakerStrategy
 from py000_nautilus.strategies.taker import TakerStrategy
 
 BITFINEX = Venue("BITFINEX")
@@ -57,6 +63,21 @@ class SimulationResult:
     source_notional_usdt: Decimal
     hedge_notional_usd: Decimal
     state_path: Path
+
+
+@dataclass(frozen=True, slots=True)
+class MakerSimulationResult:
+    orders: int
+    source_orders: int
+    hedge_orders: int
+    bid_updated: bool
+    bid_status: str
+    ask_status: str
+    hedge_status: str
+    source_position_ounces: Decimal
+    hedge_position_ounces: Decimal
+    hedge_intents: int
+    completed_hedges: int
 
 
 def run_simulated_example(state_path: Path) -> SimulationResult:
@@ -169,6 +190,116 @@ def _strategy_config(state_path: Path) -> TakerStrategyConfig:
     )
 
 
+def run_maker_simulated_example(state_path_prefix: Path) -> MakerSimulationResult:
+    """Maintain two Maker quotes, requote, fill the bid, and hedge its actual fill."""
+    engine = BacktestEngine(
+        BacktestEngineConfig(
+            logging=LoggingConfig(bypass_logging=True),
+            run_analysis=False,
+        )
+    )
+    engine.add_venue(
+        venue=BITFINEX,
+        oms_type=OmsType.NETTING,
+        account_type=AccountType.MARGIN,
+        starting_balances=[Money(1_000_000, USDT)],
+        base_currency=USDT,
+        default_leverage=Decimal(16),
+    )
+    engine.add_venue(
+        venue=MT5,
+        oms_type=OmsType.NETTING,
+        account_type=AccountType.MARGIN,
+        starting_balances=[Money(1_000_000, USD)],
+        base_currency=USD,
+        default_leverage=Decimal(10),
+    )
+    source = _source_instrument()
+    hedge = _hedge_instrument()
+    engine.add_instrument(source)
+    engine.add_instrument(hedge)
+    engine.add_strategy(MakerStrategy(_maker_strategy_config(state_path_prefix)))
+    engine.add_data(
+        [
+            _quote(hedge, "2400.00", "2401.00", "10", 1_000_000_000),
+            _quote(source, "2390.00", "2410.00", "5", 2_000_000_000),
+            _quote(hedge, "2402.00", "2403.00", "10", 3_000_000_000),
+            _quote(source, "2398.00", "2399.00", "5", 4_000_000_000),
+        ]
+    )
+    engine.run()
+    orders = engine.cache.orders()
+    source_orders = [order for order in orders if order.instrument_id == SOURCE_ID]
+    hedge_orders = [order for order in orders if order.instrument_id == HEDGE_ID]
+    bid_order = next(order for order in source_orders if order.side.name == "BUY")
+    ask_order = next(order for order in source_orders if order.side.name == "SELL")
+    hedge_order = hedge_orders[0]
+    stores = (
+        JsonStateStore(f"{state_path_prefix}.bid.json"),
+        JsonStateStore(f"{state_path_prefix}.ask.json"),
+    )
+    intents = tuple(intent for store in stores for intent in store.intents())
+    result = MakerSimulationResult(
+        orders=len(orders),
+        source_orders=len(source_orders),
+        hedge_orders=len(hedge_orders),
+        bid_updated=any(isinstance(event, OrderUpdated) for event in bid_order.events),
+        bid_status=bid_order.status.name,
+        ask_status=ask_order.status.name,
+        hedge_status=hedge_order.status.name,
+        source_position_ounces=cast(Decimal, engine.portfolio.net_position(SOURCE_ID)),
+        hedge_position_ounces=cast(Decimal, engine.portfolio.net_position(HEDGE_ID)),
+        hedge_intents=len(intents),
+        completed_hedges=sum(
+            intent.status is ObligationStatus.COMPLETED for intent in intents
+        ),
+    )
+    engine.dispose()
+    return result
+
+
+def _maker_strategy_config(state_path_prefix: Path) -> MakerStrategyConfig:
+    return MakerStrategyConfig(
+        source_instrument_id=SOURCE_ID,
+        hedge_instrument_id=HEDGE_ID,
+        source_accounts=(
+            SourceAccountRoute(
+                account_id=AccountId("BITFINEX-001"),
+                max_long_ounces=Decimal(10),
+                max_short_ounces=Decimal(10),
+                base_margin_level=Decimal(100),
+            ),
+        ),
+        hedge_accounts=(
+            HedgeAccountRoute(
+                account_id=AccountId("MT5-001"),
+                max_long_ounces=Decimal(10),
+                max_short_ounces=Decimal(10),
+            ),
+        ),
+        economics=MakerEconomicsConfig(
+            bid=MakerSideConfig(
+                open_quantity_ounces=Decimal(1),
+                open_spread=Decimal("0.001"),
+                delta=Decimal("0.0001"),
+            ),
+            ask=MakerSideConfig(
+                open_quantity_ounces=Decimal(1),
+                open_spread=Decimal("0.001"),
+                delta=Decimal("0.0001"),
+            ),
+            margin_level=Decimal(500),
+            carry=CarryConfig(),
+            fx=FxConfig(),
+            risk=RiskConfig(source_max_abs=Decimal(10), hedge_max_abs=Decimal(10)),
+        ),
+        store_path_prefix=str(state_path_prefix),
+        initial_cost_ts_ns=1_000_000_000,
+        initial_hedge_session_open=True,
+        initial_session_ts_ns=1_000_000_000,
+    )
+
+
 def _source_instrument() -> CryptoPerpetual:
     return CryptoPerpetual(
         instrument_id=SOURCE_ID,
@@ -248,6 +379,22 @@ def main() -> None:
         f"orders={result.orders} hedge_intents={result.hedge_intents} "
         f"completed_hedges={result.completed_hedges} "
         f"positions_oz={result.source_position_ounces}/{result.hedge_position_ounces}"
+    )
+
+
+def maker_main() -> None:
+    parser = argparse.ArgumentParser(description="Run the credential-free Maker example")
+    parser.add_argument("--state", type=Path, help="state prefix (defaults to a temporary path)")
+    args = parser.parse_args()
+    if args.state is not None:
+        result = run_maker_simulated_example(args.state)
+    else:
+        with tempfile.TemporaryDirectory(prefix="py000-maker-") as directory:
+            result = run_maker_simulated_example(Path(directory) / "maker.state")
+    print(
+        f"orders={result.orders} source={result.source_orders} hedge={result.hedge_orders} "
+        f"updated={result.bid_updated} positions_oz="
+        f"{result.source_position_ounces}/{result.hedge_position_ounces}"
     )
 
 

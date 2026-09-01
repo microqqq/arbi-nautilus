@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "py000-nautilus"
 version = "0.1.0"
-description = "Minimal PY000 Taker strategy slice for NautilusTrader"
+description = "Minimal PY000 Taker and Maker strategy slices for NautilusTrader"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
@@ -21,6 +21,7 @@ dev = [
 
 [project.scripts]
 py000-sim = "py000_nautilus.app:main"
+py000-maker-sim = "py000_nautilus.app:maker_main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/py000_nautilus"]

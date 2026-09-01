@@ -1,4 +1,4 @@
-"""Configuration for the first Taker vertical slice."""
+"""Configuration for the bounded PY000 Taker and Maker vertical slices."""
 
 from decimal import Decimal
 
@@ -78,3 +78,54 @@ class TakerStrategyConfig(StrategyConfig, frozen=True):
     initial_cost_ts_ns: int = 0
     initial_hedge_session_open: bool = False
     initial_session_ts_ns: int = 0
+
+
+class HedgeAccountRoute(NautilusConfig, frozen=True):
+    """One MT5 account route, with capacity expressed in canonical ounces."""
+
+    account_id: AccountId
+    max_long_ounces: Decimal
+    max_short_ounces: Decimal
+    client_id: ClientId | None = None
+
+
+class MakerSideConfig(NautilusConfig, frozen=True):
+    open_quantity_ounces: Decimal
+    open_spread: Decimal
+    delta: Decimal
+
+
+class MakerEconomicsConfig(NautilusConfig, frozen=True):
+    bid: MakerSideConfig
+    ask: MakerSideConfig
+    margin_level: Decimal
+    carry: CarryConfig
+    fx: FxConfig
+    risk: RiskConfig
+
+
+class MakerStrategyConfig(StrategyConfig, frozen=True):
+    """Specific wiring for the two active-oracle Maker working orders."""
+
+    source_instrument_id: InstrumentId
+    hedge_instrument_id: InstrumentId
+    source_accounts: tuple[SourceAccountRoute, ...]
+    hedge_accounts: tuple[HedgeAccountRoute, ...]
+    economics: MakerEconomicsConfig
+    store_path_prefix: str
+    fixed_amount: bool = False
+    keep_last_accounts: bool = False
+    cross_clamp_ticks: int = 2
+    max_quote_age_ns: int = 5_000_000_000
+    max_cross_leg_skew_ns: int = 2_000_000_000
+    max_cost_age_ns: int = 5_000_000_000
+    max_session_age_ns: int = 5_000_000_000
+    initial_cost_ts_ns: int = 0
+    initial_hedge_session_open: bool = False
+    initial_session_ts_ns: int = 0
+
+    def __post_init__(self) -> None:
+        if self.keep_last_accounts:
+            raise ValueError("keep_last_accounts is not restart-safe and is unsupported")
+        if self.cross_clamp_ticks <= 0:
+            raise ValueError("cross_clamp_ticks must be positive")

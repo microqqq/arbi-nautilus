@@ -74,7 +74,8 @@ def test_real_partial_final_duplicate_and_late_order_filled_events(tmp_path: Pat
         intent.hedge_quantity_ounces == Decimal(1)
         for intent in strategy.recorded_intents
     )
-    assert strategy.state_store.net_unhedged_ounces == 0
+    assert strategy.state_store.rounding_residual_ounces == 0
+    assert strategy.state_store.net_unhedged_ounces == Decimal(2)
 
 
 def test_late_timer_for_a_cannot_target_active_b() -> None:

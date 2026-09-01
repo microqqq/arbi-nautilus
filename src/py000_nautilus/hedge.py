@@ -24,9 +24,7 @@ class HedgeCoordinator:
         if not self._store.knows_source_order(client_order_id):
             return None
         side = _business_side(event.order_side)
-        fill_key = (
-            f"{client_order_id}|{event.venue_order_id.value}|{event.trade_id.value}"
-        )
+        fill_key = _fill_key(event)
         return self._store.reserve_source_fill(
             fill_key=fill_key,
             client_order_id=client_order_id,
@@ -35,6 +33,14 @@ class HedgeCoordinator:
             fill_ounces=Decimal(str(event.last_qty)),
         )
 
+    def has_seen_source_fill(self, event: OrderFilled) -> bool:
+        if event.instrument_id != self._source_instrument_id:
+            return False
+        client_order_id = event.client_order_id.value
+        if not self._store.knows_source_order(client_order_id):
+            return False
+        return self._store.has_seen_source_fill(_fill_key(event))
+
 
 def _business_side(side: OrderSide) -> BusinessOrderSide:
     if side is OrderSide.BUY:
@@ -42,3 +48,9 @@ def _business_side(side: OrderSide) -> BusinessOrderSide:
     if side is OrderSide.SELL:
         return BusinessOrderSide.SELL
     raise ValueError(f"unsupported source fill side {side}")
+
+
+def _fill_key(event: OrderFilled) -> str:
+    return (
+        f"{event.client_order_id.value}|{event.venue_order_id.value}|{event.trade_id.value}"
+    )
