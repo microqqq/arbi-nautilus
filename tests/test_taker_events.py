@@ -1,0 +1,155 @@
+"""Use real Nautilus order/fill event types for source-to-hedge behavior."""
+
+from decimal import Decimal
+from pathlib import Path
+from typing import Any, cast
+
+from nautilus_trader.model.enums import OrderSide
+from nautilus_trader.model.identifiers import ClientOrderId, TradeId, VenueOrderId
+from nautilus_trader.model.objects import Money
+from nautilus_trader.test_kit.stubs.events import TestEventStubs
+from nautilus_trader.test_kit.stubs.execution import TestExecStubs
+
+from py000_nautilus.app import _source_instrument, _strategy_config
+from py000_nautilus.models import BusinessOrderSide, HedgeIntent
+from py000_nautilus.strategies.taker import (
+    TakerStrategy,
+    _cancel_timer_name,
+    _timer_target_if_active,
+)
+
+
+class RecordingTakerStrategy(TakerStrategy):
+    def __init__(self, state_path: Path) -> None:
+        super().__init__(_strategy_config(state_path))
+        self.recorded_intents: list[HedgeIntent] = []
+
+    def _submit_hedge_intent(self, intent: HedgeIntent) -> None:
+        self.recorded_intents.append(intent)
+
+
+def test_real_partial_final_duplicate_and_late_order_filled_events(tmp_path: Path) -> None:
+    strategy = RecordingTakerStrategy(tmp_path / "state.json")
+    instrument = _source_instrument()
+    order = TestExecStubs.limit_order(
+        instrument=instrument,
+        order_side=OrderSide.BUY,
+        quantity=instrument.make_qty(2),
+        price=instrument.make_price(2400),
+        client_order_id=ClientOrderId("O-REAL-EVENTS"),
+    )
+    strategy.state_store.begin_source(
+        order.client_order_id.value,
+        BusinessOrderSide.BUY,
+        Decimal(2),
+    )
+
+    partial = TestEventStubs.order_filled(
+        order=order,
+        instrument=instrument,
+        venue_order_id=VenueOrderId("V-1"),
+        trade_id=TradeId("T-PARTIAL"),
+        last_qty=instrument.make_qty(1),
+        commission=Money(0, instrument.quote_currency),
+    )
+    final = TestEventStubs.order_filled(
+        order=order,
+        instrument=instrument,
+        venue_order_id=VenueOrderId("V-1"),
+        trade_id=TradeId("T-FINAL"),
+        last_qty=instrument.make_qty(1),
+        commission=Money(0, instrument.quote_currency),
+    )
+
+    strategy.on_order_filled(partial)
+    strategy.on_order_filled(final)
+    strategy.on_order_filled(partial)  # duplicate partial
+    strategy.on_order_filled(final)  # late duplicate after terminal fill
+
+    assert [intent.source_trade_id for intent in strategy.recorded_intents] == [
+        "T-PARTIAL",
+        "T-FINAL",
+    ]
+    assert all(
+        intent.hedge_quantity_ounces == Decimal(1)
+        for intent in strategy.recorded_intents
+    )
+    assert strategy.state_store.net_unhedged_ounces == 0
+
+
+def test_late_timer_for_a_cannot_target_active_b() -> None:
+    timer_a = _cancel_timer_name("O-A")
+    timer_b = _cancel_timer_name("O-B")
+
+    assert _timer_target_if_active(timer_a, "O-B") is None
+    assert _timer_target_if_active(timer_b, "O-B") == "O-B"
+
+
+class _StopStore:
+    def __init__(self, active: str) -> None:
+        self.active_source_order_id = active
+        self.unknown: list[tuple[str, str]] = []
+
+    def mark_source_unknown(self, client_order_id: str, reason: str) -> None:
+        self.unknown.append((client_order_id, reason))
+
+
+class _WorkingOrder:
+    is_closed = False
+
+
+class _StopCache:
+    def __init__(self, expected: str) -> None:
+        self.expected = expected
+        self.order_value: _WorkingOrder | None = _WorkingOrder()
+        self.requested: list[str] = []
+
+    def order(self, client_order_id: ClientOrderId) -> _WorkingOrder | None:
+        self.requested.append(client_order_id.value)
+        assert client_order_id.value == self.expected
+        return self.order_value
+
+
+class _StopHarness:
+    def __init__(self, active: str, *, fail_cancel: bool = False) -> None:
+        self.state_store = _StopStore(active)
+        self.cache = _StopCache(active)
+        self.canceled: list[_WorkingOrder] = []
+        self.fail_cancel = fail_cancel
+
+    def cancel_order(self, order: _WorkingOrder) -> None:
+        if self.fail_cancel:
+            raise RuntimeError("cancel failed")
+        self.canceled.append(order)
+
+
+def test_stop_cancels_only_exact_active_gtc_without_releasing_gate() -> None:
+    harness = _StopHarness("O-B")
+
+    TakerStrategy.on_stop(cast(Any, harness))
+
+    assert harness.cache.requested == ["O-B"]
+    assert len(harness.canceled) == 1
+    assert harness.state_store.active_source_order_id == "O-B"
+    assert harness.state_store.unknown == []
+
+
+def test_stop_cancel_failure_marks_exact_active_unknown() -> None:
+    harness = _StopHarness("O-B", fail_cancel=True)
+
+    TakerStrategy.on_stop(cast(Any, harness))
+
+    assert harness.canceled == []
+    assert harness.state_store.active_source_order_id == "O-B"
+    assert harness.state_store.unknown[0][0] == "O-B"
+
+
+def test_stop_missing_cached_order_marks_exact_active_unknown() -> None:
+    harness = _StopHarness("O-B")
+    harness.cache.order_value = None
+
+    TakerStrategy.on_stop(cast(Any, harness))
+
+    assert harness.canceled == []
+    assert harness.state_store.active_source_order_id == "O-B"
+    assert harness.state_store.unknown[0][0] == "O-B"

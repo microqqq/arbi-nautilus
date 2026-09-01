@@ -1,0 +1,371 @@
+"""One-file durable custody for source orders, fills, and hedge obligations."""
+
+import json
+import os
+import tempfile
+from dataclasses import asdict, dataclass, replace
+from decimal import Decimal
+from hashlib import sha256
+from pathlib import Path
+from typing import cast
+
+from py000_nautilus.economics import round_hedge_ounces
+from py000_nautilus.models import BusinessOrderSide, HedgeIntent, ObligationStatus
+
+
+@dataclass(frozen=True, slots=True)
+class SourceOrderRecord:
+    client_order_id: str
+    side: BusinessOrderSide
+    quantity_ounces: Decimal
+    filled_ounces: Decimal = Decimal(0)
+    status: str = "SUBMITTING"
+
+
+@dataclass(slots=True)
+class StoreState:
+    source_orders: dict[str, SourceOrderRecord]
+    active_source_order_id: str | None
+    seen_source_fills: set[str]
+    seen_hedge_fills: set[str]
+    hedge_intents: dict[str, HedgeIntent]
+    net_unhedged_ounces: Decimal
+    halt_reason: str | None
+
+
+class JsonStateStore:
+    """Atomically persist the small state needed to fail closed on restart."""
+
+    def __init__(self, path: str | Path) -> None:
+        self.path = Path(path)
+        self._state = self._load() if self.path.exists() else self._empty_state()
+
+    @staticmethod
+    def _empty_state() -> StoreState:
+        return StoreState(
+            source_orders={},
+            active_source_order_id=None,
+            seen_source_fills=set(),
+            seen_hedge_fills=set(),
+            hedge_intents={},
+            net_unhedged_ounces=Decimal(0),
+            halt_reason=None,
+        )
+
+    @property
+    def halt_reason(self) -> str | None:
+        return self._state.halt_reason
+
+    @property
+    def net_unhedged_ounces(self) -> Decimal:
+        return self._state.net_unhedged_ounces
+
+    @property
+    def active_source_order_id(self) -> str | None:
+        return self._state.active_source_order_id
+
+    def can_submit_source(self) -> bool:
+        return (
+            self._state.halt_reason is None
+            and self._state.active_source_order_id is None
+            and all(
+                intent.status is ObligationStatus.COMPLETED
+                for intent in self._state.hedge_intents.values()
+            )
+        )
+
+    def recover_for_start(self) -> str | None:
+        """Turn any crash-surviving in-flight work into an explicit stop."""
+        active = self._state.active_source_order_id
+        unresolved = [
+            intent.intent_id
+            for intent in self._state.hedge_intents.values()
+            if intent.status is not ObligationStatus.COMPLETED
+        ]
+        if active is None and not unresolved:
+            return self._state.halt_reason
+        details = []
+        if active is not None:
+            current = self._state.source_orders[active]
+            self._state.source_orders[active] = replace(current, status="UNKNOWN")
+            details.append(f"source={active}")
+        if unresolved:
+            for intent_id in unresolved:
+                current_intent = self._state.hedge_intents[intent_id]
+                self._state.hedge_intents[intent_id] = replace(
+                    current_intent,
+                    status=ObligationStatus.UNKNOWN,
+                )
+            details.append(f"hedges={','.join(unresolved)}")
+        self._state.halt_reason = "restart requires reconciliation: " + " ".join(details)
+        self._persist()
+        return self._state.halt_reason
+
+    def begin_source(
+        self,
+        client_order_id: str,
+        side: BusinessOrderSide,
+        quantity_ounces: Decimal,
+    ) -> None:
+        if not self.can_submit_source():
+            raise RuntimeError("source submission blocked by persisted state")
+        if quantity_ounces <= 0:
+            raise ValueError("source quantity must be positive")
+        record = SourceOrderRecord(client_order_id, side, quantity_ounces)
+        self._state.source_orders[client_order_id] = record
+        self._state.active_source_order_id = client_order_id
+        self._persist()
+
+    def knows_source_order(self, client_order_id: str) -> bool:
+        return client_order_id in self._state.source_orders
+
+    def update_source_status(self, client_order_id: str, status: str) -> None:
+        record = self._state.source_orders.get(client_order_id)
+        if record is None:
+            return
+        self._state.source_orders[client_order_id] = replace(record, status=status)
+        if (
+            status in {"DENIED", "FILLED", "REJECTED"}
+            and self._state.active_source_order_id == client_order_id
+        ):
+            self._state.active_source_order_id = None
+        if status in {"CANCELED", "EXPIRED"}:
+            self._state.halt_reason = _source_reconcile_reason(client_order_id)
+        self._persist()
+
+    def confirm_source_reconciled(self, client_order_id: str) -> None:
+        """Release a canceled source only after an adapter supplies an authoritative report."""
+        record = self._state.source_orders.get(client_order_id)
+        if record is None or record.status not in {"CANCELED", "EXPIRED"}:
+            raise ValueError("source order is not awaiting terminal reconciliation")
+        if self._state.active_source_order_id == client_order_id:
+            self._state.active_source_order_id = None
+        if self._state.halt_reason == _source_reconcile_reason(client_order_id):
+            self._state.halt_reason = None
+        self._persist()
+
+    def mark_source_unknown(self, client_order_id: str, reason: str) -> None:
+        record = self._state.source_orders.get(client_order_id)
+        if record is not None:
+            self._state.source_orders[client_order_id] = replace(record, status="UNKNOWN")
+        self._state.halt_reason = reason
+        self._persist()
+
+    def reserve_source_fill(
+        self,
+        *,
+        fill_key: str,
+        client_order_id: str,
+        trade_id: str,
+        source_side: BusinessOrderSide,
+        fill_ounces: Decimal,
+    ) -> HedgeIntent | None:
+        """Record one actual fill and, when integer ounces accrue, one intent."""
+        if fill_key in self._state.seen_source_fills:
+            return None
+        record = self._state.source_orders.get(client_order_id)
+        if record is None:
+            return None
+        if record.side is not source_side:
+            raise ValueError("source fill side does not match submitted order")
+        if fill_ounces <= 0:
+            raise ValueError("fill quantity must be positive")
+
+        self._state.seen_source_fills.add(fill_key)
+        filled = record.filled_ounces + fill_ounces
+        status = "FILLED" if filled >= record.quantity_ounces else "PARTIALLY_FILLED"
+        self._state.source_orders[client_order_id] = replace(
+            record,
+            filled_ounces=filled,
+            status=status,
+        )
+        if status == "FILLED" and self._state.active_source_order_id == client_order_id:
+            self._state.active_source_order_id = None
+            if self._state.halt_reason == _source_reconcile_reason(client_order_id):
+                self._state.halt_reason = None
+
+        signed_fill = fill_ounces if source_side is BusinessOrderSide.BUY else -fill_ounces
+        self._state.net_unhedged_ounces += signed_fill
+        rounded_ounces = round_hedge_ounces(self._state.net_unhedged_ounces)
+        if rounded_ounces == 0:
+            self._persist()
+            return None
+
+        self._state.net_unhedged_ounces -= Decimal(rounded_ounces)
+        digest = sha256(fill_key.encode()).hexdigest()[:24]
+        hedge_side = (
+            BusinessOrderSide.SELL if rounded_ounces > 0 else BusinessOrderSide.BUY
+        )
+        hedge_ounces = Decimal(abs(rounded_ounces))
+        intent = HedgeIntent(
+            intent_id=f"hedge-{digest}",
+            fill_key=fill_key,
+            source_client_order_id=client_order_id,
+            source_trade_id=trade_id,
+            source_side=source_side,
+            source_fill_ounces=fill_ounces,
+            hedge_side=hedge_side,
+            hedge_quantity_ounces=hedge_ounces,
+        )
+        self._state.hedge_intents[intent.intent_id] = intent
+        self._persist()
+        return intent
+
+    def bind_hedge_order(self, intent_id: str, client_order_id: str) -> None:
+        intent = self._state.hedge_intents[intent_id]
+        self._state.hedge_intents[intent_id] = replace(
+            intent,
+            hedge_client_order_id=client_order_id,
+            status=ObligationStatus.SUBMITTING,
+        )
+        self._persist()
+
+    def update_hedge_status(self, client_order_id: str, status: ObligationStatus) -> None:
+        intent = self._intent_for_hedge_order(client_order_id)
+        if intent is None:
+            return
+        self._state.hedge_intents[intent.intent_id] = replace(intent, status=status)
+        if status in {ObligationStatus.REJECTED, ObligationStatus.UNKNOWN}:
+            self._state.halt_reason = (
+                f"hedge {client_order_id} has unresolved status {status.value}"
+            )
+        self._persist()
+
+    def apply_hedge_fill(
+        self,
+        *,
+        client_order_id: str,
+        trade_id: str,
+        fill_ounces: Decimal,
+    ) -> bool:
+        fill_key = f"{client_order_id}|{trade_id}"
+        if fill_key in self._state.seen_hedge_fills:
+            return False
+        intent = self._intent_for_hedge_order(client_order_id)
+        if intent is None:
+            return False
+        if fill_ounces <= 0:
+            raise ValueError("hedge fill quantity must be positive")
+        self._state.seen_hedge_fills.add(fill_key)
+        filled = intent.hedge_filled_ounces + fill_ounces
+        status = (
+            ObligationStatus.COMPLETED
+            if filled >= intent.hedge_quantity_ounces
+            else ObligationStatus.ACCEPTED
+        )
+        self._state.hedge_intents[intent.intent_id] = replace(
+            intent,
+            hedge_filled_ounces=filled,
+            status=status,
+        )
+        self._persist()
+        return True
+
+    def intent(self, intent_id: str) -> HedgeIntent:
+        return self._state.hedge_intents[intent_id]
+
+    def intents(self) -> tuple[HedgeIntent, ...]:
+        return tuple(self._state.hedge_intents.values())
+
+    def _intent_for_hedge_order(self, client_order_id: str) -> HedgeIntent | None:
+        return next(
+            (
+                intent
+                for intent in self._state.hedge_intents.values()
+                if intent.hedge_client_order_id == client_order_id
+            ),
+            None,
+        )
+
+    def _persist(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        payload = self._to_payload()
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=self.path.parent,
+            prefix=f".{self.path.name}.",
+            delete=False,
+        ) as handle:
+            json.dump(payload, handle, sort_keys=True, separators=(",", ":"))
+            handle.flush()
+            os.fsync(handle.fileno())
+            temporary_path = Path(handle.name)
+        os.replace(temporary_path, self.path)
+
+    def _to_payload(self) -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "source_orders": {
+                key: _decimal_strings(asdict(record))
+                for key, record in self._state.source_orders.items()
+            },
+            "active_source_order_id": self._state.active_source_order_id,
+            "seen_source_fills": sorted(self._state.seen_source_fills),
+            "seen_hedge_fills": sorted(self._state.seen_hedge_fills),
+            "hedge_intents": {
+                key: _decimal_strings(asdict(intent))
+                for key, intent in self._state.hedge_intents.items()
+            },
+            "net_unhedged_ounces": str(self._state.net_unhedged_ounces),
+            "halt_reason": self._state.halt_reason,
+        }
+
+    def _load(self) -> StoreState:
+        raw = cast(dict[str, object], json.loads(self.path.read_text(encoding="utf-8")))
+        if raw.get("schema_version") != 1:
+            raise ValueError("unsupported state schema")
+        source_raw = cast(dict[str, dict[str, object]], raw["source_orders"])
+        intents_raw = cast(dict[str, dict[str, object]], raw["hedge_intents"])
+        source_orders = {
+            key: SourceOrderRecord(
+                client_order_id=str(value["client_order_id"]),
+                side=BusinessOrderSide(str(value["side"])),
+                quantity_ounces=Decimal(str(value["quantity_ounces"])),
+                filled_ounces=Decimal(str(value["filled_ounces"])),
+                status=str(value["status"]),
+            )
+            for key, value in source_raw.items()
+        }
+        hedge_intents = {
+            key: HedgeIntent(
+                intent_id=str(value["intent_id"]),
+                fill_key=str(value["fill_key"]),
+                source_client_order_id=str(value["source_client_order_id"]),
+                source_trade_id=str(value["source_trade_id"]),
+                source_side=BusinessOrderSide(str(value["source_side"])),
+                source_fill_ounces=Decimal(str(value["source_fill_ounces"])),
+                hedge_side=BusinessOrderSide(str(value["hedge_side"])),
+                hedge_quantity_ounces=Decimal(str(value["hedge_quantity_ounces"])),
+                status=ObligationStatus(str(value["status"])),
+                hedge_client_order_id=_optional_string(value["hedge_client_order_id"]),
+                hedge_filled_ounces=Decimal(str(value["hedge_filled_ounces"])),
+            )
+            for key, value in intents_raw.items()
+        }
+        return StoreState(
+            source_orders=source_orders,
+            active_source_order_id=_optional_string(raw["active_source_order_id"]),
+            seen_source_fills=set(cast(list[str], raw["seen_source_fills"])),
+            seen_hedge_fills=set(cast(list[str], raw["seen_hedge_fills"])),
+            hedge_intents=hedge_intents,
+            net_unhedged_ounces=Decimal(str(raw["net_unhedged_ounces"])),
+            halt_reason=_optional_string(raw["halt_reason"]),
+        )
+
+
+def _optional_string(value: object) -> str | None:
+    return None if value is None else str(value)
+
+
+def _source_reconcile_reason(client_order_id: str) -> str:
+    return f"source {client_order_id} terminal event requires fill reconciliation"
+
+
+def _decimal_strings(value: dict[str, object]) -> dict[str, object]:
+    return {
+        key: str(item)
+        if isinstance(item, Decimal | BusinessOrderSide | ObligationStatus)
+        else item
+        for key, item in value.items()
+    }

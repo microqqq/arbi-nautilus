@@ -1,0 +1,49 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "py000-nautilus"
+version = "0.1.0"
+description = "Minimal PY000 Taker strategy slice for NautilusTrader"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "nautilus-trader==1.231.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "mypy==1.18.2",
+  "pytest==9.0.2",
+  "ruff==0.12.12",
+]
+
+[project.scripts]
+py000-sim = "py000_nautilus.app:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/py000_nautilus"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["src", "tests", "examples"]
+warn_unreachable = true
+disallow_subclassing_any = false
+
+[[tool.mypy.overrides]]
+module = ["nautilus_trader.*"]
+ignore_missing_imports = true
