@@ -3,7 +3,6 @@
 from decimal import Decimal
 from typing import cast
 
-from nautilus_trader.common.events import TimeEvent
 from nautilus_trader.model.data import QuoteTick
 from nautilus_trader.model.enums import OrderSide, TimeInForce
 from nautilus_trader.model.events import (
@@ -173,7 +172,7 @@ class TakerStrategy(Strategy):
             order_side=side,
             quantity=instrument.make_qty(opportunity.source_quantity_ounces),
             price=instrument.make_price(opportunity.source_price_usdt),
-            time_in_force=TimeInForce.GTC,
+            time_in_force=TimeInForce.IOC,
             tags=[
                 "py000=taker-source",
                 f"legacy_leverage={opportunity.leverage}",
@@ -194,11 +193,6 @@ class TakerStrategy(Strategy):
                 client_id=opportunity.source_account.client_id,
                 params={"leverage": opportunity.leverage},
             )
-            self.clock.set_time_alert_ns(
-                name=_cancel_timer_name(order.client_order_id.value),
-                alert_time_ns=self.clock.timestamp_ns() + self._config.source_cancel_after_ns,
-                callback=self._cancel_source_remainder,
-            )
         except Exception as exc:
             self.state_store.mark_source_unknown(
                 order.client_order_id.value,
@@ -215,13 +209,11 @@ class TakerStrategy(Strategy):
                 f"hedge quote unavailable for {intent.intent_id}; source remains blocked"
             )
             return
-        limit_price = hedge_tick.ask_price if side is OrderSide.BUY else hedge_tick.bid_price
-        order = self.order_factory.limit(
+        order = self.order_factory.market(
             instrument_id=self._config.hedge_instrument_id,
             order_side=side,
             quantity=instrument.make_qty(intent.hedge_quantity_ounces),
-            price=instrument.make_price(Decimal(str(limit_price))),
-            time_in_force=TimeInForce.IOC,
+            time_in_force=TimeInForce.FOK,
             tags=[f"py000={intent.intent_id}", f"source_trade={intent.source_trade_id}"],
         )
         self.state_store.bind_hedge_order(intent.intent_id, order.client_order_id.value)
@@ -285,23 +277,6 @@ class TakerStrategy(Strategy):
         else:
             self.state_store.update_hedge_status(client_order_id, ObligationStatus.REJECTED)
 
-    def _cancel_source_remainder(self, event: TimeEvent) -> None:
-        client_order_id = _timer_target_if_active(
-            cast(str, event.name),
-            self.state_store.active_source_order_id,
-        )
-        if client_order_id is None:
-            return
-        order = self.cache.order(ClientOrderId(client_order_id))
-        if order is None:
-            self.state_store.mark_source_unknown(
-                client_order_id,
-                "source cancel timer could not resolve the Nautilus order",
-            )
-            return
-        if not order.is_closed:
-            self.cancel_order(order)
-
     def _inputs_are_fresh(self, source_tick: QuoteTick, hedge_tick: QuoteTick) -> bool:
         now_ns = cast(int, self.clock.timestamp_ns())
         return market_inputs_are_fresh(
@@ -340,15 +315,3 @@ def _book_top(tick: QuoteTick) -> BookTop:
         bid_size=Decimal(str(tick.bid_size)),
         ask_size=Decimal(str(tick.ask_size)),
     )
-
-
-def _cancel_timer_name(client_order_id: str) -> str:
-    return f"cancel-source:{client_order_id}"
-
-
-def _timer_target_if_active(timer_name: str, active_order_id: str | None) -> str | None:
-    prefix = "cancel-source:"
-    if active_order_id is None or not timer_name.startswith(prefix):
-        return None
-    timer_order_id = timer_name.removeprefix(prefix)
-    return timer_order_id if timer_order_id == active_order_id else None

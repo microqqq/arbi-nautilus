@@ -439,6 +439,6 @@ That proves the read path for that deployed build, not the current execution sou
 The corrected decimal parser and bounded DEMO `MARKET` + `FOK` path have now been
 compile-, regression-, and single-canary-tested. The remaining boundary is unchanged:
 there is no crash/power-loss durability proof, retention policy, broker-specific
-conformance beyond MetaQuotes-Demo, reconciliation API, `LIMIT` + `IOC` support, or
-Maker/Taker composition. Bitfinex live adapters and full strategy parity remain outside
+conformance beyond MetaQuotes-Demo, reconciliation API, `MARKET` + `IOC` partial-fill
+support, or Maker/Taker composition. Bitfinex live adapters and full strategy parity remain outside
 this checkpoint.

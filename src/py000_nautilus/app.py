@@ -48,6 +48,8 @@ class SimulationResult:
     completed_hedges: int
     source_side: str
     hedge_side: str
+    source_order_type: str
+    hedge_order_type: str
     source_time_in_force: str
     hedge_time_in_force: str
     source_quantity_ounces: Decimal
@@ -55,7 +57,6 @@ class SimulationResult:
     source_filled_ounces: Decimal
     hedge_filled_ounces: Decimal
     source_limit_price: Decimal
-    hedge_limit_price: Decimal
     source_average_fill_price: Decimal
     hedge_average_fill_price: Decimal
     source_position_ounces: Decimal
@@ -74,6 +75,11 @@ class MakerSimulationResult:
     bid_status: str
     ask_status: str
     hedge_status: str
+    source_order_types: tuple[str, ...]
+    source_time_in_forces: tuple[str, ...]
+    source_post_only: tuple[bool, ...]
+    hedge_order_type: str
+    hedge_time_in_force: str
     source_position_ounces: Decimal
     hedge_position_ounces: Decimal
     hedge_intents: int
@@ -126,7 +132,6 @@ def run_simulated_example(state_path: Path) -> SimulationResult:
     source_filled = Decimal(str(source_order.filled_qty))
     hedge_filled = Decimal(str(hedge_order.filled_qty))
     source_price = Decimal(str(source_order.price))
-    hedge_price = Decimal(str(hedge_order.price))
     source_average_fill_price = Decimal(str(source_order.avg_px))
     hedge_average_fill_price = Decimal(str(hedge_order.avg_px))
     result = SimulationResult(
@@ -137,6 +142,8 @@ def run_simulated_example(state_path: Path) -> SimulationResult:
         ),
         source_side=source_order.side.name,
         hedge_side=hedge_order.side.name,
+        source_order_type=source_order.order_type.name,
+        hedge_order_type=hedge_order.order_type.name,
         source_time_in_force=source_order.time_in_force.name,
         hedge_time_in_force=hedge_order.time_in_force.name,
         source_quantity_ounces=source_quantity,
@@ -144,7 +151,6 @@ def run_simulated_example(state_path: Path) -> SimulationResult:
         source_filled_ounces=source_filled,
         hedge_filled_ounces=hedge_filled,
         source_limit_price=source_price,
-        hedge_limit_price=hedge_price,
         source_average_fill_price=source_average_fill_price,
         hedge_average_fill_price=hedge_average_fill_price,
         source_position_ounces=cast(Decimal, engine.portfolio.net_position(SOURCE_ID)),
@@ -247,6 +253,11 @@ def run_maker_simulated_example(state_path_prefix: Path) -> MakerSimulationResul
         bid_status=bid_order.status.name,
         ask_status=ask_order.status.name,
         hedge_status=hedge_order.status.name,
+        source_order_types=tuple(order.order_type.name for order in source_orders),
+        source_time_in_forces=tuple(order.time_in_force.name for order in source_orders),
+        source_post_only=tuple(order.is_post_only for order in source_orders),
+        hedge_order_type=hedge_order.order_type.name,
+        hedge_time_in_force=hedge_order.time_in_force.name,
         source_position_ounces=cast(Decimal, engine.portfolio.net_position(SOURCE_ID)),
         hedge_position_ounces=cast(Decimal, engine.portfolio.net_position(HEDGE_ID)),
         hedge_intents=len(intents),

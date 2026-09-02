@@ -12,11 +12,7 @@ from nautilus_trader.test_kit.stubs.execution import TestExecStubs
 
 from py000_nautilus.app import _source_instrument, _strategy_config
 from py000_nautilus.models import BusinessOrderSide, HedgeIntent
-from py000_nautilus.strategies.taker import (
-    TakerStrategy,
-    _cancel_timer_name,
-    _timer_target_if_active,
-)
+from py000_nautilus.strategies.taker import TakerStrategy
 
 
 class RecordingTakerStrategy(TakerStrategy):
@@ -76,14 +72,6 @@ def test_real_partial_final_duplicate_and_late_order_filled_events(tmp_path: Pat
     )
     assert strategy.state_store.rounding_residual_ounces == 0
     assert strategy.state_store.net_unhedged_ounces == Decimal(2)
-
-
-def test_late_timer_for_a_cannot_target_active_b() -> None:
-    timer_a = _cancel_timer_name("O-A")
-    timer_b = _cancel_timer_name("O-B")
-
-    assert _timer_target_if_active(timer_a, "O-B") is None
-    assert _timer_target_if_active(timer_b, "O-B") == "O-B"
 
 
 class _StopStore:

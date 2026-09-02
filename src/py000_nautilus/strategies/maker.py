@@ -378,13 +378,11 @@ class MakerStrategy(Strategy):
             return
         instrument = self._required_hedge_instrument()
         side = OrderSide.BUY if intent.hedge_side is BusinessOrderSide.BUY else OrderSide.SELL
-        price = hedge_tick.ask_price if side is OrderSide.BUY else hedge_tick.bid_price
-        order = self.order_factory.limit(
+        order = self.order_factory.market(
             instrument_id=self._config.hedge_instrument_id,
             order_side=side,
             quantity=instrument.make_qty(intent.hedge_quantity_ounces),
-            price=instrument.make_price(Decimal(str(price))),
-            time_in_force=TimeInForce.IOC,
+            time_in_force=TimeInForce.FOK,
             tags=[
                 f"py000={intent.intent_id}",
                 f"source_trade={intent.source_trade_id}",

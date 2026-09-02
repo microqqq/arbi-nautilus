@@ -38,8 +38,10 @@ The current source also contains one deliberately narrow execution candidate:
 - reconciliation reports, cancel/modify, production composition, and strategy
   wiring are intentionally absent.
 
-The existing Maker and Taker strategies use `LIMIT` + `IOC`, so they are not routed
-through this canary and have not been semantically downgraded.
+The strategy layer keeps venue roles explicit: Taker submits `LIMIT` + `IOC` on the
+Bitfinex source leg, Maker maintains `LIMIT` + `GTC` + post-only source quotes, and both
+MT5 hedge legs submit `MARKET` + `FOK` to match the currently verified adapter. They are
+still not wired into a live composition.
 
 `InstrumentStatus` is only a REP-backed market-session observation. It is not
 hedge readiness and must not open source-risk admission without a separately
@@ -113,8 +115,9 @@ therefore tests that distinction explicitly and generalizes `0.2` as two
 instrument ticks, rather than claiming executable callee provenance.
 
 It does **not** establish complete oracle or live parity. Bitfinex data/execution,
-MT5 `LIMIT` + `IOC` execution, and live Maker/Taker composition remain unimplemented;
-the isolated DEMO `MARKET` + `FOK` candidate is not strategy parity. Depth/VWAP beyond
+MT5 `MARKET` + `IOC` partial-fill handling, and live Maker/Taker composition remain
+unimplemented; the isolated DEMO `MARKET` + `FOK` candidate is not strategy parity.
+Depth/VWAP beyond
 an L1 level, dynamic venue margin capacity/account reports, authoritative cancel
 reconciliation, Maker modify/cancel query closure, and application of per-order leverage by Bitfinex
 remain unimplemented. The strategies pass computed leverage in execution

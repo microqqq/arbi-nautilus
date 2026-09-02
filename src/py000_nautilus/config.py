@@ -70,7 +70,6 @@ class TakerStrategyConfig(StrategyConfig, frozen=True):
     economics: TakerEconomicsConfig
     store_path: str
     hedge_client_id: ClientId | None = None
-    source_cancel_after_ns: int = 3_000_000_000
     max_quote_age_ns: int = 5_000_000_000
     max_cross_leg_skew_ns: int = 2_000_000_000
     max_cost_age_ns: int = 5_000_000_000
