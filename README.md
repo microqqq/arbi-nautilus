@@ -39,11 +39,16 @@ The current source also contains one deliberately narrow execution candidate:
   retained journal without replaying historical terminal events, and verifies a stable
   journal/snapshot cut before admitting execution;
 - `UNKNOWN`, a dangling reservation, blocked recovery, mismatched FOK quantity, or any
-  same-symbol foreign-magic position keeps execution on HOLD. The existing poll loop
-  refreshes the snapshot at a bounded configurable interval (default one second): identity,
-  recovery, or critical execution-spec drift fails closed, while removal of foreign-magic
-  positions can restore admission. Order/fill reports, cancel/modify, production composition,
-  and strategy wiring remain intentionally absent.
+  same-symbol foreign-magic position keeps execution on HOLD and makes reconciliation
+  reports fail explicitly. The existing poll loop refreshes the snapshot at a bounded
+  configurable interval (default one second): identity, recovery, or critical execution-spec
+  drift fails closed, while removal of foreign-magic positions can restore admission;
+- the complete journal now projects deterministic bulk order/fill/position reports and an
+  exact single-order report. Filled orders preserve native MT5 order, deal, and position IDs;
+  rejected orders use a stable stream/account-scoped synthetic venue ID. HEDGING positions
+  missing from the current snapshot report FLAT against their exact cached PositionId rather
+  than an anonymous net position. Cancel/modify, production composition, and strategy wiring
+  remain intentionally absent.
 
 The strategy layer keeps venue roles explicit: Taker submits `LIMIT` + `IOC` on the
 Bitfinex source leg, Maker maintains `LIMIT` + `GTC` + post-only source quotes, and both

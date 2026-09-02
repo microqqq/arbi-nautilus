@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from dataclasses import dataclass
+from datetime import datetime
 from decimal import Decimal
 from typing import Literal, Protocol, cast
 
@@ -12,6 +14,7 @@ from nautilus_trader.common.component import LiveClock, MessageBus
 from nautilus_trader.common.enums import LogColor
 from nautilus_trader.common.providers import InstrumentProvider
 from nautilus_trader.config import LiveExecClientConfig
+from nautilus_trader.core.datetime import dt_to_unix_nanos
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.execution.messages import (
     BatchCancelOrders,
@@ -25,7 +28,12 @@ from nautilus_trader.execution.messages import (
     SubmitOrder,
     SubmitOrderList,
 )
-from nautilus_trader.execution.reports import FillReport, OrderStatusReport, PositionStatusReport
+from nautilus_trader.execution.reports import (
+    ExecutionMassStatus,
+    FillReport,
+    OrderStatusReport,
+    PositionStatusReport,
+)
 from nautilus_trader.live.execution_client import LiveExecutionClient
 from nautilus_trader.live.factories import LiveExecClientFactory
 from nautilus_trader.model.currencies import USD
@@ -34,6 +42,7 @@ from nautilus_trader.model.enums import (
     LiquiditySide,
     OmsType,
     OrderSide,
+    OrderStatus,
     OrderType,
     PositionSide,
     TimeInForce,
@@ -41,6 +50,7 @@ from nautilus_trader.model.enums import (
 from nautilus_trader.model.identifiers import (
     AccountId,
     ClientId,
+    ClientOrderId,
     InstrumentId,
     PositionId,
     TradeId,
@@ -61,6 +71,9 @@ from py000_nautilus.mt5_v1_transport import (
 
 class Mt5V1ExecutionError(RuntimeError):
     """The MT5 execution boundary cannot establish a trustworthy fact."""
+
+
+_REJECTED_ORDER_ID_DOMAIN = "py000-nautilus:mt5-v1:rejected-order"
 
 
 class Mt5V1ExecClientConfig(LiveExecClientConfig, kw_only=True, frozen=True):
@@ -643,9 +656,9 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
             self._loop.time() + self._mt5_config.snapshot_refresh_interval_ms / 1_000
         )
 
-    async def _refresh_snapshot_if_due(self) -> None:
+    async def _refresh_snapshot_if_due(self, *, force: bool = False) -> None:
         deadline = self._next_snapshot_refresh_at
-        if deadline is None or self._loop.time() < deadline:
+        if not force and (deadline is None or self._loop.time() < deadline):
             return
         try:
             identity = self._require_identity()
@@ -858,41 +871,261 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
             raise Mt5V1ExecutionError("MT5 execution snapshot is unavailable")
         return self._snapshot
 
+    def _require_reportable_state(self) -> tuple[JsonObject, _JournalProjection]:
+        self._require_identity()
+        snapshot = self._require_snapshot()
+        projection = _JournalProjection(self._reservations, self._terminal_events)
+        if self._pending:
+            raise Mt5V1ExecutionError(
+                "MT5 execution reports are unavailable while an order is pending"
+            )
+        if self._recovery_state == "blocked":
+            raise Mt5V1ExecutionError(
+                "MT5 execution reports are unavailable while EA recovery is blocked"
+            )
+        if projection.hold_reason is not None:
+            raise Mt5V1ExecutionError(
+                f"MT5 execution reports are unavailable: {projection.hold_reason}"
+            )
+        if self._foreign_position_ids:
+            raise Mt5V1ExecutionError(
+                "MT5 execution reports are unavailable with foreign-magic positions"
+            )
+        return snapshot, projection
+
+    def _report_instrument(self) -> Instrument:
+        instrument = self._instrument_provider.find(
+            self._mt5_config.instrument_id
+        ) or self._cache.instrument(self._mt5_config.instrument_id)
+        if instrument is None or instrument.lot_size is None:
+            raise Mt5V1ExecutionError("canonical MT5 instrument or lot_size is unavailable")
+        contract_size = Decimal(
+            cast(str, cast(JsonObject, self._require_snapshot()["symbol_spec"])["contract_size"])
+        )
+        if Decimal(str(instrument.lot_size)) != contract_size:
+            raise Mt5V1ExecutionError("instrument lot_size differs from MT5 contract_size")
+        return instrument
+
+    @staticmethod
+    def _event_ts_ns(event: JsonObject) -> int:
+        return int(cast(str, event["event_time_ms"])) * 1_000_000
+
+    @staticmethod
+    def _datetime_ms(value: datetime) -> int:
+        return dt_to_unix_nanos(value) // 1_000_000
+
+    @classmethod
+    def _event_in_window(
+        cls,
+        event: JsonObject,
+        start: datetime | None,
+        end: datetime | None,
+    ) -> bool:
+        timestamp_ms = int(cast(str, event["event_time_ms"]))
+        return not (
+            (start is not None and timestamp_ms < cls._datetime_ms(start))
+            or (end is not None and timestamp_ms > cls._datetime_ms(end))
+        )
+
+    @staticmethod
+    def _order_side(payload: JsonObject) -> OrderSide:
+        side = payload["side"]
+        if side == "buy":
+            return OrderSide.BUY
+        if side == "sell":
+            return OrderSide.SELL
+        raise Mt5V1ExecutionError(f"unsupported MT5 order side {side!r}")
+
+    def _synthetic_rejected_venue_order_id(self, client_order_id: str) -> VenueOrderId:
+        identity = self._require_identity()
+        material = "\0".join(
+            (
+                _REJECTED_ORDER_ID_DOMAIN,
+                identity.stream_id,
+                identity.account_id,
+                identity.symbol,
+                identity.magic,
+                client_order_id,
+            )
+        ).encode()
+        return VenueOrderId(f"PY000_REJ_{hashlib.sha256(material).hexdigest()}")
+
+    def _order_report(self, request_id: str, event: JsonObject) -> OrderStatusReport:
+        reservation = self._reservations[request_id]
+        reserved = cast(JsonObject, reservation["payload"])
+        payload = cast(JsonObject, event["payload"])
+        instrument = self._report_instrument()
+        contract_size = Decimal(str(instrument.lot_size))
+        quantity = instrument.make_qty(
+            Decimal(cast(str, reserved["quantity_lots"])) * contract_size
+        )
+        timestamp = self._event_ts_ns(event)
+        event_type = cast(str, event["event_type"])
+        if event_type == "order_filled":
+            venue_order_id = VenueOrderId(cast(str, payload["venue_order_id"]))
+            venue_position_id = PositionId(cast(str, payload["venue_position_id"]))
+            filled_qty = instrument.make_qty(
+                Decimal(cast(str, payload["filled_quantity_lots"])) * contract_size
+            )
+            status = OrderStatus.FILLED
+            avg_px = Decimal(cast(str, payload["fill_price"]))
+            cancel_reason = None
+        elif event_type == "order_rejected":
+            venue_order_id = self._synthetic_rejected_venue_order_id(request_id)
+            venue_position_id = None
+            filled_qty = instrument.make_qty(0)
+            status = OrderStatus.REJECTED
+            avg_px = None
+            cancel_reason = f"{payload['reason']} (retcode={payload['broker_retcode']})"
+        else:  # pragma: no cover - guarded by _require_reportable_state
+            raise Mt5V1ExecutionError(f"unsupported report terminal {event_type!r}")
+        return OrderStatusReport(
+            account_id=self.account_id,
+            instrument_id=self._mt5_config.instrument_id,
+            venue_order_id=venue_order_id,
+            client_order_id=ClientOrderId(request_id),
+            venue_position_id=venue_position_id,
+            order_side=self._order_side(reserved),
+            order_type=OrderType.MARKET,
+            time_in_force=TimeInForce.FOK,
+            order_status=status,
+            quantity=quantity,
+            filled_qty=filled_qty,
+            avg_px=avg_px,
+            cancel_reason=cancel_reason,
+            report_id=UUID4(),
+            ts_accepted=timestamp,
+            ts_last=timestamp,
+            ts_init=self._clock.timestamp_ns(),
+        )
+
+    def _fill_report(self, request_id: str, event: JsonObject) -> FillReport:
+        payload = cast(JsonObject, event["payload"])
+        instrument = self._report_instrument()
+        contract_size = Decimal(str(instrument.lot_size))
+        timestamp = self._event_ts_ns(event)
+        price = instrument.make_price(Decimal(cast(str, payload["fill_price"])))
+        return FillReport(
+            account_id=self.account_id,
+            instrument_id=self._mt5_config.instrument_id,
+            venue_order_id=VenueOrderId(cast(str, payload["venue_order_id"])),
+            trade_id=TradeId(cast(str, payload["venue_deal_id"])),
+            client_order_id=ClientOrderId(request_id),
+            venue_position_id=PositionId(cast(str, payload["venue_position_id"])),
+            order_side=self._order_side(payload),
+            last_qty=instrument.make_qty(
+                Decimal(cast(str, payload["filled_quantity_lots"])) * contract_size
+            ),
+            last_px=price,
+            avg_px=price.as_decimal(),
+            commission=Money(Decimal(cast(str, payload["commission"])), USD),
+            liquidity_side=LiquiditySide.NO_LIQUIDITY_SIDE,
+            report_id=UUID4(),
+            ts_event=timestamp,
+            ts_init=self._clock.timestamp_ns(),
+        )
+
+    async def generate_mass_status(
+        self,
+        lookback_mins: int | None = None,
+    ) -> ExecutionMassStatus | None:
+        async with self._state_lock:
+            self.reconciliation_active = True
+            try:
+                await self._consume_event_pages()
+                await self._refresh_snapshot_if_due(force=True)
+                return await super().generate_mass_status(lookback_mins)
+            except BaseException:
+                if self._identity is not None:
+                    await self._fail_closed_disconnect()
+                raise
+            finally:
+                self.reconciliation_active = False
+
     async def generate_order_status_report(
         self, command: GenerateOrderStatusReport
     ) -> OrderStatusReport | None:
-        raise NotImplementedError("MT5 v1 reconciliation is disabled")
+        _, projection = self._require_reportable_state()
+        if command.client_order_id is None and command.venue_order_id is None:
+            raise ValueError("client_order_id and venue_order_id cannot both be None")
+        if command.instrument_id not in {None, self._mt5_config.instrument_id}:
+            return None
+        for request_id, event in sorted(
+            projection.terminals.items(),
+            key=lambda item: int(cast(str, item[1]["event_seq"])),
+        ):
+            report = self._order_report(request_id, event)
+            if (
+                command.client_order_id is not None
+                and report.client_order_id != command.client_order_id
+            ):
+                continue
+            if (
+                command.venue_order_id is not None
+                and report.venue_order_id != command.venue_order_id
+            ):
+                continue
+            return report
+        return None
 
     async def generate_order_status_reports(
         self, command: GenerateOrderStatusReports
     ) -> list[OrderStatusReport]:
-        raise NotImplementedError("MT5 v1 reconciliation is disabled")
+        _, projection = self._require_reportable_state()
+        if command.instrument_id not in {None, self._mt5_config.instrument_id} or command.open_only:
+            return []
+        return [
+            self._order_report(request_id, event)
+            for request_id, event in sorted(
+                projection.terminals.items(),
+                key=lambda item: int(cast(str, item[1]["event_seq"])),
+            )
+            if self._event_in_window(event, command.start, command.end)
+        ]
 
     async def generate_fill_reports(self, command: GenerateFillReports) -> list[FillReport]:
-        raise NotImplementedError("MT5 v1 reconciliation is disabled")
+        _, projection = self._require_reportable_state()
+        if command.instrument_id not in {None, self._mt5_config.instrument_id}:
+            return []
+        reports = [
+            self._fill_report(request_id, event)
+            for request_id, event in sorted(
+                projection.terminals.items(),
+                key=lambda item: int(cast(str, item[1]["event_seq"])),
+            )
+            if event["event_type"] == "order_filled"
+            and self._event_in_window(event, command.start, command.end)
+        ]
+        if command.venue_order_id is not None:
+            reports = [
+                report for report in reports if report.venue_order_id == command.venue_order_id
+            ]
+        return reports
 
     async def generate_position_status_reports(
         self, command: GeneratePositionStatusReports
     ) -> list[PositionStatusReport]:
+        snapshot, _ = self._require_reportable_state()
         if command.instrument_id not in {None, self._mt5_config.instrument_id}:
             return []
-        snapshot = self._require_snapshot()
-        instrument = self._instrument_provider.find(
-            self._mt5_config.instrument_id
-        ) or self._cache.instrument(self._mt5_config.instrument_id)
-        if instrument is None:
-            raise Mt5V1ExecutionError("canonical MT5 instrument is unavailable")
-        contract_size = Decimal(
-            cast(str, cast(JsonObject, snapshot["symbol_spec"])["contract_size"])
-        )
-        if instrument.lot_size is None or Decimal(str(instrument.lot_size)) != contract_size:
-            raise Mt5V1ExecutionError("instrument lot_size differs from MT5 contract_size")
+        instrument = self._report_instrument()
+        contract_size = Decimal(str(instrument.lot_size))
         ts_init = self._clock.timestamp_ns()
         reports: list[PositionStatusReport] = []
-        for position in cast(list[JsonObject], snapshot["positions"]):
-            if position["magic"] != self._mt5_config.expected_magic:
-                continue
-            side = PositionSide.LONG if position["side"] == "buy" else PositionSide.SHORT
+        snapshot_position_ids: set[PositionId] = set()
+        for position in sorted(
+            cast(list[JsonObject], snapshot["positions"]),
+            key=lambda value: cast(str, value["identifier"]),
+        ):
+            position_id = PositionId(cast(str, position["identifier"]))
+            snapshot_position_ids.add(position_id)
+            side_text = position["side"]
+            if side_text == "buy":
+                side = PositionSide.LONG
+            elif side_text == "sell":
+                side = PositionSide.SHORT
+            else:
+                raise Mt5V1ExecutionError(f"unsupported MT5 position side {side_text!r}")
             reports.append(
                 PositionStatusReport(
                     account_id=self.account_id,
@@ -904,19 +1137,34 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
                     report_id=UUID4(),
                     ts_last=int(cast(str, position["time_msc"])) * 1_000_000,
                     ts_init=ts_init,
-                    venue_position_id=PositionId(cast(str, position["identifier"])),
+                    venue_position_id=position_id,
                     avg_px_open=Decimal(cast(str, position["price_open"])),
                 )
             )
-        if not reports and command.instrument_id == self._mt5_config.instrument_id:
-            reports.append(
-                PositionStatusReport.create_flat(
-                    account_id=self.account_id,
+        missing_positions = sorted(
+            (
+                position
+                for position in self._cache.positions_open(
                     instrument_id=self._mt5_config.instrument_id,
-                    size_precision=instrument.size_precision,
-                    ts_init=ts_init,
+                    account_id=self.account_id,
                 )
+                if position.id not in snapshot_position_ids
+            ),
+            key=lambda position: position.id.value,
+        )
+        reports.extend(
+            PositionStatusReport(
+                account_id=self.account_id,
+                instrument_id=self._mt5_config.instrument_id,
+                position_side=PositionSide.FLAT,
+                quantity=instrument.make_qty(0),
+                report_id=UUID4(),
+                ts_last=position.ts_last,
+                ts_init=ts_init,
+                venue_position_id=position.id,
             )
+            for position in missing_positions
+        )
         return reports
 
 

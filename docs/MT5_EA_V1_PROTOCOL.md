@@ -271,12 +271,43 @@ admission when no journal or local UNKNOWN blocker remains.
 The client accepts only Nautilus `MARKET` orders with `FOK` and no reduce-only,
 quote-quantity, or execution-algorithm semantics. It binds one configured MT5 instrument,
 verifies contract size, converts canonical ounces to an exact permitted lot quantity
-without rounding, and submits once. Startup position reports include only matching-magic
-positions and use the stable MT5 position identifier. Subsequent position reports use the
-latest successfully refreshed snapshot. Order/fill reports and cancel/modify/order-list
-operations remain unsupported;
-any later live composition must disable Nautilus `generate_missing_orders` until those
-report paths have an explicit policy.
+without rounding, and submits once.
+
+The four Nautilus 1.231 report APIs are deterministic projections of the retained journal
+and latest successfully refreshed snapshot. Before mass status, the client holds the existing
+state lock, consumes the journal tail, forces one snapshot refresh, proves the tail unchanged,
+and then delegates aggregation to Nautilus. The active-reconciliation flag is cleared even if
+that operation fails. Individual report methods perform no transport I/O and take no second
+lock.
+
+- `order_filled` produces a `FILLED` `MARKET`/`FOK` order report plus one fill report using
+  native MT5 order, deal, and position IDs, canonical `lots * contract_size` quantity, fill
+  price, USD commission, and journal event time.
+- `order_rejected` produces a `REJECTED` order report and no fill. Its required venue order
+  identity is `PY000_REJ_` plus SHA-256 over a fixed domain, stream, account, symbol, magic,
+  and client order ID; it is stable across processes and cannot collide with numeric MT5 IDs.
+- order and fill bulk queries honor instrument, UTC start/end, `open_only`, and venue-order
+  filters. Position reports are current-state facts and intentionally ignore historical
+  start/end windows, as long-lived open HEDGING tickets must not disappear from a lookback.
+- matching-magic snapshot positions use their native identifier. Every currently open cached
+  position for the same account/instrument which disappeared from the snapshot produces a
+  zero-quantity `FLAT` report with that exact PositionId and the cached stable `ts_last`.
+  Snapshot and cache both empty produces no anonymous flat report.
+
+Any `UNKNOWN`, dangling reservation, mismatched FOK fill, blocked recovery, foreign-magic
+position, local pending order, or disconnected client makes report queries fail explicitly;
+an empty list is reserved for a valid query with no matches. Single-order queries match every
+provided client and/or venue ID exactly and return `None` only when valid state contains no such
+order.
+
+The first future live composition should start fail closed with
+`generate_missing_orders=False` and continuous inflight/open/position checks disabled while
+engine integration is qualified. With that setting, any position discrepancy makes startup
+reconciliation fail and applies no synthetic correction: the application must require both a
+successful engine reconciliation result and `execution_admitted` before starting either strategy.
+Setting `generate_missing_orders=True` is the Nautilus-native path which can reconstruct or close
+an exact HEDGING PositionId; the offline A/B-position test covers that mechanism, but enabling it
+remains an explicit deployment decision. Cancel/modify/order-list operations remain unsupported.
 
 `InstrumentStatus` is only a market-session observation. It is derived from REP session
 evidence, rejects inconsistent symbol trade modes, and does not publish `TRADING` for a
@@ -455,6 +486,6 @@ That proves the read path for that deployed build, not the current execution sou
 The corrected decimal parser and bounded DEMO `MARKET` + `FOK` path have now been
 compile-, regression-, and single-canary-tested. The remaining boundary is unchanged:
 there is no crash/power-loss durability proof, retention policy, broker-specific
-conformance beyond MetaQuotes-Demo, reconciliation API, `MARKET` + `IOC` partial-fill
+conformance beyond MetaQuotes-Demo, `MARKET` + `IOC` partial-fill
 support, or Maker/Taker composition. Bitfinex live adapters and full strategy parity remain outside
 this checkpoint.

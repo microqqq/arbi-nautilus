@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from copy import deepcopy
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import cast
@@ -18,17 +20,29 @@ from nautilus_trader.execution.messages import (
     GeneratePositionStatusReports,
     SubmitOrder,
 )
-from nautilus_trader.model.enums import OrderSide, PositionSide, TimeInForce
+from nautilus_trader.live.config import LiveExecEngineConfig
+from nautilus_trader.live.execution_engine import LiveExecutionEngine
+from nautilus_trader.model.enums import (
+    OrderSide,
+    OrderStatus,
+    OrderType,
+    PositionSide,
+    TimeInForce,
+)
 from nautilus_trader.model.events import OrderEvent
 from nautilus_trader.model.identifiers import (
     ClientId,
     ClientOrderId,
     ExecAlgorithmId,
     InstrumentId,
+    PositionId,
     Venue,
+    VenueOrderId,
 )
 from nautilus_trader.model.orders import Order
 from nautilus_trader.test_kit.stubs.component import TestComponentStubs
+from nautilus_trader.test_kit.stubs.events import TestEventStubs
+from nautilus_trader.test_kit.stubs.execution import TestExecStubs
 
 from py000_nautilus.mt5_v1_data import instrument_from_snapshot
 from py000_nautilus.mt5_v1_execution import (
@@ -291,6 +305,7 @@ class _Harness:
         outcome: JsonObject | BaseException | None = None,
         recovery_state: RecoveryState = "ready",
         snapshot_refresh_interval_ms: int = 1_000,
+        capture_events: bool = True,
     ) -> None:
         self.identity = identity or _identity()
         self.snapshot = snapshot or _snapshot(self.identity, recovery_state=recovery_state)
@@ -298,7 +313,8 @@ class _Harness:
         self.msgbus = TestComponentStubs.msgbus()
         self.cache = TestComponentStubs.cache()
         self.events: list[OrderEvent] = []
-        self.msgbus.register("ExecEngine.process", self.events.append)
+        if capture_events:
+            self.msgbus.register("ExecEngine.process", self.events.append)
         self.instrument = instrument_from_snapshot(self.snapshot, INSTRUMENT_ID, ts_init=0)
         provider = InstrumentProvider()
         provider.add(self.instrument)
@@ -306,7 +322,7 @@ class _Harness:
             self.identity,
             self.snapshot,
             outcome=outcome,
-            event_sink=self.events,
+            event_sink=self.events if capture_events else None,
             recovery_state=recovery_state,
         )
         self.client = Mt5V1ExecutionClient(
@@ -330,6 +346,7 @@ class _Harness:
         self,
         quantity: str = "100",
         *,
+        order_side: OrderSide = OrderSide.BUY,
         time_in_force: TimeInForce = TimeInForce.FOK,
         client_order_id: ClientOrderId | None = None,
         reduce_only: bool = False,
@@ -338,7 +355,7 @@ class _Harness:
     ) -> Order:
         return TestComponentStubs.order_factory().market(
             instrument_id=INSTRUMENT_ID,
-            order_side=OrderSide.BUY,
+            order_side=order_side,
             quantity=self.instrument.make_qty(Decimal(quantity)),
             time_in_force=time_in_force,
             client_order_id=client_order_id,
@@ -365,6 +382,131 @@ class _Harness:
                 ts_init=self.clock.timestamp_ns(),
             )
         )
+
+
+def _order_reports_command(
+    harness: _Harness,
+    *,
+    instrument_id: InstrumentId | None = None,
+    start: datetime | None = None,
+    end: datetime | None = None,
+    open_only: bool = False,
+) -> GenerateOrderStatusReports:
+    return GenerateOrderStatusReports(
+        instrument_id=instrument_id,
+        start=start,
+        end=end,
+        open_only=open_only,
+        command_id=UUID4(),
+        ts_init=harness.clock.timestamp_ns(),
+    )
+
+
+def _fill_reports_command(
+    harness: _Harness,
+    *,
+    instrument_id: InstrumentId | None = None,
+    venue_order_id: VenueOrderId | None = None,
+    start: datetime | None = None,
+    end: datetime | None = None,
+) -> GenerateFillReports:
+    return GenerateFillReports(
+        instrument_id=instrument_id,
+        venue_order_id=venue_order_id,
+        start=start,
+        end=end,
+        command_id=UUID4(),
+        ts_init=harness.clock.timestamp_ns(),
+    )
+
+
+def _position_reports_command(
+    harness: _Harness,
+    *,
+    instrument_id: InstrumentId | None = None,
+    start: datetime | None = None,
+    end: datetime | None = None,
+) -> GeneratePositionStatusReports:
+    return GeneratePositionStatusReports(
+        instrument_id=instrument_id,
+        start=start,
+        end=end,
+        command_id=UUID4(),
+        ts_init=harness.clock.timestamp_ns(),
+    )
+
+
+def _live_engine(
+    harness: _Harness,
+    *,
+    generate_missing_orders: bool,
+) -> LiveExecutionEngine:
+    harness.cache.add_instrument(harness.instrument)
+    harness.cache.add_account(TestExecStubs.margin_account(account_id=harness.client.account_id))
+    engine = LiveExecutionEngine(
+        loop=asyncio.get_running_loop(),
+        msgbus=harness.msgbus,
+        cache=harness.cache,
+        clock=harness.clock,
+        config=LiveExecEngineConfig(
+            load_cache=False,
+            generate_missing_orders=generate_missing_orders,
+            inflight_check_interval_ms=0,
+            open_check_interval_secs=None,
+            position_check_interval_secs=None,
+        ),
+    )
+    engine.register_client(harness.client)
+    return engine
+
+
+def _cache_submitted_order(harness: _Harness, order: Order) -> None:
+    order.apply(
+        TestEventStubs.order_submitted(
+            order,
+            account_id=harness.client.account_id,
+            ts_event=harness.clock.timestamp_ns(),
+        )
+    )
+    harness.cache.add_order(order)
+
+
+async def _connected_report_harness(
+    loop: asyncio.AbstractEventLoop,
+    *,
+    capture_events: bool = True,
+) -> tuple[_Harness, Order, Order]:
+    harness = _Harness(loop, capture_events=capture_events)
+    filled_order = harness.market(client_order_id=ClientOrderId("REPORT-FILLED-1"))
+    rejected_order = harness.market(
+        order_side=OrderSide.SELL,
+        client_order_id=ClientOrderId("REPORT-REJECTED-1"),
+    )
+    harness.fake.pages.append(
+        _page(
+            harness.identity,
+            after_cursor="0",
+            events=[
+                _stream_started(harness.identity),
+                _event(
+                    harness.identity,
+                    2,
+                    "submission_reserved",
+                    _submission_payload(filled_order),
+                ),
+                _outcome(harness.identity, filled_order, "order_filled", sequence=3),
+                _event(
+                    harness.identity,
+                    4,
+                    "submission_reserved",
+                    _submission_payload(rejected_order),
+                ),
+                _outcome(harness.identity, rejected_order, "order_rejected", sequence=5),
+            ],
+        )
+    )
+    await harness.connect()
+    return harness, filled_order, rejected_order
 
 
 @pytest.mark.parametrize(
@@ -663,8 +805,18 @@ def test_cold_start_projects_all_pages_before_admitting_execution() -> None:
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("unresolved", ["dangling", "unknown"])
-def test_historical_unresolved_request_keeps_execution_on_hold(unresolved: str) -> None:
+@pytest.mark.parametrize(
+    ("unresolved", "hold_text"),
+    [
+        ("dangling", "dangling"),
+        ("unknown", "unknown"),
+        ("mismatched_fill", "mismatched FOK fill"),
+    ],
+)
+def test_historical_unresolved_request_keeps_execution_and_reports_on_hold(
+    unresolved: str,
+    hold_text: str,
+) -> None:
     async def scenario() -> None:
         harness = _Harness(asyncio.get_running_loop())
         old_order = harness.market()
@@ -679,13 +831,19 @@ def test_historical_unresolved_request_keeps_execution_on_hold(unresolved: str) 
         ]
         if unresolved == "unknown":
             events.append(_outcome(harness.identity, old_order, "order_unknown"))
+        elif unresolved == "mismatched_fill":
+            outcome = _outcome(harness.identity, old_order, "order_filled")
+            cast(JsonObject, outcome["payload"])["filled_quantity_lots"] = "0.5"
+            events.append(outcome)
         harness.fake.pages.append(_page(harness.identity, after_cursor="0", events=events))
 
         await harness.connect()
 
         assert harness.client.execution_admitted is False
-        assert unresolved.upper() in cast(str, harness.client.execution_hold_reason).upper()
+        assert hold_text.lower() in cast(str, harness.client.execution_hold_reason).lower()
         assert harness.events == []
+        with pytest.raises(Mt5V1ExecutionError, match="reports are unavailable"):
+            await harness.client.generate_order_status_reports(_order_reports_command(harness))
         await harness.submit(harness.market("200"))
         assert [type(event).__name__ for event in harness.events] == ["OrderDenied"]
         assert harness.fake.submit_calls == []
@@ -779,6 +937,8 @@ def test_timeout_stays_pending_and_poll_can_recover_real_fill() -> None:
             "OrderSubmitted",
             "OrderDenied",
         ]
+        with pytest.raises(Mt5V1ExecutionError, match="while an order is pending"):
+            await harness.client.generate_order_status_reports(_order_reports_command(harness))
 
         harness.fake.pages.append(
             _page(
@@ -894,7 +1054,7 @@ def test_reconnect_keeps_an_unresolved_submission_on_hold_without_retry() -> Non
     asyncio.run(scenario())
 
 
-def test_blocked_recovery_is_readable_but_never_execution_admitted() -> None:
+def test_blocked_recovery_rejects_reports_and_execution_admission() -> None:
     async def scenario() -> None:
         harness = _Harness(asyncio.get_running_loop(), recovery_state="blocked")
 
@@ -905,6 +1065,8 @@ def test_blocked_recovery_is_readable_but_never_execution_admitted() -> None:
             str,
             harness.client.execution_hold_reason,
         )
+        with pytest.raises(Mt5V1ExecutionError, match="EA recovery is blocked"):
+            await harness.client.generate_fill_reports(_fill_reports_command(harness))
         await harness.submit(harness.market())
         assert [type(event).__name__ for event in harness.events] == ["OrderDenied"]
         assert harness.fake.submit_calls == []
@@ -991,16 +1153,318 @@ def test_disabled_identity_or_snapshot_fails_connect_closed(disabled_at: str) ->
     asyncio.run(scenario())
 
 
+def test_all_report_queries_fail_explicitly_while_disconnected() -> None:
+    async def scenario() -> None:
+        harness = _Harness(asyncio.get_running_loop())
+        commands = (
+            harness.client.generate_order_status_report(
+                GenerateOrderStatusReport(
+                    instrument_id=None,
+                    client_order_id=ClientOrderId("REPORT-MISSING-1"),
+                    venue_order_id=None,
+                    command_id=UUID4(),
+                    ts_init=harness.clock.timestamp_ns(),
+                )
+            ),
+            harness.client.generate_order_status_reports(_order_reports_command(harness)),
+            harness.client.generate_fill_reports(_fill_reports_command(harness)),
+            harness.client.generate_position_status_reports(_position_reports_command(harness)),
+        )
+        for command in commands:
+            with pytest.raises(Mt5V1ExecutionError, match="identity is unavailable"):
+                await command
+
+    asyncio.run(scenario())
+
+
+def test_terminal_journal_maps_native_filled_and_stable_rejected_reports() -> None:
+    async def scenario() -> None:
+        harness, filled_order, rejected_order = await _connected_report_harness(
+            asyncio.get_running_loop()
+        )
+
+        order_reports = await harness.client.generate_order_status_reports(
+            _order_reports_command(harness)
+        )
+        assert [report.order_status for report in order_reports] == [
+            OrderStatus.FILLED,
+            OrderStatus.REJECTED,
+        ]
+        filled, rejected = order_reports
+        assert filled.client_order_id == filled_order.client_order_id
+        assert str(filled.venue_order_id) == "700000002"
+        assert str(filled.venue_position_id) == "900000002"
+        assert filled.order_side == OrderSide.BUY
+        assert filled.order_type == OrderType.MARKET
+        assert filled.time_in_force == TimeInForce.FOK
+        assert str(filled.quantity) == "100"
+        assert str(filled.filled_qty) == "100"
+        assert filled.avg_px == Decimal("2401.25")
+        assert filled.ts_accepted == 1_788_271_200_000_000_000
+        assert filled.ts_last == filled.ts_accepted
+
+        assert rejected.client_order_id == rejected_order.client_order_id
+        assert rejected.order_side == OrderSide.SELL
+        assert str(rejected.filled_qty) == "0"
+        assert rejected.cancel_reason == "broker_rejected (retcode=10013)"
+        material = "\0".join(
+            (
+                "py000-nautilus:mt5-v1:rejected-order",
+                harness.identity.stream_id,
+                harness.identity.account_id,
+                harness.identity.symbol,
+                harness.identity.magic,
+                str(rejected_order.client_order_id),
+            )
+        ).encode()
+        expected_rejected_id = f"PY000_REJ_{hashlib.sha256(material).hexdigest()}"
+        assert str(rejected.venue_order_id) == expected_rejected_id
+        assert not str(rejected.venue_order_id).isdigit()
+
+        fills = await harness.client.generate_fill_reports(_fill_reports_command(harness))
+        assert len(fills) == 1
+        fill = fills[0]
+        assert fill.client_order_id == filled_order.client_order_id
+        assert str(fill.venue_order_id) == "700000002"
+        assert str(fill.trade_id) == "800000002"
+        assert str(fill.venue_position_id) == "900000002"
+        assert fill.order_side == OrderSide.BUY
+        assert str(fill.last_qty) == "100"
+        assert str(fill.last_px) == "2401.25"
+        assert fill.avg_px == Decimal("2401.25")
+        assert str(fill.commission) == "-1.25 USD"
+        assert fill.ts_event == 1_788_271_200_000_000_000
+
+        by_client = await harness.client.generate_order_status_report(
+            GenerateOrderStatusReport(
+                instrument_id=None,
+                client_order_id=filled_order.client_order_id,
+                venue_order_id=None,
+                command_id=UUID4(),
+                ts_init=harness.clock.timestamp_ns(),
+            )
+        )
+        by_venue = await harness.client.generate_order_status_report(
+            GenerateOrderStatusReport(
+                instrument_id=INSTRUMENT_ID,
+                client_order_id=None,
+                venue_order_id=rejected.venue_order_id,
+                command_id=UUID4(),
+                ts_init=harness.clock.timestamp_ns(),
+            )
+        )
+        assert by_client is not None
+        assert by_client.client_order_id == filled_order.client_order_id
+        assert by_venue is not None
+        assert by_venue.client_order_id == rejected_order.client_order_id
+        assert by_venue.venue_order_id == rejected.venue_order_id
+
+        mismatch = await harness.client.generate_order_status_report(
+            GenerateOrderStatusReport(
+                instrument_id=None,
+                client_order_id=filled_order.client_order_id,
+                venue_order_id=rejected.venue_order_id,
+                command_id=UUID4(),
+                ts_init=harness.clock.timestamp_ns(),
+            )
+        )
+        missing = await harness.client.generate_order_status_report(
+            GenerateOrderStatusReport(
+                instrument_id=None,
+                client_order_id=ClientOrderId("REPORT-MISSING-1"),
+                venue_order_id=None,
+                command_id=UUID4(),
+                ts_init=harness.clock.timestamp_ns(),
+            )
+        )
+        assert mismatch is None
+        assert missing is None
+
+        with pytest.raises(ValueError, match="cannot both be None"):
+            await harness.client.generate_order_status_report(
+                GenerateOrderStatusReport(
+                    instrument_id=None,
+                    client_order_id=None,
+                    venue_order_id=None,
+                    command_id=UUID4(),
+                    ts_init=harness.clock.timestamp_ns(),
+                )
+            )
+
+        repeated_rejected = await harness.client.generate_order_status_report(
+            GenerateOrderStatusReport(
+                instrument_id=None,
+                client_order_id=rejected_order.client_order_id,
+                venue_order_id=None,
+                command_id=UUID4(),
+                ts_init=harness.clock.timestamp_ns(),
+            )
+        )
+        assert repeated_rejected is not None
+        assert repeated_rejected.venue_order_id == rejected.venue_order_id
+
+    asyncio.run(scenario())
+
+
+def test_live_engine_reconciles_rejected_order_once_without_fill() -> None:
+    async def scenario() -> None:
+        identity = _identity()
+        snapshot = _snapshot(identity)
+        snapshot["positions"] = []
+        harness = _Harness(
+            asyncio.get_running_loop(),
+            identity=identity,
+            snapshot=snapshot,
+            capture_events=False,
+        )
+        order = harness.market(
+            order_side=OrderSide.SELL,
+            client_order_id=ClientOrderId("ENGINE-REJECTED-1"),
+        )
+        harness.fake.pages.append(
+            _page(
+                identity,
+                after_cursor="0",
+                events=[
+                    _stream_started(identity),
+                    _event(identity, 2, "submission_reserved", _submission_payload(order)),
+                    _outcome(identity, order, "order_rejected", sequence=3),
+                ],
+            )
+        )
+        engine = _live_engine(harness, generate_missing_orders=False)
+        _cache_submitted_order(harness, order)
+        await harness.connect()
+
+        assert await engine.reconcile_execution_state(timeout_secs=1.0)
+        cached = harness.cache.order(order.client_order_id)
+        assert cached is not None
+        assert cached.status == OrderStatus.REJECTED
+        assert str(cached.filled_qty) == "0"
+        assert cached.trade_ids == []
+        event_count = len(cached.events)
+        order_count = len(harness.cache.orders())
+        report = await harness.client.generate_order_status_report(
+            GenerateOrderStatusReport(
+                instrument_id=INSTRUMENT_ID,
+                client_order_id=order.client_order_id,
+                venue_order_id=None,
+                command_id=UUID4(),
+                ts_init=harness.clock.timestamp_ns(),
+            )
+        )
+        assert report is not None
+        assert harness.cache.client_order_id(report.venue_order_id) == order.client_order_id
+
+        assert await engine.reconcile_execution_state(timeout_secs=1.0)
+        assert len(harness.cache.orders()) == order_count
+        assert len(harness.cache.order(order.client_order_id).events) == event_count
+        repeated = await harness.client.generate_order_status_report(
+            GenerateOrderStatusReport(
+                instrument_id=INSTRUMENT_ID,
+                client_order_id=order.client_order_id,
+                venue_order_id=None,
+                command_id=UUID4(),
+                ts_init=harness.clock.timestamp_ns(),
+            )
+        )
+        assert repeated is not None
+        assert repeated.venue_order_id == report.venue_order_id
+
+    asyncio.run(scenario())
+
+
+def test_bulk_report_filters_are_applied_without_hiding_invalid_state() -> None:
+    async def scenario() -> None:
+        harness, _, _ = await _connected_report_harness(asyncio.get_running_loop())
+        event_time = datetime.fromtimestamp(1_788_271_200, tz=UTC)
+        after_event = event_time + timedelta(milliseconds=1)
+        before_event = event_time - timedelta(milliseconds=1)
+        other_instrument = InstrumentId.from_str("OTHER.MT5")
+
+        assert len(
+            await harness.client.generate_order_status_reports(
+                _order_reports_command(harness, start=event_time, end=event_time)
+            )
+        ) == 2
+        assert (
+            await harness.client.generate_order_status_reports(
+                _order_reports_command(harness, start=after_event)
+            )
+            == []
+        )
+        assert (
+            await harness.client.generate_order_status_reports(
+                _order_reports_command(harness, end=before_event)
+            )
+            == []
+        )
+        assert (
+            await harness.client.generate_order_status_reports(
+                _order_reports_command(harness, open_only=True)
+            )
+            == []
+        )
+        assert (
+            await harness.client.generate_order_status_reports(
+                _order_reports_command(harness, instrument_id=other_instrument)
+            )
+            == []
+        )
+
+        native_id = VenueOrderId("700000002")
+        fills = await harness.client.generate_fill_reports(
+            _fill_reports_command(
+                harness,
+                venue_order_id=native_id,
+                start=event_time,
+                end=event_time,
+            )
+        )
+        assert [report.venue_order_id for report in fills] == [native_id]
+        assert (
+            await harness.client.generate_fill_reports(
+                _fill_reports_command(harness, venue_order_id=VenueOrderId("700000999"))
+            )
+            == []
+        )
+        assert (
+            await harness.client.generate_fill_reports(
+                _fill_reports_command(harness, instrument_id=other_instrument)
+            )
+            == []
+        )
+        assert (
+            await harness.client.generate_fill_reports(
+                _fill_reports_command(harness, start=after_event)
+            )
+            == []
+        )
+
+        assert (
+            await harness.client.generate_order_status_report(
+                GenerateOrderStatusReport(
+                    instrument_id=other_instrument,
+                    client_order_id=ClientOrderId("REPORT-FILLED-1"),
+                    venue_order_id=None,
+                    command_id=UUID4(),
+                    ts_init=harness.clock.timestamp_ns(),
+                )
+            )
+            is None
+        )
+
+    asyncio.run(scenario())
+
+
 def test_matching_magic_snapshot_maps_to_position_status_report() -> None:
     async def scenario() -> None:
         harness = _Harness(asyncio.get_running_loop())
         await harness.connect()
-        command = GeneratePositionStatusReports(
-            instrument_id=None,
-            start=None,
-            end=None,
-            command_id=UUID4(),
-            ts_init=harness.clock.timestamp_ns(),
+        command = _position_reports_command(
+            harness,
+            start=datetime(2100, 1, 1, tzinfo=UTC),
+            end=datetime(2100, 1, 2, tzinfo=UTC),
         )
 
         reports = await harness.client.generate_position_status_reports(command)
@@ -1015,19 +1479,10 @@ def test_matching_magic_snapshot_maps_to_position_status_report() -> None:
         assert report.avg_px_open == Decimal("2400.10")
         assert report.ts_last == 1_788_281_900_000_000_000
 
-        unsupported = (
-            harness.client.generate_order_status_report(cast(GenerateOrderStatusReport, None)),
-            harness.client.generate_order_status_reports(cast(GenerateOrderStatusReports, None)),
-            harness.client.generate_fill_reports(cast(GenerateFillReports, None)),
-        )
-        for call in unsupported:
-            with pytest.raises(NotImplementedError):
-                await call
-
     asyncio.run(scenario())
 
 
-def test_foreign_magic_position_is_not_reported_and_blocks_execution_admission() -> None:
+def test_foreign_magic_position_blocks_reports_and_execution_admission() -> None:
     async def scenario() -> None:
         identity = _identity()
         snapshot = _snapshot(identity)
@@ -1049,17 +1504,10 @@ def test_foreign_magic_position_is_not_reported_and_blocks_execution_admission()
         )
         await harness.connect()
 
-        reports = await harness.client.generate_position_status_reports(
-            GeneratePositionStatusReports(
-                instrument_id=INSTRUMENT_ID,
-                start=None,
-                end=None,
-                command_id=UUID4(),
-                ts_init=harness.clock.timestamp_ns(),
+        with pytest.raises(Mt5V1ExecutionError, match="foreign-magic"):
+            await harness.client.generate_position_status_reports(
+                _position_reports_command(harness, instrument_id=INSTRUMENT_ID)
             )
-        )
-
-        assert [str(report.venue_position_id) for report in reports] == ["800000001"]
         assert harness.client.execution_admitted is False
         assert "foreign-magic" in cast(str, harness.client.execution_hold_reason)
         await harness.submit(harness.market())
@@ -1069,7 +1517,7 @@ def test_foreign_magic_position_is_not_reported_and_blocks_execution_admission()
     asyncio.run(scenario())
 
 
-def test_explicit_instrument_query_reports_flat_when_no_managed_position_exists() -> None:
+def test_position_query_returns_empty_when_snapshot_and_cache_are_empty() -> None:
     async def scenario() -> None:
         identity = _identity()
         snapshot = _snapshot(identity)
@@ -1078,19 +1526,244 @@ def test_explicit_instrument_query_reports_flat_when_no_managed_position_exists(
         await harness.connect()
 
         reports = await harness.client.generate_position_status_reports(
-            GeneratePositionStatusReports(
-                instrument_id=INSTRUMENT_ID,
-                start=None,
-                end=None,
-                command_id=UUID4(),
-                ts_init=harness.clock.timestamp_ns(),
-            )
+            _position_reports_command(harness, instrument_id=INSTRUMENT_ID)
         )
 
-        assert len(reports) == 1
-        assert reports[0].position_side == PositionSide.FLAT
-        assert str(reports[0].quantity) == "0"
-        assert reports[0].venue_position_id is None
+        assert reports == []
+
+    asyncio.run(scenario())
+
+
+def test_live_engine_mass_status_recovers_fills_and_closes_only_missing_position_id() -> None:
+    async def scenario() -> None:
+        identity = _identity()
+        snapshot = _snapshot(identity)
+        template = deepcopy(cast(list[JsonObject], snapshot["positions"])[0])
+        position_a = deepcopy(template)
+        position_a.update(
+            {
+                "identifier": "900000101",
+                "ticket": "700000101",
+                "volume_lots": "1",
+                "price_open": "2401.25",
+            }
+        )
+        position_b = deepcopy(template)
+        position_b.update(
+            {
+                "identifier": "900000102",
+                "ticket": "700000102",
+                "volume_lots": "1",
+                "price_open": "2402.25",
+            }
+        )
+        snapshot["positions"] = [position_a, position_b]
+        harness = _Harness(
+            asyncio.get_running_loop(),
+            identity=identity,
+            snapshot=snapshot,
+            capture_events=False,
+        )
+        order_a = harness.market(client_order_id=ClientOrderId("ENGINE-FILLED-A"))
+        order_b = harness.market(client_order_id=ClientOrderId("ENGINE-FILLED-B"))
+        fill_a = _outcome(identity, order_a, "order_filled", sequence=3)
+        cast(JsonObject, fill_a["payload"]).update(
+            {
+                "venue_deal_id": "800000101",
+                "venue_order_id": "700000101",
+                "venue_position_id": "900000101",
+            }
+        )
+        fill_b = _outcome(identity, order_b, "order_filled", sequence=5)
+        cast(JsonObject, fill_b["payload"]).update(
+            {
+                "fill_price": "2402.25",
+                "venue_deal_id": "800000102",
+                "venue_order_id": "700000102",
+                "venue_position_id": "900000102",
+            }
+        )
+        harness.fake.pages.append(
+            _page(
+                identity,
+                after_cursor="0",
+                events=[
+                    _stream_started(identity),
+                    _event(
+                        identity,
+                        2,
+                        "submission_reserved",
+                        _submission_payload(order_a),
+                    ),
+                    fill_a,
+                    _event(
+                        identity,
+                        4,
+                        "submission_reserved",
+                        _submission_payload(order_b),
+                    ),
+                    fill_b,
+                ],
+            )
+        )
+        engine = _live_engine(harness, generate_missing_orders=True)
+        await harness.connect()
+
+        assert await engine.reconcile_execution_state(timeout_secs=1.0)
+        assert harness.client.reconciliation_active is False
+        assert len(harness.fake.snapshot_calls) == 2
+        assert harness.cache.order(order_a.client_order_id).status == OrderStatus.FILLED
+        assert harness.cache.order(order_b.client_order_id).status == OrderStatus.FILLED
+        cached_a = harness.cache.position(PositionId("900000101"))
+        cached_b = harness.cache.position(PositionId("900000102"))
+        assert cached_a is not None and cached_a.is_open
+        assert cached_b is not None and cached_b.is_open
+        original_orders = {
+            order.client_order_id: (len(order.events), tuple(order.trade_ids))
+            for order in harness.cache.orders()
+        }
+
+        assert await engine.reconcile_execution_state(timeout_secs=1.0)
+        assert {
+            order.client_order_id: (len(order.events), tuple(order.trade_ids))
+            for order in harness.cache.orders()
+        } == original_orders
+
+        refreshed = deepcopy(snapshot)
+        refreshed["positions"] = [deepcopy(position_b)]
+        harness.fake.current_snapshot = refreshed
+        await harness.client._refresh_snapshot_if_due(force=True)
+        reports = await harness.client.generate_position_status_reports(
+            _position_reports_command(harness)
+        )
+        reports_by_id = {str(report.venue_position_id): report for report in reports}
+        assert set(reports_by_id) == {"900000101", "900000102"}
+        assert reports_by_id["900000101"].position_side == PositionSide.FLAT
+        assert str(reports_by_id["900000101"].quantity) == "0"
+        assert reports_by_id["900000101"].ts_last == cached_a.ts_last
+        assert reports_by_id["900000102"].position_side == PositionSide.LONG
+
+        assert await engine.reconcile_execution_state(timeout_secs=1.0)
+        assert harness.cache.position(PositionId("900000101")).is_closed
+        assert harness.cache.position(PositionId("900000102")).is_open
+        order_count = len(harness.cache.orders())
+        event_counts = {
+            order.client_order_id: len(order.events) for order in harness.cache.orders()
+        }
+
+        assert await engine.reconcile_execution_state(timeout_secs=1.0)
+        assert len(harness.cache.orders()) == order_count
+        assert {
+            order.client_order_id: len(order.events) for order in harness.cache.orders()
+        } == event_counts
+        assert harness.cache.position(PositionId("900000101")).is_closed
+        assert harness.cache.position(PositionId("900000102")).is_open
+
+    asyncio.run(scenario())
+
+
+def test_live_engine_mass_status_fails_on_unknown_and_clears_active_flag() -> None:
+    async def scenario() -> None:
+        identity = _identity()
+        snapshot = _snapshot(identity)
+        snapshot["positions"] = []
+        harness = _Harness(
+            asyncio.get_running_loop(),
+            identity=identity,
+            snapshot=snapshot,
+            capture_events=False,
+        )
+        order = harness.market(client_order_id=ClientOrderId("ENGINE-UNKNOWN-1"))
+        harness.fake.pages.append(
+            _page(
+                identity,
+                after_cursor="0",
+                events=[
+                    _stream_started(identity),
+                    _event(
+                        identity,
+                        2,
+                        "submission_reserved",
+                        _submission_payload(order),
+                    ),
+                    _outcome(identity, order, "order_unknown", sequence=3),
+                ],
+            )
+        )
+        engine = _live_engine(harness, generate_missing_orders=False)
+        _cache_submitted_order(harness, order)
+        event_count = len(order.events)
+        await harness.connect()
+
+        assert await engine.reconcile_execution_state(timeout_secs=1.0) is False
+        assert harness.client.reconciliation_active is False
+        cached = harness.cache.order(order.client_order_id)
+        assert cached is not None
+        assert cached.status == OrderStatus.SUBMITTED
+        assert len(cached.events) == event_count
+        assert harness.fake.submit_calls == []
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("blocked_at", ["recovery", "foreign_magic"])
+def test_live_engine_mass_status_fails_on_blocked_recovery_or_foreign_magic(
+    blocked_at: str,
+) -> None:
+    async def scenario() -> None:
+        identity = _identity()
+        recovery: RecoveryState = "blocked" if blocked_at == "recovery" else "ready"
+        snapshot = _snapshot(identity, recovery_state=recovery)
+        if blocked_at == "foreign_magic":
+            foreign = deepcopy(cast(list[JsonObject], snapshot["positions"])[0])
+            foreign.update({"identifier": "800000099", "magic": "0"})
+            cast(list[JsonObject], snapshot["positions"]).append(foreign)
+        harness = _Harness(
+            asyncio.get_running_loop(),
+            identity=identity,
+            snapshot=snapshot,
+            recovery_state=recovery,
+            capture_events=False,
+        )
+        engine = _live_engine(harness, generate_missing_orders=False)
+        await harness.connect()
+
+        assert await engine.reconcile_execution_state(timeout_secs=1.0) is False
+        assert harness.client.reconciliation_active is False
+        assert harness.client.execution_admitted is False
+        assert harness.cache.orders() == []
+
+    asyncio.run(scenario())
+
+
+def test_mass_status_fails_closed_if_journal_moves_during_snapshot() -> None:
+    async def scenario() -> None:
+        harness = _Harness(asyncio.get_running_loop())
+        await harness.connect()
+        order = harness.market(client_order_id=ClientOrderId("MASS-MOVING-TAIL-1"))
+        harness.fake.pages.extend(
+            [
+                _page(harness.identity, after_cursor="1", events=[]),
+                _page(
+                    harness.identity,
+                    after_cursor="1",
+                    events=[
+                        _event(
+                            harness.identity,
+                            2,
+                            "submission_reserved",
+                            _submission_payload(order),
+                        )
+                    ],
+                ),
+            ]
+        )
+
+        with pytest.raises(Mt5V1ExecutionError, match="changed while snapshot was captured"):
+            await harness.client.generate_mass_status()
+        assert harness.client.reconciliation_active is False
+        assert harness.client.execution_admitted is False
+        assert harness.fake.closed is True
 
     asyncio.run(scenario())
 
