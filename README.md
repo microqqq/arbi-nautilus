@@ -35,8 +35,13 @@ The current source also contains one deliberately narrow execution candidate:
 - the Nautilus execution client accepts only `MARKET` + `FOK`, converts ounces to
   exact lots without rounding, submits once, consumes the journal contiguously, and
   leaves timeout or `order_unknown` pending;
-- reconciliation reports, cancel/modify, production composition, and strategy
-  wiring are intentionally absent.
+- every connect binds an operator-supplied `expected_stream_id`, projects the complete
+  retained journal without replaying historical terminal events, and verifies a stable
+  journal/snapshot cut before admitting execution;
+- `UNKNOWN`, a dangling reservation, blocked recovery, mismatched FOK quantity, or any
+  same-symbol foreign-magic position keeps execution on HOLD. Matching-magic positions
+  have a startup snapshot report; order/fill reports, runtime position refresh,
+  cancel/modify, production composition, and strategy wiring remain intentionally absent.
 
 The strategy layer keeps venue roles explicit: Taker submits `LIMIT` + `IOC` on the
 Bitfinex source leg, Maker maintains `LIMIT` + `GTC` + post-only source quotes, and both

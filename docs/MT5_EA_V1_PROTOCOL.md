@@ -253,14 +253,22 @@ expected plus observed identities into a non-overwriting two-record summary. A b
 re-handshake resets the snapshot/PUB evidence counters so facts from the old boot cannot
 qualify the replacement boot.
 
-`Mt5V1ExecutionClient` separately requires an enabled, recovery-ready identity and an
-identity-equal ready snapshot. It accepts only Nautilus `MARKET` orders with `FOK`, binds
-one configured MT5 instrument, verifies contract size, and converts canonical ounces to
-an exact permitted lot quantity without rounding. Submissions are single-flight and sent
-once. The client consumes every journal page in sequence before advancing its cursor;
-timeouts and `order_unknown` remain pending and block another order. A replaced journal
-stream, stale binding, or unresolved submission on reconnect fails closed. Reconciliation
-reports and cancel/modify/order-list operations are deliberately unsupported.
+`Mt5V1ExecutionClient` separately requires an enabled identity, an operator-supplied
+`expected_stream_id`, and an identity-equal snapshot. On connect it reads the complete
+retained journal, captures the snapshot, and proves that the journal tail did not move.
+Historical request IDs are hydrated without replaying old terminal events. A same-process
+timeout may be resolved only by its durable terminal event; `order_unknown`, a dangling
+reservation, blocked recovery, a mismatched FOK fill, or any same-symbol foreign-magic
+position keeps new execution on HOLD.
+
+The client accepts only Nautilus `MARKET` orders with `FOK` and no reduce-only,
+quote-quantity, or execution-algorithm semantics. It binds one configured MT5 instrument,
+verifies contract size, converts canonical ounces to an exact permitted lot quantity
+without rounding, and submits once. Startup position reports include only matching-magic
+positions and use the stable MT5 position identifier. They are not a runtime snapshot
+refresh. Order/fill reports and cancel/modify/order-list operations remain unsupported;
+any later live composition must disable Nautilus `generate_missing_orders` until those
+report paths have an explicit policy.
 
 `InstrumentStatus` is only a market-session observation. It is derived from REP session
 evidence, rejects inconsistent symbol trade modes, and does not publish `TRADING` for a

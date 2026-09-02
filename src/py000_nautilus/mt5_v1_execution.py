@@ -12,6 +12,7 @@ from nautilus_trader.common.component import LiveClock, MessageBus
 from nautilus_trader.common.enums import LogColor
 from nautilus_trader.common.providers import InstrumentProvider
 from nautilus_trader.config import LiveExecClientConfig
+from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.execution.messages import (
     BatchCancelOrders,
     CancelAllOrders,
@@ -34,6 +35,7 @@ from nautilus_trader.model.enums import (
     OmsType,
     OrderSide,
     OrderType,
+    PositionSide,
     TimeInForce,
 )
 from nautilus_trader.model.identifiers import (
@@ -70,6 +72,7 @@ class Mt5V1ExecClientConfig(LiveExecClientConfig, kw_only=True, frozen=True):
     expected_magic: str
     expected_ea_build_id: str
     expected_source_sha256: str
+    expected_stream_id: str
     expected_server_timezone: str = "Europe/Athens"
     request_timeout_ms: int = 1_000
     event_poll_interval_ms: int = 250
@@ -105,6 +108,94 @@ class _Pending:
     quantity_lots: Decimal
     unknown: bool = False
     accepted: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _JournalProjection:
+    reservations: dict[str, JsonObject]
+    terminals: dict[str, JsonObject]
+
+    @property
+    def seen_request_ids(self) -> frozenset[str]:
+        return frozenset(self.reservations)
+
+    @property
+    def hold_reason(self) -> str | None:
+        unknown = sorted(
+            request_id
+            for request_id, event in self.terminals.items()
+            if event["event_type"] == "order_unknown"
+        )
+        dangling = sorted(set(self.reservations) - set(self.terminals))
+        mismatched_fills = sorted(
+            request_id
+            for request_id, event in self.terminals.items()
+            if event["event_type"] == "order_filled"
+            and Decimal(cast(str, cast(JsonObject, event["payload"])["filled_quantity_lots"]))
+            != Decimal(
+                cast(
+                    str,
+                    cast(JsonObject, self.reservations[request_id]["payload"])["quantity_lots"],
+                )
+            )
+        )
+        if unknown:
+            return f"journal contains UNKNOWN request(s): {', '.join(unknown)}"
+        if dangling:
+            return f"journal contains dangling reservation(s): {', '.join(dangling)}"
+        if mismatched_fills:
+            return f"journal contains mismatched FOK fill(s): {', '.join(mismatched_fills)}"
+        return None
+
+
+def _project_journal(events: list[JsonObject], *, current_boot_id: str) -> _JournalProjection:
+    """Validate and project one complete execution journal without emitting events."""
+    if not events or events[0]["event_type"] != "stream_started":
+        raise Mt5V1ExecutionError("execution journal does not begin with stream_started")
+    reservations: dict[str, JsonObject] = {}
+    terminals: dict[str, JsonObject] = {}
+    boot_ids: set[str] = set()
+    active_boot_id: str | None = None
+
+    for event in events:
+        event_type = cast(str, event["event_type"])
+        event_boot_id = cast(str, event["boot_id"])
+        if event_type == "stream_started":
+            if event_boot_id in boot_ids:
+                raise Mt5V1ExecutionError("execution journal repeats a boot ID")
+            boot_ids.add(event_boot_id)
+            active_boot_id = event_boot_id
+            continue
+        if event_boot_id != active_boot_id:
+            raise Mt5V1ExecutionError("execution event belongs to an inactive EA boot")
+
+        payload = cast(JsonObject, event["payload"])
+        request_id = cast(str, payload["client_request_id"])
+        if event_type == "submission_reserved":
+            if request_id in reservations or request_id in terminals:
+                raise Mt5V1ExecutionError("execution journal repeats a request reservation")
+            reservations[request_id] = event
+            continue
+        if event_type not in {"order_rejected", "order_filled", "order_unknown"}:
+            raise Mt5V1ExecutionError(f"unsupported execution event {event_type!r}")
+        reservation = reservations.get(request_id)
+        if reservation is None:
+            raise Mt5V1ExecutionError("terminal execution event has no reservation")
+        if request_id in terminals:
+            raise Mt5V1ExecutionError("execution journal repeats a terminal outcome")
+        if reservation["boot_id"] != event_boot_id:
+            raise Mt5V1ExecutionError("terminal execution event changed EA boot")
+        reserved_payload = cast(JsonObject, reservation["payload"])
+        if (
+            payload["side"] != reserved_payload["side"]
+            or payload["quantity_lots"] != reserved_payload["quantity_lots"]
+        ):
+            raise Mt5V1ExecutionError("terminal execution payload differs from its reservation")
+        terminals[request_id] = event
+
+    if active_boot_id is not None and active_boot_id != current_boot_id:
+        raise Mt5V1ExecutionError("execution journal does not end at the current EA boot")
+    return _JournalProjection(reservations=reservations, terminals=terminals)
 
 
 def quantity_to_lots(
@@ -167,7 +258,12 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
         self._snapshot: JsonObject | None = None
         self._cursor = "0"
         self._pending: dict[str, _Pending] = {}
-        self._terminal_requests: set[str] = set()
+        self._seen_request_ids: set[str] = set()
+        self._reservations: dict[str, JsonObject] = {}
+        self._terminal_events: dict[str, JsonObject] = {}
+        self._recovery_state: RecoveryState | None = None
+        self._foreign_position_ids: tuple[str, ...] = ()
+        self._execution_hold_reason: str | None = "MT5 execution is not connected"
         self._state_lock = asyncio.Lock()
         self._running = False
         self._poll_task: asyncio.Task[None] | None = None
@@ -181,6 +277,14 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
     def last_failure(self) -> str | None:
         return self._last_failure
 
+    @property
+    def execution_admitted(self) -> bool:
+        return self._identity is not None and self._execution_hold_reason is None
+
+    @property
+    def execution_hold_reason(self) -> str | None:
+        return self._execution_hold_reason
+
     def connect(self) -> None:
         self.create_task(
             self._connect(),
@@ -191,23 +295,38 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
 
     async def _connect(self) -> None:
         try:
-            if self._pending:
-                raise Mt5V1ExecutionError(
-                    "MT5 execution cannot reconnect with an unresolved submission"
-                )
             await self._transport.open()
             identity, recovery = await self._transport.hello()
             self._validate_identity(identity, recovery)
             if self._bound_stream_id is not None and identity.stream_id != self._bound_stream_id:
                 raise Mt5V1ExecutionError("MT5 execution journal stream changed")
+            events, cursor = await self._read_complete_journal(identity)
             snapshot = await self._transport.snapshot(identity.binding())
-            self._validate_snapshot(snapshot, identity)
-            self._cursor = await self._seek_event_tail(identity)
+            self._validate_snapshot(snapshot, identity, recovery)
+            await self._verify_unchanged_journal_tail(identity, cursor)
+            projection = _project_journal(events, current_boot_id=identity.boot_id)
             self._bound_stream_id = identity.stream_id
             self._identity = identity
             self._snapshot = snapshot
+            self._cursor = cursor
+            self._reservations = projection.reservations
+            self._terminal_events = projection.terminals
+            self._seen_request_ids = set(projection.seen_request_ids) | set(self._pending)
+            self._recovery_state = recovery
+            self._foreign_position_ids = tuple(
+                cast(str, position["identifier"])
+                for position in cast(list[JsonObject], snapshot["positions"])
+                if position["magic"] != self._mt5_config.expected_magic
+            )
+            self._recover_local_pending_from_journal()
+            self._refresh_execution_hold()
+            self._last_failure = None
         except BaseException as exc:
             self._last_failure = f"{type(exc).__name__}: {exc}"[:300]
+            self._identity = None
+            self._snapshot = None
+            self._recovery_state = None
+            self._execution_hold_reason = "MT5 execution is not connected"
             await self._transport.close()
             raise
 
@@ -225,13 +344,25 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
         await self._transport.close()
         self._identity = None
         self._snapshot = None
+        self._recovery_state = None
+        self._execution_hold_reason = "MT5 execution is not connected"
 
     async def _submit_order(self, command: SubmitOrder) -> None:
         order = command.order
         if order.order_type != OrderType.MARKET or order.time_in_force != TimeInForce.FOK:
             self._deny(order, "MT5 v1 execution supports MARKET FOK orders only")
             return
+        if order.is_reduce_only or order.is_quote_quantity or order.exec_algorithm_id is not None:
+            self._deny(order, "MT5 v1 execution does not support additional order semantics")
+            return
         async with self._state_lock:
+            request_id = str(order.client_order_id)
+            if request_id in self._seen_request_ids:
+                self._deny(order, "MT5 execution journal already contains this order ID")
+                return
+            if self._execution_hold_reason is not None:
+                self._deny(order, f"MT5 execution HOLD: {self._execution_hold_reason}")
+                return
             if self._pending:
                 self._deny(order, "MT5 execution is blocked by an unresolved UNKNOWN submission")
                 return
@@ -240,10 +371,6 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
             except Mt5V1ExecutionError as exc:
                 self._deny(order, str(exc))
                 return
-            request_id = str(order.client_order_id)
-            if request_id in self._terminal_requests:
-                self._deny(order, "MT5 execution already has a terminal outcome for this order")
-                return
             self.generate_order_submitted(
                 order.strategy_id,
                 order.instrument_id,
@@ -251,6 +378,7 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
                 self._clock.timestamp_ns(),
             )
             self._pending[request_id] = pending
+            self._seen_request_ids.add(request_id)
             try:
                 data = await self._transport.submit_market_delta(
                     self._require_identity().binding(),
@@ -263,15 +391,17 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
                 outcome = cast(JsonObject, data["outcome"])
                 outcome_cursor = cast(str, outcome["event_seq"])
                 if int(outcome_cursor) <= int(self._cursor):
-                    self._apply_event(outcome)
+                    raise Mt5V1ExecutionError("submit outcome does not advance the journal cursor")
                 else:
                     await self._consume_event_pages(expected_outcome=outcome)
             except asyncio.CancelledError as exc:
                 pending.unknown = True
+                self._refresh_execution_hold()
                 self._last_failure = f"{type(exc).__name__}: {exc}"[:300]
                 raise
             except Exception as exc:
                 pending.unknown = True
+                self._refresh_execution_hold()
                 self._last_failure = f"{type(exc).__name__}: {exc}"[:300]
                 if not isinstance(exc, TimeoutError | Mt5V1TransportError):
                     raise
@@ -315,18 +445,23 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
                 raise
             except Mt5V1RemoteError as exc:
                 self._last_failure = f"{type(exc).__name__}: {exc}"[:300]
-                self._running = False
-                self._set_connected(False)
-                await self._transport.close()
+                await self._fail_closed_disconnect()
                 return
             except Mt5V1TransportError as exc:
                 self._last_failure = f"{type(exc).__name__}: {exc}"[:300]
             except Exception as exc:
                 self._last_failure = f"{type(exc).__name__}: {exc}"[:300]
-                self._running = False
-                self._set_connected(False)
-                await self._transport.close()
+                await self._fail_closed_disconnect()
                 return
+
+    async def _fail_closed_disconnect(self) -> None:
+        self._running = False
+        self._set_connected(False)
+        await self._transport.close()
+        self._identity = None
+        self._snapshot = None
+        self._recovery_state = None
+        self._execution_hold_reason = "MT5 execution is not connected"
 
     async def _poll_once(self) -> None:
         async with self._state_lock:
@@ -335,9 +470,7 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
     async def _consume_event_pages(self, *, expected_outcome: JsonObject | None = None) -> None:
         identity = self._require_identity()
         expected_sequence = (
-            int(cast(str, expected_outcome["event_seq"]))
-            if expected_outcome is not None
-            else None
+            int(cast(str, expected_outcome["event_seq"])) if expected_outcome is not None else None
         )
         while True:
             page = await self._transport.execution_events(
@@ -348,6 +481,8 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
             self._validate_page_identity(page, identity)
             for event in cast(list[JsonObject], page["events"]):
                 sequence = cast(str, event["event_seq"])
+                if int(sequence) != int(self._cursor) + 1:
+                    raise Mt5V1ExecutionError("execution journal cursor is not contiguous")
                 if (
                     expected_sequence is not None
                     and int(sequence) == expected_sequence
@@ -371,10 +506,14 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
         event_type = cast(str, event["event_type"])
         payload = cast(JsonObject, event["payload"])
         if event_type == "submission_reserved":
+            self._record_reservation(event)
             self._match_pending(payload)
         elif event_type == "order_unknown":
+            self._record_terminal(event)
             self._match_pending(payload).unknown = True
+            self._refresh_execution_hold()
         elif event_type == "order_rejected":
+            self._record_terminal(event)
             pending = self._match_pending(payload)
             self.generate_order_rejected(
                 pending.order.strategy_id,
@@ -384,8 +523,9 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
                 int(cast(str, event["event_time_ms"])) * 1_000_000,
             )
             self._pending.pop(str(pending.order.client_order_id))
-            self._terminal_requests.add(str(pending.order.client_order_id))
+            self._refresh_execution_hold()
         elif event_type == "order_filled":
+            self._record_terminal(event)
             self._apply_fill(event, payload)
         elif event_type == "stream_started":
             raise Mt5V1ExecutionError("MT5 execution stream restarted while connected")
@@ -426,10 +566,15 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
             ts_event,
         )
         self._pending.pop(str(pending.order.client_order_id))
-        self._terminal_requests.add(str(pending.order.client_order_id))
+        self._refresh_execution_hold()
 
-    async def _seek_event_tail(self, identity: Identity) -> str:
+    async def _read_complete_journal(
+        self,
+        identity: Identity,
+    ) -> tuple[list[JsonObject], str]:
         cursor = "0"
+        events: list[JsonObject] = []
+        last_cursor: str | None = None
         while True:
             page = await self._transport.execution_events(
                 identity.binding(),
@@ -437,9 +582,106 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
                 limit=self._mt5_config.event_page_limit,
             )
             self._validate_page_identity(page, identity)
-            cursor = cast(str, page["next_cursor"])
+            if page["first_retained_cursor"] != "0":
+                raise Mt5V1ExecutionError("execution journal history is not fully retained")
+            page_last_cursor = cast(str, page["last_cursor"])
+            if last_cursor is None:
+                last_cursor = page_last_cursor
+            elif page_last_cursor != last_cursor:
+                raise Mt5V1ExecutionError("execution journal tail changed during pagination")
+            page_events = cast(list[JsonObject], page["events"])
+            for event in page_events:
+                sequence = cast(str, event["event_seq"])
+                if int(sequence) != int(cursor) + 1:
+                    raise Mt5V1ExecutionError("execution journal cursor is not contiguous")
+                cursor = sequence
+                events.append(event)
+            if page["next_cursor"] != cursor:
+                raise Mt5V1ExecutionError("execution journal page cursor is inconsistent")
             if not cast(bool, page["has_more"]):
-                return cursor
+                if cursor != last_cursor:
+                    raise Mt5V1ExecutionError("execution journal ended before its declared tail")
+                return events, cursor
+
+    async def _verify_unchanged_journal_tail(self, identity: Identity, cursor: str) -> None:
+        page = await self._transport.execution_events(
+            identity.binding(),
+            after_cursor=cursor,
+            limit=self._mt5_config.event_page_limit,
+        )
+        self._validate_page_identity(page, identity)
+        if (
+            page["first_retained_cursor"] != "0"
+            or page["next_cursor"] != cursor
+            or page["last_cursor"] != cursor
+            or cast(list[JsonObject], page["events"])
+        ):
+            raise Mt5V1ExecutionError("execution journal changed while snapshot was captured")
+
+    def _record_reservation(self, event: JsonObject) -> None:
+        payload = cast(JsonObject, event["payload"])
+        request_id = cast(str, payload["client_request_id"])
+        if request_id in self._reservations or request_id in self._terminal_events:
+            raise Mt5V1ExecutionError("execution journal repeats a request reservation")
+        self._reservations[request_id] = event
+        self._seen_request_ids.add(request_id)
+
+    def _record_terminal(self, event: JsonObject) -> None:
+        payload = cast(JsonObject, event["payload"])
+        request_id = cast(str, payload["client_request_id"])
+        reservation = self._reservations.get(request_id)
+        if reservation is None:
+            raise Mt5V1ExecutionError("terminal execution event has no reservation")
+        if request_id in self._terminal_events:
+            raise Mt5V1ExecutionError("execution journal repeats a terminal outcome")
+        if reservation["boot_id"] != event["boot_id"]:
+            raise Mt5V1ExecutionError("terminal execution event changed EA boot")
+        reserved_payload = cast(JsonObject, reservation["payload"])
+        if (
+            payload["side"] != reserved_payload["side"]
+            or payload["quantity_lots"] != reserved_payload["quantity_lots"]
+        ):
+            raise Mt5V1ExecutionError("terminal execution payload differs from its reservation")
+        self._terminal_events[request_id] = event
+
+    def _recover_local_pending_from_journal(self) -> None:
+        for request_id in tuple(self._pending):
+            event = self._terminal_events.get(request_id)
+            if event is None:
+                continue
+            event_type = cast(str, event["event_type"])
+            payload = cast(JsonObject, event["payload"])
+            if event_type == "order_unknown":
+                self._match_pending(payload).unknown = True
+            elif event_type == "order_rejected":
+                pending = self._match_pending(payload)
+                self.generate_order_rejected(
+                    pending.order.strategy_id,
+                    pending.order.instrument_id,
+                    pending.order.client_order_id,
+                    f"{payload['reason']} (retcode={payload['broker_retcode']})",
+                    int(cast(str, event["event_time_ms"])) * 1_000_000,
+                )
+                self._pending.pop(request_id)
+            elif event_type == "order_filled":
+                self._apply_fill(event, payload)
+
+    def _refresh_execution_hold(self) -> None:
+        reasons: list[str] = []
+        if self._identity is None:
+            reasons.append("MT5 execution is not connected")
+        if self._recovery_state == "blocked":
+            reasons.append("EA recovery state is blocked")
+        projection = _JournalProjection(self._reservations, self._terminal_events)
+        if projection.hold_reason is not None:
+            reasons.append(projection.hold_reason)
+        if any(pending.unknown for pending in self._pending.values()):
+            reasons.append("a local submission has an UNKNOWN outcome")
+        elif self._pending:
+            reasons.append("a local submission is unresolved")
+        if self._foreign_position_ids:
+            reasons.append("snapshot contains foreign-magic position(s)")
+        self._execution_hold_reason = "; ".join(reasons) if reasons else None
 
     def _prepare(self, order: Order) -> _Pending:
         if order.instrument_id != self._mt5_config.instrument_id:
@@ -485,6 +727,8 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
 
     def _validate_identity(self, identity: Identity, recovery: RecoveryState) -> None:
         config = self._mt5_config
+        if identity.stream_id != config.expected_stream_id:
+            raise Mt5V1ExecutionError("MT5 journal stream differs from expected_stream_id")
         expected = (
             (identity.account_id, config.expected_account_id),
             (identity.symbol, config.expected_symbol),
@@ -493,18 +737,23 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
             (identity.declared_source_sha256, config.expected_source_sha256),
             (identity.server_timezone, config.expected_server_timezone),
         )
-        if recovery != "ready" or not identity.execution_enabled or any(
-            actual != wanted for actual, wanted in expected
+        if (
+            recovery not in {"ready", "blocked"}
+            or not identity.execution_enabled
+            or any(actual != wanted for actual, wanted in expected)
         ):
-            raise Mt5V1ExecutionError(
-                "MT5 execution identity is not configured, enabled, and ready"
-            )
+            raise Mt5V1ExecutionError("MT5 execution identity is not configured and enabled")
 
-    def _validate_snapshot(self, snapshot: JsonObject, identity: Identity) -> None:
+    def _validate_snapshot(
+        self,
+        snapshot: JsonObject,
+        identity: Identity,
+        recovery: RecoveryState,
+    ) -> None:
         if (
             Identity.from_wire(snapshot["identity"]) != identity
             or snapshot["execution_enabled"] is not True
-            or snapshot["recovery_state"] != "ready"
+            or snapshot["recovery_state"] != recovery
             or cast(JsonObject, snapshot["account"])["currency"] != "USD"
         ):
             raise Mt5V1ExecutionError("MT5 execution snapshot is inconsistent")
@@ -543,7 +792,50 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
     async def generate_position_status_reports(
         self, command: GeneratePositionStatusReports
     ) -> list[PositionStatusReport]:
-        raise NotImplementedError("MT5 v1 reconciliation is disabled")
+        if command.instrument_id not in {None, self._mt5_config.instrument_id}:
+            return []
+        snapshot = self._require_snapshot()
+        instrument = self._instrument_provider.find(
+            self._mt5_config.instrument_id
+        ) or self._cache.instrument(self._mt5_config.instrument_id)
+        if instrument is None:
+            raise Mt5V1ExecutionError("canonical MT5 instrument is unavailable")
+        contract_size = Decimal(
+            cast(str, cast(JsonObject, snapshot["symbol_spec"])["contract_size"])
+        )
+        if instrument.lot_size is None or Decimal(str(instrument.lot_size)) != contract_size:
+            raise Mt5V1ExecutionError("instrument lot_size differs from MT5 contract_size")
+        ts_init = self._clock.timestamp_ns()
+        reports: list[PositionStatusReport] = []
+        for position in cast(list[JsonObject], snapshot["positions"]):
+            if position["magic"] != self._mt5_config.expected_magic:
+                continue
+            side = PositionSide.LONG if position["side"] == "buy" else PositionSide.SHORT
+            reports.append(
+                PositionStatusReport(
+                    account_id=self.account_id,
+                    instrument_id=self._mt5_config.instrument_id,
+                    position_side=side,
+                    quantity=instrument.make_qty(
+                        Decimal(cast(str, position["volume_lots"])) * contract_size
+                    ),
+                    report_id=UUID4(),
+                    ts_last=int(cast(str, position["time_msc"])) * 1_000_000,
+                    ts_init=ts_init,
+                    venue_position_id=PositionId(cast(str, position["identifier"])),
+                    avg_px_open=Decimal(cast(str, position["price_open"])),
+                )
+            )
+        if not reports and command.instrument_id == self._mt5_config.instrument_id:
+            reports.append(
+                PositionStatusReport.create_flat(
+                    account_id=self.account_id,
+                    instrument_id=self._mt5_config.instrument_id,
+                    size_precision=instrument.size_precision,
+                    ts_init=ts_init,
+                )
+            )
+        return reports
 
 
 class Mt5V1LiveExecClientFactory(LiveExecClientFactory):
@@ -576,6 +868,11 @@ def _validate_config(config: Mt5V1ExecClientConfig) -> None:
         raise ValueError("MT5 v1 execution instrument venue must be MT5")
     if config.instrument_id.symbol.value != config.expected_symbol:
         raise ValueError("configured MT5 instrument and raw symbol differ")
+    if (
+        not config.expected_stream_id
+        or config.expected_stream_id != config.expected_stream_id.strip()
+    ):
+        raise ValueError("expected_stream_id must be a non-empty trimmed token")
     if not 50 <= config.request_timeout_ms <= 60_000:
         raise ValueError("request_timeout_ms is outside the supported range")
     if not 50 <= config.event_poll_interval_ms <= 60_000:
