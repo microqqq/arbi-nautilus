@@ -146,6 +146,19 @@ class TakerStrategy(Strategy):
         self._finish_or_reject(event.client_order_id.value, "DENIED")
 
     def on_order_rejected(self, event: OrderRejected) -> None:
+        if event.reason.strip().upper() == "UNKNOWN":
+            client_order_id = event.client_order_id.value
+            if self.state_store.knows_source_order(client_order_id):
+                self.state_store.mark_source_unknown(
+                    client_order_id,
+                    "Nautilus reported an unknown source submission outcome",
+                )
+            else:
+                self.state_store.update_hedge_status(
+                    client_order_id,
+                    ObligationStatus.UNKNOWN,
+                )
+            return
         self._finish_or_reject(event.client_order_id.value, "REJECTED")
 
     def on_order_canceled(self, event: OrderCanceled) -> None:

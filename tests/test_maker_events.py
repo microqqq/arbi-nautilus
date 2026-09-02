@@ -8,7 +8,9 @@ from typing import Any, cast
 
 import pytest
 from msgspec.structs import replace as struct_replace
+from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.model.enums import OrderSide
+from nautilus_trader.model.events import OrderRejected
 from nautilus_trader.model.identifiers import (
     AccountId,
     ClientId,
@@ -212,6 +214,21 @@ def _filled_events(quantity: int = 2) -> tuple[Any, Any]:
     return partial, final
 
 
+def _rejected(order: Any, reason: str) -> OrderRejected:
+    template = TestEventStubs.order_rejected(order)
+    return OrderRejected(
+        trader_id=template.trader_id,
+        strategy_id=template.strategy_id,
+        instrument_id=template.instrument_id,
+        client_order_id=template.client_order_id,
+        account_id=template.account_id,
+        reason=reason,
+        event_id=UUID4(),
+        ts_event=template.ts_event,
+        ts_init=template.ts_init,
+    )
+
+
 def _subunit_fill() -> Any:
     instrument = _source_instrument()
     order = TestExecStubs.limit_order(
@@ -264,6 +281,37 @@ def test_partial_final_duplicate_and_late_fills_keep_pair_and_freeze_both_sides(
     assert all(entry[2] == ClientId("HEDGE-CLIENT") for entry in strategy.recorded)
     assert store.rounding_residual_ounces == 0
     assert store.net_unhedged_ounces == D(2)
+
+
+def test_unknown_engine_rejection_freezes_source_without_declaring_failure(
+    tmp_path: Path,
+) -> None:
+    strategy = RecordingMakerStrategy(tmp_path / "unknown.state")
+    instrument = _source_instrument()
+    order = TestExecStubs.limit_order(
+        instrument=instrument,
+        order_side=OrderSide.BUY,
+        quantity=instrument.make_qty(1),
+        price=instrument.make_price(2400),
+        client_order_id=ClientOrderId("O-MAKER-UNKNOWN"),
+    )
+    store = strategy._stores[SourceDirection.LONG]
+    store.begin_source(
+        order.client_order_id.value,
+        BusinessOrderSide.BUY,
+        D(1),
+        source_account_id="BITFINEX-001",
+        hedge_account_id="MT5-001",
+    )
+    strategy._working_quotes[order.client_order_id.value] = _bound_quote()
+
+    strategy.on_order_rejected(_rejected(order, "UNKNOWN"))
+
+    record = store.source_order(order.client_order_id.value)
+    assert record is not None and record.status == "UNKNOWN"
+    assert store.active_source_order_id == order.client_order_id.value
+    assert not store.can_submit_source()
+    assert strategy.canceled == [SourceDirection.LONG, SourceDirection.SHORT]
 
 
 def test_restart_late_fill_uses_durable_pair_and_keeps_reconciliation_hold(

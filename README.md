@@ -77,11 +77,27 @@ It evaluates only on a new CRC-backed source-depth callback, never on a later he
 against retained source data.
 
 The checked-in 11-frame fixture is a bounded public wire capture. Factory and node
-construction are tested without opening a socket. This candidate has no
-private WebSocket, credentials, ordering, account state, OMS, database, retry supervisor,
-live composition, or live probe, and is not live-qualified. A future live composition must
-also require current client connectivity because Nautilus retains the last cached market
-data after a feed disconnect.
+construction are tested without opening a socket. This public client has no credentials,
+ordering, or account state. It has no retry supervisor or live probe, and is not
+live-qualified. A future live composition must also require current client connectivity
+because Nautilus retains the last cached market data after a feed disconnect.
+
+## Bitfinex private execution v1 candidate
+
+The repository also contains an offline-tested private WebSocket execution slice for the
+same `XAUTUSDT-PERP.BITFINEX` / `tXAUTF0:USTF0` contract. Authentication binds the exact
+Bitfinex user ID and account channel. It supports only Taker `LIMIT` + `IOC` and Maker
+post-only `LIMIT` + `GTC`, with integer per-order leverage, price-only Maker modify, and
+native-ID cancel. A CID is persisted before `OrderSubmitted` and before the single wire
+send. Only `tu` creates fills; its venue fee, liquidity side, and delayed pre-modify price
+are preserved. Ambiguous sends remain `UNKNOWN`, while authoritative order and notification
+events clear only the matching ambiguity. A stream gap with an unresolved order cannot
+reconnect without reconciliation.
+
+This is an execution-semantic candidate, not a live adapter. Order/fill/position reports,
+restart reconstruction, ACK deadlines, reconnect supervision, factory/node composition,
+and a real-engine lifecycle test remain absent. The report methods fail explicitly, so
+Nautilus's default reconciliation gate will not admit this client into a live kernel.
 
 `InstrumentStatus` is only a REP-backed market-session observation. It is not
 hedge readiness and must not open source-risk admission without a separately
@@ -154,14 +170,13 @@ exact carrier is excluded because it contains credential literals. This repo
 therefore tests that distinction explicitly and generalizes `0.2` as two
 instrument ticks, rather than claiming executable callee provenance.
 
-It does **not** establish complete oracle or live parity. Bitfinex private execution,
-MT5 `MARKET` + `IOC` partial-fill handling, and live Maker/Taker composition remain
-unimplemented; the isolated DEMO `MARKET` + `FOK` candidate is not strategy parity.
-Beyond the bounded checksum-gated Bitfinex P0 market-data view above, dynamic venue margin
-capacity/account reports, authoritative cancel
-reconciliation, Maker modify/cancel query closure, and application of per-order leverage by Bitfinex
-remain unimplemented. The strategies pass computed leverage in execution
-`params`, but the simulated venue only uses configured account leverage. The
+It does **not** establish complete oracle or live parity. The bounded Bitfinex private
+command/event slice exists, but its reports, restart reconstruction, ACK deadlines, and
+live composition remain unimplemented. MT5 `MARKET` + `IOC` partial-fill handling also
+remains unimplemented; the isolated DEMO `MARKET` + `FOK` candidate is not strategy parity.
+Dynamic venue margin capacity, authoritative cancel reconciliation, and Maker query closure
+remain live gates. The private Bitfinex candidate applies the strategy's validated integer
+per-order leverage; the simulated venue still uses configured account leverage. The
 shared leverage helper preserves legacy floor division when its result is at
 least one and intentionally clamps smaller results to one as a migration safety
 guard; that edge is not claimed as bitwise legacy parity.

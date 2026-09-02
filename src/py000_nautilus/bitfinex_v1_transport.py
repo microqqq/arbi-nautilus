@@ -1,4 +1,4 @@
-"""Small public WebSocket transport for the single Bitfinex v1 read-side."""
+"""Small JSON WebSocket transport shared by the Bitfinex v1 clients."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from websockets.asyncio.client import ClientConnection, connect
 
 
 class BitfinexV1TransportError(RuntimeError):
-    """The public feed cannot supply a valid JSON frame."""
+    """The Bitfinex WebSocket cannot supply a valid JSON frame."""
 
 
 class BitfinexV1Transport:
@@ -23,7 +23,7 @@ class BitfinexV1Transport:
 
     async def open(self) -> None:
         if self._socket is not None:
-            raise BitfinexV1TransportError("Bitfinex public transport is already open")
+            raise BitfinexV1TransportError("Bitfinex transport is already open")
         self._socket = await connect(
             self._url,
             open_timeout=self._open_timeout_ms / 1_000,
@@ -37,7 +37,7 @@ class BitfinexV1Transport:
         if socket is not None:
             await socket.close()
 
-    async def send_json(self, payload: dict[str, object]) -> None:
+    async def send_json(self, payload: dict[str, object] | list[object]) -> None:
         socket = self._require_socket()
         encoded = json.dumps(
             payload,
@@ -74,7 +74,7 @@ class BitfinexV1Transport:
 
     def _require_socket(self) -> ClientConnection:
         if self._socket is None:
-            raise BitfinexV1TransportError("Bitfinex public transport is not open")
+            raise BitfinexV1TransportError("Bitfinex transport is not open")
         return self._socket
 
 

@@ -144,6 +144,19 @@ class MakerStrategy(Strategy):
         self._finish_or_reject(event.client_order_id.value, "DENIED")
 
     def on_order_rejected(self, event: OrderRejected) -> None:
+        if event.reason.strip().upper() == "UNKNOWN":
+            client_order_id = event.client_order_id.value
+            direction = self._direction_for_source_order(client_order_id)
+            if direction is not None:
+                self._mark_source_unknown(
+                    client_order_id,
+                    "Nautilus reported an unknown Maker submission outcome",
+                )
+            else:
+                for store in self._stores.values():
+                    store.update_hedge_status(client_order_id, ObligationStatus.UNKNOWN)
+                self._freeze_and_cancel_all("unknown Maker hedge submission outcome")
+            return
         self._finish_or_reject(event.client_order_id.value, "REJECTED")
 
     def on_order_canceled(self, event: OrderCanceled) -> None:

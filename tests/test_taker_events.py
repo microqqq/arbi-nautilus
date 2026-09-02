@@ -4,9 +4,11 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, cast
 
+from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.model.book import OrderBook
 from nautilus_trader.model.data import BookOrder
 from nautilus_trader.model.enums import BookType, OrderSide
+from nautilus_trader.model.events import OrderRejected
 from nautilus_trader.model.identifiers import ClientOrderId, TradeId, VenueOrderId
 from nautilus_trader.model.objects import Money, Price, Quantity
 from nautilus_trader.test_kit.stubs.events import TestEventStubs
@@ -24,6 +26,21 @@ class RecordingTakerStrategy(TakerStrategy):
 
     def _submit_hedge_intent(self, intent: HedgeIntent) -> None:
         self.recorded_intents.append(intent)
+
+
+def _rejected(order: Any, reason: str) -> OrderRejected:
+    template = TestEventStubs.order_rejected(order)
+    return OrderRejected(
+        trader_id=template.trader_id,
+        strategy_id=template.strategy_id,
+        instrument_id=template.instrument_id,
+        client_order_id=template.client_order_id,
+        account_id=template.account_id,
+        reason=reason,
+        event_id=UUID4(),
+        ts_event=template.ts_event,
+        ts_init=template.ts_init,
+    )
 
 
 def _native_book(
@@ -120,6 +137,30 @@ def test_real_partial_final_duplicate_and_late_order_filled_events(tmp_path: Pat
     )
     assert strategy.state_store.rounding_residual_ounces == 0
     assert strategy.state_store.net_unhedged_ounces == Decimal(2)
+
+
+def test_unknown_engine_rejection_keeps_source_live_and_blocked(tmp_path: Path) -> None:
+    strategy = RecordingTakerStrategy(tmp_path / "unknown.json")
+    instrument = _source_instrument()
+    order = TestExecStubs.limit_order(
+        instrument=instrument,
+        order_side=OrderSide.BUY,
+        quantity=instrument.make_qty(1),
+        price=instrument.make_price(2400),
+        client_order_id=ClientOrderId("O-UNKNOWN"),
+    )
+    strategy.state_store.begin_source(
+        order.client_order_id.value,
+        BusinessOrderSide.BUY,
+        Decimal(1),
+    )
+
+    strategy.on_order_rejected(_rejected(order, "UNKNOWN"))
+
+    record = strategy.state_store.source_order(order.client_order_id.value)
+    assert record is not None and record.status == "UNKNOWN"
+    assert strategy.state_store.active_source_order_id == order.client_order_id.value
+    assert not strategy.state_store.can_submit_source()
 
 
 class _StopStore:
