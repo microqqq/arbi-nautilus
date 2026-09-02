@@ -1,0 +1,327 @@
+{
+  "_provenance": {
+    "source": "synthetic-only",
+    "live_connected": false,
+    "credentials_present": false,
+    "redactions": {
+      "account": "SYNTHETIC_ACCOUNT",
+      "balances": "SYNTHETIC_MONEY",
+      "tickets": "SYNTHETIC_TICKETS"
+    }
+  },
+  "identity_vectors": [
+    {
+      "broker_server": "Synthetic Broker",
+      "broker_login": "10000001",
+      "canonical_hex": "70793030302e6d74352f6163636f756e742d69642f7631000000001053796e7468657469632042726f6b6572003130303030303031",
+      "account_id": "mt5-sha256-a2ccbab7c131421a9275eac0599fe32b5e77742622c5e8084d2aae2f643b44ae"
+    },
+    {
+      "broker_server": "Broker-Demo",
+      "broker_login": "42",
+      "canonical_hex": "70793030302e6d74352f6163636f756e742d69642f7631000000000b42726f6b65722d44656d6f003432",
+      "account_id": "mt5-sha256-ede962c3da91c8d79708f2ef03905359b52c00ddd1f35d6a417d7019ae35c000"
+    },
+    {
+      "broker_server": "Broker Demo",
+      "broker_login": "42",
+      "canonical_hex": "70793030302e6d74352f6163636f756e742d69642f7631000000000b42726f6b65722044656d6f003432",
+      "account_id": "mt5-sha256-530713bab932b94857f01642d24cd3745d760dfeb323b358efcc99af1df1d62a"
+    },
+    {
+      "broker_server": "Broker α",
+      "broker_login": "42",
+      "canonical_hex": "70793030302e6d74352f6163636f756e742d69642f7631000000000942726f6b657220ceb1003432",
+      "account_id": "mt5-sha256-7991c517a8b90c796d09c622a5d238c0f94c9d6ef4169002076b5bec1c3c7013"
+    },
+    {
+      "broker_server": "Broker β",
+      "broker_login": "42",
+      "canonical_hex": "70793030302e6d74352f6163636f756e742d69642f7631000000000942726f6b657220ceb2003432",
+      "account_id": "mt5-sha256-c182fbea9fce5a3818f05f684cd2d3198b6525e24370f7560da789630dea85ea"
+    }
+  ],
+  "journal_namespace_vectors": [
+    {
+      "account_id": "mt5-sha256-a2ccbab7c131421a9275eac0599fe32b5e77742622c5e8084d2aae2f643b44ae",
+      "magic": "900000001",
+      "symbol": "XAUUSD.a",
+      "canonical_hex": "70793030302e6d74352f6a6f75726e616c2d6e616d6573706163652f7631006d74352d7368613235362d61326363626162376331333134323161393237356561633035393966653332623565373737343236323263356538303834643261616532663634336234346165005841555553442e6100393030303030303031",
+      "namespace": "PY000_MT5_V1_147e66ce36e897cc171c7bff7705fa3d7aa84c088036c0e07db53c65de17c2f1"
+    },
+    {
+      "account_id": "mt5-sha256-a2ccbab7c131421a9275eac0599fe32b5e77742622c5e8084d2aae2f643b44ae",
+      "magic": "900000001",
+      "symbol": "XAUUSD_a",
+      "canonical_hex": "70793030302e6d74352f6a6f75726e616c2d6e616d6573706163652f7631006d74352d7368613235362d61326363626162376331333134323161393237356561633035393966653332623565373737343236323263356538303834643261616532663634336234346165005841555553445f6100393030303030303031",
+      "namespace": "PY000_MT5_V1_6ed272fd5ed42898ed457276221c58c86248c3d6aaf06488d717490f7733da83"
+    },
+    {
+      "account_id": "mt5-sha256-a2ccbab7c131421a9275eac0599fe32b5e77742622c5e8084d2aae2f643b44ae",
+      "magic": "900000001",
+      "symbol": "XAUUSD a",
+      "canonical_hex": "70793030302e6d74352f6a6f75726e616c2d6e616d6573706163652f7631006d74352d7368613235362d6132636362616237633133313432316139323735656163303539396665333262356537373734323632326335653830383464326161653266363433623434616500584155555344206100393030303030303031",
+      "namespace": "PY000_MT5_V1_071ca8b625889a54a015927cdd5f25930b867b7f0bca62dce4b622f8cca55156"
+    },
+    {
+      "account_id": "mt5-sha256-a2ccbab7c131421a9275eac0599fe32b5e77742622c5e8084d2aae2f643b44ae",
+      "magic": "900000001",
+      "symbol": "XAUUSD#a",
+      "canonical_hex": "70793030302e6d74352f6a6f75726e616c2d6e616d6573706163652f7631006d74352d7368613235362d6132636362616237633133313432316139323735656163303539396665333262356537373734323632326335653830383464326161653266363433623434616500584155555344236100393030303030303031",
+      "namespace": "PY000_MT5_V1_a6c060c10bedb18491be93701e6936cef9def1d300b52e15661a3d2dab84a503"
+    }
+  ],
+  "request_corpus": [
+    {
+      "name": "valid_hello",
+      "raw": "{\"protocol\":\"py000.mt5\",\"version\":1,\"request_id\":\"corpus-hello\",\"op\":\"hello\"}",
+      "expected": "OK"
+    },
+    {
+      "name": "duplicate_protocol",
+      "raw": "{\"protocol\":\"py000.mt5\",\"protocol\":\"py000.mt5\",\"version\":1,\"request_id\":\"r\",\"op\":\"hello\"}",
+      "expected": "MALFORMED"
+    },
+    {
+      "name": "version_bool",
+      "raw": "{\"protocol\":\"py000.mt5\",\"version\":true,\"request_id\":\"r\",\"op\":\"hello\"}",
+      "expected": "SCHEMA_MISMATCH"
+    },
+    {
+      "name": "version_float",
+      "raw": "{\"protocol\":\"py000.mt5\",\"version\":1.0,\"request_id\":\"r\",\"op\":\"hello\"}",
+      "expected": "SCHEMA_MISMATCH"
+    },
+    {
+      "name": "protocol_wrong_type",
+      "raw": "{\"protocol\":1,\"version\":1,\"request_id\":\"r\",\"op\":\"hello\"}",
+      "expected": "SCHEMA_MISMATCH"
+    },
+    {
+      "name": "binding_wrong_type",
+      "raw": "{\"protocol\":\"py000.mt5\",\"version\":1,\"request_id\":\"r\",\"op\":\"get_snapshot\",\"binding\":[]}",
+      "expected": "SCHEMA_MISMATCH"
+    },
+    {
+      "name": "unsafe_stream_token",
+      "raw": "{\"protocol\":\"py000.mt5\",\"version\":1,\"request_id\":\"r\",\"op\":\"get_snapshot\",\"binding\":{\"account_id\":\"mt5-sha256-a2ccbab7c131421a9275eac0599fe32b5e77742622c5e8084d2aae2f643b44ae\",\"symbol\":\"XAUUSD\",\"ea_build_id\":\"py000-mt5-ea-v1-readonly\",\"stream_id\":\"bad.token\",\"boot_id\":\"boot-synthetic-001\"}}",
+      "expected": "SCHEMA_MISMATCH"
+    },
+    {
+      "name": "limit_float",
+      "raw": "{\"protocol\":\"py000.mt5\",\"version\":1,\"request_id\":\"r\",\"op\":\"get_execution_events\",\"binding\":{\"account_id\":\"mt5-sha256-a2ccbab7c131421a9275eac0599fe32b5e77742622c5e8084d2aae2f643b44ae\",\"symbol\":\"XAUUSD\",\"ea_build_id\":\"py000-mt5-ea-v1-readonly\",\"stream_id\":\"stream-synthetic-001\",\"boot_id\":\"boot-synthetic-001\"},\"after_cursor\":\"0\",\"limit\":1.0}",
+      "expected": "SCHEMA_MISMATCH"
+    },
+    {
+      "name": "escaped_surrogate",
+      "raw": "{\"protocol\":\"py000.mt5\",\"version\":1,\"request_id\":\"bad\\ud800\",\"op\":\"hello\"}",
+      "expected": "MALFORMED"
+    },
+    {
+      "name": "unknown_operation",
+      "raw": "{\"protocol\":\"py000.mt5\",\"version\":1,\"request_id\":\"r\",\"op\":\"ping\"}",
+      "expected": "UNKNOWN_OP"
+    },
+    {
+      "name": "integer_digit_bomb",
+      "recipe": "integer_5000_digits",
+      "expected": "MALFORMED"
+    },
+    {
+      "name": "nesting_bomb",
+      "recipe": "array_depth_40",
+      "expected": "MALFORMED"
+    }
+  ],
+  "identity": {
+    "account_id": "mt5-sha256-a2ccbab7c131421a9275eac0599fe32b5e77742622c5e8084d2aae2f643b44ae",
+    "broker_server": "Synthetic Broker",
+    "broker_login": "10000001",
+    "server_timezone": "Europe/Athens",
+    "server_timezone_source": "configured_input",
+    "symbol": "XAUUSD",
+    "terminal_build": 5000,
+    "ea_build_id": "py000-mt5-ea-v1-readonly",
+    "declared_source_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "stream_id": "stream-synthetic-001",
+    "boot_id": "boot-synthetic-001",
+    "magic": "900000001",
+    "execution_enabled": false
+  },
+  "interactions": [
+    {
+      "request": {
+        "protocol": "py000.mt5",
+        "version": 1,
+        "request_id": "fixture-hello-1",
+        "op": "hello"
+      },
+      "response": {
+        "protocol": "py000.mt5",
+        "version": 1,
+        "request_id": "fixture-hello-1",
+        "op": "hello",
+        "ok": true,
+        "data": {
+          "capabilities": [
+            "get_execution_events",
+            "get_snapshot",
+            "hello",
+            "submit_market_delta"
+          ],
+          "identity": {
+            "account_id": "mt5-sha256-a2ccbab7c131421a9275eac0599fe32b5e77742622c5e8084d2aae2f643b44ae",
+            "broker_server": "Synthetic Broker",
+            "broker_login": "10000001",
+            "server_timezone": "Europe/Athens",
+            "server_timezone_source": "configured_input",
+            "symbol": "XAUUSD",
+            "terminal_build": 5000,
+            "ea_build_id": "py000-mt5-ea-v1-readonly",
+            "declared_source_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "stream_id": "stream-synthetic-001",
+            "boot_id": "boot-synthetic-001",
+            "magic": "900000001",
+            "execution_enabled": false
+          },
+          "recovery_state": "ready"
+        }
+      }
+    },
+    {
+      "request": {
+        "protocol": "py000.mt5",
+        "version": 1,
+        "request_id": "fixture-submit-1",
+        "op": "submit_market_delta",
+        "binding": {
+          "account_id": "mt5-sha256-a2ccbab7c131421a9275eac0599fe32b5e77742622c5e8084d2aae2f643b44ae",
+          "symbol": "XAUUSD",
+          "ea_build_id": "py000-mt5-ea-v1-readonly",
+          "stream_id": "stream-synthetic-001",
+          "boot_id": "boot-synthetic-001"
+        },
+        "client_request_id": "synthetic-delta-1",
+        "side": "sell",
+        "quantity_lots": "0.01"
+      },
+      "response": {
+        "protocol": "py000.mt5",
+        "version": 1,
+        "request_id": "fixture-submit-1",
+        "op": "submit_market_delta",
+        "ok": false,
+        "error": {
+          "code": "EXECUTION_DISABLED",
+          "message": "v1 package cannot execute orders"
+        }
+      }
+    }
+  ],
+  "snapshot": {
+    "account": {
+      "balance": "10000.00",
+      "broker_login": "10000001",
+      "broker_server": "Synthetic Broker",
+      "equity": "10001.25",
+      "currency": "USD",
+      "leverage": 100,
+      "margin": "10.00",
+      "margin_free": "9991.25",
+      "margin_level": "100012.5",
+      "trade_allowed": true,
+      "trade_expert": true
+    },
+    "positions": [
+      {
+        "ticket": "700000001",
+        "identifier": "800000001",
+        "magic": "900000001",
+        "comment": "synthetic-position",
+        "side": "buy",
+        "volume_lots": "0.01",
+        "price_open": "2400.10",
+        "price_current": "2400.20",
+        "profit": "0.10",
+        "stop_loss": "0",
+        "swap": "0",
+        "take_profit": "0",
+        "time_msc": "1788281900000"
+      }
+    ],
+    "symbol_spec": {
+      "symbol": "XAUUSD",
+      "contract_size": "100",
+      "currency_base": "XAU",
+      "currency_margin": "USD",
+      "currency_profit": "USD",
+      "digits": 2,
+      "expiration_mode": 7,
+      "filling_mode": 3,
+      "freeze_level": 0,
+      "margin_initial": "0",
+      "margin_maintenance": "0",
+      "order_mode": 127,
+      "point": "0.01",
+      "stops_level": 0,
+      "swap_long": "-1.25",
+      "swap_mode": 1,
+      "swap_short": "0.5",
+      "tick_size": "0.01",
+      "tick_value": "1",
+      "tick_value_loss": "1",
+      "tick_value_profit": "1",
+      "trade_calc_mode": 1,
+      "trade_mode": 4,
+      "volume_limit": "0",
+      "volume_max": "100",
+      "volume_min": "0.01",
+      "volume_step": "0.01"
+    },
+    "authority_flags": {
+      "terminal_connected": true,
+      "terminal_trade_allowed": true,
+      "account_trade_allowed": true,
+      "account_trade_expert": true,
+      "mql_trade_allowed": false,
+      "symbol_trade_mode": 4,
+      "market_open_hint": true
+    },
+    "session": {
+      "freshness": "fresh",
+      "freshness_age_ms": "1000",
+      "freshness_source": "mt5_symbol_info_tick_vs_time_trade_server",
+      "sample_server_time_ms": "1788282000000",
+      "sample_server_time_source": "mt5_time_trade_server_calculated_second_precision",
+      "scheduled_open": true,
+      "session_open": true,
+      "session_schedule_available": true,
+      "session_source": "mt5_symbol_info_session_trade_at_time_trade_server"
+    },
+    "time": {
+      "observed_utc_ms": "1788271200000",
+      "observed_utc_precision_ms": "1000",
+      "observed_utc_source": "mt5_time_gmt_second_precision",
+      "server_quote_time_ms": "1788282000000",
+      "server_quote_time_source": "mt5_time_current_last_known_quote",
+      "server_timezone": "Europe/Athens"
+    }
+  },
+  "pub": [
+    {
+      "message_type": "tick",
+      "event_time_ms": "1788282000000",
+      "event_time_source": "mt5_symbol_info_tick",
+      "bid": "2400.10",
+      "ask": "2400.20",
+      "market_open_hint": true
+    },
+    {
+      "message_type": "heartbeat",
+      "event_time_ms": "1788282001000",
+      "event_time_source": "mt5_time_gmt_second_precision",
+      "last_tick_time_ms": "1788282000000",
+      "market_open_hint": true
+    }
+  ]
+}
