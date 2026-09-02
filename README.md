@@ -61,23 +61,27 @@ The repository now contains one deliberately small, offline-testable Nautilus li
 candidate for `tXAUTF0:USTF0` mapped explicitly to
 `XAUTUSDT-PERP.BITFINEX`. It subscribes only to the public `P0`/`F0`/`len=25`
 book, enables Bitfinex checksum flag `131072`, maintains the two 25-level sides,
-and emits a `QuoteTick` only after the immediately preceding book state passes the
-venue CRC. A malformed frame, wrong subscription contract or channel, incomplete book,
-checksum mismatch, or transport loss closes the feed and stops publication.
+and publishes data only after the immediately preceding book state passes the venue CRC.
+Quote subscribers receive the true BBO; depth subscribers receive a native Nautilus
+`OrderBookDeltas` L2 snapshot (`CLEAR` plus 25 levels per side). A malformed frame, wrong
+subscription contract or channel, incomplete book, checksum mismatch, or transport loss
+closes the feed and stops publication.
 
 All instrument precision, increments, quantity limits, margins, and fees are mandatory
 reviewed configuration; there is no REST specification fallback. Contract multiplier and
 lot size are fixed at one because this client supports only the one-ounce XAUT contract.
 The emitted `QuoteTick` always retains Nautilus's standard best-bid/best-ask meaning. The
-Taker's reference-depth marginal price is deliberately not disguised as a quote tick; it
-remains to be wired through Nautilus's native order-book data in the next bounded slice.
+Taker consumes the managed native L2 book, walks exact cumulative quantities to its
+configured reference depth, and produces no opportunity when either side is insufficient.
+It evaluates only on a new CRC-backed source-depth callback, never on a later hedge tick
+against retained source data.
 
 The checked-in 11-frame fixture is a bounded public wire capture. Factory and node
 construction are tested without opening a socket. This candidate has no
 private WebSocket, credentials, ordering, account state, OMS, database, retry supervisor,
-live composition, or live probe, and is not live-qualified. Before live strategy wiring,
-the composition must also require current client connectivity because Nautilus retains the
-last cached tick after a feed disconnect.
+live composition, or live probe, and is not live-qualified. A future live composition must
+also require current client connectivity because Nautilus retains the last cached market
+data after a feed disconnect.
 
 `InstrumentStatus` is only a REP-backed market-session observation. It is not
 hedge readiness and must not open source-risk admission without a separately
@@ -150,11 +154,10 @@ exact carrier is excluded because it contains credential literals. This repo
 therefore tests that distinction explicitly and generalizes `0.2` as two
 instrument ticks, rather than claiming executable callee provenance.
 
-It does **not** establish complete oracle or live parity. Bitfinex native order-book
-projection for Taker depth pricing, private execution,
+It does **not** establish complete oracle or live parity. Bitfinex private execution,
 MT5 `MARKET` + `IOC` partial-fill handling, and live Maker/Taker composition remain
 unimplemented; the isolated DEMO `MARKET` + `FOK` candidate is not strategy parity.
-Beyond the bounded checksum-gated Bitfinex P0 BBO view above, dynamic venue margin
+Beyond the bounded checksum-gated Bitfinex P0 market-data view above, dynamic venue margin
 capacity/account reports, authoritative cancel
 reconciliation, Maker modify/cancel query closure, and application of per-order leverage by Bitfinex
 remain unimplemented. The strategies pass computed leverage in execution

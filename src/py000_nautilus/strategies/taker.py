@@ -1,10 +1,11 @@
-"""Minimal Taker strategy using Nautilus lifecycle, orders, and fill events."""
+"""Minimal Taker strategy using Nautilus books, orders, and fill events."""
 
-from decimal import Decimal
+from decimal import ROUND_FLOOR, Decimal
 from typing import cast
 
-from nautilus_trader.model.data import QuoteTick
-from nautilus_trader.model.enums import OrderSide, TimeInForce
+from nautilus_trader.model.book import BookLevel, OrderBook
+from nautilus_trader.model.data import OrderBookDeltas, QuoteTick
+from nautilus_trader.model.enums import BookType, OrderSide, TimeInForce
 from nautilus_trader.model.events import (
     OrderAccepted,
     OrderCanceled,
@@ -78,7 +79,12 @@ class TakerStrategy(Strategy):
         reason = self.state_store.recover_for_start()
         if reason is not None:
             self.log.error(reason)
-        self.subscribe_quote_ticks(self._config.source_instrument_id)
+        self.subscribe_order_book_deltas(
+            self._config.source_instrument_id,
+            book_type=BookType.L2_MBP,
+            depth=25,
+            managed=True,
+        )
         self.subscribe_quote_ticks(self._config.hedge_instrument_id)
 
     def on_stop(self) -> None:
@@ -103,22 +109,23 @@ class TakerStrategy(Strategy):
                 f"source cancel on stop raised {type(exc).__name__}",
             )
 
-    def on_quote_tick(self, tick: QuoteTick) -> None:
-        if tick.instrument_id not in {
-            self._config.source_instrument_id,
-            self._config.hedge_instrument_id,
-        }:
+    def on_order_book_deltas(self, deltas: OrderBookDeltas) -> None:
+        if deltas.instrument_id != self._config.source_instrument_id:
             return
         if not self.state_store.can_submit_source():
             return
-        source_tick = self.cache.quote_tick(self._config.source_instrument_id)
+        source_book = self.cache.order_book(self._config.source_instrument_id)
         hedge_tick = self.cache.quote_tick(self._config.hedge_instrument_id)
-        if source_tick is None or hedge_tick is None:
+        if source_book is None or hedge_tick is None:
             return
-        if not self._inputs_are_fresh(source_tick, hedge_tick):
+        reference_book = _reference_book(
+            source_book,
+            self._config.economics.base_book_quantity,
+        )
+        if reference_book is None or not self._inputs_are_fresh(deltas.ts_event, hedge_tick):
             return
         opportunity = evaluate_taker(
-            source_book=_book_top(source_tick),
+            source_book=reference_book,
             hedge_book=_book_top(hedge_tick),
             accounts=self._source_accounts(),
             hedge=self._hedge_account(),
@@ -277,11 +284,11 @@ class TakerStrategy(Strategy):
         else:
             self.state_store.update_hedge_status(client_order_id, ObligationStatus.REJECTED)
 
-    def _inputs_are_fresh(self, source_tick: QuoteTick, hedge_tick: QuoteTick) -> bool:
+    def _inputs_are_fresh(self, source_ts_ns: int, hedge_tick: QuoteTick) -> bool:
         now_ns = cast(int, self.clock.timestamp_ns())
         return market_inputs_are_fresh(
             now_ns=now_ns,
-            source_ts_ns=source_tick.ts_event,
+            source_ts_ns=source_ts_ns,
             hedge_ts_ns=hedge_tick.ts_event,
             cost_ts_ns=self._cost_ts_ns,
             session_ts_ns=self._session_ts_ns,
@@ -315,3 +322,31 @@ def _book_top(tick: QuoteTick) -> BookTop:
         bid_size=Decimal(str(tick.bid_size)),
         ask_size=Decimal(str(tick.ask_size)),
     )
+
+
+def _reference_book(book: OrderBook, quantity: Decimal) -> BookTop | None:
+    if quantity <= 0:
+        raise ValueError("base book quantity must be positive")
+    bid = _reference_level(book.bids(), quantity)
+    ask = _reference_level(book.asks(), quantity)
+    if bid is None or ask is None:
+        return None
+    return BookTop(bid=bid[0], ask=ask[0], bid_size=bid[1], ask_size=ask[1])
+
+
+def _reference_level(
+    levels: list[BookLevel],
+    quantity: Decimal,
+) -> tuple[Decimal, Decimal] | None:
+    cumulative = Decimal(0)
+    for level in levels[:25]:
+        cumulative += sum(
+            (order.size.as_decimal() for order in level.orders()),
+            start=Decimal(0),
+        )
+        if cumulative >= quantity:
+            return (
+                level.price.as_decimal(),
+                cumulative.to_integral_value(rounding=ROUND_FLOOR),
+            )
+    return None

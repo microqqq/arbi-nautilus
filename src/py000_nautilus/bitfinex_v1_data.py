@@ -12,11 +12,17 @@ from nautilus_trader.common.component import LiveClock, MessageBus
 from nautilus_trader.common.enums import LogColor
 from nautilus_trader.common.providers import InstrumentProvider
 from nautilus_trader.config import LiveDataClientConfig
-from nautilus_trader.data.messages import SubscribeQuoteTicks, UnsubscribeQuoteTicks
+from nautilus_trader.data.messages import (
+    SubscribeOrderBook,
+    SubscribeQuoteTicks,
+    UnsubscribeOrderBook,
+    UnsubscribeQuoteTicks,
+)
 from nautilus_trader.live.data_client import LiveDataClient, LiveMarketDataClient
 from nautilus_trader.live.factories import LiveDataClientFactory
 from nautilus_trader.model.currencies import USDT
-from nautilus_trader.model.data import QuoteTick
+from nautilus_trader.model.data import BookOrder, OrderBookDelta, OrderBookDeltas, QuoteTick
+from nautilus_trader.model.enums import BookAction, BookType, OrderSide, RecordFlag
 from nautilus_trader.model.identifiers import ClientId, InstrumentId, Symbol, Venue
 from nautilus_trader.model.instruments import CryptoPerpetual
 from nautilus_trader.model.objects import Currency, Price, Quantity
@@ -122,13 +128,24 @@ class BitfinexP0Book:
         return self._verified
 
     def quote(self) -> tuple[Decimal, Decimal, Decimal, Decimal]:
+        bids, asks = self.levels()
+        best_bid, bid_size = bids[0]
+        best_ask, ask_size = asks[0]
+        return best_bid, bid_size, best_ask, ask_size
+
+    def levels(
+        self,
+    ) -> tuple[
+        tuple[tuple[Decimal, Decimal], ...],
+        tuple[tuple[Decimal, Decimal], ...],
+    ]:
         if not self._verified:
             raise BitfinexV1DataError("Bitfinex book has not passed its latest CRC")
-        best_bid = max(self._bids)
-        best_ask = min(self._asks)
-        if best_bid >= best_ask:
+        bids = tuple(sorted(self._bids.items(), reverse=True)[:25])
+        asks = tuple((price, abs(size)) for price, size in sorted(self._asks.items())[:25])
+        if bids[0][0] >= asks[0][0]:
             raise BitfinexV1DataError("Bitfinex book is crossed")
-        return best_bid, self._bids[best_bid], best_ask, abs(self._asks[best_ask])
+        return bids, asks
 
 
 def instrument_from_config(config: BitfinexV1DataClientConfig, *, ts_init: int) -> CryptoPerpetual:
@@ -180,8 +197,10 @@ class BitfinexV1DataClient(LiveMarketDataClient):
         )
         self._book = BitfinexP0Book()
         self._channel_id: int | None = None
+        self._pending_unsubscribe_channel_id: int | None = None
         self._subscription_requested = False
         self._publish_quotes = False
+        self._publish_deltas = False
         self._running = False
         self._reader_task: asyncio.Task[None] | None = None
         self._last_failure: str | None = None
@@ -220,16 +239,37 @@ class BitfinexV1DataClient(LiveMarketDataClient):
         self._reader_task = None
         await self._transport.close()
         self._channel_id = None
+        self._pending_unsubscribe_channel_id = None
         self._subscription_requested = False
         self._publish_quotes = False
+        self._publish_deltas = False
+        self._clear_base_subscriptions()
         self._book.clear()
 
     async def _subscribe_quote_ticks(self, command: SubscribeQuoteTicks) -> None:
-        self._require_instrument(command.instrument_id)
+        try:
+            self._require_instrument(command.instrument_id)
+        except Exception:
+            self._remove_subscription_quote_ticks(command.instrument_id)
+            raise
+        self._publish_quotes = True
+        await self._ensure_book_subscription()
+
+    async def _subscribe_order_book_deltas(self, command: SubscribeOrderBook) -> None:
+        try:
+            self._require_instrument(command.instrument_id)
+            if command.book_type != BookType.L2_MBP or command.depth != 25:
+                raise BitfinexV1DataError("Bitfinex v1 requires an L2_MBP depth-25 subscription")
+        except Exception:
+            self._remove_subscription_order_book_deltas(command.instrument_id)
+            raise
+        self._publish_deltas = True
+        await self._ensure_book_subscription()
+
+    async def _ensure_book_subscription(self) -> None:
         if self._subscription_requested:
             return
         self._subscription_requested = True
-        self._publish_quotes = True
         try:
             await self._transport.send_json({"event": "conf", "flags": _CHECKSUM_FLAG})
             await self._transport.send_json(_SUBSCRIBE)
@@ -240,12 +280,25 @@ class BitfinexV1DataClient(LiveMarketDataClient):
     async def _unsubscribe_quote_ticks(self, command: UnsubscribeQuoteTicks) -> None:
         self._require_instrument(command.instrument_id)
         self._publish_quotes = False
+        await self._unsubscribe_book_if_unused()
+
+    async def _unsubscribe_order_book_deltas(self, command: UnsubscribeOrderBook) -> None:
+        self._require_instrument(command.instrument_id)
+        self._publish_deltas = False
+        await self._unsubscribe_book_if_unused()
+
+    async def _unsubscribe_book_if_unused(self) -> None:
+        if self._publish_quotes or self._publish_deltas:
+            return
         self._subscription_requested = False
         self._book.clear()
-        if self._channel_id is not None:
+        channel_id = self._channel_id
+        self._channel_id = None
+        if channel_id is not None:
+            self._pending_unsubscribe_channel_id = channel_id
             try:
                 await self._transport.send_json(
-                    {"event": "unsubscribe", "chanId": self._channel_id}
+                    {"event": "unsubscribe", "chanId": channel_id}
                 )
             except BaseException as exc:
                 await self._fail_closed(exc)
@@ -254,9 +307,9 @@ class BitfinexV1DataClient(LiveMarketDataClient):
     async def _read_loop(self) -> None:
         try:
             while self._running:
-                quote = self._consume_frame(await self._transport.recv_json())
-                if quote is not None:
-                    self._handle_data(quote)
+                data = self._consume_frame(await self._transport.recv_json())
+                for item in data:
+                    self._handle_data(item)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -264,36 +317,52 @@ class BitfinexV1DataClient(LiveMarketDataClient):
 
     async def _fail_closed(self, exc: BaseException) -> None:
         self._last_failure = f"{type(exc).__name__}: {exc}"[:300]
-        self._running = self._subscription_requested = self._publish_quotes = False
+        self._running = False
+        self._subscription_requested = False
+        self._publish_quotes = False
+        self._publish_deltas = False
         self._channel_id = None
+        self._pending_unsubscribe_channel_id = None
+        self._clear_base_subscriptions()
         self._book.clear()
         self._set_connected(False)
         await self._transport.close()
 
-    def _consume_frame(self, frame: dict[str, object] | list[object]) -> QuoteTick | None:
+    def _consume_frame(
+        self,
+        frame: dict[str, object] | list[object],
+    ) -> tuple[QuoteTick | OrderBookDeltas, ...]:
         if isinstance(frame, dict):
             self._consume_control(frame)
-            return None
+            return ()
         if len(frame) not in {2, 3}:
             raise BitfinexV1DataError("Bitfinex channel frame has invalid length")
         channel_id = _integer(frame[0], "channel id")
+        if channel_id == self._pending_unsubscribe_channel_id:
+            return ()
         if channel_id != self._channel_id:
             raise BitfinexV1DataError("Bitfinex frame belongs to an unexpected channel")
         payload = frame[1]
         if payload == "hb" and len(frame) == 2:
-            return None
+            return ()
         if payload == "cs" and len(frame) == 3:
             checksum = _integer(frame[2], "checksum")
             if not self._book.verify(checksum):
                 raise BitfinexV1DataError("Bitfinex book checksum mismatch")
-            return self._quote_tick() if self._publish_quotes else None
+            timestamp = self._clock.timestamp_ns()
+            result: list[QuoteTick | OrderBookDeltas] = []
+            if self._publish_quotes:
+                result.append(self._quote_tick(timestamp))
+            if self._publish_deltas:
+                result.append(self._order_book_snapshot(timestamp))
+            return tuple(result)
         if len(frame) != 2 or not isinstance(payload, list) or not payload:
             raise BitfinexV1DataError("Bitfinex book frame is malformed")
         if isinstance(payload[0], list):
             self._book.apply_snapshot(payload)
         else:
             self._book.apply_delta(payload)
-        return None
+        return ()
 
     def _consume_control(self, frame: dict[str, object]) -> None:
         event = frame.get("event")
@@ -320,42 +389,94 @@ class BitfinexV1DataClient(LiveMarketDataClient):
             channel_id = _integer(frame.get("chanId"), "subscription channel id")
             if channel_id <= 0:
                 raise BitfinexV1DataError("Bitfinex subscription channel must be positive")
+            if channel_id == self._pending_unsubscribe_channel_id:
+                raise BitfinexV1DataError("Bitfinex reused a channel before unsubscribe completed")
             self._channel_id = channel_id
             self._book.clear()
             return
         if event == "unsubscribed":
-            if _integer(frame.get("chanId"), "unsubscribe channel id") != self._channel_id:
+            channel_id = _integer(frame.get("chanId"), "unsubscribe channel id")
+            if channel_id == self._pending_unsubscribe_channel_id:
+                self._pending_unsubscribe_channel_id = None
+                return
+            if channel_id != self._channel_id:
                 raise BitfinexV1DataError("Bitfinex unsubscribed the wrong channel")
-            if self._subscription_requested or self._publish_quotes:
+            if self._subscription_requested or self._publish_quotes or self._publish_deltas:
                 raise BitfinexV1DataError("Bitfinex unexpectedly ended the book subscription")
             self._channel_id = None
             self._book.clear()
             return
         raise BitfinexV1DataError(f"unsupported Bitfinex control event {event!r}")
 
-    def _quote_tick(self) -> QuoteTick:
+    def _quote_tick(self, timestamp: int | None = None) -> QuoteTick:
         bid, bid_size, ask, ask_size = self._book.quote()
-        bid_price = self._instrument.make_price(bid)
-        ask_price = self._instrument.make_price(ask)
-        bid_quantity = self._instrument.make_qty(bid_size, round_down=True)
-        ask_quantity = self._instrument.make_qty(ask_size, round_down=True)
-        if (
-            bid_price.as_decimal() != bid
-            or ask_price.as_decimal() != ask
-            or bid_quantity.as_decimal() != bid_size
-            or ask_quantity.as_decimal() != ask_size
-        ):
-            raise BitfinexV1DataError("Bitfinex BBO exceeds configured instrument precision")
-        timestamp = self._clock.timestamp_ns()
+        timestamp = self._clock.timestamp_ns() if timestamp is None else timestamp
         return QuoteTick(
             instrument_id=INSTRUMENT_ID,
-            bid_price=bid_price,
-            ask_price=ask_price,
-            bid_size=bid_quantity,
-            ask_size=ask_quantity,
+            bid_price=self._price(bid),
+            ask_price=self._price(ask),
+            bid_size=self._quantity(bid_size),
+            ask_size=self._quantity(ask_size),
             ts_event=timestamp,
             ts_init=timestamp,
         )
+
+    def _order_book_snapshot(self, timestamp: int) -> OrderBookDeltas:
+        bids, asks = self._book.levels()
+        rows = [
+            (OrderSide.BUY, price, size) for price, size in bids
+        ] + [
+            (OrderSide.SELL, price, size) for price, size in asks
+        ]
+        deltas = [
+            OrderBookDelta(
+                instrument_id=INSTRUMENT_ID,
+                action=BookAction.CLEAR,
+                order=None,
+                flags=RecordFlag.F_SNAPSHOT,
+                sequence=0,
+                ts_event=timestamp,
+                ts_init=timestamp,
+            )
+        ]
+        for index, (side, price, size) in enumerate(rows):
+            flags = RecordFlag.F_SNAPSHOT
+            if index == len(rows) - 1:
+                flags |= RecordFlag.F_LAST
+            deltas.append(
+                OrderBookDelta(
+                    instrument_id=INSTRUMENT_ID,
+                    action=BookAction.ADD,
+                    order=BookOrder(side, self._price(price), self._quantity(size), 0),
+                    flags=flags,
+                    sequence=0,
+                    ts_event=timestamp,
+                    ts_init=timestamp,
+                )
+            )
+        return OrderBookDeltas(instrument_id=INSTRUMENT_ID, deltas=deltas)
+
+    def _price(self, value: Decimal) -> Price:
+        result = Price.from_str(f"{value:.{self._bfx_config.price_precision}f}")
+        if (
+            result.as_decimal() != value
+            or value % self._bfx_config.price_increment != 0
+        ):
+            raise BitfinexV1DataError("Bitfinex book exceeds configured instrument precision")
+        return result
+
+    def _quantity(self, value: Decimal) -> Quantity:
+        result = Quantity.from_str(f"{value:.{self._bfx_config.size_precision}f}")
+        if (
+            result.as_decimal() != value
+            or value % self._bfx_config.size_increment != 0
+        ):
+            raise BitfinexV1DataError("Bitfinex book exceeds configured instrument precision")
+        return result
+
+    def _clear_base_subscriptions(self) -> None:
+        self._remove_subscription_quote_ticks(INSTRUMENT_ID)
+        self._remove_subscription_order_book_deltas(INSTRUMENT_ID)
 
     @staticmethod
     def _require_instrument(instrument_id: InstrumentId) -> None:

@@ -12,10 +12,16 @@ from nautilus_trader.common.providers import InstrumentProvider
 from nautilus_trader.config import RoutingConfig, TradingNodeConfig
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.data.engine import DataEngine
-from nautilus_trader.data.messages import SubscribeQuoteTicks, UnsubscribeQuoteTicks
+from nautilus_trader.data.messages import (
+    SubscribeOrderBook,
+    SubscribeQuoteTicks,
+    UnsubscribeOrderBook,
+    UnsubscribeQuoteTicks,
+)
 from nautilus_trader.live.config import LiveExecEngineConfig
 from nautilus_trader.live.node import TradingNode
-from nautilus_trader.model.data import QuoteTick
+from nautilus_trader.model.data import OrderBookDelta, OrderBookDeltas, QuoteTick
+from nautilus_trader.model.enums import BookAction, BookType, RecordFlag
 from nautilus_trader.model.identifiers import ClientId, InstrumentId, Symbol, TraderId, Venue
 from nautilus_trader.model.instruments import CryptoPerpetual
 from nautilus_trader.test_kit.stubs.component import TestComponentStubs
@@ -160,6 +166,35 @@ def _quote_unsubscribe_command() -> UnsubscribeQuoteTicks:
     )
 
 
+def _book_command(
+    *,
+    book_type: BookType = BookType.L2_MBP,
+    depth: int = 25,
+) -> SubscribeOrderBook:
+    return SubscribeOrderBook(
+        instrument_id=INSTRUMENT_ID,
+        book_data_type=OrderBookDelta,
+        book_type=book_type,
+        client_id=ClientId("BITFINEX"),
+        venue=Venue("BITFINEX"),
+        command_id=UUID4(),
+        ts_init=0,
+        depth=depth,
+        managed=True,
+    )
+
+
+def _book_unsubscribe_command() -> UnsubscribeOrderBook:
+    return UnsubscribeOrderBook(
+        instrument_id=INSTRUMENT_ID,
+        book_data_type=OrderBookDelta,
+        client_id=ClientId("BITFINEX"),
+        venue=Venue("BITFINEX"),
+        command_id=UUID4(),
+        ts_init=0,
+    )
+
+
 def _replay(book: BitfinexP0Book) -> None:
     for frame in CAPTURE:
         payload = frame[1]
@@ -181,6 +216,32 @@ def test_real_capture_checksum_and_bbo_semantics() -> None:
         Decimal("4456"),
         Decimal("0.17296923"),
     )
+
+
+def test_verified_book_projects_a_native_depth_25_snapshot() -> None:
+    async def scenario() -> None:
+        client = _client(_FakeTransport())
+        _replay(client._book)
+        snapshot = client._order_book_snapshot(123)
+
+        assert isinstance(snapshot, OrderBookDeltas)
+        assert snapshot.is_snapshot
+        assert len(snapshot.deltas) == 51
+        assert snapshot.deltas[0].action == BookAction.CLEAR
+        assert all(delta.flags & RecordFlag.F_SNAPSHOT for delta in snapshot.deltas)
+        assert not any(delta.flags & RecordFlag.F_LAST for delta in snapshot.deltas[:-1])
+        assert snapshot.deltas[-1].flags == (
+            RecordFlag.F_SNAPSHOT | RecordFlag.F_LAST
+        )
+        bids = [delta for delta in snapshot.deltas if delta.order.side.name == "BUY"]
+        asks = [delta for delta in snapshot.deltas if delta.order.side.name == "SELL"]
+        assert len(bids) == len(asks) == 25
+        assert str(bids[0].order.price) == "4455.2"
+        assert str(bids[0].order.size) == "0.11766725"
+        assert str(asks[0].order.price) == "4456.0"
+        assert str(asks[0].order.size) == "0.17296923"
+
+    asyncio.run(scenario())
 
 
 def test_delta_delete_is_side_specific_and_active_level_can_switch_side() -> None:
@@ -256,6 +317,36 @@ def test_subscription_is_exact_and_send_failure_rolls_back() -> None:
                 "subId": "py000-xaut-book-v1",
             },
         ]
+        await client._subscribe_order_book_deltas(_book_command())
+        assert len(fake.sent) == 2
+        await client._unsubscribe_quote_ticks(_quote_unsubscribe_command())
+        assert len(fake.sent) == 2
+        assert client._subscription_requested
+        client._consume_frame(_subscription())
+        await client._unsubscribe_order_book_deltas(_book_unsubscribe_command())
+        assert fake.sent[-1] == {"event": "unsubscribe", "chanId": CHANNEL_ID}
+        assert client._channel_id is None
+        await client._subscribe_quote_ticks(_quote_command())
+        assert fake.sent[-2:] == [
+            {"event": "conf", "flags": 131_072},
+            {
+                "event": "subscribe",
+                "channel": "book",
+                "symbol": RAW_SYMBOL,
+                "prec": "P0",
+                "freq": "F0",
+                "len": "25",
+                "subId": "py000-xaut-book-v1",
+            },
+        ]
+        assert client._consume_frame([CHANNEL_ID, "hb"]) == ()
+        assert client._consume_frame(
+            [CHANNEL_ID, [Decimal("4455"), 1, Decimal("0.1")]]
+        ) == ()
+        client._consume_frame({"event": "unsubscribed", "chanId": CHANNEL_ID})
+        client._consume_frame(_subscription(channel_id=CHANNEL_ID + 1))
+        assert client._channel_id == CHANNEL_ID + 1
+        assert client._pending_unsubscribe_channel_id is None
 
         failed = _FakeTransport()
         failed.fail_send_at = 1
@@ -283,6 +374,54 @@ def test_subscription_is_exact_and_send_failure_rolls_back() -> None:
         assert not stale.is_connected
         assert stale._channel_id is None
         assert unsubscribe_failed.closed
+
+    asyncio.run(scenario())
+
+
+def test_failed_public_book_subscription_rolls_back_and_can_retry() -> None:
+    async def scenario() -> None:
+        fake = _FakeTransport()
+        fake.fail_send_at = 1
+        client = _client(fake)
+        await fake.open()
+        client._set_connected(True)
+        client._running = True
+
+        client.subscribe_order_book_deltas(_book_command())
+        await _wait_until(lambda: fake.closed and not client.is_connected)
+        assert not client.is_subscribed_order_book_deltas(INSTRUMENT_ID)
+
+        fake.fail_send_at = None
+        fake.sent.clear()
+        await fake.open()
+        client._set_connected(True)
+        client._running = True
+        client.subscribe_order_book_deltas(_book_command())
+        await _wait_until(lambda: len(fake.sent) == 2)
+        assert client.is_subscribed_order_book_deltas(INSTRUMENT_ID)
+        await client._disconnect()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        _book_command(book_type=BookType.L3_MBO),
+        _book_command(depth=10),
+    ],
+)
+def test_native_book_subscription_requires_l2_depth_25(
+    command: SubscribeOrderBook,
+) -> None:
+    async def scenario() -> None:
+        fake = _FakeTransport()
+        client = _client(fake)
+        client._add_subscription_order_book_deltas(command.instrument_id)
+        with pytest.raises(BitfinexV1DataError, match="L2_MBP depth-25"):
+            await client._subscribe_order_book_deltas(command)
+        assert not client.is_subscribed_order_book_deltas(command.instrument_id)
+        assert fake.sent == []
 
     asyncio.run(scenario())
 
@@ -365,7 +504,7 @@ def test_unknown_channel_duplicate_ack_and_bad_crc_fail_immediately() -> None:
     asyncio.run(scenario())
 
 
-def test_client_publishes_only_after_successful_checksum() -> None:
+def test_client_publishes_bbo_and_native_depth_only_after_successful_checksum() -> None:
     async def scenario() -> None:
         clock = TestComponentStubs.clock()
         msgbus = TestComponentStubs.msgbus()
@@ -387,12 +526,17 @@ def test_client_publishes_only_after_successful_checksum() -> None:
             client.connect()
             await _wait_until(lambda: client.is_connected)
             engine.execute(_quote_command())
+            engine.execute(_book_command())
             await _wait_until(lambda: len(fake.sent) == 2)
             await fake.queue.put(_subscription())
             for frame in CAPTURE[:-1]:
                 await fake.queue.put(frame)
             await asyncio.sleep(0.01)
             assert cache.quote_tick(INSTRUMENT_ID) is None
+            pending = cache.order_book(INSTRUMENT_ID)
+            assert pending is not None
+            assert pending.bids() == []
+            assert pending.asks() == []
             await fake.queue.put(CAPTURE[-1])
             await _wait_until(lambda: cache.quote_tick(INSTRUMENT_ID) is not None)
             quote = cache.quote_tick(INSTRUMENT_ID)
@@ -401,7 +545,18 @@ def test_client_publishes_only_after_successful_checksum() -> None:
             assert str(quote.bid_size) == "0.11766725"
             assert str(quote.ask_price) == "4456.0"
             assert str(quote.ask_size) == "0.17296923"
+            book = cache.order_book(INSTRUMENT_ID)
+            assert book is not None
+            assert book.book_type == BookType.L2_MBP
+            assert len(book.bids()) == len(book.asks()) == 25
+            assert str(book.best_bid_price()) == "4455.2"
+            assert str(book.best_bid_size()) == "0.11766725"
+            assert str(book.best_ask_price()) == "4456.0"
+            assert str(book.best_ask_size()) == "0.17296923"
             engine.execute(_quote_unsubscribe_command())
+            await asyncio.sleep(0.01)
+            assert len(fake.sent) == 2
+            engine.execute(_book_unsubscribe_command())
             await _wait_until(lambda: len(fake.sent) == 3)
             assert fake.sent[-1] == {"event": "unsubscribe", "chanId": CHANNEL_ID}
         finally:

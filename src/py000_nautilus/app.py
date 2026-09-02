@@ -11,8 +11,16 @@ from nautilus_trader.backtest.engine import BacktestEngine
 from nautilus_trader.common.config import LoggingConfig
 from nautilus_trader.config import BacktestEngineConfig
 from nautilus_trader.model.currencies import USD, USDT
-from nautilus_trader.model.data import QuoteTick
-from nautilus_trader.model.enums import AccountType, AssetClass, OmsType
+from nautilus_trader.model.data import BookOrder, OrderBookDelta, OrderBookDeltas, QuoteTick
+from nautilus_trader.model.enums import (
+    AccountType,
+    AssetClass,
+    BookAction,
+    BookType,
+    OmsType,
+    OrderSide,
+    RecordFlag,
+)
 from nautilus_trader.model.events import OrderUpdated
 from nautilus_trader.model.identifiers import AccountId, InstrumentId, Symbol, Venue
 from nautilus_trader.model.instruments import Cfd, CryptoPerpetual
@@ -98,6 +106,7 @@ def run_simulated_example(state_path: Path) -> SimulationResult:
         venue=BITFINEX,
         oms_type=OmsType.NETTING,
         account_type=AccountType.MARGIN,
+        book_type=BookType.L2_MBP,
         starting_balances=[Money(1_000_000, USDT)],
         base_currency=USDT,
         default_leverage=Decimal(16),
@@ -117,8 +126,9 @@ def run_simulated_example(state_path: Path) -> SimulationResult:
     engine.add_strategy(TakerStrategy(_strategy_config(state_path)))
     engine.add_data(
         [
-            _quote(hedge, "2404.00", "2405.00", "10.00", 1_000_000_000),
-            _quote(source, "2398.00", "2400.00", "5", 2_000_000_000),
+            _book_snapshot(source, "2388.00", "2390.00", "5", 1_000_000_000),
+            _quote(hedge, "2404.00", "2405.00", "10.00", 2_000_000_000),
+            _book_snapshot(source, "2398.00", "2400.00", "5", 3_000_000_000),
         ]
     )
     engine.run()
@@ -375,6 +385,46 @@ def _quote(
         ts_event=timestamp,
         ts_init=timestamp,
     )
+
+
+def _book_snapshot(
+    instrument: CryptoPerpetual,
+    bid: str,
+    ask: str,
+    size: str,
+    timestamp: int,
+) -> OrderBookDeltas:
+    snapshot = RecordFlag.F_SNAPSHOT
+    deltas = [
+        OrderBookDelta(
+            instrument_id=instrument.id,
+            action=BookAction.CLEAR,
+            order=None,
+            flags=snapshot,
+            sequence=0,
+            ts_event=timestamp,
+            ts_init=timestamp,
+        )
+    ]
+    for index, (side, price) in enumerate(((OrderSide.BUY, bid), (OrderSide.SELL, ask))):
+        flags = snapshot | RecordFlag.F_LAST if index == 1 else snapshot
+        deltas.append(
+            OrderBookDelta(
+                instrument_id=instrument.id,
+                action=BookAction.ADD,
+                order=BookOrder(
+                    side,
+                    instrument.make_price(Decimal(price)),
+                    instrument.make_qty(Decimal(size)),
+                    0,
+                ),
+                flags=flags,
+                sequence=0,
+                ts_event=timestamp,
+                ts_init=timestamp,
+            )
+        )
+    return OrderBookDeltas(instrument_id=instrument.id, deltas=deltas)
 
 
 def main() -> None:

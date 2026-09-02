@@ -4,15 +4,17 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, cast
 
-from nautilus_trader.model.enums import OrderSide
+from nautilus_trader.model.book import OrderBook
+from nautilus_trader.model.data import BookOrder
+from nautilus_trader.model.enums import BookType, OrderSide
 from nautilus_trader.model.identifiers import ClientOrderId, TradeId, VenueOrderId
-from nautilus_trader.model.objects import Money
+from nautilus_trader.model.objects import Money, Price, Quantity
 from nautilus_trader.test_kit.stubs.events import TestEventStubs
 from nautilus_trader.test_kit.stubs.execution import TestExecStubs
 
 from py000_nautilus.app import _source_instrument, _strategy_config
-from py000_nautilus.models import BusinessOrderSide, HedgeIntent
-from py000_nautilus.strategies.taker import TakerStrategy
+from py000_nautilus.models import BookTop, BusinessOrderSide, HedgeIntent
+from py000_nautilus.strategies.taker import TakerStrategy, _reference_book
 
 
 class RecordingTakerStrategy(TakerStrategy):
@@ -22,6 +24,52 @@ class RecordingTakerStrategy(TakerStrategy):
 
     def _submit_hedge_intent(self, intent: HedgeIntent) -> None:
         self.recorded_intents.append(intent)
+
+
+def _native_book(
+    bids: tuple[tuple[str, str], ...],
+    asks: tuple[tuple[str, str], ...],
+) -> OrderBook:
+    book = OrderBook(_source_instrument().id, BookType.L2_MBP)
+    for index, (price, size) in enumerate(bids):
+        book.add(
+            BookOrder(OrderSide.BUY, Price.from_str(price), Quantity.from_str(size), index),
+            ts_event=1,
+        )
+    for index, (price, size) in enumerate(asks, start=len(bids)):
+        book.add(
+            BookOrder(OrderSide.SELL, Price.from_str(price), Quantity.from_str(size), index),
+            ts_event=1,
+        )
+    return book
+
+
+def test_managed_l2_returns_reference_marginal_prices_and_floored_sizes() -> None:
+    book = _native_book(
+        bids=(("100", "0.6"), ("99.5", "0.7")),
+        asks=(("101", "0.4"), ("101.5", "2.3")),
+    )
+
+    assert _reference_book(book, Decimal(1)) == BookTop(
+        bid=Decimal("99.5"),
+        ask=Decimal("101.5"),
+        bid_size=Decimal(1),
+        ask_size=Decimal(2),
+    )
+
+
+def test_managed_l2_returns_none_when_either_side_is_shallow() -> None:
+    shallow_bid = _native_book(
+        bids=(("100", "0.4"), ("99.5", "0.5")),
+        asks=(("101", "1.1"),),
+    )
+    shallow_ask = _native_book(
+        bids=(("100", "1.1"),),
+        asks=(("101", "0.4"), ("101.5", "0.5")),
+    )
+
+    assert _reference_book(shallow_bid, Decimal(1)) is None
+    assert _reference_book(shallow_ask, Decimal(1)) is None
 
 
 def test_real_partial_final_duplicate_and_late_order_filled_events(tmp_path: Path) -> None:
