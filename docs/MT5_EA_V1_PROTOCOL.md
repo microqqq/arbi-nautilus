@@ -261,12 +261,20 @@ timeout may be resolved only by its durable terminal event; `order_unknown`, a d
 reservation, blocked recovery, a mismatched FOK fill, or any same-symbol foreign-magic
 position keeps new execution on HOLD.
 
+The same execution poll loop refreshes the REP snapshot no more often than
+`snapshot_refresh_interval_ms` (default 1000 ms), under the existing state lock and through
+the same REQ socket. Each refresh follows journal poll -> snapshot -> unchanged-tail proof.
+Identity, recovery-state, or critical execution-spec drift closes the client; a foreign-magic
+position holds admission but remains observable, so a later clean snapshot can restore
+admission when no journal or local UNKNOWN blocker remains.
+
 The client accepts only Nautilus `MARKET` orders with `FOK` and no reduce-only,
 quote-quantity, or execution-algorithm semantics. It binds one configured MT5 instrument,
 verifies contract size, converts canonical ounces to an exact permitted lot quantity
 without rounding, and submits once. Startup position reports include only matching-magic
-positions and use the stable MT5 position identifier. They are not a runtime snapshot
-refresh. Order/fill reports and cancel/modify/order-list operations remain unsupported;
+positions and use the stable MT5 position identifier. Subsequent position reports use the
+latest successfully refreshed snapshot. Order/fill reports and cancel/modify/order-list
+operations remain unsupported;
 any later live composition must disable Nautilus `generate_missing_orders` until those
 report paths have an explicit policy.
 

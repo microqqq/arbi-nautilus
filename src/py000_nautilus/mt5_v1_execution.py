@@ -76,6 +76,7 @@ class Mt5V1ExecClientConfig(LiveExecClientConfig, kw_only=True, frozen=True):
     expected_server_timezone: str = "Europe/Athens"
     request_timeout_ms: int = 1_000
     event_poll_interval_ms: int = 250
+    snapshot_refresh_interval_ms: int = 1_000
     event_page_limit: int = 100
 
 
@@ -263,6 +264,8 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
         self._terminal_events: dict[str, JsonObject] = {}
         self._recovery_state: RecoveryState | None = None
         self._foreign_position_ids: tuple[str, ...] = ()
+        self._execution_spec: tuple[object, ...] | None = None
+        self._next_snapshot_refresh_at: float | None = None
         self._execution_hold_reason: str | None = "MT5 execution is not connected"
         self._state_lock = asyncio.Lock()
         self._running = False
@@ -307,25 +310,24 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
             projection = _project_journal(events, current_boot_id=identity.boot_id)
             self._bound_stream_id = identity.stream_id
             self._identity = identity
-            self._snapshot = snapshot
+            self._execution_spec = self._snapshot_execution_spec(snapshot)
+            self._install_snapshot(snapshot)
             self._cursor = cursor
             self._reservations = projection.reservations
             self._terminal_events = projection.terminals
             self._seen_request_ids = set(projection.seen_request_ids) | set(self._pending)
             self._recovery_state = recovery
-            self._foreign_position_ids = tuple(
-                cast(str, position["identifier"])
-                for position in cast(list[JsonObject], snapshot["positions"])
-                if position["magic"] != self._mt5_config.expected_magic
-            )
             self._recover_local_pending_from_journal()
             self._refresh_execution_hold()
+            self._schedule_snapshot_refresh()
             self._last_failure = None
         except BaseException as exc:
             self._last_failure = f"{type(exc).__name__}: {exc}"[:300]
             self._identity = None
             self._snapshot = None
             self._recovery_state = None
+            self._execution_spec = None
+            self._next_snapshot_refresh_at = None
             self._execution_hold_reason = "MT5 execution is not connected"
             await self._transport.close()
             raise
@@ -345,6 +347,8 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
         self._identity = None
         self._snapshot = None
         self._recovery_state = None
+        self._execution_spec = None
+        self._next_snapshot_refresh_at = None
         self._execution_hold_reason = "MT5 execution is not connected"
 
     async def _submit_order(self, command: SubmitOrder) -> None:
@@ -359,6 +363,13 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
             request_id = str(order.client_order_id)
             if request_id in self._seen_request_ids:
                 self._deny(order, "MT5 execution journal already contains this order ID")
+                return
+            try:
+                await self._refresh_snapshot_if_due()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._deny(order, f"MT5 snapshot refresh failed: {type(exc).__name__}: {exc}")
                 return
             if self._execution_hold_reason is not None:
                 self._deny(order, f"MT5 execution HOLD: {self._execution_hold_reason}")
@@ -445,13 +456,19 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
                 raise
             except Mt5V1RemoteError as exc:
                 self._last_failure = f"{type(exc).__name__}: {exc}"[:300]
-                await self._fail_closed_disconnect()
+                if self._identity is not None:
+                    await self._fail_closed_disconnect()
                 return
             except Mt5V1TransportError as exc:
                 self._last_failure = f"{type(exc).__name__}: {exc}"[:300]
+                deadline = self._next_snapshot_refresh_at
+                if deadline is not None and self._loop.time() >= deadline:
+                    await self._fail_closed_disconnect()
+                    return
             except Exception as exc:
                 self._last_failure = f"{type(exc).__name__}: {exc}"[:300]
-                await self._fail_closed_disconnect()
+                if self._identity is not None:
+                    await self._fail_closed_disconnect()
                 return
 
     async def _fail_closed_disconnect(self) -> None:
@@ -461,11 +478,14 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
         self._identity = None
         self._snapshot = None
         self._recovery_state = None
+        self._execution_spec = None
+        self._next_snapshot_refresh_at = None
         self._execution_hold_reason = "MT5 execution is not connected"
 
     async def _poll_once(self) -> None:
         async with self._state_lock:
             await self._consume_event_pages()
+            await self._refresh_snapshot_if_due()
 
     async def _consume_event_pages(self, *, expected_outcome: JsonObject | None = None) -> None:
         identity = self._require_identity()
@@ -618,6 +638,63 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
         ):
             raise Mt5V1ExecutionError("execution journal changed while snapshot was captured")
 
+    def _schedule_snapshot_refresh(self) -> None:
+        self._next_snapshot_refresh_at = (
+            self._loop.time() + self._mt5_config.snapshot_refresh_interval_ms / 1_000
+        )
+
+    async def _refresh_snapshot_if_due(self) -> None:
+        deadline = self._next_snapshot_refresh_at
+        if deadline is None or self._loop.time() < deadline:
+            return
+        try:
+            identity = self._require_identity()
+            snapshot = await self._transport.snapshot(identity.binding())
+            self._validate_snapshot(
+                snapshot,
+                identity,
+                cast(RecoveryState, self._recovery_state),
+                expected_spec=self._execution_spec,
+            )
+            await self._verify_unchanged_journal_tail(identity, self._cursor)
+        except BaseException as exc:
+            self._last_failure = f"{type(exc).__name__}: {exc}"[:300]
+            await self._fail_closed_disconnect()
+            raise
+        self._install_snapshot(snapshot)
+        self._refresh_execution_hold()
+        self._schedule_snapshot_refresh()
+
+    def _install_snapshot(self, snapshot: JsonObject) -> None:
+        self._snapshot = snapshot
+        self._foreign_position_ids = tuple(
+            cast(str, position["identifier"])
+            for position in cast(list[JsonObject], snapshot["positions"])
+            if position["magic"] != self._mt5_config.expected_magic
+        )
+
+    @staticmethod
+    def _snapshot_execution_spec(snapshot: JsonObject) -> tuple[object, ...]:
+        spec = cast(JsonObject, snapshot["symbol_spec"])
+        fields = (
+            "symbol",
+            "contract_size",
+            "currency_base",
+            "currency_margin",
+            "currency_profit",
+            "digits",
+            "filling_mode",
+            "order_mode",
+            "point",
+            "tick_size",
+            "trade_calc_mode",
+            "trade_mode",
+            "volume_max",
+            "volume_min",
+            "volume_step",
+        )
+        return tuple(spec[field] for field in fields)
+
     def _record_reservation(self, event: JsonObject) -> None:
         payload = cast(JsonObject, event["payload"])
         request_id = cast(str, payload["client_request_id"])
@@ -749,6 +826,8 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
         snapshot: JsonObject,
         identity: Identity,
         recovery: RecoveryState,
+        *,
+        expected_spec: tuple[object, ...] | None = None,
     ) -> None:
         if (
             Identity.from_wire(snapshot["identity"]) != identity
@@ -757,6 +836,9 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
             or cast(JsonObject, snapshot["account"])["currency"] != "USD"
         ):
             raise Mt5V1ExecutionError("MT5 execution snapshot is inconsistent")
+        actual_spec = self._snapshot_execution_spec(snapshot)
+        if expected_spec is not None and actual_spec != expected_spec:
+            raise Mt5V1ExecutionError("MT5 execution symbol spec changed")
 
     @staticmethod
     def _validate_page_identity(page: JsonObject, identity: Identity) -> None:
@@ -877,5 +959,9 @@ def _validate_config(config: Mt5V1ExecClientConfig) -> None:
         raise ValueError("request_timeout_ms is outside the supported range")
     if not 50 <= config.event_poll_interval_ms <= 60_000:
         raise ValueError("event_poll_interval_ms is outside the supported range")
+    if not 1_000 <= config.snapshot_refresh_interval_ms <= 60_000:
+        raise ValueError("snapshot_refresh_interval_ms is outside the supported range")
+    if config.snapshot_refresh_interval_ms < config.event_poll_interval_ms:
+        raise ValueError("snapshot refresh cannot be faster than the event poll interval")
     if not 1 <= config.event_page_limit <= 500:
         raise ValueError("event_page_limit is outside the v1 wire range")

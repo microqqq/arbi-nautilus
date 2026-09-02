@@ -70,7 +70,11 @@ def _snapshot(
     return value
 
 
-def _config(identity: Identity) -> Mt5V1ExecClientConfig:
+def _config(
+    identity: Identity,
+    *,
+    snapshot_refresh_interval_ms: int = 1_000,
+) -> Mt5V1ExecClientConfig:
     return Mt5V1ExecClientConfig(
         pub_url="tcp://127.0.0.1:6001",
         rep_url="tcp://127.0.0.1:6002",
@@ -83,6 +87,7 @@ def _config(identity: Identity) -> Mt5V1ExecClientConfig:
         expected_stream_id=identity.stream_id,
         expected_server_timezone=identity.server_timezone,
         event_poll_interval_ms=50,
+        snapshot_refresh_interval_ms=snapshot_refresh_interval_ms,
     )
 
 
@@ -190,6 +195,7 @@ class _FakeTransport:
         self.pages: list[JsonObject | BaseException] = []
         self.submit_calls: list[tuple[str, str, str]] = []
         self.event_calls: list[tuple[str, int]] = []
+        self.snapshot_calls: list[Binding] = []
         self.opened = False
         self.closed = False
 
@@ -205,6 +211,7 @@ class _FakeTransport:
 
     async def snapshot(self, binding: Binding) -> JsonObject:
         assert binding == self.identity.binding()
+        self.snapshot_calls.append(binding)
         return self.current_snapshot
 
     async def submit_market_delta(
@@ -283,6 +290,7 @@ class _Harness:
         snapshot: JsonObject | None = None,
         outcome: JsonObject | BaseException | None = None,
         recovery_state: RecoveryState = "ready",
+        snapshot_refresh_interval_ms: int = 1_000,
     ) -> None:
         self.identity = identity or _identity()
         self.snapshot = snapshot or _snapshot(self.identity, recovery_state=recovery_state)
@@ -304,7 +312,10 @@ class _Harness:
         self.client = Mt5V1ExecutionClient(
             loop=loop,
             name="MT5",
-            config=_config(self.identity),
+            config=_config(
+                self.identity,
+                snapshot_refresh_interval_ms=snapshot_refresh_interval_ms,
+            ),
             msgbus=self.msgbus,
             cache=self.cache,
             clock=self.clock,
@@ -1080,6 +1091,127 @@ def test_explicit_instrument_query_reports_flat_when_no_managed_position_exists(
         assert reports[0].position_side == PositionSide.FLAT
         assert str(reports[0].quantity) == "0"
         assert reports[0].venue_position_id is None
+
+    asyncio.run(scenario())
+
+
+def test_runtime_snapshot_refresh_is_throttled_and_updates_position_reports() -> None:
+    async def scenario() -> None:
+        harness = _Harness(asyncio.get_running_loop())
+        await harness.connect()
+        assert len(harness.fake.snapshot_calls) == 1
+
+        await harness.client._poll_once()
+        assert len(harness.fake.snapshot_calls) == 1
+
+        refreshed = deepcopy(harness.snapshot)
+        position = cast(list[JsonObject], refreshed["positions"])[0]
+        position["identifier"] = "800000002"
+        position["volume_lots"] = "0.02"
+        harness.fake.current_snapshot = refreshed
+        harness.client._next_snapshot_refresh_at = 0
+        await harness.client._poll_once()
+
+        reports = await harness.client.generate_position_status_reports(
+            GeneratePositionStatusReports(
+                instrument_id=None,
+                start=None,
+                end=None,
+                command_id=UUID4(),
+                ts_init=harness.clock.timestamp_ns(),
+            )
+        )
+        assert len(harness.fake.snapshot_calls) == 2
+        assert len(reports) == 1
+        assert str(reports[0].venue_position_id) == "800000002"
+        assert str(reports[0].quantity) == "2"
+
+        await harness.client._poll_once()
+        assert len(harness.fake.snapshot_calls) == 2
+
+    asyncio.run(scenario())
+
+
+def test_runtime_foreign_position_holds_then_clean_snapshot_restores_admission() -> None:
+    async def scenario() -> None:
+        harness = _Harness(asyncio.get_running_loop())
+        await harness.connect()
+        clean = deepcopy(harness.snapshot)
+        foreign = deepcopy(harness.snapshot)
+        positions = cast(list[JsonObject], foreign["positions"])
+        foreign_position = deepcopy(positions[0])
+        foreign_position.update({"identifier": "800000099", "magic": "0"})
+        positions.append(foreign_position)
+
+        harness.fake.current_snapshot = foreign
+        harness.client._next_snapshot_refresh_at = 0
+        await harness.submit(harness.market())
+        assert harness.client.execution_admitted is False
+        assert "foreign-magic" in cast(str, harness.client.execution_hold_reason)
+        assert [type(event).__name__ for event in harness.events] == ["OrderDenied"]
+        assert harness.fake.submit_calls == []
+
+        harness.fake.current_snapshot = clean
+        harness.client._next_snapshot_refresh_at = 0
+        await harness.client._poll_once()
+        assert harness.client.execution_admitted is True
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("anomaly", ["identity", "recovery", "spec"])
+def test_runtime_snapshot_boundary_anomaly_fails_closed(anomaly: str) -> None:
+    async def scenario() -> None:
+        harness = _Harness(asyncio.get_running_loop())
+        await harness.connect()
+        invalid = deepcopy(harness.snapshot)
+        if anomaly == "identity":
+            identity = harness.identity.to_wire()
+            identity["boot_id"] = "boot-replacement-001"
+            invalid["identity"] = identity
+        elif anomaly == "recovery":
+            invalid["recovery_state"] = "blocked"
+        else:
+            cast(JsonObject, invalid["symbol_spec"])["contract_size"] = "200"
+        harness.fake.current_snapshot = invalid
+        harness.client._next_snapshot_refresh_at = 0
+
+        with pytest.raises(Mt5V1ExecutionError):
+            await harness.client._poll_once()
+
+        assert harness.fake.closed is True
+        assert harness.client.execution_admitted is False
+        assert harness.client.execution_hold_reason == "MT5 execution is not connected"
+
+    asyncio.run(scenario())
+
+
+def test_due_refresh_failure_denies_order_without_transport_submit() -> None:
+    async def scenario() -> None:
+        harness = _Harness(asyncio.get_running_loop())
+        await harness.connect()
+        invalid = deepcopy(harness.snapshot)
+        invalid["recovery_state"] = "blocked"
+        harness.fake.current_snapshot = invalid
+        harness.client._next_snapshot_refresh_at = 0
+
+        await harness.submit(harness.market())
+
+        assert [type(event).__name__ for event in harness.events] == ["OrderDenied"]
+        assert harness.fake.submit_calls == []
+        assert harness.fake.closed is True
+        assert harness.client.execution_admitted is False
+
+    asyncio.run(scenario())
+
+
+def test_snapshot_refresh_interval_is_bounded() -> None:
+    async def scenario() -> None:
+        with pytest.raises(ValueError, match="snapshot_refresh_interval_ms"):
+            _Harness(
+                asyncio.get_running_loop(),
+                snapshot_refresh_interval_ms=999,
+            )
 
     asyncio.run(scenario())
 
