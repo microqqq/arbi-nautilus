@@ -58,8 +58,9 @@ still not wired into a live composition.
 ## Bitfinex public read-side v1 candidate
 
 The repository now contains one deliberately small, offline-testable Nautilus live-data
-candidate for `tXAUTF0:USTF0` mapped explicitly to
-`XAUTUSDT-PERP.BITFINEX`. It subscribes only to the public `P0`/`F0`/`len=25`
+candidate for the production `tXAUTF0:USTF0` or paper
+`tTESTXAUTF0:TESTUSDTF0` profile, each mapped explicitly to the canonical
+`XAUTUSDT-PERP.BITFINEX` instrument. It subscribes only to the public `P0`/`F0`/`len=25`
 book, enables Bitfinex checksum flag `131072`, maintains the two 25-level sides,
 and publishes data only after the immediately preceding book state passes the venue CRC.
 Quote subscribers receive the true BBO; depth subscribers receive a native Nautilus
@@ -68,7 +69,9 @@ subscription contract or channel, incomplete book, checksum mismatch, or transpo
 closes the feed and stops publication.
 
 All instrument precision, increments, quantity limits, margins, and fees are mandatory
-reviewed configuration; there is no REST specification fallback. Contract multiplier and
+reviewed configuration; there is no REST specification fallback. The current public paper
+contract reports minimum/maximum quantities `2`/`10000` and initial/maintenance margins
+`0.01`/`0.005`; these must not be copied from production blindly. Contract multiplier and
 lot size are fixed at one because this client supports only the one-ounce XAUT contract.
 The emitted `QuoteTick` always retains Nautilus's standard best-bid/best-ask meaning. The
 Taker consumes the managed native L2 book, walks exact cumulative quantities to its
@@ -85,19 +88,31 @@ because Nautilus retains the last cached market data after a feed disconnect.
 ## Bitfinex private execution v1 candidate
 
 The repository also contains an offline-tested private WebSocket execution slice for the
-same `XAUTUSDT-PERP.BITFINEX` / `tXAUTF0:USTF0` contract. Authentication binds the exact
-Bitfinex user ID and account channel. It supports only Taker `LIMIT` + `IOC` and Maker
+same canonical instrument. Production binds `tXAUTF0:USTF0` to the `USTF0` margin wallet;
+paper binds `tTESTXAUTF0:TESTUSDTF0` to `TESTUSDTF0`. Crossed profiles fail configuration,
+and authenticated REST user info must match both the configured user ID and paper/live mode
+before the private socket opens. It supports only Taker `LIMIT` + `IOC` and Maker
 post-only `LIMIT` + `GTC`, with integer per-order leverage, price-only Maker modify, and
 native-ID cancel. A CID is persisted before `OrderSubmitted` and before the single wire
 send. Only `tu` creates fills; its venue fee, liquidity side, and delayed pre-modify price
-are preserved. Ambiguous sends remain `UNKNOWN`, while authoritative order and notification
-events clear only the matching ambiguity. A stream gap with an unresolved order cannot
-reconnect without reconciliation.
+are preserved. Every successful submit, modify, and cancel send has an independent ACK
+deadline; silence or an ambiguous send becomes sticky `UNKNOWN` without a retry. A stream
+gap with an unresolved order cannot hot-reconnect.
 
-This is an execution-semantic candidate, not a live adapter. Order/fill/position reports,
-restart reconstruction, ACK deadlines, reconnect supervision, factory/node composition,
-and a real-engine lifecycle test remain absent. The report methods fail explicitly, so
-Nautilus's default reconciliation gate will not admit this client into a live kernel.
+The client now supplies bounded native Nautilus order, fill, and NETTING position reports
+from Bitfinex's authenticated read-only REST endpoints. Closed-order recovery is limited to
+the venue's documented two-week window. Full pages are bisected or overlap-paged with ID
+deduplication; an unprovable timestamp saturation fails reconciliation instead of silently
+truncating it. A reconciled open order can be reconstructed lazily from the Nautilus cache
+and its persisted CID. Factory and offline node construction are covered, as is the real
+`ExecutionEngine` lifecycle from submit through partial fills and cancel.
+
+This remains a candidate, not live qualification. In-flight strategy state stays on HOLD
+after process restart until the strategy store and reconciled Nautilus cache are joined
+explicitly. Same-process hot reconnect and a complete two-venue live composition remain
+absent. Nautilus's default startup reconciliation must remain enabled. Paper and production
+must use separate account IDs, CID/state paths, and caches; the shared canonical instrument
+ID means the two profiles must never run concurrently in one node.
 
 `InstrumentStatus` is only a REP-backed market-session observation. It is not
 hedge readiness and must not open source-risk admission without a separately
@@ -171,8 +186,8 @@ therefore tests that distinction explicitly and generalizes `0.2` as two
 instrument ticks, rather than claiming executable callee provenance.
 
 It does **not** establish complete oracle or live parity. The bounded Bitfinex private
-command/event slice exists, but its reports, restart reconstruction, ACK deadlines, and
-live composition remain unimplemented. MT5 `MARKET` + `IOC` partial-fill handling also
+command/event and startup-report slices exist, but strategy-state restart release, hot
+reconnect, and live composition remain unimplemented. MT5 `MARKET` + `IOC` partial-fill handling also
 remains unimplemented; the isolated DEMO `MARKET` + `FOK` candidate is not strategy parity.
 Dynamic venue margin capacity, authoritative cancel reconciliation, and Maker query closure
 remain live gates. The private Bitfinex candidate applies the strategy's validated integer

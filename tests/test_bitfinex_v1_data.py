@@ -28,6 +28,7 @@ from nautilus_trader.test_kit.stubs.component import TestComponentStubs
 
 from py000_nautilus.bitfinex_v1_data import (
     INSTRUMENT_ID,
+    PAPER_RAW_SYMBOL,
     RAW_SYMBOL,
     BitfinexP0Book,
     BitfinexV1DataClient,
@@ -111,12 +112,26 @@ class _Socket:
         self.closed = True
 
 
-def _client(fake: _FakeTransport) -> BitfinexV1DataClient:
+def _client(
+    fake: _FakeTransport,
+    *,
+    raw_symbol: str = RAW_SYMBOL,
+) -> BitfinexV1DataClient:
     clock = TestComponentStubs.clock()
+    profile = (
+        {
+            "min_quantity": Decimal("2"),
+            "max_quantity": Decimal("10000"),
+            "margin_init": Decimal("0.01"),
+            "margin_maint": Decimal("0.005"),
+        }
+        if raw_symbol == PAPER_RAW_SYMBOL
+        else {}
+    )
     return BitfinexV1DataClient(
         loop=asyncio.get_running_loop(),
         name="BITFINEX",
-        config=_config(),
+        config=_config(raw_symbol=raw_symbol, **profile),
         msgbus=TestComponentStubs.msgbus(),
         cache=TestComponentStubs.cache(),
         clock=clock,
@@ -280,6 +295,38 @@ def test_instrument_comes_only_from_complete_strict_config() -> None:
     assert str(instrument.size_increment) == "0.00000001"
     assert str(instrument.multiplier) == "1"
     assert instrument.info["checksum_required"] is True
+
+
+def test_paper_profile_preserves_canonical_instrument_and_uses_test_wire_symbol() -> None:
+    async def scenario() -> None:
+        fake = _FakeTransport()
+        client = _client(fake, raw_symbol=PAPER_RAW_SYMBOL)
+        instrument = instrument_from_config(
+            _config(
+                raw_symbol=PAPER_RAW_SYMBOL,
+                min_quantity=Decimal("2"),
+                max_quantity=Decimal("10000"),
+                margin_init=Decimal("0.01"),
+                margin_maint=Decimal("0.005"),
+            ),
+            ts_init=7,
+        )
+
+        assert instrument.id == INSTRUMENT_ID
+        assert instrument.raw_symbol == Symbol(PAPER_RAW_SYMBOL)
+        assert instrument.quote_currency.code == "USDT"
+        assert instrument.info["bitfinex_environment"] == "paper"
+
+        await fake.open()
+        client._set_connected(True)
+        client._running = True
+        await client._subscribe_quote_ticks(_quote_command())
+        assert fake.sent[-1]["symbol"] == PAPER_RAW_SYMBOL
+        client._consume_frame(_subscription(symbol=PAPER_RAW_SYMBOL))
+        assert client._channel_id == CHANNEL_ID
+        await client._disconnect()
+
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize(

@@ -32,17 +32,22 @@ from py000_nautilus.bitfinex_v1_transport import BitfinexV1Transport
 BITFINEX = Venue("BITFINEX")
 INSTRUMENT_ID = InstrumentId.from_str("XAUTUSDT-PERP.BITFINEX")
 RAW_SYMBOL = "tXAUTF0:USTF0"
+PAPER_RAW_SYMBOL = "tTESTXAUTF0:TESTUSDTF0"
+SUPPORTED_RAW_SYMBOLS = frozenset({RAW_SYMBOL, PAPER_RAW_SYMBOL})
 _CHECKSUM_FLAG = 131_072
 _BOOK_SUB_ID = "py000-xaut-book-v1"
-_SUBSCRIBE: dict[str, object] = {
-    "event": "subscribe",
-    "channel": "book",
-    "symbol": RAW_SYMBOL,
-    "prec": "P0",
-    "freq": "F0",
-    "len": "25",
-    "subId": _BOOK_SUB_ID,
-}
+
+
+def _subscription(raw_symbol: str) -> dict[str, object]:
+    return {
+        "event": "subscribe",
+        "channel": "book",
+        "symbol": raw_symbol,
+        "prec": "P0",
+        "freq": "F0",
+        "len": "25",
+        "subId": _BOOK_SUB_ID,
+    }
 
 
 class BitfinexV1DataError(RuntimeError):
@@ -167,8 +172,12 @@ def instrument_from_config(config: BitfinexV1DataClientConfig, *, ts_init: int) 
         maker_fee=config.maker_fee, taker_fee=config.taker_fee,
         ts_event=0, ts_init=ts_init,
         info={
-            "book_channel": "P0/F0/len25", "checksum_required": True,
+            "book_channel": "P0/F0/len25",
+            "checksum_required": True,
             "canonical_quantity": "ounce",
+            "bitfinex_environment": (
+                "paper" if config.raw_symbol == PAPER_RAW_SYMBOL else "production"
+            ),
         },
     )
 
@@ -192,6 +201,7 @@ class BitfinexV1DataClient(LiveMarketDataClient):
                          instrument_provider=instrument_provider, config=config)
         self._bfx_config = config
         self._instrument = instrument_from_config(config, ts_init=clock.timestamp_ns())
+        self._subscription = _subscription(config.raw_symbol)
         self._transport = transport or BitfinexV1Transport(
             config.url, open_timeout_ms=config.open_timeout_ms
         )
@@ -272,7 +282,7 @@ class BitfinexV1DataClient(LiveMarketDataClient):
         self._subscription_requested = True
         try:
             await self._transport.send_json({"event": "conf", "flags": _CHECKSUM_FLAG})
-            await self._transport.send_json(_SUBSCRIBE)
+            await self._transport.send_json(self._subscription)
         except BaseException as exc:
             await self._fail_closed(exc)
             raise
@@ -380,7 +390,7 @@ class BitfinexV1DataClient(LiveMarketDataClient):
                 raise BitfinexV1DataError("unsolicited Bitfinex subscription")
             if self._channel_id is not None:
                 raise BitfinexV1DataError("Bitfinex repeated the book subscription")
-            for key, expected in _SUBSCRIBE.items():
+            for key, expected in self._subscription.items():
                 if key == "event":
                     continue
                 if frame.get(key) != expected:
@@ -412,7 +422,7 @@ class BitfinexV1DataClient(LiveMarketDataClient):
         bid, bid_size, ask, ask_size = self._book.quote()
         timestamp = self._clock.timestamp_ns() if timestamp is None else timestamp
         return QuoteTick(
-            instrument_id=INSTRUMENT_ID,
+            instrument_id=self._instrument.id,
             bid_price=self._price(bid),
             ask_price=self._price(ask),
             bid_size=self._quantity(bid_size),
@@ -430,7 +440,7 @@ class BitfinexV1DataClient(LiveMarketDataClient):
         ]
         deltas = [
             OrderBookDelta(
-                instrument_id=INSTRUMENT_ID,
+                instrument_id=self._instrument.id,
                 action=BookAction.CLEAR,
                 order=None,
                 flags=RecordFlag.F_SNAPSHOT,
@@ -445,7 +455,7 @@ class BitfinexV1DataClient(LiveMarketDataClient):
                 flags |= RecordFlag.F_LAST
             deltas.append(
                 OrderBookDelta(
-                    instrument_id=INSTRUMENT_ID,
+                    instrument_id=self._instrument.id,
                     action=BookAction.ADD,
                     order=BookOrder(side, self._price(price), self._quantity(size), 0),
                     flags=flags,
@@ -454,7 +464,7 @@ class BitfinexV1DataClient(LiveMarketDataClient):
                     ts_init=timestamp,
                 )
             )
-        return OrderBookDeltas(instrument_id=INSTRUMENT_ID, deltas=deltas)
+        return OrderBookDeltas(instrument_id=self._instrument.id, deltas=deltas)
 
     def _price(self, value: Decimal) -> Price:
         result = Price.from_str(f"{value:.{self._bfx_config.price_precision}f}")
@@ -475,12 +485,11 @@ class BitfinexV1DataClient(LiveMarketDataClient):
         return result
 
     def _clear_base_subscriptions(self) -> None:
-        self._remove_subscription_quote_ticks(INSTRUMENT_ID)
-        self._remove_subscription_order_book_deltas(INSTRUMENT_ID)
+        self._remove_subscription_quote_ticks(self._instrument.id)
+        self._remove_subscription_order_book_deltas(self._instrument.id)
 
-    @staticmethod
-    def _require_instrument(instrument_id: InstrumentId) -> None:
-        if instrument_id != INSTRUMENT_ID:
+    def _require_instrument(self, instrument_id: InstrumentId) -> None:
+        if instrument_id != self._instrument.id:
             raise BitfinexV1DataError(f"unsupported Bitfinex instrument {instrument_id}")
 
 
@@ -506,8 +515,10 @@ class BitfinexV1LiveDataClientFactory(LiveDataClientFactory):
 
 
 def _validate_config(config: BitfinexV1DataClientConfig) -> None:
-    if config.instrument_id != INSTRUMENT_ID or config.raw_symbol != RAW_SYMBOL:
-        raise ValueError("Bitfinex v1 supports only tXAUTF0:USTF0 at XAUTUSDT-PERP.BITFINEX")
+    if config.instrument_id != INSTRUMENT_ID or config.raw_symbol not in SUPPORTED_RAW_SYMBOLS:
+        raise ValueError(
+            "Bitfinex v1 supports only the production or paper XAUT perpetual profile"
+        )
     if not config.url.startswith("wss://"):
         raise ValueError("Bitfinex public endpoint must use wss://")
     if config.routing.default or config.routing.venues != frozenset({"BITFINEX"}):

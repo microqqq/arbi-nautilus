@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -8,31 +9,59 @@ from typing import Any, cast
 
 import pytest
 from nautilus_trader.common.providers import InstrumentProvider
-from nautilus_trader.config import RoutingConfig
+from nautilus_trader.config import LiveExecClientConfig, RoutingConfig, TradingNodeConfig
 from nautilus_trader.core.uuid import UUID4
-from nautilus_trader.execution.messages import CancelOrder, ModifyOrder, SubmitOrder
-from nautilus_trader.model.enums import LiquiditySide, OrderSide, TimeInForce
-from nautilus_trader.model.events import OrderEvent
+from nautilus_trader.execution.engine import ExecutionEngine
+from nautilus_trader.execution.messages import (
+    CancelOrder,
+    GenerateFillReports,
+    GenerateOrderStatusReports,
+    GeneratePositionStatusReports,
+    ModifyOrder,
+    SubmitOrder,
+)
+from nautilus_trader.live.config import LiveExecEngineConfig
+from nautilus_trader.live.execution_engine import LiveExecutionEngine
+from nautilus_trader.live.node import TradingNode
+from nautilus_trader.model.enums import (
+    LiquiditySide,
+    OrderSide,
+    OrderStatus,
+    PositionSide,
+    TimeInForce,
+)
+from nautilus_trader.model.events import OrderEvent, OrderFilled
 from nautilus_trader.model.identifiers import (
     AccountId,
+    ClientId,
     ClientOrderId,
     InstrumentId,
+    TradeId,
+    TraderId,
+    Venue,
     VenueOrderId,
 )
+from nautilus_trader.model.objects import Money
 from nautilus_trader.model.orders import Order
 from nautilus_trader.test_kit.stubs.component import TestComponentStubs
+from nautilus_trader.test_kit.stubs.events import TestEventStubs
+from nautilus_trader.test_kit.stubs.execution import TestExecStubs
 
+import py000_nautilus.bitfinex_v1_execution as execution_module
 from py000_nautilus.bitfinex_v1_data import (
     INSTRUMENT_ID as SOURCE_ID,
 )
 from py000_nautilus.bitfinex_v1_data import (
+    PAPER_RAW_SYMBOL,
     BitfinexV1DataClientConfig,
+    BitfinexV1LiveDataClientFactory,
     instrument_from_config,
 )
 from py000_nautilus.bitfinex_v1_execution import (
     BitfinexV1ExecClientConfig,
     BitfinexV1ExecutionClient,
     BitfinexV1ExecutionError,
+    BitfinexV1LiveExecClientFactory,
 )
 from py000_nautilus.bitfinex_v1_protocol import POST_ONLY_FLAG
 
@@ -65,8 +94,68 @@ class _FakeTransport:
         return await self.queue.get()
 
 
+class _FakeRest:
+    def __init__(self, expected_symbol: str = RAW_SYMBOL) -> None:
+        self.expected_symbol = expected_symbol
+        self.user_id = 269_312
+        self.paper_enabled = int(expected_symbol == PAPER_RAW_SYMBOL)
+        self.user_info_calls = 0
+        self.active: list[object] = []
+        self.history: list[object] = []
+        self.trades: list[object] = []
+        self.position_rows: list[object] = []
+
+    async def user_info(self) -> object:
+        self.user_info_calls += 1
+        row: list[object] = [None] * 22
+        row[0] = self.user_id
+        row[21] = self.paper_enabled
+        return row
+
+    async def active_orders_by_symbol(self, symbol: str) -> object:
+        assert symbol == self.expected_symbol
+        return self.active
+
+    async def order_history_by_symbol(
+        self,
+        symbol: str,
+        *,
+        start: int | None = None,
+        end: int | None = None,
+        limit: int = 2_500,
+    ) -> object:
+        assert symbol == self.expected_symbol and start is not None and end is not None
+        assert limit == 2_500
+        return self.history
+
+    async def trades_by_symbol(
+        self,
+        symbol: str,
+        *,
+        start: int | None = None,
+        end: int | None = None,
+        limit: int = 2_500,
+    ) -> object:
+        assert symbol == self.expected_symbol and start is not None and end is not None
+        assert limit == 2_500
+        return self.trades
+
+    async def positions(self) -> object:
+        return self.position_rows
+
+
 class _Harness:
-    def __init__(self, *, cid_store_path: Path | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        cid_store_path: Path | None = None,
+        mutation_ack_timeout_ms: int = 10_000,
+        rest: _FakeRest | None = None,
+        raw_symbol: str = RAW_SYMBOL,
+        wallet_currency: str = "USTF0",
+        instrument_raw_symbol: str | None = None,
+        instrument_available: bool = True,
+    ) -> None:
         self._temporary = TemporaryDirectory() if cid_store_path is None else None
         if cid_store_path is None:
             assert self._temporary is not None
@@ -77,19 +166,36 @@ class _Harness:
         self.events: list[Any] = []
         self.msgbus.register("ExecEngine.process", self.events.append)
         self.msgbus.register("Portfolio.update_account", self.events.append)
+        profile_symbol = instrument_raw_symbol or raw_symbol
         self.instrument = instrument_from_config(
             BitfinexV1DataClientConfig(
                 url="wss://api-pub.bitfinex.com/ws/2",
                 instrument_id=SOURCE_ID,
-                raw_symbol=RAW_SYMBOL,
+                raw_symbol=profile_symbol,
                 price_precision=2,
                 size_precision=8,
                 price_increment=Decimal("0.01"),
                 size_increment=Decimal("0.00000001"),
-                min_quantity=Decimal("0.00000001"),
-                max_quantity=Decimal("100000"),
-                margin_init=Decimal("0.1"),
-                margin_maint=Decimal("0.05"),
+                min_quantity=(
+                    Decimal("2")
+                    if profile_symbol == PAPER_RAW_SYMBOL
+                    else Decimal("0.002")
+                ),
+                max_quantity=(
+                    Decimal("10000")
+                    if profile_symbol == PAPER_RAW_SYMBOL
+                    else Decimal("400")
+                ),
+                margin_init=(
+                    Decimal("0.01")
+                    if profile_symbol == PAPER_RAW_SYMBOL
+                    else Decimal("0.1")
+                ),
+                margin_maint=(
+                    Decimal("0.005")
+                    if profile_symbol == PAPER_RAW_SYMBOL
+                    else Decimal("0.05")
+                ),
                 maker_fee=Decimal(0),
                 taker_fee=Decimal("0.0002"),
                 routing=RoutingConfig(default=False, venues=frozenset({"BITFINEX"})),
@@ -98,8 +204,10 @@ class _Harness:
         )
         self.order_factory = TestComponentStubs.order_factory()
         provider = InstrumentProvider()
-        provider.add(self.instrument)
+        if instrument_available:
+            provider.add(self.instrument)
         self.fake = _FakeTransport()
+        self.rest = rest or _FakeRest(raw_symbol)
         self.client = BitfinexV1ExecutionClient(
             loop=asyncio.get_running_loop(),
             name="BITFINEX",
@@ -110,15 +218,20 @@ class _Harness:
                 user_id=269_312,
                 account_id=AccountId("BITFINEX-001"),
                 instrument_id=SOURCE_ID,
-                raw_symbol=RAW_SYMBOL,
+                raw_symbol=raw_symbol,
+                wallet_currency=wallet_currency,
                 cid_store_path=str(cid_store_path),
+                mutation_ack_timeout_ms=mutation_ack_timeout_ms,
             ),
             msgbus=self.msgbus,
             cache=self.cache,
             clock=self.clock,
             instrument_provider=provider,
             transport=self.fake,
+            rest=self.rest,
         )
+        self.raw_symbol = raw_symbol
+        self.wallet_currency = wallet_currency
 
     async def connect(self, *, available: Decimal | None = Decimal("800")) -> None:
         await self.fake.queue.put({"event": "info", "version": 2})
@@ -129,7 +242,15 @@ class _Harness:
             [
                 0,
                 "ws",
-                [["margin", "USTF0", Decimal("1000"), Decimal("0"), available]],
+                [
+                    [
+                        "margin",
+                        self.wallet_currency,
+                        Decimal("1000"),
+                        Decimal("0"),
+                        available,
+                    ]
+                ],
             ]
         )
         await self.client._connect()
@@ -281,6 +402,32 @@ def _types(harness: _Harness) -> list[str]:
     return [type(event).__name__ for event in harness.events]
 
 
+def _position_row(
+    quantity: Decimal,
+    *,
+    avg_px: Decimal,
+    raw_symbol: str = RAW_SYMBOL,
+) -> list[object]:
+    return [
+        raw_symbol,
+        "ACTIVE",
+        quantity,
+        avg_px,
+        Decimal(0),
+        0,
+        Decimal(0),
+        Decimal(0),
+        Decimal("3000"),
+        Decimal(10),
+        None,
+        44,
+        None,
+        None,
+        None,
+        1,
+    ]
+
+
 def _order_events(harness: _Harness) -> list[OrderEvent]:
     return [event for event in harness.events if isinstance(event, OrderEvent)]
 
@@ -302,6 +449,31 @@ def test_connect_authenticates_and_uses_zero_free_when_wallet_available_is_unkno
             assert account.balances[0].total.as_decimal() == Decimal("1000")
             assert account.balances[0].locked.as_decimal() == Decimal("1000")
             assert account.balances[0].free.as_decimal() == Decimal("0")
+            assert harness.client.execution_hold_reason is None
+        finally:
+            await harness.close()
+
+    asyncio.run(scenario())
+
+
+def test_connect_waits_for_data_instrument_before_private_io() -> None:
+    async def scenario() -> None:
+        rest = _FakeRest()
+        harness = _Harness(rest=rest, instrument_available=False)
+
+        async def publish_instrument() -> None:
+            await asyncio.sleep(0)
+            assert rest.user_info_calls == 0
+            assert not harness.fake.opened
+            assert harness.fake.sent == []
+            harness.cache.add_instrument(harness.instrument)
+
+        publish_task = asyncio.create_task(publish_instrument())
+        try:
+            await harness.connect()
+            await publish_task
+            assert rest.user_info_calls == 1
+            assert harness.fake.opened
             assert harness.client.execution_hold_reason is None
         finally:
             await harness.close()
@@ -407,6 +579,151 @@ def test_submit_send_failure_stays_unknown_and_is_never_retried() -> None:
             )
             assert len(harness.fake.sent) == sent
             assert _types(harness)[-1] == "OrderDenied"
+        finally:
+            await harness.close()
+
+    asyncio.run(scenario())
+
+
+def test_submit_ack_deadlines_do_not_block_concurrent_maker_sides() -> None:
+    async def scenario() -> None:
+        harness = _Harness(mutation_ack_timeout_ms=100)
+        await harness.connect()
+        try:
+            bid = harness.order(side=OrderSide.BUY)
+            ask = harness.order(side=OrderSide.SELL)
+            bid_cid = await harness.submit(bid)
+            ask_cid = await harness.submit(ask)
+            assert len(harness.fake.sent) == 3
+            assert not bool(harness.client.execution_hold_reason)
+            assert len(harness.client._ack_deadlines) == 2
+
+            await asyncio.sleep(0.15)
+
+            assert harness.client.execution_hold_reason is not None
+            assert harness.client._by_cid[bid_cid].unknown_operations == {"submit"}
+            assert harness.client._by_cid[ask_cid].unknown_operations == {"submit"}
+            assert not harness.client._ack_deadlines
+            sent = len(harness.fake.sent)
+            await harness.client._submit_order(
+                SubmitOrder(
+                    trader_id=bid.trader_id,
+                    strategy_id=bid.strategy_id,
+                    order=harness.order(),
+                    command_id=UUID4(),
+                    ts_init=harness.clock.timestamp_ns(),
+                    params={"leverage": 10},
+                )
+            )
+            assert len(harness.fake.sent) == sent
+            assert _types(harness)[-1] == "OrderDenied"
+        finally:
+            await harness.close()
+
+    asyncio.run(scenario())
+
+
+def test_modify_ack_deadline_is_sticky_until_authoritative_tu() -> None:
+    async def scenario() -> None:
+        harness = _Harness(mutation_ack_timeout_ms=100)
+        await harness.connect()
+        try:
+            order = harness.order()
+            cid = await harness.submit(order)
+            harness.client._consume_private_frame(harness.order_frame("on", cid, order))
+            await harness.modify(order, price="3925.10")
+            sent = len(harness.fake.sent)
+
+            await asyncio.sleep(0.15)
+
+            assert harness.client._by_cid[cid].unknown_operations == {"modify"}
+            await harness.modify(order, price="3925.20")
+            assert len(harness.fake.sent) == sent
+            assert _types(harness)[-1] == "OrderModifyRejected"
+
+            harness.client._consume_private_frame(
+                harness.trade_frame(cid, order, order_price="3925.10")
+            )
+            assert harness.client.execution_hold_reason is None
+            assert not harness.client._by_cid[cid].unknown_operations
+            assert _types(harness)[-2:] == ["OrderUpdated", "OrderFilled"]
+        finally:
+            await harness.close()
+
+    asyncio.run(scenario())
+
+
+def test_cancel_ack_deadline_is_sticky_until_authoritative_full_tu() -> None:
+    async def scenario() -> None:
+        harness = _Harness(mutation_ack_timeout_ms=100)
+        await harness.connect()
+        try:
+            order = harness.order(quantity="1")
+            cid = await harness.submit(order)
+            harness.client._consume_private_frame(harness.order_frame("on", cid, order))
+            await harness.cancel(order)
+            sent = len(harness.fake.sent)
+
+            await asyncio.sleep(0.15)
+
+            assert harness.client._by_cid[cid].unknown_operations == {"cancel"}
+            await harness.cancel(order)
+            assert len(harness.fake.sent) == sent
+            assert _types(harness)[-1] == "OrderCancelRejected"
+
+            harness.client._consume_private_frame(harness.trade_frame(cid, order))
+            assert harness.client.execution_hold_reason is None
+            assert not harness.client._by_cid[cid].unknown_operations
+            assert not harness.client._by_cid[cid].pending_cancel
+            assert not harness.client._ack_deadlines
+        finally:
+            await harness.close()
+
+    asyncio.run(scenario())
+
+
+def test_terminal_order_cancels_all_mutation_deadlines() -> None:
+    async def scenario() -> None:
+        harness = _Harness(mutation_ack_timeout_ms=100)
+        await harness.connect()
+        try:
+            order = harness.order()
+            cid = await harness.submit(order)
+            harness.client._consume_private_frame(harness.order_frame("on", cid, order))
+            await harness.modify(order, price="3925.10")
+            await harness.cancel(order)
+            assert len(harness.client._ack_deadlines) == 2
+
+            harness.client._consume_private_frame(
+                harness.order_frame("oc", cid, order, status="CANCELED")
+            )
+            await asyncio.sleep(0)
+
+            assert not harness.client._ack_deadlines
+            assert not harness.client._by_cid[cid].unknown_operations
+            assert harness.client.execution_hold_reason is None
+            assert _types(harness)[-1] == "OrderCanceled"
+        finally:
+            await harness.close()
+
+    asyncio.run(scenario())
+
+
+def test_disconnect_cancels_deadlines_and_marks_sent_mutation_unknown() -> None:
+    async def scenario() -> None:
+        harness = _Harness(mutation_ack_timeout_ms=10_000)
+        await harness.connect()
+        try:
+            order = harness.order()
+            cid = await harness.submit(order)
+            deadline = next(iter(harness.client._ack_deadlines.values()))
+
+            await harness.client._disconnect()
+
+            assert not harness.client._ack_deadlines
+            assert deadline.cancelled()
+            assert harness.client._by_cid[cid].unknown_operations == {"submit"}
+            assert harness.client.execution_hold_reason is not None
         finally:
             await harness.close()
 
@@ -1078,13 +1395,213 @@ def test_pre_ack_cancel_and_non_price_modify_fail_closed_without_wire_send() -> 
     asyncio.run(scenario())
 
 
-def test_reports_are_explicitly_unavailable() -> None:
+def test_owned_rest_rows_generate_reports_but_unanchored_mass_status_holds() -> None:
     async def scenario() -> None:
-        harness = _Harness()
-        with pytest.raises(BitfinexV1ExecutionError, match="reconciliation"):
-            await harness.client.generate_order_status_reports(None)
-        with pytest.raises(BitfinexV1ExecutionError, match="reconciliation"):
-            await harness.client.generate_fill_reports(None)
+        rest = _FakeRest()
+        harness = _Harness(rest=rest)
+        now_ms = harness.clock.timestamp_ns() // 1_000_000
+        binding = harness.client._cid_store.allocate("REPORT-OWNED-1", epoch_ms=now_ms - 2_000)
+        rest.active = [
+            [
+                VENUE_ORDER_ID,
+                None,
+                binding.cid,
+                RAW_SYMBOL,
+                now_ms - 2_000,
+                now_ms - 1_000,
+                Decimal("2"),
+                Decimal("4"),
+                "LIMIT",
+                None,
+                None,
+                None,
+                POST_ONLY_FLAG,
+                "ACTIVE",
+                None,
+                None,
+                Decimal("3926.70"),
+                Decimal("3926.75"),
+            ]
+        ]
+        rest.trades = [
+            [
+                1234,
+                RAW_SYMBOL,
+                now_ms - 1_500,
+                VENUE_ORDER_ID,
+                Decimal("2"),
+                Decimal("3926.75"),
+                "LIMIT",
+                Decimal("3926.70"),
+                1,
+                Decimal("-0.10"),
+                "USTF0",
+                binding.cid,
+            ]
+        ]
+        rest.position_rows = [
+            [
+                RAW_SYMBOL,
+                "ACTIVE",
+                Decimal("2"),
+                Decimal("3926.75"),
+                Decimal(0),
+                0,
+                Decimal(0),
+                Decimal(0),
+                Decimal("3000"),
+                Decimal(10),
+                None,
+                44,
+                now_ms - 2_000,
+                now_ms - 1_000,
+                None,
+                1,
+            ]
+        ]
+        start = datetime.fromtimestamp((now_ms - 60_000) / 1_000, UTC)
+
+        orders = await harness.client.generate_order_status_reports(
+            GenerateOrderStatusReports(
+                instrument_id=SOURCE_ID,
+                start=start,
+                end=None,
+                open_only=False,
+                command_id=UUID4(),
+                ts_init=harness.clock.timestamp_ns(),
+            )
+        )
+        fills = await harness.client.generate_fill_reports(
+            GenerateFillReports(
+                instrument_id=SOURCE_ID,
+                venue_order_id=None,
+                start=start,
+                end=None,
+                command_id=UUID4(),
+                ts_init=harness.clock.timestamp_ns(),
+            )
+        )
+        positions = await harness.client.generate_position_status_reports(
+            GeneratePositionStatusReports(
+                instrument_id=SOURCE_ID,
+                start=None,
+                end=None,
+                command_id=UUID4(),
+                ts_init=harness.clock.timestamp_ns(),
+            )
+        )
+
+        assert len(orders) == len(fills) == len(positions) == 1
+        assert orders[0].client_order_id == ClientOrderId("REPORT-OWNED-1")
+        assert orders[0].order_status == OrderStatus.PARTIALLY_FILLED
+        assert orders[0].filled_qty.as_decimal() == Decimal("2")
+        assert fills[0].client_order_id == ClientOrderId("REPORT-OWNED-1")
+        assert fills[0].commission.as_decimal() == Decimal("0.10")
+        assert positions[0].position_side == PositionSide.LONG
+        assert positions[0].venue_position_id is None
+
+        with pytest.raises(BitfinexV1ExecutionError, match="position differs"):
+            await harness.client.generate_mass_status(lookback_mins=1)
+
+        terminal_row = cast(list[object], rest.active[0]).copy()
+        terminal_row[13] = "CANCELED"
+        rest.active = []
+        rest.history = [terminal_row]
+        with pytest.raises(BitfinexV1ExecutionError, match="position differs"):
+            await harness.client.generate_mass_status(lookback_mins=1)
+
+    asyncio.run(scenario())
+
+
+def test_order_history_bisects_full_pages_and_fails_on_one_ms_saturation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class HistoryRest(_FakeRest):
+        def __init__(self, rows: list[object]) -> None:
+            super().__init__()
+            self.rows = rows
+            self.calls = 0
+
+        async def order_history_by_symbol(
+            self,
+            symbol: str,
+            *,
+            start: int | None = None,
+            end: int | None = None,
+            limit: int = 2,
+        ) -> object:
+            assert symbol == RAW_SYMBOL and start is not None and end is not None
+            self.calls += 1
+            return [
+                row
+                for row in self.rows
+                if start <= cast(int, cast(list[object], row)[4]) <= end
+            ][:limit]
+
+    async def scenario() -> None:
+        monkeypatch.setattr(execution_module, "_REPORT_PAGE_LIMIT", 2)
+        now_ms = TestComponentStubs.clock().timestamp_ns() // 1_000_000
+        complete = HistoryRest(
+            [[1, None, None, None, now_ms - 9], [2, None, None, None, now_ms - 1]]
+        )
+        harness = _Harness(rest=complete)
+        rows = await harness.client._order_history_rows(now_ms - 10, now_ms)
+        assert rows == complete.rows
+        assert complete.calls > 1
+
+        saturated = HistoryRest(
+            [[1, None, None, None, now_ms], [2, None, None, None, now_ms]]
+        )
+        harness = _Harness(rest=saturated)
+        with pytest.raises(BitfinexV1ExecutionError, match="one-millisecond"):
+            await harness.client._order_history_rows(now_ms - 10, now_ms)
+
+    asyncio.run(scenario())
+
+
+def test_trade_history_uses_overlap_dedup_and_rejects_stalled_full_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class TradeRest(_FakeRest):
+        def __init__(self, rows: list[object]) -> None:
+            super().__init__()
+            self.rows = rows
+
+        async def trades_by_symbol(
+            self,
+            symbol: str,
+            *,
+            start: int | None = None,
+            end: int | None = None,
+            limit: int = 2,
+        ) -> object:
+            assert symbol == RAW_SYMBOL and start is not None and end is not None
+            return [
+                row
+                for row in self.rows
+                if start <= cast(int, cast(list[object], row)[2]) <= end
+            ][:limit]
+
+    async def scenario() -> None:
+        monkeypatch.setattr(execution_module, "_REPORT_PAGE_LIMIT", 2)
+        now_ms = TestComponentStubs.clock().timestamp_ns() // 1_000_000
+        complete = TradeRest(
+            [
+                [1, RAW_SYMBOL, now_ms - 3],
+                [2, RAW_SYMBOL, now_ms - 2],
+                [3, RAW_SYMBOL, now_ms - 1],
+            ]
+        )
+        harness = _Harness(rest=complete)
+        rows = await harness.client._trade_history_rows(now_ms - 4, now_ms)
+        assert [cast(list[object], row)[0] for row in rows] == [1, 2, 3]
+
+        stalled = TradeRest(
+            [[1, RAW_SYMBOL, now_ms], [2, RAW_SYMBOL, now_ms]]
+        )
+        harness = _Harness(rest=stalled)
+        with pytest.raises(BitfinexV1ExecutionError, match="pagination is saturated"):
+            await harness.client._trade_history_rows(now_ms, now_ms)
 
     asyncio.run(scenario())
 
@@ -1143,6 +1660,231 @@ def test_reconnect_with_unresolved_order_is_blocked_until_reconciliation() -> No
     asyncio.run(scenario())
 
 
+def test_open_order_rehydrates_from_reconciled_cache_and_deduplicates_old_trade() -> None:
+    async def scenario() -> None:
+        harness = _Harness()
+        harness.msgbus.deregister("ExecEngine.process", harness.events.append)
+        engine = ExecutionEngine(
+            msgbus=harness.msgbus,
+            cache=harness.cache,
+            clock=harness.clock,
+        )
+        engine.register_client(harness.client)
+        harness.cache.add_instrument(harness.instrument)
+        harness.cache.add_account(TestExecStubs.margin_account(account_id=harness.client.account_id))
+        order = harness.order()
+        harness.cache.add_order(order)
+        await harness.connect()
+        try:
+            cid = await harness.submit(order)
+            harness.client._consume_private_frame(harness.order_frame("on", cid, order))
+            trade = harness.trade_frame(cid, order)
+            harness.client._consume_private_frame(trade)
+            assert order.status == OrderStatus.PARTIALLY_FILLED
+            assert order.filled_qty.as_decimal() == Decimal("1")
+
+            harness.client._by_cid.clear()
+            harness.client._cid_by_client.clear()
+            harness.client._cid_by_venue.clear()
+            harness.client._seen_trades.clear()
+            event_count = engine.event_count
+
+            harness.client._consume_private_frame(trade)
+            assert engine.event_count == event_count
+            await harness.modify(order, price="3925.10")
+            assert cast(list[object], harness.fake.sent[-1])[1] == "ou"
+            assert harness.client._by_cid[cid].filled_qty == Decimal("1")
+        finally:
+            await harness.close()
+
+    asyncio.run(scenario())
+
+
+def test_live_engine_reconciliation_requires_consistent_open_order_report() -> None:
+    async def scenario() -> None:
+        rest = _FakeRest()
+        harness = _Harness(rest=rest)
+        harness.msgbus.deregister("ExecEngine.process", harness.events.append)
+        engine = LiveExecutionEngine(
+            loop=asyncio.get_running_loop(),
+            msgbus=harness.msgbus,
+            cache=harness.cache,
+            clock=harness.clock,
+            config=LiveExecEngineConfig(
+                load_cache=False,
+                reconciliation=True,
+                reconciliation_lookback_mins=None,
+                generate_missing_orders=False,
+                inflight_check_interval_ms=0,
+                open_check_interval_secs=None,
+                position_check_interval_secs=None,
+            ),
+        )
+        engine.register_client(harness.client)
+        harness.cache.add_instrument(harness.instrument)
+        harness.cache.add_account(
+            TestExecStubs.margin_account(account_id=harness.client.account_id)
+        )
+        order = harness.order(client_order_id=ClientOrderId("ENGINE-OPEN-1"))
+        harness.cache.add_order(order)
+        await harness.connect()
+        try:
+            cid = await harness.submit(order)
+            frame = harness.order_frame("on", cid, order)
+            harness.client._consume_private_frame(frame)
+            order.apply(
+                TestEventStubs.order_submitted(
+                    order,
+                    account_id=harness.client.account_id,
+                    ts_event=harness.clock.timestamp_ns(),
+                )
+            )
+            harness.cache.update_order(order)
+            order.apply(
+                TestEventStubs.order_accepted(
+                    order,
+                    account_id=harness.client.account_id,
+                    venue_order_id=VenueOrderId(str(VENUE_ORDER_ID)),
+                    ts_event=harness.clock.timestamp_ns(),
+                )
+            )
+            harness.cache.update_order(order)
+            assert order.status == OrderStatus.ACCEPTED
+            assert harness.cache.orders_open(instrument_id=SOURCE_ID) == [order]
+
+            rest.active = []
+            assert await engine.reconcile_execution_state(timeout_secs=1.0) is False
+            assert order.status == OrderStatus.ACCEPTED
+
+            wrong_identity = cast(list[object], frame[2]).copy()
+            wrong_identity[0] = VENUE_ORDER_ID + 1
+            rest.active = [wrong_identity]
+            assert await engine.reconcile_execution_state(timeout_secs=1.0) is False
+            assert order.status == OrderStatus.ACCEPTED
+
+            wrong_price = cast(list[object], frame[2]).copy()
+            wrong_price[16] = Decimal("3926.80")
+            rest.active = [wrong_price]
+            assert await engine.reconcile_execution_state(timeout_secs=1.0) is False
+            assert order.price == harness.instrument.make_price(Decimal("3926.70"))
+
+            rest.active = [cast(list[object], frame[2])]
+            rest.position_rows = [
+                _position_row(Decimal("1"), avg_px=Decimal("3926.75"))
+            ]
+            assert await engine.reconcile_execution_state(timeout_secs=1.0) is False
+
+            rest.position_rows = []
+            assert await engine.reconcile_execution_state(timeout_secs=1.0) is True
+            assert order.status == OrderStatus.ACCEPTED
+
+            trade_ts_ms = harness.clock.timestamp_ns() // 1_000_000
+            first_filled_frame = harness.order_frame(
+                "on",
+                cid,
+                order,
+                remaining="3",
+            )
+            cast(list[object], first_filled_frame[2])[17] = Decimal("3926.75")
+            first_trade_row = cast(list[object], harness.trade_frame(cid, order)[2]).copy()
+            first_trade_row[2] = trade_ts_ms
+            rest.active = [cast(list[object], first_filled_frame[2])]
+            rest.trades = [first_trade_row]
+            rest.position_rows = [
+                _position_row(Decimal("1"), avg_px=Decimal("3926.75"))
+            ]
+            assert await engine.reconcile_execution_state(timeout_secs=1.0) is True
+            assert order.status == OrderStatus.PARTIALLY_FILLED
+            assert order.filled_qty == harness.instrument.make_qty(Decimal("1"))
+            assert sum(
+                (
+                    position.signed_decimal_qty()
+                    for position in harness.cache.positions_open(
+                        instrument_id=SOURCE_ID,
+                        account_id=harness.client.account_id,
+                    )
+                ),
+                Decimal(),
+            ) == Decimal("1")
+            first_fill = next(
+                event for event in order.events if isinstance(event, OrderFilled)
+            )
+            assert first_fill.position_id is not None
+            second_fill = TestEventStubs.order_filled(
+                order=order,
+                instrument=harness.instrument,
+                account_id=harness.client.account_id,
+                venue_order_id=VenueOrderId(str(VENUE_ORDER_ID)),
+                trade_id=TradeId("1235"),
+                last_qty=harness.instrument.make_qty(Decimal("2")),
+                last_px=harness.instrument.make_price(Decimal("3926.80")),
+                liquidity_side=LiquiditySide.MAKER,
+                commission=Money(Decimal("0.20"), harness.instrument.quote_currency),
+                ts_event=trade_ts_ms * 1_000_000,
+            )
+            ExecutionEngine.process(engine, second_fill)
+            assert second_fill.position_id == first_fill.position_id
+            assert order.status == OrderStatus.PARTIALLY_FILLED
+            filled_frame = harness.order_frame(
+                "on",
+                cid,
+                order,
+                remaining="1",
+            )
+            cast(list[object], filled_frame[2])[17] = Decimal("3926.78333333")
+            second_trade_row = cast(
+                list[object],
+                harness.trade_frame(
+                    cid,
+                    order,
+                    trade_id=1235,
+                    quantity="2",
+                    price="3926.80",
+                    fee="-0.20",
+                )[2],
+            ).copy()
+            second_trade_row[2] = trade_ts_ms
+            rest.active = [cast(list[object], filled_frame[2])]
+            rest.trades = [first_trade_row, second_trade_row]
+            rest.position_rows = [
+                _position_row(Decimal("3"), avg_px=Decimal("3926.78333333"))
+            ]
+            assert await harness.client.generate_mass_status(lookback_mins=None) is not None
+            rest.trades = [second_trade_row]
+            assert await harness.client.generate_mass_status(lookback_mins=None) is not None
+
+            wrong_average = cast(list[object], filled_frame[2]).copy()
+            wrong_average[17] = Decimal("3926.79333333")
+            rest.active = [wrong_average]
+            with pytest.raises(BitfinexV1ExecutionError, match="average price"):
+                await harness.client.generate_mass_status(lookback_mins=None)
+
+            rest.active = [cast(list[object], filled_frame[2])]
+            unknown_fill = second_trade_row.copy()
+            unknown_fill[0] = 1236
+            rest.trades = [unknown_fill]
+            with pytest.raises(BitfinexV1ExecutionError, match="unknown fill"):
+                await harness.client.generate_mass_status(lookback_mins=None)
+
+            conflicting_fill = second_trade_row.copy()
+            conflicting_fill[5] = Decimal("3926.81")
+            rest.trades = [conflicting_fill]
+            with pytest.raises(BitfinexV1ExecutionError, match="last_px"):
+                await harness.client.generate_mass_status(lookback_mins=None)
+
+            regressed_frame = harness.order_frame("on", cid, order, remaining="2")
+            cast(list[object], regressed_frame[2])[17] = Decimal("3926.78")
+            rest.active = [cast(list[object], regressed_frame[2])]
+            rest.trades = [first_trade_row, second_trade_row]
+            with pytest.raises(BitfinexV1ExecutionError, match="regressed"):
+                await harness.client.generate_mass_status(lookback_mins=None)
+        finally:
+            await harness.close()
+            engine.dispose()
+
+    asyncio.run(scenario())
+
+
 def test_config_rejects_account_issuer_or_client_id_mismatch(tmp_path: Path) -> None:
     async def scenario() -> None:
         clock = TestComponentStubs.clock()
@@ -1187,13 +1929,197 @@ def test_config_rejects_account_issuer_or_client_id_mismatch(tmp_path: Path) -> 
     asyncio.run(scenario())
 
 
+def test_execution_factory_builds_typed_client_without_connecting(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        config = BitfinexV1ExecClientConfig(
+            url="wss://offline.invalid/ws/2",
+            rest_url="https://offline.invalid",
+            api_key="KEY",
+            api_secret="SECRET",
+            user_id=269_312,
+            account_id=AccountId("BITFINEX-001"),
+            instrument_id=SOURCE_ID,
+            raw_symbol=RAW_SYMBOL,
+            cid_store_path=str(tmp_path / "cids.json"),
+        )
+        client = BitfinexV1LiveExecClientFactory.create(
+            loop=asyncio.get_running_loop(),
+            name="BITFINEX",
+            config=config,
+            msgbus=TestComponentStubs.msgbus(),
+            cache=TestComponentStubs.cache(),
+            clock=TestComponentStubs.clock(),
+        )
+        assert isinstance(client, BitfinexV1ExecutionClient)
+        assert client.id == ClientId("BITFINEX")
+        assert client.venue == Venue("BITFINEX")
+        assert not client.is_connected
+        with pytest.raises(TypeError):
+            BitfinexV1LiveExecClientFactory.create(
+                loop=asyncio.get_running_loop(),
+                name="BITFINEX",
+                config=LiveExecClientConfig(),
+                msgbus=TestComponentStubs.msgbus(),
+                cache=TestComponentStubs.cache(),
+                clock=TestComponentStubs.clock(),
+            )
+
+    asyncio.run(scenario())
+
+
+def test_paper_profile_binds_test_symbol_wallet_and_canonical_instrument() -> None:
+    async def scenario() -> None:
+        rest = _FakeRest(PAPER_RAW_SYMBOL)
+        harness = _Harness(
+            raw_symbol=PAPER_RAW_SYMBOL,
+            wallet_currency="TESTUSDTF0",
+            rest=rest,
+        )
+        try:
+            await harness.connect()
+            auth = cast(dict[str, object], harness.fake.sent[0])
+            assert auth["filter"] == [f"trading-{PAPER_RAW_SYMBOL}", "wallet", "notify"]
+            assert harness.instrument.id == SOURCE_ID
+            assert harness.instrument.quote_currency.code == "USDT"
+            assert harness.client.execution_hold_reason is None
+            assert await harness.client._order_reports(start=None, end=None, open_only=True) == []
+
+            payload = harness.client._submission_payload(
+                harness.order(quantity="2"),
+                leverage=10,
+                cid=1,
+            )
+            assert cast(dict[str, object], payload[3])["symbol"] == PAPER_RAW_SYMBOL
+        finally:
+            await harness.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("execution_symbol", "wallet_currency", "instrument_symbol"),
+    [
+        (RAW_SYMBOL, "USTF0", PAPER_RAW_SYMBOL),
+        (PAPER_RAW_SYMBOL, "TESTUSDTF0", RAW_SYMBOL),
+    ],
+)
+def test_execution_rejects_crossed_data_and_account_profiles(
+    execution_symbol: str,
+    wallet_currency: str,
+    instrument_symbol: str,
+) -> None:
+    async def scenario() -> None:
+        harness = _Harness(
+            raw_symbol=execution_symbol,
+            wallet_currency=wallet_currency,
+            instrument_raw_symbol=instrument_symbol,
+        )
+        try:
+            with pytest.raises(BitfinexV1ExecutionError, match="instrument profile"):
+                await harness.connect()
+            assert not harness.fake.opened
+            assert harness.fake.sent == []
+        finally:
+            await harness.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("raw_symbol", "wallet_currency", "paper_enabled", "user_id", "message"),
+    [
+        (RAW_SYMBOL, "USTF0", 1, 269_312, "environments differ"),
+        (PAPER_RAW_SYMBOL, "TESTUSDTF0", 0, 269_312, "environments differ"),
+        (RAW_SYMBOL, "USTF0", 0, 999_999, "identity does not match"),
+    ],
+)
+def test_rest_identity_must_match_ws_user_and_symbol_environment(
+    raw_symbol: str,
+    wallet_currency: str,
+    paper_enabled: int,
+    user_id: int,
+    message: str,
+) -> None:
+    async def scenario() -> None:
+        rest = _FakeRest(raw_symbol)
+        rest.paper_enabled = paper_enabled
+        rest.user_id = user_id
+        harness = _Harness(
+            raw_symbol=raw_symbol,
+            wallet_currency=wallet_currency,
+            rest=rest,
+        )
+        try:
+            with pytest.raises(BitfinexV1ExecutionError, match=message):
+                await harness.client._connect()
+            assert not harness.fake.opened
+            assert harness.fake.sent == []
+        finally:
+            await harness.close()
+
+    asyncio.run(scenario())
+
+
+def test_trading_node_builds_data_and_execution_clients_offline(tmp_path: Path) -> None:
+    loop = asyncio.new_event_loop()
+    data_config = BitfinexV1DataClientConfig(
+        url="wss://offline.invalid/ws/2",
+        instrument_id=SOURCE_ID,
+        raw_symbol=RAW_SYMBOL,
+        price_precision=2,
+        size_precision=8,
+        price_increment=Decimal("0.01"),
+        size_increment=Decimal("0.00000001"),
+        min_quantity=Decimal("0.00000001"),
+        max_quantity=Decimal("100000"),
+        margin_init=Decimal("0.1"),
+        margin_maint=Decimal("0.05"),
+        maker_fee=Decimal(0),
+        taker_fee=Decimal("0.0002"),
+        routing=RoutingConfig(default=False, venues=frozenset({"BITFINEX"})),
+    )
+    exec_config = BitfinexV1ExecClientConfig(
+        url="wss://offline.invalid/ws/2",
+        rest_url="https://offline.invalid",
+        api_key="KEY",
+        api_secret="SECRET",
+        user_id=269_312,
+        account_id=AccountId("BITFINEX-001"),
+        instrument_id=SOURCE_ID,
+        raw_symbol=RAW_SYMBOL,
+        cid_store_path=str(tmp_path / "cids.json"),
+    )
+    node = TradingNode(
+        config=TradingNodeConfig(
+            trader_id=TraderId("PY000-BFX-EXEC-001"),
+            data_clients={"BITFINEX": data_config},
+            exec_clients={"BITFINEX": exec_config},
+            exec_engine=LiveExecEngineConfig(reconciliation=True),
+        ),
+        loop=loop,
+    )
+    try:
+        node.add_data_client_factory("BITFINEX", BitfinexV1LiveDataClientFactory)
+        node.add_exec_client_factory("BITFINEX", BitfinexV1LiveExecClientFactory)
+        node.build()
+        assert node.kernel.exec_engine.registered_clients == [ClientId("BITFINEX")]
+        assert node.kernel.exec_engine.check_disconnected()
+    finally:
+        node.dispose()
+
+    assert loop.is_closed()
+
+
 @pytest.mark.parametrize(
     ("override", "message"),
     [
         ({"instrument_id": InstrumentId.from_str("BTCUSDT.BITFINEX")}, "XAUT"),
         ({"raw_symbol": "tBTCUSD"}, "XAUT"),
         ({"wallet_currency": "USD"}, "USTF0"),
+        ({"raw_symbol": PAPER_RAW_SYMBOL}, "TESTUSDTF0"),
+        ({"wallet_currency": "TESTUSDTF0"}, "USTF0"),
         ({"user_id": 0}, "user ID"),
+        ({"mutation_ack_timeout_ms": 99}, "acknowledgment timeout"),
     ],
 )
 def test_config_locks_exact_account_instrument_symbol_and_wallet(

@@ -1,0 +1,389 @@
+from __future__ import annotations
+
+from collections.abc import Callable
+from decimal import Decimal
+
+import pytest
+from nautilus_trader.config import RoutingConfig
+from nautilus_trader.model.enums import LiquiditySide, OrderSide, OrderStatus, PositionSide
+from nautilus_trader.model.identifiers import AccountId, ClientOrderId
+
+from py000_nautilus.bitfinex_v1_data import (
+    INSTRUMENT_ID,
+    PAPER_RAW_SYMBOL,
+    RAW_SYMBOL,
+    BitfinexV1DataClientConfig,
+    instrument_from_config,
+)
+from py000_nautilus.bitfinex_v1_protocol import POST_ONLY_FLAG
+from py000_nautilus.bitfinex_v1_reports import (
+    BitfinexV1ReportError,
+    map_fill_reports,
+    map_order_status_reports,
+    map_position_status_reports,
+)
+
+ACCOUNT_ID = AccountId("BITFINEX-001")
+TS_INIT = 1_800_000_000_000_000_000
+
+
+@pytest.fixture
+def instrument():  # type: ignore[no-untyped-def]
+    return _instrument()
+
+
+def _instrument(raw_symbol: str = RAW_SYMBOL):  # type: ignore[no-untyped-def]
+    return instrument_from_config(
+        BitfinexV1DataClientConfig(
+            url="wss://api-pub.bitfinex.com/ws/2",
+            instrument_id=INSTRUMENT_ID,
+            raw_symbol=raw_symbol,
+            price_precision=2,
+            size_precision=8,
+            price_increment=Decimal("0.01"),
+            size_increment=Decimal("0.00000001"),
+            min_quantity=Decimal("0.00000001"),
+            max_quantity=Decimal("100000"),
+            margin_init=Decimal("0.1"),
+            margin_maint=Decimal("0.05"),
+            maker_fee=Decimal(0),
+            taker_fee=Decimal("0.0002"),
+            routing=RoutingConfig(default=False, venues=frozenset({"BITFINEX"})),
+        ),
+        ts_init=0,
+    )
+
+
+def _order_row(
+    *,
+    venue_id: int = 1001,
+    cid: int | None = 101,
+    remaining: str = "4",
+    original: str = "4",
+    status: str = "ACTIVE",
+    order_type: str = "LIMIT",
+    flags: int = 0,
+    price: str = "3926.70",
+    average: str | None = None,
+    updated: int = 1_700_000_000_100,
+) -> list[object]:
+    if average is None:
+        unfilled = Decimal(remaining).copy_abs() == Decimal(original).copy_abs()
+        average = "0" if unfilled else "3926.75"
+    return [
+        venue_id,
+        None,
+        cid,
+        RAW_SYMBOL,
+        1_700_000_000_000,
+        updated,
+        Decimal(remaining),
+        Decimal(original),
+        order_type,
+        None,
+        None,
+        None,
+        flags,
+        status,
+        None,
+        None,
+        Decimal(price),
+        Decimal(average),
+    ]
+
+
+def _trade_row(
+    *,
+    trade_id: int = 5001,
+    venue_id: int = 1001,
+    cid: int | None = 101,
+    quantity: str = "-0.25",
+    price: str = "3926.75",
+    maker: int = 1,
+    fee: str = "-0.10",
+    currency: str = "USTF0",
+    symbol: str = RAW_SYMBOL,
+    timestamp: int = 1_700_000_000_120,
+) -> list[object]:
+    return [
+        trade_id,
+        symbol,
+        timestamp,
+        venue_id,
+        Decimal(quantity),
+        Decimal(price),
+        "LIMIT",
+        Decimal("3926.70"),
+        maker,
+        Decimal(fee),
+        currency,
+        cid,
+    ]
+
+
+def _position_row(
+    *,
+    symbol: str = RAW_SYMBOL,
+    amount: str = "0.75",
+    base_price: str = "4050.10",
+    position_id: int = 9001,
+    status: str = "ACTIVE",
+    position_type: int = 1,
+    created: int | None = 1_700_000_000_000,
+    updated: int | None = 1_700_000_000_200,
+) -> list[object]:
+    return [
+        symbol,
+        status,
+        Decimal(amount),
+        Decimal(base_price),
+        Decimal(0),
+        0,
+        Decimal(0),
+        Decimal(0),
+        Decimal("7000"),
+        Decimal("10"),
+        None,
+        position_id,
+        created,
+        updated,
+        None,
+        position_type,
+    ]
+
+
+def _lookup(*cids: int) -> Callable[[int], ClientOrderId | None]:
+    bindings = {cid: ClientOrderId(f"O-{cid}") for cid in cids}
+    return bindings.get
+
+
+def test_order_status_mapping_covers_active_partial_and_history_terminals(instrument) -> None:  # type: ignore[no-untyped-def]
+    active_rows: list[object] = [
+        _order_row(venue_id=1001, cid=101, updated=1_700_000_000_010),
+        _order_row(
+            venue_id=1002,
+            cid=102,
+            remaining="3",
+            status="ACTIVE",
+            average="3926.754321",
+            updated=1_700_000_000_020,
+        ),
+        _order_row(
+            venue_id=1003,
+            cid=103,
+            remaining="2",
+            status="PARTIALLY FILLED @ 3926.75(2)",
+            updated=1_700_000_000_030,
+        ),
+    ]
+    history_rows: list[object] = [
+        _order_row(
+            venue_id=1004,
+            cid=104,
+            remaining="0",
+            status="EXECUTED @ 3926.75(4)",
+            updated=1_700_000_000_040,
+        ),
+        _order_row(
+            venue_id=1005,
+            cid=105,
+            remaining="2",
+            status="CANCELED was: PARTIALLY FILLED @ 3926.75(2)",
+            updated=1_700_000_000_050,
+        ),
+        _order_row(
+            venue_id=1006,
+            cid=106,
+            status="POSTONLY CANCELED",
+            flags=POST_ONLY_FLAG,
+            updated=1_700_000_000_060,
+        ),
+    ]
+
+    reports = map_order_status_reports(
+        active_rows=active_rows,
+        history_rows=history_rows,
+        instrument=instrument,
+        account_id=ACCOUNT_ID,
+        cid_lookup=_lookup(101, 102, 103, 104, 105, 106),
+        ts_init=TS_INIT,
+    )
+
+    assert [report.order_status for report in reports] == [
+        OrderStatus.ACCEPTED,
+        OrderStatus.PARTIALLY_FILLED,
+        OrderStatus.PARTIALLY_FILLED,
+        OrderStatus.FILLED,
+        OrderStatus.CANCELED,
+        OrderStatus.REJECTED,
+    ]
+    assert reports[1].filled_qty.as_decimal() == Decimal("1")
+    assert reports[1].avg_px == Decimal("3926.754321")
+    assert reports[3].filled_qty.as_decimal() == Decimal("4")
+    assert reports[5].post_only
+    assert all(report.venue_position_id is None for report in reports)
+
+
+def test_order_mapping_is_exact_about_precision_ownership_and_duplicate_ids(instrument) -> None:  # type: ignore[no-untyped-def]
+    with pytest.raises(BitfinexV1ReportError, match=r"active.*CID"):
+        map_order_status_reports(
+            active_rows=[_order_row()],
+            history_rows=[],
+            instrument=instrument,
+            account_id=ACCOUNT_ID,
+            cid_lookup=_lookup(),
+            ts_init=TS_INIT,
+        )
+    assert (
+        map_order_status_reports(
+            active_rows=[],
+            history_rows=[_order_row(status="CANCELED")],
+            instrument=instrument,
+            account_id=ACCOUNT_ID,
+            cid_lookup=_lookup(),
+            ts_init=TS_INIT,
+        )
+        == []
+    )
+    with pytest.raises(BitfinexV1ReportError, match="precision"):
+        map_order_status_reports(
+            active_rows=[_order_row(price="3926.701")],
+            history_rows=[],
+            instrument=instrument,
+            account_id=ACCOUNT_ID,
+            cid_lookup=_lookup(101),
+            ts_init=TS_INIT,
+        )
+    changed = _order_row(price="3926.71")
+    with pytest.raises(BitfinexV1ReportError, match=r"duplicate.*changed"):
+        map_order_status_reports(
+            active_rows=[_order_row(), changed],
+            history_rows=[],
+            instrument=instrument,
+            account_id=ACCOUNT_ID,
+            cid_lookup=_lookup(101),
+            ts_init=TS_INIT,
+        )
+
+
+def test_fill_mapping_uses_tu_semantics_and_deduplicates_stably(instrument) -> None:  # type: ignore[no-untyped-def]
+    later = _trade_row(trade_id=5002, timestamp=200, quantity="0.125", maker=-1)
+    earlier = _trade_row(trade_id=5001, timestamp=100)
+    reports = map_fill_reports(
+        rows=[later, earlier, earlier.copy()],
+        instrument=instrument,
+        account_id=ACCOUNT_ID,
+        cid_lookup=_lookup(101),
+        fee_currency="USTF0",
+        ts_init=TS_INIT,
+    )
+
+    assert [report.trade_id.value for report in reports] == ["5001", "5002"]
+    assert reports[0].order_side == OrderSide.SELL
+    assert reports[0].last_qty.as_decimal() == Decimal("0.25")
+    assert reports[0].last_px.as_decimal() == Decimal("3926.75")
+    assert reports[0].commission.as_decimal() == Decimal("0.10")
+    assert reports[0].liquidity_side == LiquiditySide.MAKER
+    assert reports[0].venue_position_id is None
+    assert reports[1].order_side == OrderSide.BUY
+    assert reports[1].liquidity_side == LiquiditySide.TAKER
+
+
+def test_paper_fill_currency_maps_to_canonical_usdt_commission() -> None:
+    report = map_fill_reports(
+        rows=[_trade_row(symbol=PAPER_RAW_SYMBOL, currency="TESTUSDTF0")],
+        instrument=_instrument(PAPER_RAW_SYMBOL),
+        account_id=ACCOUNT_ID,
+        cid_lookup=_lookup(101),
+        fee_currency="TESTUSDTF0",
+        ts_init=TS_INIT,
+    )[0]
+
+    assert report.commission.currency.code == "USDT"
+    assert report.commission.as_decimal() == Decimal("0.10")
+
+
+def test_fill_mapping_ignores_unknown_cids_and_rejects_conflicting_trade_ids(instrument) -> None:  # type: ignore[no-untyped-def]
+    assert (
+        map_fill_reports(
+            rows=[_trade_row()],
+            instrument=instrument,
+            account_id=ACCOUNT_ID,
+            cid_lookup=_lookup(),
+            fee_currency="USTF0",
+            ts_init=TS_INIT,
+        )
+        == []
+    )
+    changed = _trade_row(price="3926.76")
+    with pytest.raises(BitfinexV1ReportError, match="trade ID changed"):
+        map_fill_reports(
+            rows=[_trade_row(), changed],
+            instrument=instrument,
+            account_id=ACCOUNT_ID,
+            cid_lookup=_lookup(101),
+            fee_currency="USTF0",
+            ts_init=TS_INIT,
+        )
+    with pytest.raises(BitfinexV1ReportError, match="USTF0"):
+        map_fill_reports(
+            rows=[_trade_row(currency="USD")],
+            instrument=instrument,
+            account_id=ACCOUNT_ID,
+            cid_lookup=_lookup(101),
+            fee_currency="USTF0",
+            ts_init=TS_INIT,
+        )
+
+
+def test_position_mapping_covers_long_short_and_explicit_target_flat(instrument) -> None:  # type: ignore[no-untyped-def]
+    unrelated = _position_row(symbol="tBTCF0:USTF0")
+    flat = map_position_status_reports(
+        rows=[unrelated], instrument=instrument, account_id=ACCOUNT_ID, ts_init=TS_INIT
+    )[0]
+    long = map_position_status_reports(
+        rows=[unrelated, _position_row(amount="0.75", base_price="4050.123456")],
+        instrument=instrument,
+        account_id=ACCOUNT_ID,
+        ts_init=TS_INIT,
+    )[0]
+    short = map_position_status_reports(
+        rows=[_position_row(amount="-0.125")],
+        instrument=instrument,
+        account_id=ACCOUNT_ID,
+        ts_init=TS_INIT,
+    )[0]
+    observed = map_position_status_reports(
+        rows=[_position_row(created=None, updated=None)],
+        instrument=instrument,
+        account_id=ACCOUNT_ID,
+        ts_init=TS_INIT,
+    )[0]
+
+    assert flat.position_side == PositionSide.FLAT
+    assert flat.quantity.as_decimal() == 0
+    assert flat.ts_last == TS_INIT
+    assert long.position_side == PositionSide.LONG
+    assert long.quantity.as_decimal() == Decimal("0.75")
+    assert long.avg_px_open == Decimal("4050.123456")
+    assert short.position_side == PositionSide.SHORT
+    assert short.quantity.as_decimal() == Decimal("0.125")
+    assert observed.ts_last == TS_INIT
+    assert all(report.venue_position_id is None for report in (flat, long, short, observed))
+
+
+def test_position_mapping_rejects_non_derivative_and_multiple_target_positions(instrument) -> None:  # type: ignore[no-untyped-def]
+    with pytest.raises(BitfinexV1ReportError, match="derivative type"):
+        map_position_status_reports(
+            rows=[_position_row(position_type=0)],
+            instrument=instrument,
+            account_id=ACCOUNT_ID,
+            ts_init=TS_INIT,
+        )
+    with pytest.raises(BitfinexV1ReportError, match="one NETTING"):
+        map_position_status_reports(
+            rows=[_position_row(position_id=1), _position_row(position_id=2)],
+            instrument=instrument,
+            account_id=ACCOUNT_ID,
+            ts_init=TS_INIT,
+        )
