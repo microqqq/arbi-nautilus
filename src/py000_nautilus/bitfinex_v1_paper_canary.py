@@ -510,7 +510,7 @@ def build_paper_node(
         raw_symbol=PAPER_RAW_SYMBOL, wallet_currency=WALLET_CURRENCY,
         cid_store_path=str(cid_path), auth_timeout_ms=int(timeout * 1_000),
         open_timeout_ms=int(timeout * 1_000), mutation_ack_timeout_ms=int(timeout * 1_000),
-        rest_timeout_secs=int(timeout),
+        rest_timeout_secs=min(5, max(1, int(timeout / 3))),
         routing=RoutingConfig(default=False, venues=frozenset({CLIENT_NAME})),
     )
     node = TradingNode(

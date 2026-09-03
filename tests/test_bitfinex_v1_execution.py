@@ -2054,6 +2054,7 @@ def test_rest_identity_must_match_ws_user_and_symbol_environment(
                 await harness.client._connect()
             assert not harness.fake.opened
             assert harness.fake.sent == []
+            assert rest.user_info_calls == 1
         finally:
             await harness.close()
 

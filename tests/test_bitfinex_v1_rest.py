@@ -8,8 +8,9 @@ from decimal import Decimal
 from typing import Any
 
 import pytest
-from nautilus_trader.core.nautilus_pyo3 import HttpMethod
+from nautilus_trader.core.nautilus_pyo3 import HttpError, HttpMethod, HttpTimeoutError
 
+import py000_nautilus.bitfinex_v1_rest as rest_module
 from py000_nautilus.bitfinex_v1_rest import (
     BitfinexV1RestClient,
     BitfinexV1RestError,
@@ -37,9 +38,17 @@ class Call:
 
 
 class FakeHttpClient:
-    def __init__(self, responses: list[FakeResponse] | None = None) -> None:
+    def __init__(
+        self,
+        responses: list[FakeResponse] | None = None,
+        *,
+        hang: bool = False,
+    ) -> None:
         self.calls: list[Call] = []
         self._responses = list(responses or [FakeResponse()])
+        self._hang = hang
+        self.active = 0
+        self.max_active = 0
 
     async def request(
         self,
@@ -54,14 +63,42 @@ class FakeHttpClient:
         del params, keys, timeout_secs
         assert headers is not None
         assert body is not None
-        self.calls.append(Call(method, url, dict(headers), body))
-        return self._responses.pop(0)
+        self.active += 1
+        self.max_active = max(self.max_active, self.active)
+        try:
+            if self._hang:
+                await asyncio.Event().wait()
+            await asyncio.sleep(0)
+            self.calls.append(Call(method, url, dict(headers), body))
+            return self._responses.pop(0)
+        finally:
+            self.active -= 1
+
+
+class FailingHttpClient(FakeHttpClient):
+    def __init__(self, failure: Exception) -> None:
+        super().__init__()
+        self._failure = failure
+
+    async def request(
+        self,
+        method: HttpMethod,
+        url: str,
+        params: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+        body: bytes | None = None,
+        keys: list[str] | None = None,
+        timeout_secs: int | None = None,
+    ) -> FakeResponse:
+        del method, url, params, headers, body, keys, timeout_secs
+        raise self._failure
 
 
 def client(
     http: FakeHttpClient,
     *,
     clock_ns: int = 1_700_000_000_000_123_000,
+    timeout_secs: int = 10,
 ) -> BitfinexV1RestClient:
     return BitfinexV1RestClient(
         api_key="KEY",
@@ -69,6 +106,7 @@ def client(
         base_url="https://example.test/",
         http_client=http,
         clock_ns=lambda: clock_ns,
+        timeout_secs=timeout_secs,
     )
 
 
@@ -117,6 +155,21 @@ def test_nonce_is_microsecond_and_strictly_monotonic_per_client() -> None:
             "1700000000000001",
             "1700000000000002",
         ]
+
+    asyncio.run(scenario())
+
+
+def test_concurrent_reads_are_serialized_to_preserve_nonce_arrival_order() -> None:
+    async def scenario() -> None:
+        http = FakeHttpClient([FakeResponse(), FakeResponse(), FakeResponse()])
+        rest = client(http)
+
+        await asyncio.gather(rest.user_info(), rest.permissions(), rest.positions())
+
+        assert http.max_active == 1
+        assert len(http.calls) == 3
+        nonces = [int(call.headers["bfx-nonce"]) for call in http.calls]
+        assert nonces == list(range(nonces[0], nonces[0] + 3))
 
     asyncio.run(scenario())
 
@@ -240,34 +293,154 @@ def test_response_contract_fails_closed_without_echoing_body_or_credentials(
         rendered = str(error.value)
         assert "KEY" not in rendered
         assert "SECRET" not in rendered
+        assert not error.value.retryable
         if response.body:
             assert response.body.decode(errors="ignore") not in rendered
 
     asyncio.run(scenario())
 
 
-def test_transport_failure_is_redacted() -> None:
-    class FailingHttpClient(FakeHttpClient):
-        async def request(
-            self,
-            method: HttpMethod,
-            url: str,
-            params: dict[str, Any] | None = None,
-            headers: dict[str, str] | None = None,
-            body: bytes | None = None,
-            keys: list[str] | None = None,
-            timeout_secs: int | None = None,
-        ) -> FakeResponse:
-            del method, url, params, body, keys, timeout_secs
-            raise RuntimeError(f"upstream leaked {headers} SECRET")
-
+@pytest.mark.parametrize(
+    "failure",
+    [
+        ConnectionError("connection leaked SECRET"),
+        HttpError("HTTP client leaked SECRET"),
+        HttpTimeoutError("timeout leaked SECRET"),
+    ],
+)
+def test_transport_failure_is_redacted_and_retryable(failure: Exception) -> None:
     async def scenario() -> None:
-        rest = client(FailingHttpClient())
+        rest = client(FailingHttpClient(failure))
 
         with pytest.raises(BitfinexV1RestError) as error:
-            await rest.positions()
+            await rest._post("v2/auth/r/positions", {})
         assert "KEY" not in str(error.value)
         assert "SECRET" not in str(error.value)
+        assert error.value.retryable
         assert error.value.__suppress_context__ is True
+
+    asyncio.run(scenario())
+
+
+def test_retryable_response_failure_still_advances_the_nonce() -> None:
+    async def scenario() -> None:
+        http = FakeHttpClient([FakeResponse(status=500), FakeResponse()])
+        rest = client(http, clock_ns=1_700_000_000_000_000_000)
+
+        assert await rest.user_info() == []
+        assert [call.headers["bfx-nonce"] for call in http.calls] == [
+            "1700000000000000",
+            "1700000000000001",
+        ]
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("responses", "calls", "message"),
+    [
+        ([FakeResponse(500), FakeResponse(500), FakeResponse(500), FakeResponse()], 3, "500"),
+        ([FakeResponse(500), FakeResponse(401), FakeResponse()], 2, "401"),
+    ],
+)
+def test_read_retry_stops_at_the_bounded_or_permanent_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    responses: list[FakeResponse],
+    calls: int,
+    message: str,
+) -> None:
+    async def scenario() -> None:
+        monkeypatch.setattr(rest_module, "_READ_RETRY_DELAYS_SECS", (0.0, 0.0))
+        http = FakeHttpClient(responses)
+
+        with pytest.raises(BitfinexV1RestError, match=message):
+            await client(http).user_info()
+
+        assert len(http.calls) == calls
+        assert len(http._responses) == len(responses) - calls
+
+    asyncio.run(scenario())
+
+
+def test_read_retry_has_one_total_timeout_budget() -> None:
+    async def scenario() -> None:
+        http = FakeHttpClient(hang=True)
+        rest = client(http, timeout_secs=1)
+        started = asyncio.get_running_loop().time()
+
+        with pytest.raises(BitfinexV1RestError, match="read timed out"):
+            await rest.user_info()
+
+        assert asyncio.get_running_loop().time() - started < 1.5
+        http._hang = False
+        assert await rest.positions() == []
+
+    asyncio.run(scenario())
+
+
+def test_read_timeout_budget_includes_waiting_for_the_single_flight_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        http = FakeHttpClient()
+        rest = client(http)
+        monkeypatch.setattr(rest, "_read_timeout_secs", 0.05)
+        await rest._read_lock.acquire()
+        queued = asyncio.create_task(rest.user_info())
+        await asyncio.sleep(0.1)
+
+        with pytest.raises(BitfinexV1RestError, match="read timed out"):
+            await queued
+        assert http.calls == []
+
+        rest._read_lock.release()
+        assert await rest.user_info() == []
+        assert len(http.calls) == 1
+
+    asyncio.run(scenario())
+
+
+def test_unknown_transport_failure_is_redacted_and_not_retryable() -> None:
+    async def scenario() -> None:
+        rest = client(FailingHttpClient(RuntimeError("programming failure leaked KEY SECRET")))
+
+        with pytest.raises(BitfinexV1RestError) as error:
+            await rest._post("v2/auth/r/positions", {})
+        assert "KEY" not in str(error.value)
+        assert "SECRET" not in str(error.value)
+        assert not error.value.retryable
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("status", "retryable"),
+    [
+        (408, True),
+        (500, True),
+        (502, True),
+        (503, True),
+        (504, True),
+        (400, False),
+        (401, False),
+        (425, False),
+        (429, False),
+        (501, False),
+        (505, False),
+        (201, False),
+    ],
+)
+def test_http_error_exposes_only_bounded_retry_classification(
+    status: int,
+    retryable: bool,
+) -> None:
+    async def scenario() -> None:
+        rest = client(FakeHttpClient([FakeResponse(status=status)]))
+
+        with pytest.raises(BitfinexV1RestError) as error:
+            await rest._post("v2/auth/r/info/user", {})
+
+        assert error.value.retryable is retryable
+        assert str(status) in str(error.value)
 
     asyncio.run(scenario())

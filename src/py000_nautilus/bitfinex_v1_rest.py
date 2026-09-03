@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
@@ -11,11 +12,18 @@ from collections.abc import Callable
 from decimal import Decimal
 from typing import Any, Never, Protocol
 
-from nautilus_trader.core.nautilus_pyo3 import HttpClient, HttpMethod
+from nautilus_trader.core.nautilus_pyo3 import (
+    HttpClient,
+    HttpError,
+    HttpMethod,
+    HttpTimeoutError,
+)
 
 MAX_PAGE_SIZE = 2_500
 _DEFAULT_BASE_URL = "https://api.bitfinex.com"
 _SYMBOL = re.compile(r"t[A-Za-z0-9:_-]+\Z")
+_RETRYABLE_HTTP_STATUSES = frozenset({408, 500, 502, 503, 504})
+_READ_RETRY_DELAYS_SECS = (0.25, 0.75)
 
 type JsonScalar = None | bool | int | Decimal | str
 type JsonValue = JsonScalar | list[JsonValue] | dict[str, JsonValue]
@@ -23,6 +31,10 @@ type JsonValue = JsonScalar | list[JsonValue] | dict[str, JsonValue]
 
 class BitfinexV1RestError(RuntimeError):
     """The response cannot be safely used as Bitfinex reconciliation evidence."""
+
+    def __init__(self, message: str, *, retryable: bool = False) -> None:
+        super().__init__(message)
+        self.retryable = retryable
 
 
 class _HttpResponse(Protocol):
@@ -77,18 +89,20 @@ class BitfinexV1RestClient:
         self._http = http_client or HttpClient(timeout_secs=timeout_secs)
         self._clock_ns = clock_ns
         self._last_nonce = 0
+        self._read_timeout_secs = timeout_secs
+        self._read_lock = asyncio.Lock()
 
     async def user_info(self) -> JsonValue:
-        return await self._post("v2/auth/r/info/user", {})
+        return await self._read("v2/auth/r/info/user", {})
 
     async def permissions(self) -> JsonValue:
-        return await self._post("v2/auth/r/permissions", {})
+        return await self._read("v2/auth/r/permissions", {})
 
     async def wallets(self) -> JsonValue:
-        return await self._post("v2/auth/r/wallets", {})
+        return await self._read("v2/auth/r/wallets", {})
 
     async def active_orders_by_symbol(self, symbol: str) -> JsonValue:
-        return await self._post(f"v2/auth/r/orders/{_validated_symbol(symbol)}", {})
+        return await self._read(f"v2/auth/r/orders/{_validated_symbol(symbol)}", {})
 
     async def order_history_by_symbol(
         self,
@@ -98,7 +112,7 @@ class BitfinexV1RestClient:
         end: int | None = None,
         limit: int = MAX_PAGE_SIZE,
     ) -> JsonValue:
-        return await self._post(
+        return await self._read(
             f"v2/auth/r/orders/{_validated_symbol(symbol)}/hist",
             _window(start=start, end=end, limit=limit),
         )
@@ -113,13 +127,31 @@ class BitfinexV1RestClient:
     ) -> JsonValue:
         body = _window(start=start, end=end, limit=limit)
         body["sort"] = 1
-        return await self._post(
+        return await self._read(
             f"v2/auth/r/trades/{_validated_symbol(symbol)}/hist",
             body,
         )
 
     async def positions(self) -> JsonValue:
-        return await self._post("v2/auth/r/positions", {})
+        return await self._read("v2/auth/r/positions", {})
+
+    async def _read(self, api_path: str, payload: dict[str, int]) -> JsonValue:
+        try:
+            async with asyncio.timeout(self._read_timeout_secs):
+                async with self._read_lock:
+                    for delay in (*_READ_RETRY_DELAYS_SECS, None):
+                        try:
+                            return await self._post(api_path, payload)
+                        except BitfinexV1RestError as exc:
+                            if not exc.retryable or delay is None:
+                                raise
+                            await asyncio.sleep(delay)
+        except TimeoutError:
+            raise BitfinexV1RestError(
+                f"Bitfinex REST read timed out: {api_path}",
+                retryable=True,
+            ) from None
+        raise AssertionError("unreachable Bitfinex REST read retry loop")
 
     async def _post(self, api_path: str, payload: dict[str, int]) -> JsonValue:
         body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -139,8 +171,14 @@ class BitfinexV1RestClient:
                 headers=headers,
                 body=body,
             )
-        except Exception:
-            raise BitfinexV1RestError(f"Bitfinex REST request failed: {api_path}") from None
+        except Exception as exc:
+            raise BitfinexV1RestError(
+                f"Bitfinex REST request failed: {api_path}",
+                retryable=isinstance(
+                    exc,
+                    HttpError | HttpTimeoutError | ConnectionError | TimeoutError,
+                ),
+            ) from None
         return _decode_response(response, api_path)
 
     def _nonce(self) -> str:
@@ -188,7 +226,11 @@ def _decode_response(response: _HttpResponse, api_path: str) -> JsonValue:
 
     if type(status) is not int or status != 200:
         safe_status = status if type(status) is int else "invalid"
-        raise BitfinexV1RestError(f"Bitfinex REST HTTP {safe_status}: {api_path}")
+        retryable = type(status) is int and status in _RETRYABLE_HTTP_STATUSES
+        raise BitfinexV1RestError(
+            f"Bitfinex REST HTTP {safe_status}: {api_path}",
+            retryable=retryable,
+        )
     if type(headers) is not dict or any(
         type(key) is not str or type(value) is not str for key, value in headers.items()
     ):
