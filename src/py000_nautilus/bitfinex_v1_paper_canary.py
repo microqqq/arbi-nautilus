@@ -732,19 +732,15 @@ async def _execute(
     run_task = asyncio.create_task(node.run_async())
     try:
         await asyncio.wait_for(strategy.started.wait(), timeout)
-        await asyncio.wait_for(strategy.quote_ready.wait(), timeout)
-        second = await read_snapshot(rest)
-        if second.user_id != user_id:
-            raise PaperCanaryError("paper account identity changed")
+        second = await _await_pre_arm_snapshot(
+            node,
+            strategy,
+            rest,
+            user_id,
+            timeout,
+        )
         if second.holds:
             return second, False
-        if (
-            not node.is_running()
-            or not node.kernel.data_engine.check_connected()
-            or not node.kernel.exec_engine.check_connected()
-        ):
-            raise PaperCanaryError("Nautilus clients disconnected before arming")
-        strategy.planned_price()
         strategy.arm(second.available)
         with suppress(TimeoutError):
             await asyncio.wait_for(strategy.finished.wait(), timeout * 2)
@@ -771,6 +767,71 @@ async def _execute(
             stop_error = run_result
         if stop_error is not None:
             raise PaperCanaryError("TradingNode shutdown failed") from stop_error
+
+
+async def _await_pre_arm_snapshot(
+    node: TradingNode,
+    strategy: PaperCanaryStrategy,
+    rest: _Rest,
+    user_id: int,
+    timeout: float,
+) -> PaperSnapshot:
+    deadline = asyncio.get_running_loop().time() + timeout
+    while True:
+        if not _paper_node_connected(node):
+            raise PaperCanaryError("Nautilus clients disconnected before arming")
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            raise PaperCanaryError("paper pre-arm checks timed out")
+        await _await_actionable_quote(strategy, remaining)
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            raise PaperCanaryError("paper pre-arm checks timed out")
+        try:
+            snapshot = await asyncio.wait_for(read_snapshot(rest), remaining)
+        except TimeoutError:
+            raise PaperCanaryError("paper pre-arm snapshot timed out") from None
+        if snapshot.user_id != user_id:
+            raise PaperCanaryError("paper account identity changed")
+        if snapshot.holds:
+            return snapshot
+        if not _paper_node_connected(node):
+            raise PaperCanaryError("Nautilus clients disconnected before arming")
+        try:
+            strategy.planned_price()
+        except PaperCanaryError:
+            continue
+        return snapshot
+
+
+def _paper_node_connected(node: TradingNode) -> bool:
+    return (
+        node.is_running()
+        and node.kernel.data_engine.check_connected()
+        and node.kernel.exec_engine.check_connected()
+    )
+
+
+async def _await_actionable_quote(
+    strategy: PaperCanaryStrategy,
+    timeout: float,
+) -> None:
+    deadline = asyncio.get_running_loop().time() + timeout
+    while True:
+        strategy.quote_ready.clear()
+        try:
+            strategy.planned_price()
+            return
+        except PaperCanaryError:
+            pass
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            break
+        try:
+            await asyncio.wait_for(strategy.quote_ready.wait(), remaining)
+        except TimeoutError:
+            break
+    raise PaperCanaryError("a fresh CRC-backed quote did not arrive")
 
 
 def _post_mutation_evidence(

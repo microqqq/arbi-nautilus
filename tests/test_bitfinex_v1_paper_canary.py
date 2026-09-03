@@ -770,6 +770,139 @@ def test_order_fill_fact_survives_later_trade_history_failure() -> None:
     assert evidence.error == "trade_history_ConnectionError"
 
 
+def test_actionable_quote_must_be_refreshed_after_a_stale_preflight_quote() -> None:
+    async def scenario() -> None:
+        quote_ready = asyncio.Event()
+        quote_ready.set()
+        fresh = False
+        calls = 0
+
+        def planned_price() -> Decimal:
+            nonlocal calls
+            calls += 1
+            if not fresh:
+                raise PaperCanaryError("the CRC-backed quote is stale")
+            return Decimal("4370")
+
+        strategy = SimpleNamespace(
+            quote_ready=quote_ready,
+            planned_price=planned_price,
+        )
+        waiting = asyncio.create_task(
+            canary._await_actionable_quote(cast(Any, strategy), 1.0)
+        )
+        await asyncio.sleep(0)
+        assert not waiting.done()
+
+        fresh = True
+        quote_ready.set()
+        await waiting
+        assert calls == 2
+
+    asyncio.run(scenario())
+
+
+def test_actionable_quote_wait_is_bounded() -> None:
+    async def scenario() -> None:
+        def stale_price() -> Decimal:
+            raise PaperCanaryError("the CRC-backed quote is stale")
+
+        strategy = SimpleNamespace(
+            quote_ready=asyncio.Event(),
+            planned_price=stale_price,
+        )
+        with pytest.raises(PaperCanaryError, match="fresh CRC-backed quote"):
+            await canary._await_actionable_quote(cast(Any, strategy), 0.01)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("boundary", ["dirty_account", "disconnected"])
+def test_pre_arm_checks_are_repeated_after_waiting_for_a_fresh_quote(
+    boundary: str,
+) -> None:
+    async def scenario() -> None:
+        class Connected:
+            def __init__(self) -> None:
+                self.connected = True
+
+            def check_connected(self) -> bool:
+                return self.connected
+
+        class Execution(Connected):
+            async def reconcile_execution_state(self, *, timeout_secs: float) -> bool:
+                del timeout_secs
+                return True
+
+        class Node:
+            def __init__(self) -> None:
+                self.data = Connected()
+                self.execution = Execution()
+                self.kernel = SimpleNamespace(
+                    data_engine=self.data,
+                    exec_engine=self.execution,
+                )
+
+            async def run_async(self) -> None:
+                await asyncio.Event().wait()
+
+            def is_running(self) -> bool:
+                return True
+
+            async def stop_async(self) -> None:
+                pass
+
+        node = Node()
+        rest = _Rest()
+        started, quote_ready, finished = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        started.set()
+        finished.set()
+        fresh = False
+        arm_calls: list[Decimal] = []
+
+        def planned_price() -> Decimal:
+            if not fresh:
+                raise PaperCanaryError("the CRC-backed quote is stale")
+            return Decimal("4370")
+
+        strategy = SimpleNamespace(
+            started=started,
+            quote_ready=quote_ready,
+            finished=finished,
+            outcome="CANCELED",
+            planned_price=planned_price,
+            arm=arm_calls.append,
+            mark_timeout=lambda: None,
+        )
+        executing = asyncio.create_task(
+            canary._execute(
+                cast(Any, node),
+                cast(Any, strategy),
+                rest,
+                269_312,
+                1.0,
+            )
+        )
+        await asyncio.sleep(0)
+        if boundary == "dirty_account":
+            rest.orders.append(_order_row())
+        else:
+            node.execution.connected = False
+        fresh = True
+        quote_ready.set()
+
+        if boundary == "dirty_account":
+            snapshot, reconciled = await executing
+            assert snapshot.holds == ("target_has_preexisting_active_orders",)
+            assert not reconciled
+        else:
+            with pytest.raises(PaperCanaryError, match="disconnected"):
+                await executing
+        assert arm_calls == []
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("failure", ["run", "stop"])
 def test_execute_rejects_trading_node_run_or_shutdown_failure(failure: str) -> None:
     async def scenario() -> None:
