@@ -124,7 +124,9 @@ uv run py000-bitfinex-paper-canary --output /new/path/bitfinex-preflight.jsonl
 
 Mutation requires `--execute`, an unused CID-state path, a clean target symbol, sufficient
 `TESTUSDTF0` balance for 1x, current CRC-backed data, connected data/execution clients, and
-successful Nautilus startup reconciliation. It then submits exactly one `BUY 2` post-only
+successful Nautilus startup reconciliation. The final account snapshot completes before the
+paper-book subscription starts, so the next CRC can be checked and used immediately. It then
+submits exactly one `BUY 2` post-only
 `LIMIT/GTC` at 5% below the current bid and sends one native-ID cancel immediately after the
 acceptance event. It never changes the quantity, side, or leverage; never retries a mutation;
 and never uses cancel-all or touches MT5. `PASSED` additionally requires exact canceled-order

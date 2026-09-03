@@ -320,6 +320,7 @@ def _run_strategy(available: Decimal) -> tuple[PaperCanaryStrategy, BacktestEngi
     strategy = PaperCanaryStrategy(PaperCanaryStrategyConfig())
     strategy.arm(available)
     engine.add_strategy(strategy)
+    strategy.start_quote_subscription()
     engine.add_data(
         [
             QuoteTick(
@@ -364,6 +365,25 @@ def test_strategy_refuses_to_raise_leverage_when_1x_balance_is_insufficient() ->
         assert strategy.reason == "available balance cannot cover the 1x canary"
     finally:
         engine.dispose()
+
+
+def test_arm_rechecks_price_and_submits_nothing_when_quote_expires(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    strategy = PaperCanaryStrategy(PaperCanaryStrategyConfig())
+    harness = cast(Any, strategy)
+    harness._instrument = instrument_from_config(paper_data_config(), ts_init=0)
+    harness._quote = object()
+
+    def stale_price() -> Decimal:
+        raise PaperCanaryError("the CRC-backed quote is stale")
+
+    monkeypatch.setattr(strategy, "planned_price", stale_price)
+    strategy.arm(Decimal("100000"))
+
+    assert strategy.order is None
+    assert strategy.outcome == "FAILED"
+    assert strategy.reason == "the CRC-backed quote is stale"
 
 
 def test_partial_fill_waits_for_cancel_and_can_never_become_a_pass() -> None:
@@ -817,88 +837,60 @@ def test_actionable_quote_wait_is_bounded() -> None:
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("boundary", ["dirty_account", "disconnected"])
-def test_pre_arm_checks_are_repeated_after_waiting_for_a_fresh_quote(
-    boundary: str,
-) -> None:
+@pytest.mark.parametrize("boundary", ["clean", "dirty_account", "disconnected"])
+def test_pre_arm_snapshot_precedes_quote_subscription(boundary: str) -> None:
     async def scenario() -> None:
-        class Connected:
-            def __init__(self) -> None:
-                self.connected = True
+        class Rest(_Rest):
+            async def positions(self) -> object:
+                trace.append("snapshot")
+                if boundary == "disconnected":
+                    state["connected"] = False
+                return await super().positions()
 
-            def check_connected(self) -> bool:
-                return self.connected
+        trace: list[str] = []
+        state = {"connected": True}
+        connected = SimpleNamespace(check_connected=lambda: state["connected"])
+        node = SimpleNamespace(
+            is_running=lambda: True,
+            kernel=SimpleNamespace(data_engine=connected, exec_engine=connected),
+        )
+        quote_ready = asyncio.Event()
 
-        class Execution(Connected):
-            async def reconcile_execution_state(self, *, timeout_secs: float) -> bool:
-                del timeout_secs
-                return True
-
-        class Node:
-            def __init__(self) -> None:
-                self.data = Connected()
-                self.execution = Execution()
-                self.kernel = SimpleNamespace(
-                    data_engine=self.data,
-                    exec_engine=self.execution,
-                )
-
-            async def run_async(self) -> None:
-                await asyncio.Event().wait()
-
-            def is_running(self) -> bool:
-                return True
-
-            async def stop_async(self) -> None:
-                pass
-
-        node = Node()
-        rest = _Rest()
-        started, quote_ready, finished = asyncio.Event(), asyncio.Event(), asyncio.Event()
-        started.set()
-        finished.set()
-        fresh = False
-        arm_calls: list[Decimal] = []
+        def start_quote_subscription() -> None:
+            assert trace == ["snapshot"]
+            trace.append("subscribe")
+            quote_ready.set()
 
         def planned_price() -> Decimal:
-            if not fresh:
-                raise PaperCanaryError("the CRC-backed quote is stale")
+            trace.append("price")
             return Decimal("4370")
 
         strategy = SimpleNamespace(
-            started=started,
             quote_ready=quote_ready,
-            finished=finished,
-            outcome="CANCELED",
+            start_quote_subscription=start_quote_subscription,
             planned_price=planned_price,
-            arm=arm_calls.append,
-            mark_timeout=lambda: None,
         )
-        executing = asyncio.create_task(
-            canary._execute(
-                cast(Any, node),
-                cast(Any, strategy),
-                rest,
-                269_312,
-                1.0,
-            )
-        )
-        await asyncio.sleep(0)
+        rest = Rest()
         if boundary == "dirty_account":
             rest.orders.append(_order_row())
-        else:
-            node.execution.connected = False
-        fresh = True
-        quote_ready.set()
 
-        if boundary == "dirty_account":
-            snapshot, reconciled = await executing
-            assert snapshot.holds == ("target_has_preexisting_active_orders",)
-            assert not reconciled
-        else:
+        if boundary == "disconnected":
             with pytest.raises(PaperCanaryError, match="disconnected"):
-                await executing
-        assert arm_calls == []
+                await canary._await_pre_arm_snapshot(
+                    cast(Any, node), cast(Any, strategy), rest, 269_312, 1.0
+                )
+            assert trace == ["snapshot"]
+        else:
+            snapshot = await canary._await_pre_arm_snapshot(
+                cast(Any, node), cast(Any, strategy), rest, 269_312, 1.0
+            )
+            if boundary == "clean":
+                assert snapshot.holds == ()
+                assert trace == ["snapshot", "subscribe", "price", "price"]
+            else:
+                assert boundary == "dirty_account"
+                assert snapshot.holds == ("target_has_preexisting_active_orders",)
+                assert trace == ["snapshot"]
 
     asyncio.run(scenario())
 
@@ -940,6 +932,7 @@ def test_execute_rejects_trading_node_run_or_shutdown_failure(failure: str) -> N
             quote_ready=quote_ready,
             finished=finished,
             outcome="CANCELED",
+            start_quote_subscription=lambda: None,
             planned_price=lambda: Decimal("4370"),
             arm=lambda _available: None,
             mark_timeout=lambda: None,
@@ -990,6 +983,7 @@ def test_execute_never_arms_while_a_client_is_disconnected(
             quote_ready=quote_ready,
             finished=finished,
             outcome="PENDING",
+            start_quote_subscription=lambda: None,
             planned_price=lambda: Decimal("4370"),
             arm=arm_calls.append,
             mark_timeout=lambda: None,

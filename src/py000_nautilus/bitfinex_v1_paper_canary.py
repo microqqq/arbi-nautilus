@@ -175,6 +175,7 @@ class PaperCanaryStrategy(Strategy):
         self._order: Order | None = None
         self._armed = False
         self._cancel_sent = False
+        self._quote_subscribed = False
         self.started = asyncio.Event()
         self.quote_ready = asyncio.Event()
         self.finished = asyncio.Event()
@@ -199,12 +200,19 @@ class PaperCanaryStrategy(Strategy):
             self._finish("FAILED", "paper_instrument_is_unavailable")
             self.stop()
             return
-        self.subscribe_quote_ticks(INSTRUMENT_ID, client_id=CLIENT_ID)
-        self.reason = "waiting_for_crc_quote"
+        self.reason = "awaiting_pre_arm_snapshot"
         self.started.set()
 
     def on_stop(self) -> None:
-        self.unsubscribe_quote_ticks(INSTRUMENT_ID, client_id=CLIENT_ID)
+        if self._quote_subscribed:
+            self.unsubscribe_quote_ticks(INSTRUMENT_ID, client_id=CLIENT_ID)
+
+    def start_quote_subscription(self) -> None:
+        if self._quote_subscribed:
+            raise PaperCanaryError("paper canary quote subscription already started")
+        self.subscribe_quote_ticks(INSTRUMENT_ID, client_id=CLIENT_ID)
+        self._quote_subscribed = True
+        self.reason = "waiting_for_crc_quote"
 
     def on_quote_tick(self, tick: QuoteTick) -> None:
         if tick.instrument_id != INSTRUMENT_ID:
@@ -777,31 +785,27 @@ async def _await_pre_arm_snapshot(
     timeout: float,
 ) -> PaperSnapshot:
     deadline = asyncio.get_running_loop().time() + timeout
-    while True:
-        if not _paper_node_connected(node):
-            raise PaperCanaryError("Nautilus clients disconnected before arming")
-        remaining = deadline - asyncio.get_running_loop().time()
-        if remaining <= 0:
-            raise PaperCanaryError("paper pre-arm checks timed out")
-        await _await_actionable_quote(strategy, remaining)
-        remaining = deadline - asyncio.get_running_loop().time()
-        if remaining <= 0:
-            raise PaperCanaryError("paper pre-arm checks timed out")
-        try:
-            snapshot = await asyncio.wait_for(read_snapshot(rest), remaining)
-        except TimeoutError:
-            raise PaperCanaryError("paper pre-arm snapshot timed out") from None
-        if snapshot.user_id != user_id:
-            raise PaperCanaryError("paper account identity changed")
-        if snapshot.holds:
-            return snapshot
-        if not _paper_node_connected(node):
-            raise PaperCanaryError("Nautilus clients disconnected before arming")
-        try:
-            strategy.planned_price()
-        except PaperCanaryError:
-            continue
+    if not _paper_node_connected(node):
+        raise PaperCanaryError("Nautilus clients disconnected before arming")
+    try:
+        snapshot = await asyncio.wait_for(read_snapshot(rest), timeout)
+    except TimeoutError:
+        raise PaperCanaryError("paper pre-arm snapshot timed out") from None
+    if snapshot.user_id != user_id:
+        raise PaperCanaryError("paper account identity changed")
+    if snapshot.holds:
         return snapshot
+    if not _paper_node_connected(node):
+        raise PaperCanaryError("Nautilus clients disconnected before arming")
+    strategy.start_quote_subscription()
+    remaining = deadline - asyncio.get_running_loop().time()
+    if remaining <= 0:
+        raise PaperCanaryError("paper pre-arm checks timed out")
+    await _await_actionable_quote(strategy, remaining)
+    if not _paper_node_connected(node):
+        raise PaperCanaryError("Nautilus clients disconnected before arming")
+    strategy.planned_price()
+    return snapshot
 
 
 def _paper_node_connected(node: TradingNode) -> bool:
