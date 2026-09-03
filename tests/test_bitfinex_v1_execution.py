@@ -33,7 +33,7 @@ from nautilus_trader.model.enums import (
     PositionSide,
     TimeInForce,
 )
-from nautilus_trader.model.events import OrderAccepted, OrderEvent, OrderFilled
+from nautilus_trader.model.events import OrderAccepted, OrderCanceled, OrderEvent, OrderFilled
 from nautilus_trader.model.identifiers import (
     AccountId,
     ClientId,
@@ -348,7 +348,7 @@ class _Harness:
                 VENUE_ORDER_ID,
                 None,
                 cid,
-                RAW_SYMBOL,
+                self.raw_symbol,
                 1_700_000_000_000,
                 1_700_000_000_100,
                 remaining_qty,
@@ -626,10 +626,26 @@ def test_submit_ack_deadlines_do_not_block_concurrent_maker_sides() -> None:
     asyncio.run(scenario())
 
 
-def test_targeted_rest_acceptance_binds_pending_submit_for_cancel() -> None:
+@pytest.mark.parametrize(
+    ("raw_symbol", "wallet_currency", "venue_flags", "reported_post_only"),
+    [
+        (RAW_SYMBOL, "USTF0", POST_ONLY_FLAG, True),
+        (PAPER_RAW_SYMBOL, "TESTUSDTF0", 0, False),
+    ],
+)
+def test_targeted_rest_acceptance_binds_pending_submit_for_cancel(
+    raw_symbol: str,
+    wallet_currency: str,
+    venue_flags: int,
+    reported_post_only: bool,
+) -> None:
     async def scenario() -> None:
-        rest = _FakeRest()
-        harness = _Harness(rest=rest)
+        rest = _FakeRest(raw_symbol)
+        harness = _Harness(
+            rest=rest,
+            raw_symbol=raw_symbol,
+            wallet_currency=wallet_currency,
+        )
         await harness.connect()
         try:
             order = harness.order()
@@ -642,7 +658,9 @@ def test_targeted_rest_acceptance_binds_pending_submit_for_cancel() -> None:
                 )
             )
             accepted = harness.order_frame("on", cid, order)
-            rest.active = [cast(list[object], accepted[2])]
+            row = cast(list[object], accepted[2])
+            row[12] = venue_flags
+            rest.active = [row]
 
             report = await harness.client.generate_order_status_report(
                 GenerateOrderStatusReport(
@@ -656,6 +674,7 @@ def test_targeted_rest_acceptance_binds_pending_submit_for_cancel() -> None:
 
             assert report is not None
             assert report.order_status == OrderStatus.ACCEPTED
+            assert report.post_only is reported_post_only
             live = harness.client._by_cid[cid]
             assert live.accepted
             assert live.venue_order_id == VENUE_ORDER_ID
@@ -688,9 +707,11 @@ def test_targeted_rest_acceptance_binds_pending_submit_for_cancel() -> None:
         ({16: Decimal("3926.71")}, "price"),
     ],
 )
+@pytest.mark.parametrize("ws_first", [False, True])
 def test_targeted_rest_acceptance_rejects_submit_semantic_mismatch(
     row_updates: dict[int, object],
     mismatch: str,
+    ws_first: bool,
 ) -> None:
     async def scenario() -> None:
         rest = _FakeRest()
@@ -706,7 +727,10 @@ def test_targeted_rest_acceptance_rejects_submit_semantic_mismatch(
                     ts_event=harness.clock.timestamp_ns(),
                 )
             )
-            row = cast(list[object], harness.order_frame("on", cid, order)[2]).copy()
+            accepted = harness.order_frame("on", cid, order)
+            if ws_first:
+                harness.client._consume_private_frame(accepted)
+            row = cast(list[object], accepted[2]).copy()
             for row_index, wrong_value in row_updates.items():
                 row[row_index] = wrong_value
             rest.active = [row]
@@ -723,20 +747,67 @@ def test_targeted_rest_acceptance_rejects_submit_semantic_mismatch(
                 )
 
             live = harness.client._by_cid[cid]
-            assert not live.accepted
-            assert live.venue_order_id is None
-            assert VENUE_ORDER_ID not in harness.client._cid_by_venue
-            assert (cid, "submit") in harness.client._ack_deadlines
+            assert live.accepted is ws_first
+            assert live.venue_order_id == (VENUE_ORDER_ID if ws_first else None)
+            assert (VENUE_ORDER_ID in harness.client._cid_by_venue) is ws_first
+            assert ((cid, "submit") in harness.client._ack_deadlines) is not ws_first
         finally:
             await harness.close()
 
     asyncio.run(scenario())
 
 
-def test_terminal_history_cannot_create_its_own_zero_flag_post_only_witness() -> None:
+@pytest.mark.parametrize(
+    ("raw_symbol", "wallet_currency", "operation", "row_updates"),
+    [
+        (RAW_SYMBOL, "USTF0", "on", {12: 0}),
+        (
+            PAPER_RAW_SYMBOL,
+            "TESTUSDTF0",
+            "on",
+            {10: 1_700_000_200_000, 12: 0},
+        ),
+        (PAPER_RAW_SYMBOL, "TESTUSDTF0", "ou", {12: 0}),
+    ],
+)
+def test_private_zero_flag_tolerance_keeps_profile_tif_and_operation_boundaries(
+    raw_symbol: str,
+    wallet_currency: str,
+    operation: str,
+    row_updates: dict[int, object],
+) -> None:
     async def scenario() -> None:
-        rest = _FakeRest()
-        harness = _Harness(rest=rest)
+        harness = _Harness(
+            raw_symbol=raw_symbol,
+            wallet_currency=wallet_currency,
+        )
+        await harness.connect()
+        try:
+            order = harness.order()
+            cid = await harness.submit(order)
+            frame = harness.order_frame(operation, cid, order)
+            row = cast(list[object], frame[2])
+            for index, value in row_updates.items():
+                row[index] = value
+
+            with pytest.raises(BitfinexV1ExecutionError, match="differs from local submission"):
+                harness.client._consume_private_frame(frame)
+
+            assert not harness.client._by_cid[cid].accepted
+        finally:
+            await harness.close()
+
+    asyncio.run(scenario())
+
+
+def test_terminal_history_requires_strict_flags_and_does_not_bind_pending_submit() -> None:
+    async def scenario() -> None:
+        rest = _FakeRest(PAPER_RAW_SYMBOL)
+        harness = _Harness(
+            rest=rest,
+            raw_symbol=PAPER_RAW_SYMBOL,
+            wallet_currency="TESTUSDTF0",
+        )
         await harness.connect()
         try:
             order = harness.order()
@@ -770,6 +841,65 @@ def test_terminal_history_cannot_create_its_own_zero_flag_post_only_witness() ->
 
             assert not harness.client._by_cid[cid].accepted
             assert "OrderAccepted" not in _types(harness)
+
+            terminal[12] = POST_ONLY_FLAG
+            report = await harness.client.generate_order_status_report(
+                GenerateOrderStatusReport(
+                    instrument_id=order.instrument_id,
+                    client_order_id=order.client_order_id,
+                    venue_order_id=None,
+                    command_id=UUID4(),
+                    ts_init=harness.clock.timestamp_ns(),
+                )
+            )
+            assert report is not None
+            assert report.order_status == OrderStatus.CANCELED
+            assert not harness.client._by_cid[cid].accepted
+        finally:
+            await harness.close()
+
+    asyncio.run(scenario())
+
+
+def test_paper_partial_rest_zero_flags_cannot_bind_pending_submit() -> None:
+    async def scenario() -> None:
+        rest = _FakeRest(PAPER_RAW_SYMBOL)
+        harness = _Harness(
+            rest=rest,
+            raw_symbol=PAPER_RAW_SYMBOL,
+            wallet_currency="TESTUSDTF0",
+        )
+        await harness.connect()
+        try:
+            order = harness.order()
+            cid = await harness.submit(order)
+            order.apply(
+                TestEventStubs.order_submitted(
+                    order,
+                    account_id=harness.client.account_id,
+                    ts_event=harness.clock.timestamp_ns(),
+                )
+            )
+            partial = harness.order_frame("on", cid, order, remaining="3")
+            row = cast(list[object], partial[2])
+            row[12] = 0
+            row[17] = Decimal("3926.75")
+            rest.active = [row]
+
+            with pytest.raises(BitfinexV1ExecutionError, match="post_only"):
+                await harness.client.generate_order_status_report(
+                    GenerateOrderStatusReport(
+                        instrument_id=order.instrument_id,
+                        client_order_id=order.client_order_id,
+                        venue_order_id=None,
+                        command_id=UUID4(),
+                        ts_init=harness.clock.timestamp_ns(),
+                    )
+                )
+
+            live = harness.client._by_cid[cid]
+            assert not live.accepted
+            assert live.venue_order_id is None
         finally:
             await harness.close()
 
@@ -778,14 +908,14 @@ def test_terminal_history_cannot_create_its_own_zero_flag_post_only_witness() ->
 
 @pytest.mark.parametrize(
     "acceptance_timing",
-    ["rest_only", "before_query", "during_rest"],
+    ["rest_without_ws", "rest_then_ws", "before_query", "during_rest"],
 )
 def test_ws_and_targeted_rest_race_publishes_one_acceptance(
     acceptance_timing: str,
 ) -> None:
     class WsFirstRest(_FakeRest):
         def __init__(self) -> None:
-            super().__init__()
+            super().__init__(PAPER_RAW_SYMBOL)
             self.inject: Callable[[], None] | None = None
 
         async def order_history_by_symbol(
@@ -805,7 +935,11 @@ def test_ws_and_targeted_rest_race_publishes_one_acceptance(
 
     async def scenario() -> None:
         rest = WsFirstRest()
-        harness = _Harness(rest=rest)
+        harness = _Harness(
+            rest=rest,
+            raw_symbol=PAPER_RAW_SYMBOL,
+            wallet_currency="TESTUSDTF0",
+        )
         harness.msgbus.deregister("ExecEngine.process", harness.events.append)
         engine = LiveExecutionEngine(
             loop=asyncio.get_running_loop(),
@@ -843,7 +977,9 @@ def test_ws_and_targeted_rest_race_publishes_one_acceptance(
                 await asyncio.sleep(0)
             assert order.status == OrderStatus.SUBMITTED
             accepted = harness.order_frame("on", cid, order)
-            rest.active = [cast(list[object], accepted[2])]
+            row = cast(list[object], accepted[2])
+            row[12] = 0
+            rest.active = [row]
             if acceptance_timing == "before_query":
                 harness.client._consume_private_frame(accepted)
             elif acceptance_timing == "during_rest":
@@ -863,15 +999,24 @@ def test_ws_and_targeted_rest_race_publishes_one_acceptance(
             for _ in range(20):
                 await asyncio.sleep(0)
 
-            if acceptance_timing == "rest_only":
+            if acceptance_timing == "rest_then_ws":
                 harness.client._consume_private_frame(accepted)
                 await asyncio.sleep(0)
             assert sum(isinstance(event, OrderAccepted) for event in published) == 1
             assert [type(event).__name__ for event in order.events].count("OrderAccepted") == 1
-            assert engine.report_count == (1 if acceptance_timing == "rest_only" else 0)
+            rest_first = acceptance_timing in {"rest_without_ws", "rest_then_ws"}
+            assert engine.report_count == (1 if rest_first else 0)
             assert harness.client._by_cid[cid].venue_order_id == VENUE_ORDER_ID
             await harness.cancel(order)
             assert harness.fake.sent[-1] == [0, "oc", None, {"id": VENUE_ORDER_ID}]
+            canceled = harness.order_frame("oc", cid, order, status="CANCELED")
+            cast(list[object], canceled[2])[12] = 0
+            harness.client._consume_private_frame(canceled)
+            for _ in range(20):
+                await asyncio.sleep(0)
+            assert sum(isinstance(event, OrderCanceled) for event in published) == 1
+            assert order.status == OrderStatus.CANCELED
+            assert harness.client.execution_hold_reason is None
         finally:
             engine.stop()
             await asyncio.sleep(0)
@@ -2029,6 +2174,88 @@ def test_open_order_rehydrates_from_reconciled_cache_and_deduplicates_old_trade(
             assert harness.client._by_cid[cid].filled_qty == Decimal("1")
         finally:
             await harness.close()
+
+    asyncio.run(scenario())
+
+
+def test_rehydrated_paper_order_does_not_inherit_zero_flag_tolerance() -> None:
+    async def scenario() -> None:
+        harness = _Harness(
+            raw_symbol=PAPER_RAW_SYMBOL,
+            wallet_currency="TESTUSDTF0",
+        )
+        harness.msgbus.deregister("ExecEngine.process", harness.events.append)
+        engine = ExecutionEngine(
+            msgbus=harness.msgbus,
+            cache=harness.cache,
+            clock=harness.clock,
+        )
+        engine.register_client(harness.client)
+        harness.cache.add_instrument(harness.instrument)
+        harness.cache.add_account(
+            TestExecStubs.margin_account(account_id=harness.client.account_id)
+        )
+        order = harness.order()
+        harness.cache.add_order(order)
+        await harness.connect()
+        try:
+            cid = await harness.submit(order)
+            harness.client._consume_private_frame(harness.order_frame("on", cid, order))
+            assert order.status == OrderStatus.ACCEPTED
+
+            harness.client._by_cid.clear()
+            harness.client._cid_by_client.clear()
+            harness.client._cid_by_venue.clear()
+            update = harness.order_frame("ou", cid, order)
+            cast(list[object], update[2])[12] = 0
+
+            with pytest.raises(BitfinexV1ExecutionError, match="differs from local submission"):
+                harness.client._consume_private_frame(update)
+
+            assert not harness.client._by_cid[cid].submitted_in_process
+        finally:
+            await harness.close()
+            engine.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_paper_mass_status_does_not_inherit_pending_submit_zero_flag_tolerance() -> None:
+    async def scenario() -> None:
+        rest = _FakeRest(PAPER_RAW_SYMBOL)
+        harness = _Harness(
+            rest=rest,
+            raw_symbol=PAPER_RAW_SYMBOL,
+            wallet_currency="TESTUSDTF0",
+        )
+        harness.msgbus.deregister("ExecEngine.process", harness.events.append)
+        engine = ExecutionEngine(
+            msgbus=harness.msgbus,
+            cache=harness.cache,
+            clock=harness.clock,
+        )
+        engine.register_client(harness.client)
+        harness.cache.add_instrument(harness.instrument)
+        harness.cache.add_account(
+            TestExecStubs.margin_account(account_id=harness.client.account_id)
+        )
+        order = harness.order()
+        harness.cache.add_order(order)
+        await harness.connect()
+        try:
+            cid = await harness.submit(order)
+            accepted = harness.order_frame("on", cid, order)
+            harness.client._consume_private_frame(accepted)
+            assert order.status == OrderStatus.ACCEPTED
+            row = cast(list[object], accepted[2]).copy()
+            row[12] = 0
+            rest.active = [row]
+
+            with pytest.raises(BitfinexV1ExecutionError, match="post_only"):
+                await harness.client.generate_mass_status(lookback_mins=1)
+        finally:
+            await harness.close()
+            engine.dispose()
 
     asyncio.run(scenario())
 

@@ -131,11 +131,16 @@ submits exactly one `BUY 2` post-only
 acceptance event. It never changes the quantity, side, or leverage; never retries a mutation;
 and never uses cancel-all or touches MT5. `PASSED` additionally requires exact canceled-order
 history for that CID and venue ID, no matching trade, a flat final position, no active order,
-and final Nautilus reconciliation. `UNKNOWN` retains the CID transcript for manual inspection;
-the existing CID state prevents an automatic rerun.
-Paper history has been observed clearing a canceled post-only order's terminal flag to zero;
-that form is accepted only when the same run's strictly validated acceptance names the exact
-venue order ID, and the transcript records both the historical flag and witness use.
+and final Nautilus reconciliation. `PASSED` qualifies that submit/cancel lifecycle, not an
+independent proof that the paper venue enforced post-only. `UNKNOWN` retains the CID transcript
+for manual inspection; the existing CID state prevents an automatic rerun.
+Bitfinex paper has been observed omitting the submitted post-only flag from both active and
+canceled order rows. Only a same-process pending submit with otherwise exact identity and
+semantics may use an unfilled active row to bind its native ID; production, restart, mass, partial,
+and terminal reconciliation remain strict. The venue report retains `post_only=false`; only the
+internal same-run matcher treats it as missing evidence. Final evidence records raw flags and
+`post_only_assurance=SUBMITTED_INTENT_ONLY` rather than claiming venue enforcement. A raw `4096`
+is recorded as `VENUE_FLAG_OBSERVED`.
 
 `InstrumentStatus` is only a REP-backed market-session observation. It is not
 hedge readiness and must not open source-risk admission without a separately

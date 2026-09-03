@@ -153,6 +153,7 @@ class _LiveOrder:
     current_price: Decimal
     known_prices: set[Decimal]
     unknown_operations: set[str]
+    submitted_in_process: bool = False
     venue_order_id: int | None = None
     accepted: bool = False
     filled_qty: Decimal = Decimal(0)
@@ -438,6 +439,7 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
             current_price=Decimal(str(order.price)),
             known_prices={Decimal(str(order.price))},
             unknown_operations=set(),
+            submitted_in_process=True,
         )
         self._by_cid[cid] = live
         self._cid_by_client[order.client_order_id] = cid
@@ -606,7 +608,7 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
             if event.operation == "oc" and state == live.terminal:
                 return
             raise BitfinexV1ExecutionError("Bitfinex order update followed its terminal event")
-        self._validate_order_state(live, state)
+        self._validate_order_state(live, state, event.operation)
         if event.operation == "oc":
             _terminal_disposition(state)
         rejection = (
@@ -862,11 +864,29 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
             raise BitfinexV1ExecutionError("Bitfinex event changed venue order ID")
         return live
 
-    def _validate_order_state(self, live: _LiveOrder, state: OrderState) -> None:
+    def _validate_order_state(
+        self,
+        live: _LiveOrder,
+        state: OrderState,
+        operation: str,
+    ) -> None:
         expected_qty = Decimal(str(live.order.quantity))
         expected_sign = Decimal(1) if live.order.side == OrderSide.BUY else Decimal(-1)
         expected_type = "IOC" if live.order.time_in_force == TimeInForce.IOC else "LIMIT"
         expected_flags = POST_ONLY_FLAG if cast(bool, live.order.is_post_only) else 0
+        flags_match = state.flags == expected_flags or (
+            self._bfx_config.raw_symbol == PAPER_RAW_SYMBOL
+            and live.submitted_in_process
+            and expected_flags == POST_ONLY_FLAG
+            and live.order.order_type == OrderType.LIMIT
+            and live.order.time_in_force == TimeInForce.GTC
+            and state.flags == 0
+            and (
+                operation == "on"
+                or (operation == "ou" and live.pending_modify_price is not None)
+                or (operation == "oc" and live.accepted and live.pending_cancel)
+            )
+        )
         expected_prices = {live.current_price}
         if live.pending_modify_price is not None:
             expected_prices.add(live.pending_modify_price)
@@ -878,7 +898,8 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
             or abs(state.original_qty) != expected_qty
             or abs(state.remaining_qty) > expected_qty
             or state.order_type != expected_type
-            or state.flags != expected_flags
+            or state.tif_expiry_ms is not None
+            or not flags_match
             or state.price not in expected_prices
         ):
             raise BitfinexV1ExecutionError("Bitfinex order event differs from local submission")
@@ -1153,6 +1174,8 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
         order: Order,
         report: OrderStatusReport,
         fills: list[FillReport],
+        *,
+        allow_missing_post_only: bool = False,
     ) -> None:
         mismatched: list[str] = []
         if order.account_id != report.account_id:
@@ -1169,7 +1192,13 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
             mismatched.append("order_type")
         if order.time_in_force != report.time_in_force:
             mismatched.append("time_in_force")
-        if cast(bool, order.is_post_only) != report.post_only:
+        post_only_mismatch = cast(bool, order.is_post_only) != report.post_only
+        missing_post_only_is_opaque = (
+            allow_missing_post_only
+            and cast(bool, order.is_post_only)
+            and not report.post_only
+        )
+        if post_only_mismatch and not missing_post_only_is_opaque:
             mismatched.append("post_only")
         if cast(bool, order.is_reduce_only) != report.reduce_only:
             mismatched.append("reduce_only")
@@ -1265,6 +1294,7 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
             candidate = self._by_cid.get(cid) if cid is not None else None
             if (
                 candidate is not None
+                and candidate.submitted_in_process
                 and (
                     not candidate.accepted
                     or candidate.order.status == OrderStatus.SUBMITTED
@@ -1310,24 +1340,40 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
         existing_cid = self._cid_by_venue.get(venue_order_id)
         if existing_cid not in {None, live.cid}:
             raise BitfinexV1ExecutionError("Bitfinex venue order ID changed CID")
+        report_is_unfilled_active = report.order_status == OrderStatus.ACCEPTED
+        report_can_bind = report.order_status in {
+            OrderStatus.ACCEPTED,
+            OrderStatus.PARTIALLY_FILLED,
+        }
+        paper_omits_post_only = (
+            report_is_unfilled_active
+            and self._bfx_config.raw_symbol == PAPER_RAW_SYMBOL
+            and live.submitted_in_process
+            and cast(bool, live.order.is_post_only)
+            and live.order.order_type == OrderType.LIMIT
+            and live.order.time_in_force == TimeInForce.GTC
+            and not report.post_only
+        )
+        self._validate_cached_open_report(
+            live.order,
+            report,
+            [],
+            allow_missing_post_only=paper_omits_post_only,
+        )
+        if report.price != live.order.price:
+            raise BitfinexV1ExecutionError(
+                "pending Bitfinex submit differs from targeted venue report: price"
+            )
         if live.accepted:
             if live.venue_order_id is None:
                 raise BitfinexV1ExecutionError(
                     "accepted Bitfinex order has no authoritative venue ID"
                 )
             # A private-stream event arrived during the REST await and has already
-            # been queued for Nautilus. Suppress the report so strategies cannot
-            # observe the same order transition twice.
+            # been queued for Nautilus. Suppress the now-validated report so
+            # strategies cannot observe the same transition twice.
             return False
-        self._validate_cached_open_report(live.order, report, [])
-        if report.price != live.order.price:
-            raise BitfinexV1ExecutionError(
-                "pending Bitfinex submit differs from targeted venue report: price"
-            )
-        if report.order_status not in {
-            OrderStatus.ACCEPTED,
-            OrderStatus.PARTIALLY_FILLED,
-        }:
+        if not report_can_bind:
             return True
 
         # The caller publishes the returned report to Nautilus. Keep that as the

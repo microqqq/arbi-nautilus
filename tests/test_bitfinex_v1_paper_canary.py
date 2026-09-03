@@ -216,10 +216,16 @@ def test_owned_evidence_requires_exact_cancel_and_no_active_order_or_trade() -> 
     rest.history = [_order_row(status="CANCELED")]
     clean = asyncio.run(
         read_owned_evidence(
-            rest, cid=456, venue_order_id=123, price=Decimal("4370.0"), start_ms=0
+            rest,
+            cid=456,
+            venue_order_id=123,
+            price=Decimal("4370.0"),
+            start_ms=0,
+            post_only_intent_submitted=True,
         )
     )
-    assert clean.terminal_exact
+    assert clean.terminal_lifecycle_exact
+    assert clean.post_only_assurance == "VENUE_FLAG_OBSERVED"
     assert clean.complete
     assert not clean.fill_indicated
     assert clean.active_venue_ids == ()
@@ -244,7 +250,7 @@ def test_owned_evidence_requires_exact_cancel_and_no_active_order_or_trade() -> 
         )
     )
     assert partial.fill_indicated
-    assert not partial.terminal_exact
+    assert not partial.terminal_lifecycle_exact
 
     timed = _order_row(status="CANCELED")
     timed[10] = 1_700_000_100_000
@@ -254,7 +260,7 @@ def test_owned_evidence_requires_exact_cancel_and_no_active_order_or_trade() -> 
             rest, cid=456, venue_order_id=123, price=Decimal("4370.0"), start_ms=0
         )
     )
-    assert not not_gtc.terminal_exact
+    assert not not_gtc.terminal_lifecycle_exact
 
     rest.history = []
     missing = asyncio.run(
@@ -262,24 +268,35 @@ def test_owned_evidence_requires_exact_cancel_and_no_active_order_or_trade() -> 
             rest, cid=456, venue_order_id=123, price=Decimal("4370.0"), start_ms=0
         )
     )
-    assert not missing.terminal_exact
+    assert not missing.terminal_lifecycle_exact
 
 
 @pytest.mark.parametrize(
-    ("flags", "witness_venue_order_id", "terminal_exact", "witness_used"),
+    (
+        "flags",
+        "ownership_venue_order_id",
+        "intent_submitted",
+        "terminal_lifecycle_exact",
+        "witness_used",
+        "assurance",
+    ),
     [
-        (POST_ONLY_FLAG, None, True, False),
-        (0, None, False, False),
-        (0, 123, True, True),
-        (0, 124, False, False),
-        (POST_ONLY_FLAG * 2, 123, False, False),
+        (POST_ONLY_FLAG, None, True, True, False, "VENUE_FLAG_OBSERVED"),
+        (POST_ONLY_FLAG, None, False, False, False, "UNPROVEN"),
+        (0, None, True, False, False, "UNPROVEN"),
+        (0, 123, True, True, True, "SUBMITTED_INTENT_ONLY"),
+        (0, 123, False, False, False, "UNPROVEN"),
+        (0, 124, True, False, False, "UNPROVEN"),
+        (POST_ONLY_FLAG * 2, 123, True, False, False, "UNPROVEN"),
     ],
 )
-def test_terminal_zero_flags_require_same_run_post_only_acceptance_witness(
+def test_terminal_zero_flags_require_same_run_ownership_and_post_only_intent(
     flags: int,
-    witness_venue_order_id: int | None,
-    terminal_exact: bool,
+    ownership_venue_order_id: int | None,
+    intent_submitted: bool,
+    terminal_lifecycle_exact: bool,
     witness_used: bool,
+    assurance: str,
 ) -> None:
     rest = _Rest()
     rest.history = [_order_row(status="CANCELED", flags=flags)]
@@ -291,12 +308,14 @@ def test_terminal_zero_flags_require_same_run_post_only_acceptance_witness(
             venue_order_id=123,
             price=Decimal("4370.0"),
             start_ms=0,
-            post_only_witness_venue_order_id=witness_venue_order_id,
+            same_run_ownership_venue_order_id=ownership_venue_order_id,
+            post_only_intent_submitted=intent_submitted,
         )
     )
 
-    assert evidence.terminal_exact is terminal_exact
-    assert evidence.post_only_witness_used is witness_used
+    assert evidence.terminal_lifecycle_exact is terminal_lifecycle_exact
+    assert evidence.submitted_intent_fallback_used is witness_used
+    assert evidence.post_only_assurance == assurance
     assert evidence.historical_flags == (flags,)
 
 
@@ -386,7 +405,7 @@ def test_strategy_submits_one_fixed_passive_order_and_cancels_on_acceptance() ->
         assert order.time_in_force == TimeInForce.GTC
         assert order.is_post_only
         assert strategy.outcome == "CANCELED"
-        assert strategy.post_only_acceptance_venue_order_id is not None
+        assert strategy.same_run_ownership_venue_order_id is not None
         assert strategy.filled == 0
         with pytest.raises(PaperCanaryError, match="only once"):
             strategy.arm(Decimal("100000"))
@@ -394,7 +413,7 @@ def test_strategy_submits_one_fixed_passive_order_and_cancels_on_acceptance() ->
         engine.dispose()
 
 
-def test_plain_limit_acceptance_does_not_create_a_post_only_witness(
+def test_plain_limit_acceptance_does_not_create_an_ownership_witness(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     strategy = _submitted_strategy(post_only=False)
@@ -418,7 +437,7 @@ def test_plain_limit_acceptance_does_not_create_a_post_only_witness(
     )
 
     assert strategy.venue_order_id == VenueOrderId("123")
-    assert strategy.post_only_acceptance_venue_order_id is None
+    assert strategy.same_run_ownership_venue_order_id is None
     assert len(sent) == 1
 
 
@@ -610,7 +629,7 @@ def _evidence(
         fill_indicated=fill,
         complete=complete,
         error=None if complete else "incomplete_test_evidence",
-        terminal_exact=exact,
+        terminal_lifecycle_exact=exact,
     )
 
 
@@ -635,7 +654,7 @@ def _submitted_strategy(
     harness._cancel_sent = True
     strategy.venue_order_id = VenueOrderId("123")
     if post_only:
-        strategy.post_only_acceptance_venue_order_id = VenueOrderId("123")
+        strategy.same_run_ownership_venue_order_id = VenueOrderId("123")
     strategy.outcome = cast(Any, outcome)
     strategy.reason = "strategy_terminal"
     strategy.filled = Decimal(filled)
@@ -834,7 +853,7 @@ def test_post_evidence_keeps_final_snapshot_when_history_read_fails() -> None:
     assert evidence.error == "order_history_ConnectionError"
 
 
-def test_post_evidence_carries_the_same_run_acceptance_witness() -> None:
+def test_post_evidence_carries_same_run_ownership_without_claiming_venue_flag() -> None:
     rest = _Rest()
     rest.history = [_order_row(status="CANCELED", flags=0)]
     transcript = io.StringIO()
@@ -853,18 +872,20 @@ def test_post_evidence_carries_the_same_run_acceptance_witness() -> None:
 
     assert not final.holds
     assert evidence is not None
-    assert evidence.terminal_exact
-    assert evidence.post_only_witness_used
+    assert evidence.terminal_lifecycle_exact
+    assert evidence.submitted_intent_fallback_used
+    assert evidence.post_only_assurance == "SUBMITTED_INTENT_ONLY"
     record = json.loads(transcript.getvalue().splitlines()[-1])
     assert record["historical_flags"] == [0]
-    assert record["post_only_witness_used"] is True
+    assert record["submitted_intent_fallback_used"] is True
+    assert record["post_only_assurance"] == "SUBMITTED_INTENT_ONLY"
 
 
 def test_post_evidence_rejects_zero_flags_for_a_plain_limit_order() -> None:
     rest = _Rest()
     rest.history = [_order_row(status="CANCELED", flags=0)]
     strategy = _submitted_strategy(post_only=False)
-    strategy.post_only_acceptance_venue_order_id = VenueOrderId("123")
+    strategy.same_run_ownership_venue_order_id = VenueOrderId("123")
     transcript = io.StringIO()
     loop = asyncio.new_event_loop()
     try:
@@ -880,8 +901,9 @@ def test_post_evidence_rejects_zero_flags_for_a_plain_limit_order() -> None:
         loop.close()
 
     assert evidence is not None
-    assert not evidence.terminal_exact
-    assert not evidence.post_only_witness_used
+    assert not evidence.terminal_lifecycle_exact
+    assert not evidence.submitted_intent_fallback_used
+    assert evidence.post_only_assurance == "UNPROVEN"
 
 
 def test_order_fill_fact_survives_later_trade_history_failure() -> None:

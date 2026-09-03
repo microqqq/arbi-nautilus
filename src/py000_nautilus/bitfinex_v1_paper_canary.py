@@ -66,6 +66,11 @@ MIN_QUANTITY = Decimal("2")
 PRICE_INCREMENT = Decimal("0.1")
 MAX_QUOTE_AGE_NS = 1_000_000_000
 type Outcome = Literal["READY", "HOLD", "PASSED", "FAILED", "UNKNOWN", "FILLED_HOLD"]
+type PostOnlyAssurance = Literal[
+    "VENUE_FLAG_OBSERVED",
+    "SUBMITTED_INTENT_ONLY",
+    "UNPROVEN",
+]
 type Record = dict[str, object]
 
 
@@ -144,9 +149,10 @@ class OwnedOrderEvidence:
     fill_indicated: bool
     complete: bool
     error: str | None
-    terminal_exact: bool
+    terminal_lifecycle_exact: bool
     historical_flags: tuple[int, ...] = ()
-    post_only_witness_used: bool = False
+    submitted_intent_fallback_used: bool = False
+    post_only_assurance: PostOnlyAssurance = "UNPROVEN"
 
     def record(self) -> Record:
         return {
@@ -157,9 +163,10 @@ class OwnedOrderEvidence:
             "fill_indicated": self.fill_indicated,
             "complete": self.complete,
             "error": self.error,
-            "terminal_exact": self.terminal_exact,
+            "terminal_lifecycle_exact": self.terminal_lifecycle_exact,
             "historical_flags": list(self.historical_flags),
-            "post_only_witness_used": self.post_only_witness_used,
+            "submitted_intent_fallback_used": self.submitted_intent_fallback_used,
+            "post_only_assurance": self.post_only_assurance,
         }
 
 
@@ -188,7 +195,7 @@ class PaperCanaryStrategy(Strategy):
         )
         self.reason = "not_started"
         self.venue_order_id: VenueOrderId | None = None
-        self.post_only_acceptance_venue_order_id: VenueOrderId | None = None
+        self.same_run_ownership_venue_order_id: VenueOrderId | None = None
         self.filled = Decimal()
 
     @property
@@ -261,7 +268,7 @@ class PaperCanaryStrategy(Strategy):
             and self._order.time_in_force == TimeInForce.GTC
             and cast(bool, self._order.is_post_only)
         ):
-            self.post_only_acceptance_venue_order_id = event.venue_order_id
+            self.same_run_ownership_venue_order_id = event.venue_order_id
         self._cancel_sent = True
         self.reason = "cancel_sent"
         try:
@@ -406,7 +413,8 @@ async def read_owned_evidence(
     venue_order_id: int | None,
     price: Decimal,
     start_ms: int,
-    post_only_witness_venue_order_id: int | None = None,
+    same_run_ownership_venue_order_id: int | None = None,
+    post_only_intent_submitted: bool = False,
 ) -> OwnedOrderEvidence:
     active = parse_private_message(
         [0, "os", _rows(await rest.active_orders_by_symbol(PAPER_RAW_SYMBOL), "active orders")]
@@ -453,21 +461,22 @@ async def read_owned_evidence(
             error=f"trade_history_{type(exc).__name__}",
         )
     exact = len(historical) == 1
-    zero_flag_witness = False
+    zero_flag_ownership_witness = False
+    post_only_assurance: PostOnlyAssurance = "UNPROVEN"
     if exact:
         order = historical[0]
-        post_only_exact = order.flags == POST_ONLY_FLAG
+        post_only_exact = post_only_intent_submitted and order.flags == POST_ONLY_FLAG
         if (
             order.flags == 0
-            and post_only_witness_venue_order_id is not None
-            and post_only_witness_venue_order_id == venue_order_id
-            and order.venue_order_id == post_only_witness_venue_order_id
+            and post_only_intent_submitted
+            and same_run_ownership_venue_order_id is not None
+            and same_run_ownership_venue_order_id == venue_order_id
+            and order.venue_order_id == same_run_ownership_venue_order_id
         ):
-            # Observed paper history may clear terminal order flags. Zero is
-            # accepted only when this same run already witnessed the exact venue
-            # order accepted through the strict adapter path.
+            # Paper order events and REST rows may omit the submitted flag. The
+            # same-run acceptance proves identity, not venue-enforced post-only.
             post_only_exact = True
-            zero_flag_witness = True
+            zero_flag_ownership_witness = True
         exact = (
             venue_order_id is not None
             and order.venue_order_id == venue_order_id
@@ -481,6 +490,12 @@ async def read_owned_evidence(
             and order.average_price == 0
             and order.status.upper().startswith("CANCELED")
         )
+        if exact:
+            post_only_assurance = (
+                "SUBMITTED_INTENT_ONLY"
+                if zero_flag_ownership_witness
+                else "VENUE_FLAG_OBSERVED"
+            )
     return OwnedOrderEvidence(
         active_venue_ids=tuple(order.venue_order_id for order in active_owned),
         historical_venue_ids=tuple(order.venue_order_id for order in historical),
@@ -489,9 +504,10 @@ async def read_owned_evidence(
         fill_indicated=any(_order_indicates_fill(order) for order in (*active_owned, *historical)),
         complete=True,
         error=None,
-        terminal_exact=exact,
+        terminal_lifecycle_exact=exact,
         historical_flags=tuple(order.flags for order in historical),
-        post_only_witness_used=exact and zero_flag_witness,
+        submitted_intent_fallback_used=exact and zero_flag_ownership_witness,
+        post_only_assurance=post_only_assurance,
     )
 
 
@@ -509,7 +525,7 @@ def _incomplete_owned_evidence(
         fill_indicated=any(_order_indicates_fill(order) for order in (*active, *historical)),
         complete=False,
         error=error,
-        terminal_exact=False,
+        terminal_lifecycle_exact=False,
         historical_flags=tuple(order.flags for order in historical),
     )
 
@@ -673,10 +689,13 @@ def run_paper_canary(
             "client_order_id": strategy.order.client_order_id.value if strategy.order else None,
             "cid": binding.cid if binding else None,
             "venue_order_id": strategy.venue_order_id.value if strategy.venue_order_id else None,
-            "post_only_acceptance_venue_order_id": (
-                strategy.post_only_acceptance_venue_order_id.value
-                if strategy.post_only_acceptance_venue_order_id
+            "same_run_ownership_venue_order_id": (
+                strategy.same_run_ownership_venue_order_id.value
+                if strategy.same_run_ownership_venue_order_id
                 else None
+            ),
+            "post_only_intent_submitted": bool(
+                strategy.order is not None and strategy.order.is_post_only
             ),
             "filled": format(strategy.filled, "f"), "reconciled": reconciled,
         })
@@ -707,7 +726,7 @@ def run_paper_canary(
             or not evidence.complete
             or evidence.active_venue_ids
             or evidence.trade_ids
-            or not evidence.terminal_exact
+            or not evidence.terminal_lifecycle_exact
         ):
             return finish("UNKNOWN", "final_reconciliation_is_not_clean")
         return finish("PASSED", "one_order_canary_reconciled")
@@ -884,16 +903,17 @@ def _post_mutation_evidence(
     evidence = None
     if cid is not None and strategy.order is not None:
         venue_id = int(strategy.venue_order_id.value) if strategy.venue_order_id else None
-        post_only_witness_id = None
-        if (
+        post_only_intent_submitted = (
             strategy.order.order_type == OrderType.LIMIT
             and strategy.order.time_in_force == TimeInForce.GTC
             and cast(bool, strategy.order.is_post_only)
-            and strategy.post_only_acceptance_venue_order_id is not None
-        ):
-            post_only_witness_id = int(
-                strategy.post_only_acceptance_venue_order_id.value
-            )
+        )
+        ownership_venue_id = (
+            int(strategy.same_run_ownership_venue_order_id.value)
+            if post_only_intent_submitted
+            and strategy.same_run_ownership_venue_order_id is not None
+            else None
+        )
         try:
             evidence = loop.run_until_complete(
                 read_owned_evidence(
@@ -902,7 +922,8 @@ def _post_mutation_evidence(
                     venue_order_id=venue_id,
                     price=strategy.order.price.as_decimal(),
                     start_ms=max(0, started_ms - 1_000),
-                    post_only_witness_venue_order_id=post_only_witness_id,
+                    same_run_ownership_venue_order_id=ownership_venue_id,
+                    post_only_intent_submitted=post_only_intent_submitted,
                 )
             )
             _write(transcript, {"kind": "owned_order_evidence", **evidence.record()})
