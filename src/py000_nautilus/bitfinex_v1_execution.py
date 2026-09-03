@@ -1346,6 +1346,11 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
     async def _order_history_rows(self, start_ms: int, end_ms: int) -> list[object]:
         pending = [(start_ms, end_ms)]
         result: list[object] = []
+        timestamp_axes = {
+            4: "order creation timestamp",
+            5: "order update timestamp",
+        }
+        candidate_axes = set(timestamp_axes)
         while pending:
             window_start, window_end = pending.pop()
             page = _rows(
@@ -1357,12 +1362,19 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
                 ),
                 "order history",
             )
-            for row in page:
-                created_ms = _row_int(row, 4, "order creation timestamp")
-                if not window_start <= created_ms <= window_end:
-                    raise BitfinexV1ExecutionError(
-                        "Bitfinex order history escaped its requested window"
-                    )
+            page_axes = {
+                index
+                for index in candidate_axes
+                if all(
+                    window_start <= _row_int(row, index, timestamp_axes[index]) <= window_end
+                    for row in page
+                )
+            }
+            candidate_axes.intersection_update(page_axes)
+            if not candidate_axes:
+                raise BitfinexV1ExecutionError(
+                    "Bitfinex order history has no consistent requested-window timestamp"
+                )
             if len(page) < _REPORT_PAGE_LIMIT:
                 result.extend(page)
                 continue

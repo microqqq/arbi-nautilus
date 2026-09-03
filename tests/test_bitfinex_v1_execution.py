@@ -1517,9 +1517,10 @@ def test_order_history_bisects_full_pages_and_fails_on_one_ms_saturation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class HistoryRest(_FakeRest):
-        def __init__(self, rows: list[object]) -> None:
+        def __init__(self, rows: list[object], *, timestamp_index: int) -> None:
             super().__init__()
             self.rows = rows
+            self.timestamp_index = timestamp_index
             self.calls = 0
 
         async def order_history_by_symbol(
@@ -1535,26 +1536,100 @@ def test_order_history_bisects_full_pages_and_fails_on_one_ms_saturation(
             return [
                 row
                 for row in self.rows
-                if start <= cast(int, cast(list[object], row)[4]) <= end
+                if start
+                <= cast(int, cast(list[object], row)[self.timestamp_index])
+                <= end
             ][:limit]
 
     async def scenario() -> None:
         monkeypatch.setattr(execution_module, "_REPORT_PAGE_LIMIT", 2)
         now_ms = TestComponentStubs.clock().timestamp_ns() // 1_000_000
-        complete = HistoryRest(
-            [[1, None, None, None, now_ms - 9], [2, None, None, None, now_ms - 1]]
+        by_creation = HistoryRest(
+            [
+                [1, None, None, None, now_ms - 9, now_ms + 10],
+                [2, None, None, None, now_ms - 1, now_ms + 10],
+            ],
+            timestamp_index=4,
         )
-        harness = _Harness(rest=complete)
+        harness = _Harness(rest=by_creation)
         rows = await harness.client._order_history_rows(now_ms - 10, now_ms)
-        assert rows == complete.rows
-        assert complete.calls > 1
+        assert rows == by_creation.rows
+        assert by_creation.calls > 1
+
+        by_update = HistoryRest(
+            [
+                [1, None, None, None, now_ms - 100, now_ms - 9],
+                [2, None, None, None, now_ms - 100, now_ms - 1],
+            ],
+            timestamp_index=5,
+        )
+        harness = _Harness(rest=by_update)
+        rows = await harness.client._order_history_rows(now_ms - 10, now_ms)
+        assert rows == by_update.rows
+        assert by_update.calls > 1
 
         saturated = HistoryRest(
-            [[1, None, None, None, now_ms], [2, None, None, None, now_ms]]
+            [
+                [1, None, None, None, now_ms, now_ms],
+                [2, None, None, None, now_ms, now_ms],
+            ],
+            timestamp_index=5,
         )
         harness = _Harness(rest=saturated)
         with pytest.raises(BitfinexV1ExecutionError, match="one-millisecond"):
             await harness.client._order_history_rows(now_ms - 10, now_ms)
+
+    asyncio.run(scenario())
+
+
+def test_order_history_requires_one_consistent_timestamp_axis(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ScriptedHistoryRest(_FakeRest):
+        def __init__(self, pages: list[list[object]]) -> None:
+            super().__init__()
+            self.pages = pages
+
+        async def order_history_by_symbol(
+            self,
+            symbol: str,
+            *,
+            start: int | None = None,
+            end: int | None = None,
+            limit: int = 2,
+        ) -> object:
+            assert symbol == RAW_SYMBOL and start is not None and end is not None
+            assert limit == 2
+            return self.pages.pop(0)
+
+    async def scenario() -> None:
+        monkeypatch.setattr(execution_module, "_REPORT_PAGE_LIMIT", 2)
+        now_ms = TestComponentStubs.clock().timestamp_ns() // 1_000_000
+        lower, upper = now_ms - 10, now_ms
+        both_in_whole_window: list[object] = [
+            [1, None, None, None, lower + 1, lower + 2],
+            [2, None, None, None, upper - 2, upper - 1],
+        ]
+        creation_only_in_lower: list[object] = [
+            [3, None, None, None, lower + 1, upper - 1]
+        ]
+        update_only_in_upper: list[object] = [
+            [4, None, None, None, lower + 1, upper - 1]
+        ]
+        rest = ScriptedHistoryRest(
+            [both_in_whole_window, creation_only_in_lower, update_only_in_upper]
+        )
+        harness = _Harness(rest=rest)
+
+        with pytest.raises(BitfinexV1ExecutionError, match="no consistent"):
+            await harness.client._order_history_rows(lower, upper)
+
+        outside = ScriptedHistoryRest(
+            [[[5, None, None, None, lower - 2, upper + 2]]]
+        )
+        harness = _Harness(rest=outside)
+        with pytest.raises(BitfinexV1ExecutionError, match="no consistent"):
+            await harness.client._order_history_rows(lower, upper)
 
     asyncio.run(scenario())
 
