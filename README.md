@@ -125,7 +125,10 @@ uv run py000-bitfinex-paper-canary --output /new/path/bitfinex-preflight.jsonl
 Mutation requires `--execute`, an unused CID-state path, a clean target symbol, sufficient
 `TESTUSDTF0` balance for 1x, current CRC-backed data, connected data/execution clients, and
 successful Nautilus startup reconciliation. The final account snapshot completes before the
-paper-book subscription starts, so the next CRC can be checked and used immediately. It then
+paper-book subscription starts. Because Bitfinex emits a checksum on a book iteration rather
+than immediately after an otherwise idle initial snapshot, the first CRC-backed quote has its
+own bounded 60-second wait; connection, REST, reconciliation, and mutation operations retain
+their separate 10-second default. It then
 submits exactly one `BUY 2` post-only
 `LIMIT/GTC` at 5% below the current bid and sends one native-ID cancel immediately after the
 acceptance event. It never changes the quantity, side, or leverage; never retries a mutation;

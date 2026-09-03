@@ -65,6 +65,7 @@ CLIENT_ID = ClientId(CLIENT_NAME)
 MIN_QUANTITY = Decimal("2")
 PRICE_INCREMENT = Decimal("0.1")
 MAX_QUOTE_AGE_NS = 1_000_000_000
+DEFAULT_FIRST_CHECKSUM_TIMEOUT = 60.0
 type Outcome = Literal["READY", "HOLD", "PASSED", "FAILED", "UNKNOWN", "FILLED_HOLD"]
 type PostOnlyAssurance = Literal[
     "VENUE_FLAG_OBSERVED",
@@ -603,10 +604,13 @@ def run_paper_canary(
     execute: bool,
     expected_user_id: int | None = None,
     timeout: float = 10.0,
+    quote_timeout: float = DEFAULT_FIRST_CHECKSUM_TIMEOUT,
 ) -> PaperCanaryResult:
     """Default to REST-only preflight; ``execute`` grants exactly one submit and cancel."""
     if not key or not secret or not 1 <= timeout <= 60:
         raise ValueError("credentials and timeout in [1, 60] are required")
+    if not 1 <= quote_timeout <= 60:
+        raise ValueError("quote_timeout in [1, 60] is required")
     if execute and (type(expected_user_id) is not int or expected_user_id <= 0):
         raise ValueError("execute requires a positive expected_user_id")
     transcript = _new_transcript(output)
@@ -649,6 +653,7 @@ def run_paper_canary(
         _write(transcript, {
             "kind": "started", "execute": execute, "symbol": PAPER_RAW_SYMBOL,
             "quantity": "2", "leverage": 1, "expected_user_id": expected_user_id,
+            "quote_timeout_seconds": quote_timeout,
             "ts_utc_ns": time.time_ns(),
         })
         if execute:
@@ -672,7 +677,14 @@ def run_paper_canary(
             key, secret, expected_user_id, cid_path, loop, timeout
         )
         second, reconciled = loop.run_until_complete(
-            _execute(node, strategy, rest, expected_user_id, timeout)
+            _execute(
+                node,
+                strategy,
+                rest,
+                expected_user_id,
+                timeout,
+                quote_timeout=quote_timeout,
+            )
         )
         _write(transcript, {"kind": "preflight", "phase": 2, **second.record()})
         if second.holds:
@@ -788,6 +800,8 @@ async def _execute(
     rest: _Rest,
     user_id: int,
     timeout: float,
+    *,
+    quote_timeout: float = DEFAULT_FIRST_CHECKSUM_TIMEOUT,
 ) -> tuple[PaperSnapshot, bool]:
     run_task = asyncio.create_task(node.run_async())
     try:
@@ -798,6 +812,7 @@ async def _execute(
             rest,
             user_id,
             timeout,
+            quote_timeout=quote_timeout,
         )
         if second.holds:
             return second, False
@@ -835,8 +850,9 @@ async def _await_pre_arm_snapshot(
     rest: _Rest,
     user_id: int,
     timeout: float,
+    *,
+    quote_timeout: float = DEFAULT_FIRST_CHECKSUM_TIMEOUT,
 ) -> PaperSnapshot:
-    deadline = asyncio.get_running_loop().time() + timeout
     if not _paper_node_connected(node):
         raise PaperCanaryError("Nautilus clients disconnected before arming")
     try:
@@ -850,10 +866,7 @@ async def _await_pre_arm_snapshot(
     if not _paper_node_connected(node):
         raise PaperCanaryError("Nautilus clients disconnected before arming")
     strategy.start_quote_subscription()
-    remaining = deadline - asyncio.get_running_loop().time()
-    if remaining <= 0:
-        raise PaperCanaryError("paper pre-arm checks timed out")
-    await _await_actionable_quote(strategy, remaining)
+    await _await_actionable_quote(strategy, quote_timeout)
     if not _paper_node_connected(node):
         raise PaperCanaryError("Nautilus clients disconnected before arming")
     strategy.planned_price()
@@ -1093,7 +1106,18 @@ def main() -> int:
     parser.add_argument("--cid-store", type=Path, default=Path("bitfinex-paper-cids.state.json"))
     parser.add_argument("--expected-user-id", type=int)
     parser.add_argument("--execute", action="store_true", help="allow one submit and one cancel")
-    parser.add_argument("--timeout", type=float, default=10.0)
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=10.0,
+        help="connection, REST, reconciliation, and mutation timeout",
+    )
+    parser.add_argument(
+        "--quote-timeout",
+        type=float,
+        default=DEFAULT_FIRST_CHECKSUM_TIMEOUT,
+        help="independent wait for the paper book's first CRC-backed quote",
+    )
     args = parser.parse_args()
     try:
         key, secret, env_user_id = credentials(args.env_file)
@@ -1103,6 +1127,7 @@ def main() -> int:
         result = run_paper_canary(
             key, secret, args.output, args.cid_store, execute=args.execute,
             expected_user_id=expected_user_id, timeout=args.timeout,
+            quote_timeout=args.quote_timeout,
         )
     except Exception as exc:
         print(json.dumps({"outcome": "FAILED", "reason": type(exc).__name__}), file=sys.stderr)

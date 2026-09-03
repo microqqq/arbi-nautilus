@@ -671,6 +671,9 @@ def _run_orchestrated(
     evidence: canary.OwnedOrderEvidence | None = None,
     execute_error: Exception | None = None,
     dispose_error: Exception | None = None,
+    operation_timeout: float = 10.0,
+    quote_timeout: float = canary.DEFAULT_FIRST_CHECKSUM_TIMEOUT,
+    observed_timeouts: dict[str, object] | None = None,
 ) -> tuple[canary.PaperCanaryResult, int]:
     rest = _Rest()
     strategy = strategy or _submitted_strategy()
@@ -678,7 +681,13 @@ def _run_orchestrated(
     evidence = evidence or _evidence()
     recovery_calls = 0
 
-    async def execute(*_args: object) -> tuple[canary.PaperSnapshot, bool]:
+    async def execute(
+        *_args: object,
+        **kwargs: object,
+    ) -> tuple[canary.PaperSnapshot, bool]:
+        if observed_timeouts is not None:
+            observed_timeouts["execute_operation"] = _args[-1]
+            observed_timeouts["execute_quote"] = kwargs["quote_timeout"]
         if execute_error is not None:
             raise execute_error
         return _snapshot(), reconciled
@@ -696,8 +705,18 @@ def _run_orchestrated(
         def binding_for_client(self, _client_order_id: str) -> object:
             return SimpleNamespace(cid=456)
 
-    monkeypatch.setattr(canary, "BitfinexV1RestClient", lambda **_: rest)
-    monkeypatch.setattr(canary, "build_paper_node", lambda *_args: (object(), strategy))
+    def rest_client(**kwargs: object) -> _Rest:
+        if observed_timeouts is not None:
+            observed_timeouts["rest"] = kwargs["timeout_secs"]
+        return rest
+
+    def build_paper_node(*args: object) -> tuple[object, PaperCanaryStrategy]:
+        if observed_timeouts is not None:
+            observed_timeouts["build"] = args[-1]
+        return object(), strategy
+
+    monkeypatch.setattr(canary, "BitfinexV1RestClient", rest_client)
+    monkeypatch.setattr(canary, "build_paper_node", build_paper_node)
     monkeypatch.setattr(canary, "BitfinexV1CidStore", Store)
     monkeypatch.setattr(canary, "_execute", execute)
     monkeypatch.setattr(canary, "_post_mutation_evidence", post_evidence)
@@ -713,8 +732,35 @@ def _run_orchestrated(
         tmp_path / "runner.state.json",
         execute=True,
         expected_user_id=269_312,
+        timeout=operation_timeout,
+        quote_timeout=quote_timeout,
     )
     return result, recovery_calls
+
+
+def test_runner_routes_quote_timeout_without_widening_other_operations(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, object] = {}
+
+    result, _ = _run_orchestrated(
+        tmp_path,
+        monkeypatch,
+        operation_timeout=7.0,
+        quote_timeout=47.0,
+        observed_timeouts=observed,
+    )
+
+    assert result.outcome == "PASSED"
+    assert observed == {
+        "rest": 7,
+        "build": 7.0,
+        "execute_operation": 7.0,
+        "execute_quote": 47.0,
+    }
+    started = json.loads((tmp_path / "runner.jsonl").read_text().splitlines()[0])
+    assert started["quote_timeout_seconds"] == 47.0
 
 
 @pytest.mark.parametrize(
@@ -975,6 +1021,41 @@ def test_actionable_quote_wait_is_bounded() -> None:
         )
         with pytest.raises(PaperCanaryError, match="fresh CRC-backed quote"):
             await canary._await_actionable_quote(cast(Any, strategy), 0.01)
+
+    asyncio.run(scenario())
+
+
+def test_pre_arm_quote_wait_uses_an_independent_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        connected = SimpleNamespace(check_connected=lambda: True)
+        node = SimpleNamespace(
+            is_running=lambda: True,
+            kernel=SimpleNamespace(data_engine=connected, exec_engine=connected),
+        )
+        waits: list[float] = []
+
+        async def await_quote(_strategy: object, timeout: float) -> None:
+            waits.append(timeout)
+
+        monkeypatch.setattr(canary, "_await_actionable_quote", await_quote)
+        strategy = SimpleNamespace(
+            start_quote_subscription=lambda: None,
+            planned_price=lambda: Decimal("4370"),
+        )
+
+        snapshot = await canary._await_pre_arm_snapshot(
+            cast(Any, node),
+            cast(Any, strategy),
+            _Rest(),
+            269_312,
+            1.0,
+            quote_timeout=47.0,
+        )
+
+        assert snapshot.holds == ()
+        assert waits == [47.0]
 
     asyncio.run(scenario())
 
