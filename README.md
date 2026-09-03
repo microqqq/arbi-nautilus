@@ -114,6 +114,24 @@ absent. Nautilus's default startup reconciliation must remain enabled. Paper and
 must use separate account IDs, CID/state paths, and caches; the shared canonical instrument
 ID means the two profiles must never run concurrently in one node.
 
+`py000-bitfinex-paper-canary` is the one bounded exception used to exercise this adapter.
+It reads `BFX_TEST_API_KEY`, `BFX_TEST_API_SECRET`, and `BFX_TEST_USER_ID` from the process
+environment or `.env`. Without `--execute` it performs authenticated REST preflight only:
+
+```bash
+uv run py000-bitfinex-paper-canary --output /new/path/bitfinex-preflight.jsonl
+```
+
+Mutation requires `--execute`, an unused CID-state path, a clean target symbol, sufficient
+`TESTUSDTF0` balance for 1x, current CRC-backed data, connected data/execution clients, and
+successful Nautilus startup reconciliation. It then submits exactly one `BUY 2` post-only
+`LIMIT/GTC` at 5% below the current bid and sends one native-ID cancel immediately after the
+acceptance event. It never changes the quantity, side, or leverage; never retries a mutation;
+and never uses cancel-all or touches MT5. `PASSED` additionally requires exact canceled-order
+history for that CID and venue ID, no matching trade, a flat final position, no active order,
+and final Nautilus reconciliation. `UNKNOWN` retains the CID transcript for manual inspection;
+the existing CID state prevents an automatic rerun.
+
 `InstrumentStatus` is only a REP-backed market-session observation. It is not
 hedge readiness and must not open source-risk admission without a separately
 connected, authenticated execution client and matching account/terminal/MQL authority.

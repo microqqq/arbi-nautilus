@@ -208,7 +208,7 @@ def _decode_response(response: _HttpResponse, api_path: str) -> JsonValue:
             parse_constant=_reject_json_constant,
             object_pairs_hook=_unique_json_object,
         )
-        if not isinstance(decoded, (list, dict)):
+        if not isinstance(decoded, list | dict):
             raise ValueError
         return _json_value(decoded)
     except (UnicodeDecodeError, ValueError, TypeError, OverflowError):
@@ -229,7 +229,7 @@ def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 
 
 def _json_value(value: object) -> JsonValue:
-    if value is None or isinstance(value, (bool, int, str)):
+    if value is None or isinstance(value, bool | int | str):
         return value
     if isinstance(value, Decimal):
         if not value.is_finite():

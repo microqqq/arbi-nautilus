@@ -25,6 +25,7 @@ dev = [
 py000-sim = "py000_nautilus.app:main"
 py000-maker-sim = "py000_nautilus.app:maker_main"
 py000-mt5-shadow = "py000_nautilus.mt5_v1_observe:main"
+py000-bitfinex-paper-canary = "py000_nautilus.bitfinex_v1_paper_canary:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/py000_nautilus"]
