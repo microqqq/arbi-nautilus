@@ -133,6 +133,9 @@ and never uses cancel-all or touches MT5. `PASSED` additionally requires exact c
 history for that CID and venue ID, no matching trade, a flat final position, no active order,
 and final Nautilus reconciliation. `UNKNOWN` retains the CID transcript for manual inspection;
 the existing CID state prevents an automatic rerun.
+Paper history has been observed clearing a canceled post-only order's terminal flag to zero;
+that form is accepted only when the same run's strictly validated acceptance names the exact
+venue order ID, and the transcript records both the historical flag and witness use.
 
 `InstrumentStatus` is only a REP-backed market-session observation. It is not
 hedge readiness and must not open source-risk admission without a separately

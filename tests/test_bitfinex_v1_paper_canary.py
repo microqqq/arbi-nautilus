@@ -110,6 +110,7 @@ def _order_row(
     status: str = "ACTIVE",
     remaining: str = "2",
     average: str = "0",
+    flags: int = POST_ONLY_FLAG,
 ) -> list[object]:
     return [
         123,
@@ -124,7 +125,7 @@ def _order_row(
         None,
         None,
         None,
-        POST_ONLY_FLAG,
+        flags,
         status,
         None,
         None,
@@ -264,6 +265,41 @@ def test_owned_evidence_requires_exact_cancel_and_no_active_order_or_trade() -> 
     assert not missing.terminal_exact
 
 
+@pytest.mark.parametrize(
+    ("flags", "witness_venue_order_id", "terminal_exact", "witness_used"),
+    [
+        (POST_ONLY_FLAG, None, True, False),
+        (0, None, False, False),
+        (0, 123, True, True),
+        (0, 124, False, False),
+        (POST_ONLY_FLAG * 2, 123, False, False),
+    ],
+)
+def test_terminal_zero_flags_require_same_run_post_only_acceptance_witness(
+    flags: int,
+    witness_venue_order_id: int | None,
+    terminal_exact: bool,
+    witness_used: bool,
+) -> None:
+    rest = _Rest()
+    rest.history = [_order_row(status="CANCELED", flags=flags)]
+
+    evidence = asyncio.run(
+        read_owned_evidence(
+            rest,
+            cid=456,
+            venue_order_id=123,
+            price=Decimal("4370.0"),
+            start_ms=0,
+            post_only_witness_venue_order_id=witness_venue_order_id,
+        )
+    )
+
+    assert evidence.terminal_exact is terminal_exact
+    assert evidence.post_only_witness_used is witness_used
+    assert evidence.historical_flags == (flags,)
+
+
 def test_credentials_load_only_named_values_and_environment_wins(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -350,11 +386,40 @@ def test_strategy_submits_one_fixed_passive_order_and_cancels_on_acceptance() ->
         assert order.time_in_force == TimeInForce.GTC
         assert order.is_post_only
         assert strategy.outcome == "CANCELED"
+        assert strategy.post_only_acceptance_venue_order_id is not None
         assert strategy.filled == 0
         with pytest.raises(PaperCanaryError, match="only once"):
             strategy.arm(Decimal("100000"))
     finally:
         engine.dispose()
+
+
+def test_plain_limit_acceptance_does_not_create_a_post_only_witness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    strategy = _submitted_strategy(post_only=False)
+    order = strategy.order
+    assert order is not None
+    harness = cast(Any, strategy)
+    harness._cancel_sent = False
+    strategy.venue_order_id = None
+    sent: list[object] = []
+    monkeypatch.setattr(
+        strategy,
+        "cancel_order",
+        lambda *args, **kwargs: sent.append((args, kwargs)),
+    )
+
+    strategy.on_order_accepted(
+        TestEventStubs.order_accepted(
+            order,
+            venue_order_id=VenueOrderId("123"),
+        )
+    )
+
+    assert strategy.venue_order_id == VenueOrderId("123")
+    assert strategy.post_only_acceptance_venue_order_id is None
+    assert len(sent) == 1
 
 
 def test_strategy_refuses_to_raise_leverage_when_1x_balance_is_insufficient() -> None:
@@ -553,6 +618,7 @@ def _submitted_strategy(
     outcome: str = "CANCELED",
     *,
     filled: str = "0",
+    post_only: bool = True,
 ) -> PaperCanaryStrategy:
     instrument = instrument_from_config(paper_data_config(), ts_init=0)
     strategy = PaperCanaryStrategy(PaperCanaryStrategyConfig())
@@ -561,11 +627,15 @@ def _submitted_strategy(
         order_side=OrderSide.BUY,
         quantity=instrument.make_qty(2),
         price=instrument.make_price(4370),
+        time_in_force=TimeInForce.GTC,
+        post_only=post_only,
     )
     harness = cast(Any, strategy)
     harness._order = order
     harness._cancel_sent = True
     strategy.venue_order_id = VenueOrderId("123")
+    if post_only:
+        strategy.post_only_acceptance_venue_order_id = VenueOrderId("123")
     strategy.outcome = cast(Any, outcome)
     strategy.reason = "strategy_terminal"
     strategy.filled = Decimal(filled)
@@ -762,6 +832,56 @@ def test_post_evidence_keeps_final_snapshot_when_history_read_fails() -> None:
     assert evidence.fill_indicated
     assert not evidence.complete
     assert evidence.error == "order_history_ConnectionError"
+
+
+def test_post_evidence_carries_the_same_run_acceptance_witness() -> None:
+    rest = _Rest()
+    rest.history = [_order_row(status="CANCELED", flags=0)]
+    transcript = io.StringIO()
+    loop = asyncio.new_event_loop()
+    try:
+        final, evidence = canary._post_mutation_evidence(
+            loop,
+            rest,
+            _submitted_strategy(),
+            456,
+            0,
+            transcript,
+        )
+    finally:
+        loop.close()
+
+    assert not final.holds
+    assert evidence is not None
+    assert evidence.terminal_exact
+    assert evidence.post_only_witness_used
+    record = json.loads(transcript.getvalue().splitlines()[-1])
+    assert record["historical_flags"] == [0]
+    assert record["post_only_witness_used"] is True
+
+
+def test_post_evidence_rejects_zero_flags_for_a_plain_limit_order() -> None:
+    rest = _Rest()
+    rest.history = [_order_row(status="CANCELED", flags=0)]
+    strategy = _submitted_strategy(post_only=False)
+    strategy.post_only_acceptance_venue_order_id = VenueOrderId("123")
+    transcript = io.StringIO()
+    loop = asyncio.new_event_loop()
+    try:
+        _, evidence = canary._post_mutation_evidence(
+            loop,
+            rest,
+            strategy,
+            456,
+            0,
+            transcript,
+        )
+    finally:
+        loop.close()
+
+    assert evidence is not None
+    assert not evidence.terminal_exact
+    assert not evidence.post_only_witness_used
 
 
 def test_order_fill_fact_survives_later_trade_history_failure() -> None:

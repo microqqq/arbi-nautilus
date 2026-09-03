@@ -20,7 +20,7 @@ from nautilus_trader.config import RoutingConfig, TradingNodeConfig
 from nautilus_trader.live.config import LiveExecEngineConfig
 from nautilus_trader.live.node import TradingNode
 from nautilus_trader.model.data import QuoteTick
-from nautilus_trader.model.enums import OrderSide, TimeInForce
+from nautilus_trader.model.enums import OrderSide, OrderType, TimeInForce
 from nautilus_trader.model.events import (
     OrderAccepted,
     OrderCanceled,
@@ -145,6 +145,8 @@ class OwnedOrderEvidence:
     complete: bool
     error: str | None
     terminal_exact: bool
+    historical_flags: tuple[int, ...] = ()
+    post_only_witness_used: bool = False
 
     def record(self) -> Record:
         return {
@@ -156,6 +158,8 @@ class OwnedOrderEvidence:
             "complete": self.complete,
             "error": self.error,
             "terminal_exact": self.terminal_exact,
+            "historical_flags": list(self.historical_flags),
+            "post_only_witness_used": self.post_only_witness_used,
         }
 
 
@@ -184,6 +188,7 @@ class PaperCanaryStrategy(Strategy):
         )
         self.reason = "not_started"
         self.venue_order_id: VenueOrderId | None = None
+        self.post_only_acceptance_venue_order_id: VenueOrderId | None = None
         self.filled = Decimal()
 
     @property
@@ -251,6 +256,12 @@ class PaperCanaryStrategy(Strategy):
             self._finish("UNKNOWN", "duplicate_or_unbound_acceptance")
             return
         self.venue_order_id = event.venue_order_id
+        if (
+            self._order.order_type == OrderType.LIMIT
+            and self._order.time_in_force == TimeInForce.GTC
+            and cast(bool, self._order.is_post_only)
+        ):
+            self.post_only_acceptance_venue_order_id = event.venue_order_id
         self._cancel_sent = True
         self.reason = "cancel_sent"
         try:
@@ -395,6 +406,7 @@ async def read_owned_evidence(
     venue_order_id: int | None,
     price: Decimal,
     start_ms: int,
+    post_only_witness_venue_order_id: int | None = None,
 ) -> OwnedOrderEvidence:
     active = parse_private_message(
         [0, "os", _rows(await rest.active_orders_by_symbol(PAPER_RAW_SYMBOL), "active orders")]
@@ -441,15 +453,28 @@ async def read_owned_evidence(
             error=f"trade_history_{type(exc).__name__}",
         )
     exact = len(historical) == 1
+    zero_flag_witness = False
     if exact:
         order = historical[0]
+        post_only_exact = order.flags == POST_ONLY_FLAG
+        if (
+            order.flags == 0
+            and post_only_witness_venue_order_id is not None
+            and post_only_witness_venue_order_id == venue_order_id
+            and order.venue_order_id == post_only_witness_venue_order_id
+        ):
+            # Observed paper history may clear terminal order flags. Zero is
+            # accepted only when this same run already witnessed the exact venue
+            # order accepted through the strict adapter path.
+            post_only_exact = True
+            zero_flag_witness = True
         exact = (
             venue_order_id is not None
             and order.venue_order_id == venue_order_id
             and order.symbol == PAPER_RAW_SYMBOL
             and order.order_type == "LIMIT"
             and order.tif_expiry_ms is None
-            and order.flags == POST_ONLY_FLAG
+            and post_only_exact
             and order.original_qty == MIN_QUANTITY
             and order.remaining_qty == MIN_QUANTITY
             and order.price == price
@@ -465,6 +490,8 @@ async def read_owned_evidence(
         complete=True,
         error=None,
         terminal_exact=exact,
+        historical_flags=tuple(order.flags for order in historical),
+        post_only_witness_used=exact and zero_flag_witness,
     )
 
 
@@ -483,6 +510,7 @@ def _incomplete_owned_evidence(
         complete=False,
         error=error,
         terminal_exact=False,
+        historical_flags=tuple(order.flags for order in historical),
     )
 
 
@@ -645,6 +673,11 @@ def run_paper_canary(
             "client_order_id": strategy.order.client_order_id.value if strategy.order else None,
             "cid": binding.cid if binding else None,
             "venue_order_id": strategy.venue_order_id.value if strategy.venue_order_id else None,
+            "post_only_acceptance_venue_order_id": (
+                strategy.post_only_acceptance_venue_order_id.value
+                if strategy.post_only_acceptance_venue_order_id
+                else None
+            ),
             "filled": format(strategy.filled, "f"), "reconciled": reconciled,
         })
         if strategy.submitted:
@@ -851,6 +884,16 @@ def _post_mutation_evidence(
     evidence = None
     if cid is not None and strategy.order is not None:
         venue_id = int(strategy.venue_order_id.value) if strategy.venue_order_id else None
+        post_only_witness_id = None
+        if (
+            strategy.order.order_type == OrderType.LIMIT
+            and strategy.order.time_in_force == TimeInForce.GTC
+            and cast(bool, strategy.order.is_post_only)
+            and strategy.post_only_acceptance_venue_order_id is not None
+        ):
+            post_only_witness_id = int(
+                strategy.post_only_acceptance_venue_order_id.value
+            )
         try:
             evidence = loop.run_until_complete(
                 read_owned_evidence(
@@ -859,6 +902,7 @@ def _post_mutation_evidence(
                     venue_order_id=venue_id,
                     price=strategy.order.price.as_decimal(),
                     start_ms=max(0, started_ms - 1_000),
+                    post_only_witness_venue_order_id=post_only_witness_id,
                 )
             )
             _write(transcript, {"kind": "owned_order_evidence", **evidence.record()})
