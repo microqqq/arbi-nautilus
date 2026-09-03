@@ -39,6 +39,7 @@ from nautilus_trader.model.enums import (
     LiquiditySide,
     OmsType,
     OrderSide,
+    OrderStatus,
     OrderType,
     TimeInForce,
 )
@@ -1258,6 +1259,20 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
             raise ValueError("client_order_id and venue_order_id cannot both be None")
         if command.instrument_id not in {None, self._bfx_config.instrument_id}:
             return None
+        pending_submit: _LiveOrder | None = None
+        if command.client_order_id is not None:
+            cid = self._cid_by_client.get(command.client_order_id)
+            candidate = self._by_cid.get(cid) if cid is not None else None
+            if (
+                candidate is not None
+                and (
+                    not candidate.accepted
+                    or candidate.order.status == OrderStatus.SUBMITTED
+                )
+                and candidate.terminal is None
+                and candidate.rejection_key is None
+            ):
+                pending_submit = candidate
         reports = await self._order_reports(start=None, end=None, open_only=False)
         for report in reports:
             if (
@@ -1270,8 +1285,58 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
                 and report.venue_order_id != command.venue_order_id
             ):
                 continue
+            if pending_submit is not None and not self._handle_pending_submit_report(
+                pending_submit,
+                report,
+            ):
+                return None
             return report
         return None
+
+    def _handle_pending_submit_report(
+        self,
+        live: _LiveOrder,
+        report: OrderStatusReport,
+    ) -> bool:
+        """Validate a targeted report, binding it or suppressing a private-stream race."""
+        if live.terminal is not None or live.rejection_key is not None:
+            return False
+        venue_text = report.venue_order_id.value
+        if not venue_text.isdigit() or int(venue_text) <= 0:
+            raise BitfinexV1ExecutionError("targeted Bitfinex venue order ID is invalid")
+        venue_order_id = int(venue_text)
+        if live.venue_order_id not in {None, venue_order_id}:
+            raise BitfinexV1ExecutionError("Bitfinex order changed venue ID")
+        existing_cid = self._cid_by_venue.get(venue_order_id)
+        if existing_cid not in {None, live.cid}:
+            raise BitfinexV1ExecutionError("Bitfinex venue order ID changed CID")
+        if live.accepted:
+            if live.venue_order_id is None:
+                raise BitfinexV1ExecutionError(
+                    "accepted Bitfinex order has no authoritative venue ID"
+                )
+            # A private-stream event arrived during the REST await and has already
+            # been queued for Nautilus. Suppress the report so strategies cannot
+            # observe the same order transition twice.
+            return False
+        self._validate_cached_open_report(live.order, report, [])
+        if report.price != live.order.price:
+            raise BitfinexV1ExecutionError(
+                "pending Bitfinex submit differs from targeted venue report: price"
+            )
+        if report.order_status not in {
+            OrderStatus.ACCEPTED,
+            OrderStatus.PARTIALLY_FILLED,
+        }:
+            return True
+
+        # The caller publishes the returned report to Nautilus. Keep that as the
+        # sole framework event while synchronizing the adapter before it can cancel.
+        live.venue_order_id = venue_order_id
+        self._cid_by_venue[venue_order_id] = live.cid
+        live.accepted = True
+        self._resolve_mutation(live, "submit")
+        return True
 
     async def generate_order_status_reports(
         self,

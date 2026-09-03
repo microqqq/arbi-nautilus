@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -15,9 +16,11 @@ from nautilus_trader.execution.engine import ExecutionEngine
 from nautilus_trader.execution.messages import (
     CancelOrder,
     GenerateFillReports,
+    GenerateOrderStatusReport,
     GenerateOrderStatusReports,
     GeneratePositionStatusReports,
     ModifyOrder,
+    QueryOrder,
     SubmitOrder,
 )
 from nautilus_trader.live.config import LiveExecEngineConfig
@@ -30,7 +33,7 @@ from nautilus_trader.model.enums import (
     PositionSide,
     TimeInForce,
 )
-from nautilus_trader.model.events import OrderEvent, OrderFilled
+from nautilus_trader.model.events import OrderAccepted, OrderEvent, OrderFilled
 from nautilus_trader.model.identifiers import (
     AccountId,
     ClientId,
@@ -619,6 +622,261 @@ def test_submit_ack_deadlines_do_not_block_concurrent_maker_sides() -> None:
             assert _types(harness)[-1] == "OrderDenied"
         finally:
             await harness.close()
+
+    asyncio.run(scenario())
+
+
+def test_targeted_rest_acceptance_binds_pending_submit_for_cancel() -> None:
+    async def scenario() -> None:
+        rest = _FakeRest()
+        harness = _Harness(rest=rest)
+        await harness.connect()
+        try:
+            order = harness.order()
+            cid = await harness.submit(order)
+            order.apply(
+                TestEventStubs.order_submitted(
+                    order,
+                    account_id=harness.client.account_id,
+                    ts_event=harness.clock.timestamp_ns(),
+                )
+            )
+            accepted = harness.order_frame("on", cid, order)
+            rest.active = [cast(list[object], accepted[2])]
+
+            report = await harness.client.generate_order_status_report(
+                GenerateOrderStatusReport(
+                    instrument_id=order.instrument_id,
+                    client_order_id=order.client_order_id,
+                    venue_order_id=None,
+                    command_id=UUID4(),
+                    ts_init=harness.clock.timestamp_ns(),
+                )
+            )
+
+            assert report is not None
+            assert report.order_status == OrderStatus.ACCEPTED
+            live = harness.client._by_cid[cid]
+            assert live.accepted
+            assert live.venue_order_id == VENUE_ORDER_ID
+            assert harness.client._cid_by_venue[VENUE_ORDER_ID] == cid
+            assert (cid, "submit") not in harness.client._ack_deadlines
+            assert harness.client.execution_hold_reason is None
+            assert "OrderAccepted" not in _types(harness)
+
+            harness.client._consume_private_frame(accepted)
+            assert "OrderAccepted" not in _types(harness)
+
+            await harness.cancel(order)
+            assert harness.fake.sent[-1] == [
+                0,
+                "oc",
+                None,
+                {"id": VENUE_ORDER_ID},
+            ]
+        finally:
+            await harness.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("row_updates", "mismatch"),
+    [
+        ({6: Decimal("5"), 7: Decimal("5")}, "quantity"),
+        ({12: 0}, "post_only"),
+        ({16: Decimal("3926.71")}, "price"),
+    ],
+)
+def test_targeted_rest_acceptance_rejects_submit_semantic_mismatch(
+    row_updates: dict[int, object],
+    mismatch: str,
+) -> None:
+    async def scenario() -> None:
+        rest = _FakeRest()
+        harness = _Harness(rest=rest)
+        await harness.connect()
+        try:
+            order = harness.order()
+            cid = await harness.submit(order)
+            order.apply(
+                TestEventStubs.order_submitted(
+                    order,
+                    account_id=harness.client.account_id,
+                    ts_event=harness.clock.timestamp_ns(),
+                )
+            )
+            row = cast(list[object], harness.order_frame("on", cid, order)[2]).copy()
+            for row_index, wrong_value in row_updates.items():
+                row[row_index] = wrong_value
+            rest.active = [row]
+
+            with pytest.raises(BitfinexV1ExecutionError, match=mismatch):
+                await harness.client.generate_order_status_report(
+                    GenerateOrderStatusReport(
+                        instrument_id=order.instrument_id,
+                        client_order_id=order.client_order_id,
+                        venue_order_id=None,
+                        command_id=UUID4(),
+                        ts_init=harness.clock.timestamp_ns(),
+                    )
+                )
+
+            live = harness.client._by_cid[cid]
+            assert not live.accepted
+            assert live.venue_order_id is None
+            assert VENUE_ORDER_ID not in harness.client._cid_by_venue
+            assert (cid, "submit") in harness.client._ack_deadlines
+        finally:
+            await harness.close()
+
+    asyncio.run(scenario())
+
+
+def test_terminal_history_cannot_create_its_own_zero_flag_post_only_witness() -> None:
+    async def scenario() -> None:
+        rest = _FakeRest()
+        harness = _Harness(rest=rest)
+        await harness.connect()
+        try:
+            order = harness.order()
+            cid = await harness.submit(order)
+            order.apply(
+                TestEventStubs.order_submitted(
+                    order,
+                    account_id=harness.client.account_id,
+                    ts_event=harness.clock.timestamp_ns(),
+                )
+            )
+            terminal = cast(
+                list[object],
+                harness.order_frame("oc", cid, order, status="CANCELED")[2],
+            ).copy()
+            now_ms = harness.clock.timestamp_ns() // 1_000_000
+            terminal[4], terminal[5] = now_ms - 100, now_ms
+            terminal[12] = 0
+            rest.history = [terminal]
+
+            with pytest.raises(BitfinexV1ExecutionError, match="post_only"):
+                await harness.client.generate_order_status_report(
+                    GenerateOrderStatusReport(
+                        instrument_id=order.instrument_id,
+                        client_order_id=order.client_order_id,
+                        venue_order_id=None,
+                        command_id=UUID4(),
+                        ts_init=harness.clock.timestamp_ns(),
+                    )
+                )
+
+            assert not harness.client._by_cid[cid].accepted
+            assert "OrderAccepted" not in _types(harness)
+        finally:
+            await harness.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "acceptance_timing",
+    ["rest_only", "before_query", "during_rest"],
+)
+def test_ws_and_targeted_rest_race_publishes_one_acceptance(
+    acceptance_timing: str,
+) -> None:
+    class WsFirstRest(_FakeRest):
+        def __init__(self) -> None:
+            super().__init__()
+            self.inject: Callable[[], None] | None = None
+
+        async def order_history_by_symbol(
+            self,
+            symbol: str,
+            *,
+            start: int | None = None,
+            end: int | None = None,
+            limit: int = 2_500,
+        ) -> object:
+            assert symbol == self.expected_symbol
+            assert start is not None and end is not None and limit == 2_500
+            if self.inject is not None:
+                inject, self.inject = self.inject, None
+                inject()
+            return []
+
+    async def scenario() -> None:
+        rest = WsFirstRest()
+        harness = _Harness(rest=rest)
+        harness.msgbus.deregister("ExecEngine.process", harness.events.append)
+        engine = LiveExecutionEngine(
+            loop=asyncio.get_running_loop(),
+            msgbus=harness.msgbus,
+            cache=harness.cache,
+            clock=harness.clock,
+            config=LiveExecEngineConfig(
+                load_cache=False,
+                reconciliation=False,
+                inflight_check_interval_ms=0,
+                open_check_interval_secs=None,
+                position_check_interval_secs=None,
+                graceful_shutdown_on_exception=True,
+            ),
+        )
+        engine.register_client(harness.client)
+        harness.cache.add_instrument(harness.instrument)
+        harness.cache.add_account(
+            TestExecStubs.margin_account(account_id=harness.client.account_id)
+        )
+        order = harness.order()
+        harness.cache.add_order(order)
+        published: list[OrderEvent] = []
+        harness.msgbus.subscribe(
+            topic=f"events.order.{order.strategy_id}",
+            handler=published.append,
+        )
+        await harness.connect()
+        engine.start()
+        try:
+            cid = await harness.submit(order)
+            for _ in range(20):
+                if order.status == OrderStatus.SUBMITTED:
+                    break
+                await asyncio.sleep(0)
+            assert order.status == OrderStatus.SUBMITTED
+            accepted = harness.order_frame("on", cid, order)
+            rest.active = [cast(list[object], accepted[2])]
+            if acceptance_timing == "before_query":
+                harness.client._consume_private_frame(accepted)
+            elif acceptance_timing == "during_rest":
+                rest.inject = lambda: harness.client._consume_private_frame(accepted)
+
+            await harness.client._query_order(
+                QueryOrder(
+                    trader_id=order.trader_id,
+                    strategy_id=order.strategy_id,
+                    instrument_id=order.instrument_id,
+                    client_order_id=order.client_order_id,
+                    venue_order_id=None,
+                    command_id=UUID4(),
+                    ts_init=harness.clock.timestamp_ns(),
+                )
+            )
+            for _ in range(20):
+                await asyncio.sleep(0)
+
+            if acceptance_timing == "rest_only":
+                harness.client._consume_private_frame(accepted)
+                await asyncio.sleep(0)
+            assert sum(isinstance(event, OrderAccepted) for event in published) == 1
+            assert [type(event).__name__ for event in order.events].count("OrderAccepted") == 1
+            assert engine.report_count == (1 if acceptance_timing == "rest_only" else 0)
+            assert harness.client._by_cid[cid].venue_order_id == VENUE_ORDER_ID
+            await harness.cancel(order)
+            assert harness.fake.sent[-1] == [0, "oc", None, {"id": VENUE_ORDER_ID}]
+        finally:
+            engine.stop()
+            await asyncio.sleep(0)
+            await harness.close()
+            engine.dispose()
 
     asyncio.run(scenario())
 
