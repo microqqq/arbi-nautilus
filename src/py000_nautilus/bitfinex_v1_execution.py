@@ -1354,6 +1354,12 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
             if cast(bool, live.order.is_reduce_only)
             else 0
         )
+        paper_full_fill_terminal = (
+            operation == "oc"
+            and live.accepted
+            and live.filled_qty == expected_qty
+            and _terminal_filled(state) == expected_qty
+        )
         flags_match = state.flags == expected_flags or (
             self._bfx_config.raw_symbol == PAPER_RAW_SYMBOL
             and live.submitted_in_process
@@ -1365,6 +1371,7 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
                 operation == "on"
                 or (operation == "ou" and live.pending_modify_price is not None)
                 or (operation == "oc" and live.accepted and live.pending_cancel)
+                or paper_full_fill_terminal
             )
         )
         expected_prices = {live.current_price}
