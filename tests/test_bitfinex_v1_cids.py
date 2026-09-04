@@ -6,11 +6,13 @@ from pathlib import Path
 
 import pytest
 
+import py000_nautilus.bitfinex_v1_cids as cid_module
 from py000_nautilus.bitfinex_v1_cids import (
     MAX_CID,
     BitfinexV1CidError,
     BitfinexV1CidStore,
 )
+from py000_nautilus.durability import ParentDirectorySyncError
 
 
 def test_binding_is_durable_and_bidirectional_across_restart(tmp_path: Path) -> None:
@@ -78,6 +80,35 @@ def test_persist_failure_does_not_allocate_in_memory_or_replace_state(
     assert store.binding_for_cid(first.cid + 1) is None
     assert path.read_bytes() == original
     assert not tuple(tmp_path.glob(".cids.json.*"))
+
+
+def test_post_replace_sync_failure_conservatively_burns_the_cid(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "cids.json"
+    store = BitfinexV1CidStore(path, account_id="BITFINEX-001")
+    original_replace = os.replace
+
+    def replace_then_fail(
+        source: str | os.PathLike[str],
+        destination: str | os.PathLike[str],
+    ) -> None:
+        original_replace(source, destination)
+        raise ParentDirectorySyncError("replacement completed but parent sync failed")
+
+    monkeypatch.setattr(cid_module, "replace_and_sync_parent", replace_then_fail)
+
+    with pytest.raises(ParentDirectorySyncError, match="replacement completed"):
+        store.allocate("O-UNCERTAIN", epoch_ms=200)
+
+    binding = store.binding_for_client("O-UNCERTAIN")
+    assert binding is not None
+    assert store.binding_for_cid(binding.cid) == binding
+    reloaded = BitfinexV1CidStore(path, account_id="BITFINEX-001")
+    assert reloaded.binding_for_cid(binding.cid) == binding
+    with pytest.raises(BitfinexV1CidError, match="already bound"):
+        store.allocate("O-UNCERTAIN", epoch_ms=201)
 
 
 def test_existing_client_id_is_a_conflict_and_lookup_keeps_original(tmp_path: Path) -> None:

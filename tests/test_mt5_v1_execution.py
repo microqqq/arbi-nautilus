@@ -96,6 +96,8 @@ def _config(
     request_timeout_ms: int = 1_000,
     mutation_timeout_ms: int = 15_000,
     snapshot_refresh_interval_ms: int = 1_000,
+    event_pagination_max_pages: int = 1_000,
+    event_pagination_timeout_ms: int = 30_000,
 ) -> Mt5V1ExecClientConfig:
     return Mt5V1ExecClientConfig(
         pub_url="tcp://127.0.0.1:6001",
@@ -113,6 +115,8 @@ def _config(
         mutation_timeout_ms=mutation_timeout_ms,
         event_poll_interval_ms=50,
         snapshot_refresh_interval_ms=snapshot_refresh_interval_ms,
+        event_pagination_max_pages=event_pagination_max_pages,
+        event_pagination_timeout_ms=event_pagination_timeout_ms,
     )
 
 
@@ -404,6 +408,8 @@ class _Harness:
         request_timeout_ms: int = 1_000,
         mutation_timeout_ms: int = 15_000,
         snapshot_refresh_interval_ms: int = 1_000,
+        event_pagination_max_pages: int = 1_000,
+        event_pagination_timeout_ms: int = 30_000,
         capture_events: bool = True,
     ) -> None:
         self.identity = identity or _identity()
@@ -451,6 +457,8 @@ class _Harness:
                 request_timeout_ms=request_timeout_ms,
                 mutation_timeout_ms=mutation_timeout_ms,
                 snapshot_refresh_interval_ms=snapshot_refresh_interval_ms,
+                event_pagination_max_pages=event_pagination_max_pages,
+                event_pagination_timeout_ms=event_pagination_timeout_ms,
             ),
             msgbus=self.msgbus,
             cache=self.cache,
@@ -703,6 +711,149 @@ def test_connect_walks_every_retained_page_before_choosing_the_tail() -> None:
 
         assert harness.client._cursor == "2"
         assert harness.fake.event_calls == [("0", 100), ("1", 100), ("2", 100)]
+
+    asyncio.run(scenario())
+
+
+def test_complete_journal_default_budget_accepts_five_hundred_pages() -> None:
+    async def scenario() -> None:
+        harness = _Harness(asyncio.get_running_loop())
+        harness.fake.pages.extend(
+            _page(
+                harness.identity,
+                after_cursor=str(sequence - 1),
+                events=[
+                    _event(
+                        harness.identity,
+                        sequence,
+                        "stream_started",
+                        {"ea_build_id": "current", "execution_enabled": True},
+                        boot_id=f"boot-history-{sequence}",
+                    )
+                ],
+                last_cursor="500",
+            )
+            for sequence in range(1, 501)
+        )
+
+        events, cursor = await harness.client._read_complete_journal(harness.identity)
+
+        assert len(events) == 500
+        assert cursor == "500"
+        assert len(harness.fake.event_calls) == 500
+
+    asyncio.run(scenario())
+
+
+def test_complete_journal_page_budget_fails_closed_without_an_extra_request() -> None:
+    async def scenario() -> None:
+        harness = _Harness(asyncio.get_running_loop(), event_pagination_max_pages=2)
+        harness.fake.pages.extend(
+            [
+                _page(
+                    harness.identity,
+                    after_cursor="0",
+                    events=[_stream_started(harness.identity)],
+                    last_cursor="3",
+                ),
+                _page(
+                    harness.identity,
+                    after_cursor="1",
+                    events=[
+                        _event(
+                            harness.identity,
+                            2,
+                            "stream_started",
+                            {"ea_build_id": "current", "execution_enabled": True},
+                            boot_id="boot-history-002",
+                        )
+                    ],
+                    last_cursor="3",
+                ),
+            ]
+        )
+
+        with pytest.raises(Mt5V1ExecutionError, match="page budget"):
+            await harness.connect()
+
+        assert harness.fake.event_calls == [("0", 100), ("1", 100)]
+        assert harness.client.execution_admitted is False
+        assert harness.fake.closed is True
+
+    asyncio.run(scenario())
+
+
+def test_runtime_page_walk_stops_at_the_first_declared_tail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        harness = _Harness(asyncio.get_running_loop())
+        await harness.connect()
+        monkeypatch.setattr(harness.client, "_apply_event", lambda _event: None)
+        harness.fake.pages.extend(
+            [
+                _page(
+                    harness.identity,
+                    after_cursor="1",
+                    events=[_stream_started(harness.identity, sequence=2)],
+                    last_cursor="3",
+                ),
+                _page(
+                    harness.identity,
+                    after_cursor="2",
+                    events=[_stream_started(harness.identity, sequence=3)],
+                    last_cursor="4",
+                ),
+                _page(
+                    harness.identity,
+                    after_cursor="3",
+                    events=[_stream_started(harness.identity, sequence=4)],
+                    last_cursor="4",
+                ),
+            ]
+        )
+        initial_calls = len(harness.fake.event_calls)
+
+        await harness.client._consume_event_pages()
+
+        assert harness.client._cursor == "3"
+        assert harness.fake.event_calls[initial_calls:] == [("1", 100), ("2", 1)]
+        assert len(harness.fake.pages) == 1
+
+    asyncio.run(scenario())
+
+
+def test_runtime_pagination_time_budget_disconnects_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        harness = _Harness(
+            asyncio.get_running_loop(),
+            event_pagination_timeout_ms=50,
+        )
+        await harness.connect()
+        harness.client._set_connected(True)
+        harness.client._running = True
+
+        async def never_reply(
+            _binding: Binding,
+            *,
+            after_cursor: str,
+            limit: int,
+        ) -> JsonObject:
+            del after_cursor, limit
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+        monkeypatch.setattr(harness.fake, "execution_events", never_reply)
+
+        await asyncio.wait_for(harness.client._poll_events(), timeout=0.5)
+
+        assert harness.client.execution_admitted is False
+        assert harness.client.is_connected is False
+        assert harness.fake.closed is True
+        assert harness.client.last_failure is not None
+        assert "time budget" in harness.client.last_failure
 
     asyncio.run(scenario())
 
@@ -1477,6 +1628,77 @@ def test_unknown_outcome_stays_pending_and_blocks_without_retry() -> None:
         ]
         assert len(harness.fake.submit_calls) == 1
         assert harness.client.pending_client_order_ids == (str(first.client_order_id),)
+
+    asyncio.run(scenario())
+
+
+def test_submit_outcome_page_budget_stays_pending_unknown_without_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        harness = _Harness(
+            asyncio.get_running_loop(),
+            event_pagination_max_pages=1,
+        )
+        order = harness.market()
+        outcome = _outcome(harness.identity, order, "order_filled")
+        harness.fake.outcome = outcome
+        await harness.connect()
+        original_submit = harness.fake.submit_market_delta
+
+        async def submit_with_paginated_outcome(
+            binding: Binding,
+            *,
+            client_request_id: str,
+            side: str,
+            quantity_lots: str,
+        ) -> JsonObject:
+            result = await original_submit(
+                binding,
+                client_request_id=client_request_id,
+                side=side,
+                quantity_lots=quantity_lots,
+            )
+            harness.fake.pages[:] = [
+                _page(
+                    harness.identity,
+                    after_cursor="1",
+                    events=[
+                        _event(
+                            harness.identity,
+                            2,
+                            "submission_reserved",
+                            _submission_payload(order),
+                        )
+                    ],
+                    last_cursor="3",
+                ),
+                _page(
+                    harness.identity,
+                    after_cursor="2",
+                    events=[outcome],
+                    last_cursor="3",
+                ),
+            ]
+            return result
+
+        monkeypatch.setattr(harness.fake, "submit_market_delta", submit_with_paginated_outcome)
+
+        with pytest.raises(Mt5V1ExecutionError, match="page budget"):
+            await harness.submit(order)
+
+        assert harness.fake.submit_calls == [(str(order.client_order_id), "buy", "1")]
+        assert harness.client.pending_client_order_ids == (str(order.client_order_id),)
+        assert "UNKNOWN" in cast(str, harness.client.execution_hold_reason)
+        assert len(harness.fake.pages) == 1
+
+        await harness.submit(harness.market("200"))
+
+        assert harness.fake.submit_calls == [(str(order.client_order_id), "buy", "1")]
+        assert [type(event).__name__ for event in harness.events] == [
+            "OrderSubmitted",
+            "OrderDenied",
+        ]
 
     asyncio.run(scenario())
 
@@ -2534,6 +2756,26 @@ def test_mutation_timeout_must_cover_queries_and_remain_bounded(
                 request_timeout_ms=1_000,
                 mutation_timeout_ms=mutation_timeout_ms,
             )
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("event_pagination_max_pages", True),
+        ("event_pagination_max_pages", 0),
+        ("event_pagination_max_pages", 10_001),
+        ("event_pagination_timeout_ms", True),
+        ("event_pagination_timeout_ms", 49),
+        ("event_pagination_timeout_ms", 60_001),
+    ],
+)
+def test_event_pagination_budgets_are_exact_and_bounded(field: str, value: object) -> None:
+    async def scenario() -> None:
+        arguments: dict[str, object] = {field: value}
+        with pytest.raises(ValueError, match=field):
+            _Harness(asyncio.get_running_loop(), **arguments)  # type: ignore[arg-type]
 
     asyncio.run(scenario())
 

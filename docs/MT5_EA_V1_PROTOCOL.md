@@ -572,11 +572,12 @@ sequences 14-17 are contiguous `submission_reserved`, `order_filled`,
 final snapshot is empty with margin zero, balance/equity `79292.95`, identity unchanged,
 and recovery ready.
 
-The current Taker-paper candidate adds required closed snapshot field
+The historical cap-bound Taker-paper candidate adds required closed snapshot field
 `execution_limits.max_order_lots`, binds it in the Python execution profile, and raises the
 default ceiling from 0.01 to the Bitfinex paper minimum hedge of 0.02 lot (2 ounces at the
-observed 100-ounce contract). Its build ID is `py000-mt5-ea-v1-taker-paper`. The exact source
-hashes are:
+observed 100-ounce contract). It is retained here as deployment history and is not the current
+source manifest. Its build ID is `py000-mt5-ea-v1-taker-paper`. The exact historical source hashes
+are:
 
 - `d4712049f4a7f866988e786d6dfc42d6a480aafacb49fdd1b2cba2020fcc7f6f`
   (`PY000_Nautilus_MT5.mq5`);
@@ -602,10 +603,13 @@ Python and EA must be replaced in lockstep: new Python rejects an older EA missi
 and older Python rejects the new field. This completed rehearsal is required evidence before,
 but does not itself authorize, any source-risk test.
 
-The final current source exposes the broker's native Sunday-through-Saturday swap multipliers as
-the closed seven-item `swap_rates` vector; it does not infer rollover from a single weekday. The
-ordered source manifest is
+The current source supersedes that historical candidate and exposes the broker's native
+Sunday-through-Saturday swap multipliers as the closed seven-item `swap_rates` vector; it does not
+infer rollover from a single weekday. The current ordered source manifest is
 `e8126bf3ef0b42d01facdd2ef30f048972062b5ca38c81b84717156fb74cad00`.
+Its current per-file hashes and deterministic derivation are pinned by
+`tests/test_mt5_source_manifest.py` and can be recomputed with
+`tools/mt5_source_manifest.sh --lines`.
 MetaEditor compiled it with 0 errors and 0 warnings as
 `PY000_Nautilus_MT5_taker_paper_e8126bf3.ex5`; the retained binary SHA-256 is
 `686c5386e15fc74b6b622b133225c33b70f72768296912e1a3132ea738c2b551`.
