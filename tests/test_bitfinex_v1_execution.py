@@ -2198,6 +2198,92 @@ def test_paper_te_is_prompt_fill_authority_when_tu_is_absent() -> None:
     asyncio.run(scenario())
 
 
+def test_paper_full_te_then_zero_flag_executed_oc_survives_cancel_race() -> None:
+    async def scenario() -> None:
+        harness = _Harness(
+            raw_symbol=PAPER_RAW_SYMBOL,
+            wallet_currency="TESTUSDTF0",
+        )
+        await harness.connect()
+        try:
+            order = harness.order(quantity="2")
+            cid = await harness.submit(order)
+            accepted = harness.order_frame("on", cid, order)
+            cast(list[object], accepted[2])[12] = 0
+            harness.client._consume_private_frame(accepted)
+            await harness.cancel(order)
+
+            assert harness.client._by_cid[cid].pending_cancel
+            trade = harness.trade_frame(cid, order, quantity="2", maker=1)
+            interim = cast(list[object], trade[2]).copy()
+            interim[9:11] = [None, None]
+            harness.client._consume_private_frame([0, "te", interim])
+            live = harness.client._by_cid[cid]
+            assert live.accepted
+            assert live.filled_qty == Decimal("2")
+            assert not live.pending_cancel
+
+            terminal = harness.order_frame(
+                "oc",
+                cid,
+                order,
+                remaining="0",
+                status="EXECUTED @ 3926.75(2)",
+            )
+            cast(list[object], terminal[2])[12] = 0
+            harness.client._consume_private_frame(terminal)
+
+            assert live.terminal is not None
+            assert live.terminal_emitted
+            assert harness.client.execution_hold_reason is None
+            assert _types(harness).count("OrderFilled") == 1
+            assert "OrderCanceled" not in _types(harness)
+        finally:
+            await harness.close()
+
+    asyncio.run(scenario())
+
+
+def test_paper_zero_flag_executed_oc_rejects_partial_trusted_fill() -> None:
+    async def scenario() -> None:
+        harness = _Harness(
+            raw_symbol=PAPER_RAW_SYMBOL,
+            wallet_currency="TESTUSDTF0",
+        )
+        await harness.connect()
+        try:
+            order = harness.order(quantity="2")
+            cid = await harness.submit(order)
+            harness.client._consume_private_frame(harness.order_frame("on", cid, order))
+            trade = harness.trade_frame(cid, order, quantity="1", maker=1)
+            interim = cast(list[object], trade[2]).copy()
+            interim[9:11] = [None, None]
+            harness.client._consume_private_frame([0, "te", interim])
+
+            live = harness.client._by_cid[cid]
+            assert live.accepted
+            assert live.filled_qty == Decimal("1")
+            assert not live.pending_cancel
+            terminal = harness.order_frame(
+                "oc",
+                cid,
+                order,
+                remaining="0",
+                status="EXECUTED @ 3926.75(2)",
+            )
+            cast(list[object], terminal[2])[12] = 0
+
+            with pytest.raises(BitfinexV1ExecutionError, match="differs from local submission"):
+                harness.client._consume_private_frame(terminal)
+
+            assert live.terminal is None
+            assert not live.terminal_emitted
+        finally:
+            await harness.close()
+
+    asyncio.run(scenario())
+
+
 def test_canceled_oc_waits_for_authoritative_late_tu_then_cancels_once() -> None:
     async def scenario() -> None:
         harness = _Harness()
