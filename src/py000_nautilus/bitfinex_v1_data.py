@@ -244,6 +244,7 @@ class BitfinexV1DataClient(LiveMarketDataClient):
         self._funding_unsubscribe_task: asyncio.Task[None] | None = None
         self._subscription_requested = False
         self._funding_subscription_requested = False
+        self._pre_ack_heartbeat_channel_ids: set[int] = set()
         self._publish_quotes = False
         self._publish_deltas = False
         self._publish_funding = False
@@ -308,6 +309,7 @@ class BitfinexV1DataClient(LiveMarketDataClient):
         self._unsubscribe_funding_on_ack = False
         self._subscription_requested = False
         self._funding_subscription_requested = False
+        self._pre_ack_heartbeat_channel_ids.clear()
         self._publish_quotes = False
         self._publish_deltas = False
         self._publish_funding = False
@@ -455,6 +457,7 @@ class BitfinexV1DataClient(LiveMarketDataClient):
         self._checksum_configured = False
         self._subscription_requested = False
         self._funding_subscription_requested = False
+        self._pre_ack_heartbeat_channel_ids.clear()
         self._publish_quotes = False
         self._publish_deltas = False
         self._publish_funding = False
@@ -490,6 +493,13 @@ class BitfinexV1DataClient(LiveMarketDataClient):
         if payload == "hb" and len(frame) == 2:
             if channel_id in {self._channel_id, self._funding_channel_id}:
                 return ()
+            pending_ack_count = self._pending_subscription_ack_count()
+            if pending_ack_count:
+                if channel_id in self._pre_ack_heartbeat_channel_ids:
+                    return ()
+                if len(self._pre_ack_heartbeat_channel_ids) < pending_ack_count:
+                    self._pre_ack_heartbeat_channel_ids.add(channel_id)
+                    return ()
             raise BitfinexV1DataError(
                 "Bitfinex unknown hb "
                 f"requested=book:{int(self._subscription_requested)},"
@@ -509,6 +519,11 @@ class BitfinexV1DataClient(LiveMarketDataClient):
             f"{channel_id} (book={self._channel_id}, funding={self._funding_channel_id}, "
             f"pending_book={self._pending_unsubscribe_channel_id}, "
             f"pending_funding={self._pending_funding_unsubscribe_channel_id})"
+        )
+
+    def _pending_subscription_ack_count(self) -> int:
+        return int(self._subscription_requested and self._channel_id is None) + int(
+            self._funding_subscription_requested and self._funding_channel_id is None
         )
 
     def _consume_book_frame(
@@ -623,6 +638,15 @@ class BitfinexV1DataClient(LiveMarketDataClient):
         }
         if channel_id in occupied:
             raise BitfinexV1DataError("Bitfinex reused an active or pending channel")
+
+        pending_ack_count_before = self._pending_subscription_ack_count()
+        remaining_pending = pending_ack_count_before - 1
+        if channel_id in self._pre_ack_heartbeat_channel_ids:
+            self._pre_ack_heartbeat_channel_ids.remove(channel_id)
+        elif len(self._pre_ack_heartbeat_channel_ids) > remaining_pending:
+            raise BitfinexV1DataError(
+                "Bitfinex subscription ACK does not match pre-ACK heartbeat channel"
+            )
 
         if channel == "book":
             self._channel_id = channel_id
