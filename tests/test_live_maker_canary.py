@@ -200,19 +200,95 @@ class _RoundtripCancelProbe(canary.MakerRoundtripStrategy):
         )
         self.owned: Order | None = None
         self.cancel_calls = 0
-        self._test_cache = SimpleNamespace(order=self._order)
+        self.observation_failure: str | None = None
+        self._test_cache = SimpleNamespace(
+            order=self._order,
+            quote_tick=self._quote_tick,
+        )
+        self._test_clock = SimpleNamespace(timestamp_ns=self._timestamp_ns)
 
     @property
     def cache(self) -> Any:
         return self._test_cache
+
+    @property
+    def clock(self) -> Any:
+        return self._test_clock
 
     def _order(self, client_order_id: ClientOrderId) -> Order | None:
         if self.owned is None or self.owned.client_order_id != client_order_id:
             return None
         return self.owned
 
+    def _quote_tick(self, _instrument_id: InstrumentId) -> None:
+        if self.observation_failure == "cache":
+            raise RuntimeError("injected quote cache failure")
+
+    def _timestamp_ns(self) -> int:
+        if self.observation_failure == "clock":
+            raise RuntimeError("injected clock failure")
+        return 10_000_000_000
+
     def cancel_order(self, *_args: object, **_kwargs: object) -> None:
         self.cancel_calls += 1
+
+
+class _RoundtripReadinessProbe:
+    def __init__(self, profile: canary.LiveMakerCanaryProfile) -> None:
+        self._config = profile.strategy_config
+        self.now_ns = 10_000_000_000
+        self.is_running = True
+        self._cost_snapshot_valid = True
+        self._cost_ts_ns = self.now_ns
+        self._session_ts_ns = self.now_ns
+        self._hedge_session_open = True
+        self.invalidations: list[str] = []
+        self.ticks = {
+            SOURCE_ID: _quote(_source_instrument(), "2000", "2001", "2", self.now_ns),
+            HEDGE_ID: _quote(_hedge_instrument(), "2000", "2001", "2", self.now_ns),
+        }
+        self.cache = SimpleNamespace(quote_tick=self.ticks.get)
+        self.clock = SimpleNamespace(timestamp_ns=lambda: self.now_ns)
+        self._live_submission_ready = lambda: True
+
+    def _inputs_are_fresh(
+        self,
+        source_tick: Any,
+        hedge_tick: Any,
+        timestamp_ns: int,
+    ) -> bool:
+        return MakerStrategy._inputs_are_fresh(
+            cast(Any, self), source_tick, hedge_tick, timestamp_ns
+        )
+
+    def _invalidate_cost_snapshot(self, reason: str) -> None:
+        self.invalidations.append(reason)
+        self._cost_snapshot_valid = False
+
+    def quote(self, instrument_id: InstrumentId, ts_event: int) -> None:
+        instrument = _source_instrument() if instrument_id == SOURCE_ID else _hedge_instrument()
+        self.ticks[instrument_id] = _quote(instrument, "2000", "2001", "2", ts_event)
+
+
+class _ConnectedEngine:
+    @staticmethod
+    def check_connected() -> bool:
+        return True
+
+
+class _RoundtripReadinessNode:
+    kernel = SimpleNamespace(
+        data_engine=_ConnectedEngine(),
+        exec_engine=_ConnectedEngine(),
+    )
+
+    @staticmethod
+    def is_running() -> bool:
+        return True
+
+
+async def _run_forever() -> None:
+    await asyncio.Event().wait()
 
 
 def _submitted_roundtrip_source(
@@ -1148,85 +1224,77 @@ def test_post_rest_freshness_timeout_holds_before_mutation(
     assert not strategy.armed and not strategy.claimed
 
 
-def test_wait_ready_accepts_same_bbo_source_refresh_within_cross_leg_window(
+def test_roundtrip_arm_ready_waits_for_same_bbo_refresh_with_headroom(
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
-        now_ns = 10_000_000_000
-        config = _profile(tmp_path).strategy_config
-        source_instrument = _source_instrument()
-        hedge_instrument = _hedge_instrument()
-        stale_source = _quote(
-            source_instrument,
-            "2000",
-            "2001",
-            "2",
-            now_ns - config.max_quote_age_ns - 1,
-        )
-        hedge = _quote(
-            hedge_instrument,
-            "2000",
-            "2001",
-            "2",
-            now_ns - config.max_cross_leg_skew_ns,
-        )
-        ticks = {SOURCE_ID: stale_source, HEDGE_ID: hedge}
-
-        class Strategy:
-            _config = config
-            cache = SimpleNamespace(quote_tick=ticks.get)
-            clock = SimpleNamespace(timestamp_ns=lambda: now_ns)
-            is_running = True
-            _live_submission_ready = staticmethod(lambda: True)
-            _cost_snapshot_valid = True
-            _cost_ts_ns = now_ns - 1
-            _session_ts_ns = now_ns - 1
-            _hedge_session_open = True
-
-            def _inputs_are_fresh(
-                self, source_tick: Any, hedge_tick: Any, timestamp_ns: int,
-            ) -> bool:
-                return MakerStrategy._inputs_are_fresh(
-                    cast(Any, self), source_tick, hedge_tick, timestamp_ns
-                )
-
-        class ConnectedEngine:
-            @staticmethod
-            def check_connected() -> bool:
-                return True
-
-        class Node:
-            kernel = SimpleNamespace(
-                data_engine=ConnectedEngine(),
-                exec_engine=ConnectedEngine(),
-            )
-
-            @staticmethod
-            def is_running() -> bool:
-                return True
-
-        async def run_node() -> None:
-            await asyncio.Event().wait()
-
-        node_task = asyncio.create_task(run_node())
+        probe = _RoundtripReadinessProbe(_profile(tmp_path))
+        config, now_ns = probe._config, probe.now_ns
+        probe.quote(SOURCE_ID, now_ns - config.max_quote_age_ns - 1)
+        stale_source = probe.ticks[SOURCE_ID]
+        probe.quote(HEDGE_ID, now_ns - config.max_cross_leg_skew_ns)
+        node_task = asyncio.create_task(_run_forever())
         readiness = asyncio.create_task(
-            canary._wait_ready(
-                cast(Any, Node()), cast(Any, Strategy()), node_task, timeout=1.0
+            canary._wait_roundtrip_arm_ready(
+                cast(Any, _RoundtripReadinessNode()),
+                cast(Any, probe),
+                node_task,
+                timeout=1.0,
             )
         )
         try:
             await asyncio.sleep(0.02)
             assert not readiness.done()
 
-            heartbeat_source = _quote(
-                source_instrument, "2000", "2001", "2", now_ns
-            )
+            probe.quote(SOURCE_ID, now_ns)
+            heartbeat_source = probe.ticks[SOURCE_ID]
             assert heartbeat_source.bid_price == stale_source.bid_price
             assert heartbeat_source.ask_price == stale_source.ask_price
             assert heartbeat_source.bid_size == stale_source.bid_size
             assert heartbeat_source.ask_size == stale_source.ask_size
-            ticks[SOURCE_ID] = heartbeat_source
+            await asyncio.sleep(0.02)
+            assert not readiness.done()
 
+            probe.quote(HEDGE_ID, now_ns - canary._roundtrip_arm_headroom_ns(config))
+
+            await asyncio.wait_for(readiness, timeout=0.5)
+        finally:
+            if not readiness.done():
+                readiness.cancel()
+            node_task.cancel()
+            await asyncio.gather(readiness, node_task, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+def test_roundtrip_arm_ready_invalidates_future_cost_until_new_snapshot(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        probe = _RoundtripReadinessProbe(_profile(tmp_path))
+        probe._cost_ts_ns = probe.now_ns + 1
+        node_task = asyncio.create_task(_run_forever())
+        readiness = asyncio.create_task(
+            canary._wait_roundtrip_arm_ready(
+                cast(Any, _RoundtripReadinessNode()),
+                cast(Any, probe),
+                node_task,
+                timeout=0.5,
+            )
+        )
+        try:
+            await asyncio.sleep(0.03)
+            assert probe.invalidations == ["Maker costs are future-dated"]
+            probe._cost_ts_ns = probe.now_ns
+            await asyncio.sleep(0.12)
+            assert not readiness.done()
+            probe.now_ns += 1
+            probe._cost_ts_ns = probe.now_ns
+            probe._cost_snapshot_valid = True
+            probe.quote(SOURCE_ID, probe.now_ns - 2)
+            await asyncio.sleep(0.12)
+            assert not readiness.done()
+            probe.quote(SOURCE_ID, probe.now_ns)
             await asyncio.wait_for(readiness, timeout=0.5)
         finally:
             if not readiness.done():
@@ -1248,12 +1316,14 @@ def test_roundtrip_dry_run_builds_only_selected_direction(
     def builder(**kwargs: Any) -> tuple[Any, canary.MakerRoundtripStrategy]:
         node, strategy = build_live_maker_node(**kwargs)
         assert isinstance(strategy, canary.MakerRoundtripStrategy)
+        strategy.first_cancel_diagnostic = {"reason": "serialized-probe"}
         built.append(strategy)
         return node, strategy
 
+    output = tmp_path / f"roundtrip-{direction.value}.jsonl"
     result = canary.run_maker_canary(
         profile,
-        tmp_path / f"roundtrip-{direction.value}.jsonl",
+        output,
         node_builder=cast(Any, builder),
         roundtrip_direction=direction,
     )
@@ -1265,6 +1335,10 @@ def test_roundtrip_dry_run_builds_only_selected_direction(
     assert (bid, ask) == ((D(2), D()) if direction is SourceDirection.LONG else (D(), D(2)))
     assert profile.strategy_config.economics.bid.open_quantity_ounces == D(2)
     assert profile.strategy_config.economics.ask.open_quantity_ounces == 0
+    assert (
+        '"first_cancel":{"reason":"serialized-probe"}'
+        in output.read_text(encoding="utf-8").splitlines()[-1]
+    )
 
 
 @pytest.mark.parametrize("direction", [SourceDirection.LONG, SourceDirection.SHORT])
@@ -1574,6 +1648,7 @@ def test_roundtrip_final_gate_requires_external_exact_flat(
         return True
 
     monkeypatch.setattr(canary, "_wait_ready", wait_ready)
+    monkeypatch.setattr(canary, "_wait_roundtrip_arm_ready", wait_ready)
     monkeypatch.setattr(canary, "read_snapshot", read_next)
     monkeypatch.setattr(canary, "_wait_roundtrip_phase", phase)
     monkeypatch.setattr(canary, "_runtime_flat", lambda *_args: True)
@@ -1734,6 +1809,10 @@ def test_roundtrip_pre_ack_stale_cancel_is_sent_immediately_on_acceptance(
     order, account = _submitted_roundtrip_source(strategy)
     strategy._cancel_working(strategy.direction, reason="stale quote")
     assert strategy.cancel_calls == 0
+    first = strategy.first_cancel_diagnostic
+    assert first is not None
+    assert first["reason"] == "stale quote"
+    assert first["source_order_id"] == order.client_order_id.value
 
     accepted = TestEventStubs.order_accepted(
         order,
@@ -1747,6 +1826,34 @@ def test_roundtrip_pre_ack_stale_cancel_is_sent_immediately_on_acceptance(
     strategy._cancel_working(strategy.direction, reason="cleanup")
     strategy._send_required_cancel_once(strategy.direction, "cleanup")
     assert strategy.cancel_calls == 1
+    assert strategy.first_cancel_diagnostic is first
+
+
+@pytest.mark.parametrize("failure", ["clock", "cache"])
+def test_roundtrip_cancel_observation_failure_does_not_block_cancel(
+    tmp_path: Path, failure: str
+) -> None:
+    strategy = _RoundtripCancelProbe(_profile(tmp_path))
+    order, account = _submitted_roundtrip_source(strategy)
+    strategy.observation_failure = failure
+
+    strategy._cancel_working(strategy.direction, reason="stale timer")
+    strategy.observation_failure = None
+    accepted = TestEventStubs.order_accepted(
+        order,
+        account_id=account,
+        venue_order_id=VenueOrderId("V-ROUNDTRIP-OBSERVATION-FAILURE"),
+    )
+    order.apply(accepted)
+    strategy.on_order_accepted(accepted)
+
+    assert strategy.cancel_calls == 1
+    assert strategy.first_cancel_diagnostic == {
+        "reason": "stale timer",
+        "direction": "LONG",
+        "source_order_id": order.client_order_id.value,
+        "observation_error": "RuntimeError",
+    }
 
 
 def test_roundtrip_cleanup_loop_sends_deferred_cancel_after_venue_id_arrives(

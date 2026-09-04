@@ -60,6 +60,8 @@ from py000_nautilus.strategies.maker import MakerStrategy, SourceTerminalQuery
 
 D = Decimal
 QUANTITY = D(2)
+_ROUNDTRIP_ARM_MAX_HEADROOM_NS = 1_000_000_000
+_ROUNDTRIP_ARM_MAX_DWELL_NS = 100_000_000
 type Outcome = Literal[
     "VALIDATED", "PASSED", "PASSED_FLAT", "HOLD", "FAILED", "UNKNOWN", "FILLED_HOLD"
 ]
@@ -329,6 +331,7 @@ class MakerRoundtripStrategy(MakerStrategy):
         self.cleanup_started = False
         self._cancel_required: set[str] = set()
         self._cancel_sent: set[str] = set()
+        self.first_cancel_diagnostic: dict[str, object] | None = None
 
     @property
     def source_order_id(self) -> str | None:
@@ -401,12 +404,39 @@ class MakerRoundtripStrategy(MakerStrategy):
             return
         if active_id in self._cancel_sent:
             return
+        self._record_first_cancel(direction, active_id, reason)
         order = self.cache.order(ClientOrderId(active_id))
         if order is None:
             MakerStrategy._cancel_working(self, direction, reason=reason)
             return
         self._cancel_required.add(active_id)
         self._send_required_cancel_once(direction, reason)
+
+    def _record_first_cancel(self, direction: SourceDirection, order_id: str, reason: str) -> None:
+        if self.first_cancel_diagnostic is not None:
+            return
+        diagnostic: dict[str, object] = dict(
+            reason=reason, direction=direction.name, source_order_id=order_id
+        )
+        self.first_cancel_diagnostic = diagnostic
+        try:
+            now_ns = cast(int, self.clock.timestamp_ns())
+            source = self.cache.quote_tick(self._config.source_instrument_id)
+            hedge = self.cache.quote_tick(self._config.hedge_instrument_id)
+            source_ts_ns = None if source is None else cast(int, source.ts_event)
+            hedge_ts_ns = None if hedge is None else cast(int, hedge.ts_event)
+            diagnostic.update(
+                now_ns=now_ns,
+                source_age_ns=None if source_ts_ns is None else now_ns - source_ts_ns,
+                hedge_age_ns=None if hedge_ts_ns is None else now_ns - hedge_ts_ns,
+                cost_age_ns=now_ns - self._cost_ts_ns,
+                session_age_ns=now_ns - self._session_ts_ns,
+                cross_leg_skew_ns=None
+                if source_ts_ns is None or hedge_ts_ns is None
+                else abs(source_ts_ns - hedge_ts_ns),
+            )
+        except Exception as exc:
+            diagnostic["observation_error"] = type(exc).__name__
 
     def _send_required_cancel_once(self, direction: SourceDirection, reason: str) -> None:
         store = self._stores[direction]
@@ -817,16 +847,19 @@ def run_maker_canary(
             result = MakerCanaryResult(outcome, "node_cleanup_failed", output, _order_id(strategy))
         if lock is not None:
             lock.close()
-    _write(
-        transcript,
-        {
-            "kind": "finished",
-            "outcome": result.outcome,
-            "reason": result.reason,
-            "source_order_id": result.source_order_id,
-            "ts_utc_ns": time.time_ns(),
-        },
-    )
+    finished: dict[str, object] = {
+        "kind": "finished",
+        "outcome": result.outcome,
+        "reason": result.reason,
+        "source_order_id": result.source_order_id,
+        "ts_utc_ns": time.time_ns(),
+    }
+    if (
+        isinstance(strategy, MakerRoundtripStrategy)
+        and strategy.first_cancel_diagnostic is not None
+    ):
+        finished["first_cancel"] = strategy.first_cancel_diagnostic
+    _write(transcript, finished)
     transcript.close()
     return result
 
@@ -852,7 +885,7 @@ async def _run_roundtrip_lifecycle(
             or not _runtime_flat(node, strategy)
         ):
             return _roundtrip_failure(strategy, output, "pre_arm_runtime_not_flat", True)
-        await _wait_ready(node, strategy, task, connection_timeout * 4)
+        await _wait_roundtrip_arm_ready(node, strategy, task, connection_timeout * 4)
         strategy.arm()
         if not strategy.trigger_cached_once():
             return _roundtrip_failure(strategy, output, "cached_quote_not_eligible", True)
@@ -1202,6 +1235,123 @@ async def _wait_ready(
             return
         await asyncio.sleep(0.01)
     raise PaperCanaryError("Maker readiness timed out")
+
+
+def _roundtrip_arm_headroom_ns(config: MakerStrategyConfig) -> int:
+    return max(
+        1,
+        min(
+            _ROUNDTRIP_ARM_MAX_HEADROOM_NS,
+            config.max_quote_age_ns // 2,
+            config.max_cross_leg_skew_ns // 2,
+            config.max_cost_age_ns // 2,
+            config.max_session_age_ns // 2,
+        ),
+    )
+
+
+def _roundtrip_arm_has_headroom(
+    strategy: MakerRoundtripStrategy,
+    source: QuoteTick,
+    hedge: QuoteTick,
+    now_ns: int,
+    required_ns: int,
+) -> bool:
+    config = strategy._config
+    source_ts_ns = cast(int, source.ts_event)
+    hedge_ts_ns = cast(int, hedge.ts_event)
+    remaining = (
+        source_ts_ns + config.max_quote_age_ns - now_ns,
+        hedge_ts_ns + config.max_quote_age_ns - now_ns,
+        strategy._cost_ts_ns + config.max_cost_age_ns - now_ns,
+        strategy._session_ts_ns + config.max_session_age_ns - now_ns,
+        config.max_cross_leg_skew_ns - abs(source_ts_ns - hedge_ts_ns),
+    )
+    return min(remaining) >= required_ns
+
+
+async def _wait_roundtrip_arm_ready(
+    node: TradingNode,
+    strategy: MakerRoundtripStrategy,
+    task: asyncio.Task[None],
+    timeout: float,
+) -> None:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    required_ns = _roundtrip_arm_headroom_ns(strategy._config)
+    dwell_seconds = min(_ROUNDTRIP_ARM_MAX_DWELL_NS, required_ns) / 1_000_000_000
+    stable_since: float | None = None
+    timestamp_high_water: tuple[int, int, int, int] | None = None
+    now_high_water_ns: int | None = None
+    while loop.time() < deadline:
+        if task.done():
+            _raise_node_task(task, "Maker node stopped before roundtrip arm")
+        source = strategy.cache.quote_tick(strategy._config.source_instrument_id)
+        hedge = strategy.cache.quote_tick(strategy._config.hedge_instrument_id)
+        now_ns = cast(int, strategy.clock.timestamp_ns())
+        timestamps = (
+            None
+            if source is None or hedge is None
+            else (
+                cast(int, source.ts_event),
+                cast(int, hedge.ts_event),
+                strategy._cost_ts_ns,
+                strategy._session_ts_ns,
+            )
+        )
+        regressed = bool(
+            timestamps is not None
+            and timestamp_high_water is not None
+            and any(
+                current < high_water
+                for current, high_water in zip(timestamps, timestamp_high_water, strict=True)
+            )
+        ) or (now_high_water_ns is not None and now_ns < now_high_water_ns)
+        connected = (
+            node.is_running()
+            and strategy.is_running
+            and node.kernel.data_engine.check_connected()
+            and node.kernel.exec_engine.check_connected()
+        )
+        fresh = bool(
+            source is not None
+            and hedge is not None
+            and strategy._inputs_are_fresh(source, hedge, now_ns)
+        )
+        ready = bool(
+            connected
+            and fresh
+            and not regressed
+            and timestamps is not None
+            and all(timestamp <= now_ns for timestamp in timestamps)
+            and source is not None
+            and hedge is not None
+            and _roundtrip_arm_has_headroom(strategy, source, hedge, now_ns, required_ns)
+        )
+        if ready:
+            if stable_since is None:
+                stable_since = loop.time()
+            elif loop.time() - stable_since >= dwell_seconds:
+                return
+        else:
+            stable_since = None
+        if timestamps is not None:
+            timestamp_high_water = (
+                timestamps
+                if timestamp_high_water is None
+                else cast(
+                    tuple[int, int, int, int],
+                    tuple(
+                        max(current, high_water)
+                        for current, high_water in zip(
+                            timestamps, timestamp_high_water, strict=True
+                        )
+                    ),
+                )
+            )
+        now_high_water_ns = now_ns if now_high_water_ns is None else max(now_ns, now_high_water_ns)
+        await asyncio.sleep(0.01)
+    raise PaperCanaryError("Maker roundtrip arm readiness timed out")
 
 
 def _raise_node_task(task: asyncio.Task[None], reason: str) -> None:
