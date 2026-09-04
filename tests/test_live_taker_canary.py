@@ -668,11 +668,80 @@ def _complete_strategy(
 
 
 @pytest.mark.parametrize(
-    ("source_position", "source_tif", "outcome", "reason"),
+    (
+        "engine_connected",
+        "bitfinex_connected",
+        "mt5_connected",
+        "snapshot_refresh_healthy",
+        "expected",
+    ),
     [
-        (D(2), TimeInForce.IOC, "PASSED_PAIRED", "exact_2oz_pair_reconciled"),
-        (D(1), TimeInForce.IOC, "UNKNOWN", "paired_positions_are_not_exact_and_opposite"),
-        (D(2), TimeInForce.GTC, "UNKNOWN", "order_evidence_is_not_exact_ioc_fok_2oz"),
+        (True, True, True, True, None),
+        (False, True, True, True, "data_plane_not_clean_after_reconciliation"),
+        (True, False, True, True, "data_plane_not_clean_after_reconciliation"),
+        (True, True, False, True, "data_plane_not_clean_after_reconciliation"),
+        (True, True, True, False, "data_plane_not_clean_after_reconciliation"),
+    ],
+)
+def test_final_data_plane_requires_connected_clients_and_healthy_snapshot_refresh(
+    monkeypatch: pytest.MonkeyPatch,
+    engine_connected: bool,
+    bitfinex_connected: bool,
+    mt5_connected: bool,
+    snapshot_refresh_healthy: bool,
+    expected: str | None,
+) -> None:
+    node = SimpleNamespace(
+        kernel=SimpleNamespace(
+            data_engine=SimpleNamespace(check_connected=lambda: engine_connected),
+        ),
+    )
+    monkeypatch.setattr(
+        canary,
+        "_data_clients",
+        lambda _node: (
+            SimpleNamespace(is_connected=bitfinex_connected),
+            SimpleNamespace(
+                is_connected=mt5_connected,
+                snapshot_refresh_healthy=snapshot_refresh_healthy,
+            ),
+        ),
+    )
+
+    assert canary._final_data_plane_mismatch(cast(Any, node)) == expected
+
+
+@pytest.mark.parametrize(
+    (
+        "source_position",
+        "source_tif",
+        "snapshot_refresh_healthy",
+        "outcome",
+        "reason",
+    ),
+    [
+        (D(2), TimeInForce.IOC, True, "PASSED_PAIRED", "exact_2oz_pair_reconciled"),
+        (
+            D(2),
+            TimeInForce.IOC,
+            False,
+            "UNKNOWN",
+            "data_plane_not_clean_after_reconciliation",
+        ),
+        (
+            D(1),
+            TimeInForce.IOC,
+            True,
+            "UNKNOWN",
+            "paired_positions_are_not_exact_and_opposite",
+        ),
+        (
+            D(2),
+            TimeInForce.GTC,
+            True,
+            "UNKNOWN",
+            "order_evidence_is_not_exact_ioc_fok_2oz",
+        ),
     ],
 )
 def test_exact_success_and_position_near_miss_are_classified(
@@ -680,6 +749,7 @@ def test_exact_success_and_position_near_miss_are_classified(
     monkeypatch: pytest.MonkeyPatch,
     source_position: Decimal,
     source_tif: TimeInForce,
+    snapshot_refresh_healthy: bool,
     outcome: canary.CanaryOutcome,
     reason: str,
 ) -> None:
@@ -725,7 +795,10 @@ def test_exact_success_and_position_near_miss_are_classified(
     }
 
     node = SimpleNamespace(
-        kernel=SimpleNamespace(exec_engine=ExecEngine()),
+        kernel=SimpleNamespace(
+            data_engine=SimpleNamespace(check_connected=lambda: True),
+            exec_engine=ExecEngine(),
+        ),
         cache=SimpleNamespace(
             orders_open=lambda **_kwargs: [],
             positions_open=positions_open,
@@ -742,6 +815,17 @@ def test_exact_success_and_position_near_miss_are_classified(
                 terminal_reconciliation_required=False,
             ),
             SimpleNamespace(execution_hold_reason=None, pending_client_order_ids=()),
+        ),
+    )
+    monkeypatch.setattr(
+        canary,
+        "_data_clients",
+        lambda _node: (
+            SimpleNamespace(is_connected=True),
+            SimpleNamespace(
+                is_connected=True,
+                snapshot_refresh_healthy=snapshot_refresh_healthy,
+            ),
         ),
     )
 
@@ -976,14 +1060,24 @@ def test_silent_terminal_reconciliation_is_bounded_when_rest_only_reports_open(
     assert bitfinex.confirm_calls == 2
 
 
+@pytest.mark.parametrize(
+    ("snapshot_refresh_healthy", "expected_outcome", "expected_reason"),
+    [
+        (True, "PASSED_FLAT", "exact_2oz_pair_closed"),
+        (False, "UNKNOWN", "data_plane_not_clean_after_reconciliation"),
+    ],
+)
 def test_exact_existing_pair_closes_to_flat_only_with_reduce_only_orders(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    snapshot_refresh_healthy: bool,
+    expected_outcome: canary.CanaryOutcome,
+    expected_reason: str,
 ) -> None:
     strategy = _complete_strategy(
         tmp_path,
         "close",
-        source_side=BusinessOrderSide.SELL,
+        source_side=BusinessOrderSide.BUY,
         planned_close=True,
     )
     completed = strategy.state_store.intents()[0]
@@ -1000,7 +1094,7 @@ def test_exact_existing_pair_closes_to_flat_only_with_reduce_only_orders(
         "S-close": SimpleNamespace(
             order_type=OrderType.LIMIT,
             time_in_force=TimeInForce.IOC,
-            side=OrderSide.SELL,
+            side=OrderSide.BUY,
             quantity=quantity,
             filled_qty=quantity,
             is_reduce_only=True,
@@ -1009,7 +1103,7 @@ def test_exact_existing_pair_closes_to_flat_only_with_reduce_only_orders(
         "H-close": SimpleNamespace(
             order_type=OrderType.MARKET,
             time_in_force=TimeInForce.FOK,
-            side=OrderSide.BUY,
+            side=OrderSide.SELL,
             quantity=quantity,
             filled_qty=quantity,
             is_reduce_only=True,
@@ -1017,7 +1111,10 @@ def test_exact_existing_pair_closes_to_flat_only_with_reduce_only_orders(
         ),
     }
     node = SimpleNamespace(
-        kernel=SimpleNamespace(exec_engine=ExecEngine()),
+        kernel=SimpleNamespace(
+            data_engine=SimpleNamespace(check_connected=lambda: True),
+            exec_engine=ExecEngine(),
+        ),
         cache=SimpleNamespace(
             orders_open=lambda **_kwargs: [],
             positions_open=lambda **_kwargs: [],
@@ -1036,6 +1133,17 @@ def test_exact_existing_pair_closes_to_flat_only_with_reduce_only_orders(
             SimpleNamespace(execution_hold_reason=None, pending_client_order_ids=()),
         ),
     )
+    monkeypatch.setattr(
+        canary,
+        "_data_clients",
+        lambda _node: (
+            SimpleNamespace(is_connected=True),
+            SimpleNamespace(
+                is_connected=True,
+                snapshot_refresh_healthy=snapshot_refresh_healthy,
+            ),
+        ),
+    )
 
     async def scenario() -> canary.TakerCanaryResult:
         async def wait_forever() -> None:
@@ -1047,19 +1155,19 @@ def test_exact_existing_pair_closes_to_flat_only_with_reduce_only_orders(
                 cast(Any, node),
                 strategy,
                 task,
-                SourceDirection.SHORT,
+                SourceDirection.LONG,
                 0.1,
                 0.1,
                 close_existing=True,
-                expected_source_position=D(2),
+                expected_source_position=D(-2),
             )
         finally:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
 
     assert asyncio.run(scenario()) == canary.TakerCanaryResult(
-        "PASSED_FLAT",
-        "exact_2oz_pair_closed",
+        expected_outcome,
+        expected_reason,
         "S-close",
     )
 
