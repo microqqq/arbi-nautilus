@@ -490,7 +490,16 @@ class BitfinexV1DataClient(LiveMarketDataClient):
         if payload == "hb" and len(frame) == 2:
             if channel_id in {self._channel_id, self._funding_channel_id}:
                 return ()
-            raise BitfinexV1DataError("Bitfinex frame belongs to an unexpected channel")
+            raise BitfinexV1DataError(
+                "Bitfinex unknown hb "
+                f"requested=book:{int(self._subscription_requested)},"
+                f"funding:{int(self._funding_subscription_requested)} "
+                f"deferred=book:{int(self._unsubscribe_book_on_ack)},"
+                f"funding:{int(self._unsubscribe_funding_on_ack)} "
+                f"channels=book:{self._channel_id},funding:{self._funding_channel_id},"
+                f"pend_book:{self._pending_unsubscribe_channel_id},"
+                f"pend_funding:{self._pending_funding_unsubscribe_channel_id},in:{channel_id}"
+            )
         if channel_id == self._channel_id:
             return self._consume_book_frame(frame)
         if channel_id == self._funding_channel_id:

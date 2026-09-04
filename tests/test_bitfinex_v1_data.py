@@ -927,6 +927,50 @@ def test_unknown_channel_duplicate_ack_and_bad_crc_fail_immediately() -> None:
     asyncio.run(scenario())
 
 
+def test_unknown_heartbeat_reports_safe_channel_state_and_stays_fail_closed() -> None:
+    async def scenario() -> None:
+        client = _client(_FakeTransport())
+        client._subscription_requested = True
+
+        with pytest.raises(BitfinexV1DataError) as before_ack:
+            client._consume_frame([CHANNEL_ID, "hb"])
+        assert str(before_ack.value) == (
+            "Bitfinex unknown hb requested=book:1,funding:0 deferred=book:0,funding:0 "
+            "channels=book:None,funding:None,pend_book:None,pend_funding:None,in:474371"
+        )
+
+        client._consume_frame(_subscription())
+        assert client._consume_frame([CHANNEL_ID, "hb"]) == ()
+        with pytest.raises(BitfinexV1DataError) as after_ack:
+            client._consume_frame([CHANNEL_ID + 2, "hb"])
+        assert str(after_ack.value) == (
+            "Bitfinex unknown hb requested=book:1,funding:0 deferred=book:0,funding:0 "
+            "channels=book:474371,funding:None,pend_book:None,pend_funding:None,in:474373"
+        )
+
+    asyncio.run(scenario())
+
+
+def test_reader_disconnects_on_unknown_heartbeat_and_retains_diagnostic() -> None:
+    async def scenario() -> None:
+        fake = _FakeTransport()
+        client = _client(fake)
+        client.connect()
+        await _wait_until(lambda: client.is_connected)
+        await client._subscribe_quote_ticks(_quote_command())
+
+        await fake.queue.put([CHANNEL_ID, "hb"])
+        await _wait_until(lambda: fake.closed and not client.is_connected)
+
+        assert client.last_failure == (
+            "BitfinexV1DataError: Bitfinex unknown hb requested=book:1,funding:0 "
+            "deferred=book:0,funding:0 channels=book:None,funding:None,pend_book:None,"
+            "pend_funding:None,in:474371"
+        )
+
+    asyncio.run(scenario())
+
+
 def test_client_publishes_atomic_snapshot_then_revalidates_deltas_with_crc() -> None:
     async def scenario() -> None:
         clock = TestComponentStubs.clock()
