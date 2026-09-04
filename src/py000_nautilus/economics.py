@@ -1,9 +1,78 @@
 """Taker formulas translated directly from the authenticated active script."""
 
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from py000_nautilus.config import CarryConfig, FxConfig, TakerEconomicsConfig
 from py000_nautilus.models import BookTop, HedgeAccount, Opportunity, SourceAccount, SourceDirection
+
+_MT5_SWAP_DISABLED = 0
+_MT5_SWAP_POINTS = 1
+
+
+def normalize_mt5_points_swap(
+    *,
+    swap_long: Decimal,
+    swap_short: Decimal,
+    point: Decimal,
+    ask: Decimal,
+    native_swap_mode: int,
+    swap_rates: tuple[Decimal, ...],
+    now_ns: int,
+    server_timezone: str,
+) -> tuple[Decimal, Decimal]:
+    """Return signed MT5 long/short daily swap as decimal notional returns.
+
+    ``swap_rates`` is the broker-native Sunday-through-Saturday multiplier vector,
+    using MQL's weekday numbering. Only native ``DISABLED`` and ``POINTS`` modes have
+    defined semantics here.
+    """
+    _require_finite_decimal("swap_long", swap_long)
+    _require_finite_decimal("swap_short", swap_short)
+    _require_positive_decimal("point", point)
+    _require_positive_decimal("ask", ask)
+    if type(native_swap_mode) is not int or native_swap_mode not in {
+        _MT5_SWAP_DISABLED,
+        _MT5_SWAP_POINTS,
+    }:
+        raise ValueError("native_swap_mode must be MT5 DISABLED(0) or POINTS(1)")
+    if not isinstance(swap_rates, tuple) or len(swap_rates) != 7:
+        raise ValueError("swap_rates must contain exactly seven MQL weekday multipliers")
+    for index, rate in enumerate(swap_rates):
+        _require_finite_decimal(f"swap_rates[{index}]", rate)
+    if type(now_ns) is not int or now_ns < 0:
+        raise ValueError("now_ns must be a non-bool non-negative integer")
+    if (
+        not isinstance(server_timezone, str)
+        or not server_timezone
+        or server_timezone != server_timezone.strip()
+    ):
+        raise ValueError("server_timezone must be a non-empty trimmed IANA timezone")
+    try:
+        server_zone = ZoneInfo(server_timezone)
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        raise ValueError("server_timezone must name an available IANA timezone") from exc
+
+    seconds, nanoseconds = divmod(now_ns, 1_000_000_000)
+    try:
+        observed_utc = datetime.fromtimestamp(seconds, UTC) + timedelta(
+            microseconds=nanoseconds // 1_000,
+        )
+        observed_server = observed_utc.astimezone(server_zone)
+    except (OverflowError, OSError, ValueError) as exc:
+        raise ValueError("now_ns is outside the supported datetime range") from exc
+
+    if native_swap_mode == _MT5_SWAP_DISABLED:
+        return Decimal(0), Decimal(0)
+
+    # Python Monday=0; MQL Sunday=0.
+    mql_weekday = (observed_server.weekday() + 1) % 7
+    multiplier = swap_rates[mql_weekday]
+    return (
+        swap_long * point / ask * multiplier,
+        swap_short * point / ask * multiplier,
+    )
 
 
 def select_source_account(
@@ -78,6 +147,7 @@ def evaluate_taker(
     hedge: HedgeAccount,
     config: TakerEconomicsConfig,
     *,
+    allowed_direction: SourceDirection | None = None,
     carry: CarryConfig | None = None,
     fx: FxConfig | None = None,
 ) -> Opportunity | None:
@@ -98,7 +168,11 @@ def evaluate_taker(
     )
 
     # The active script checks short first and uses `elif` for long.
-    if short_return is not None and short_return > config.threshold_short:
+    if (
+        allowed_direction in {None, SourceDirection.SHORT}
+        and short_return is not None
+        and short_return > config.threshold_short
+    ):
         account = select_source_account(accounts, SourceDirection.SHORT)
         quantity = min(
             account.max_short_ounces,
@@ -117,7 +191,11 @@ def evaluate_taker(
         )
         return candidate if risk_allows(candidate, hedge, config) else None
 
-    if long_return is not None and long_return > config.threshold_long:
+    if (
+        allowed_direction in {None, SourceDirection.LONG}
+        and long_return is not None
+        and long_return > config.threshold_long
+    ):
         account = select_source_account(accounts, SourceDirection.LONG)
         quantity = min(
             account.max_long_ounces,
@@ -214,5 +292,16 @@ def _validate_book(book: BookTop) -> None:
 
 
 def _require_positive(name: str, value: Decimal) -> None:
+    if value <= 0:
+        raise ValueError(f"{name} must be positive")
+
+
+def _require_finite_decimal(name: str, value: Decimal) -> None:
+    if not isinstance(value, Decimal) or not value.is_finite():
+        raise ValueError(f"{name} must be a finite Decimal")
+
+
+def _require_positive_decimal(name: str, value: Decimal) -> None:
+    _require_finite_decimal(name, value)
     if value <= 0:
         raise ValueError(f"{name} must be positive")

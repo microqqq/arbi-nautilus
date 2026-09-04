@@ -8,11 +8,16 @@ from typing import Any, cast
 
 import pytest
 from msgspec.structs import replace as struct_replace
-from nautilus_trader.model.enums import OrderSide
+from nautilus_trader.core.uuid import UUID4
+from nautilus_trader.execution.reports import OrderStatusReport
+from nautilus_trader.model.data import FundingRateUpdate
+from nautilus_trader.model.enums import OrderSide, OrderStatus, TimeInForce
+from nautilus_trader.model.events import OrderRejected
 from nautilus_trader.model.identifiers import (
     AccountId,
     ClientId,
     ClientOrderId,
+    PositionId,
     TradeId,
     VenueOrderId,
 )
@@ -27,6 +32,7 @@ from py000_nautilus.app import (
     _source_instrument,
 )
 from py000_nautilus.config import CarryConfig, FxConfig
+from py000_nautilus.hedge import HedgeCoordinator
 from py000_nautilus.models import (
     BookTop,
     BusinessOrderSide,
@@ -40,6 +46,8 @@ from py000_nautilus.models import (
 from py000_nautilus.store import JsonStateStore
 from py000_nautilus.strategies.maker import (
     MakerStrategy,
+    SourceTerminalQuery,
+    SourceTerminalResult,
     _maker_timer_name,
     _maker_timer_target,
 )
@@ -74,8 +82,21 @@ def _bound_quote() -> MakerQuote:
 
 
 class RecordingMakerStrategy(MakerStrategy):
-    def __init__(self, state_prefix: Path) -> None:
-        super().__init__(_maker_strategy_config(state_prefix))
+    def __init__(
+        self,
+        state_prefix: Path,
+        *,
+        hedge_client_id: ClientId | None = None,
+        source_terminal_query: SourceTerminalQuery | None = None,
+    ) -> None:
+        config = _maker_strategy_config(state_prefix)
+        if hedge_client_id is not None:
+            route = struct_replace(config.hedge_accounts[0], client_id=hedge_client_id)
+            config = struct_replace(config, hedge_accounts=(route,))
+        super().__init__(
+            config,
+            source_terminal_query=source_terminal_query,
+        )
         self.recorded: list[
             tuple[SourceDirection, AccountId, ClientId | None, HedgeIntent]
         ] = []
@@ -89,6 +110,10 @@ class RecordingMakerStrategy(MakerStrategy):
         intent: HedgeIntent,
     ) -> None:
         self.recorded.append((direction, hedge_account_id, hedge_client_id, intent))
+        self._stores[direction].bind_hedge_order(
+            intent.intent_id,
+            f"H-RECORDED-{len(self.recorded)}",
+        )
 
     def _cancel_working(
         self,
@@ -184,6 +209,28 @@ class CyclePlacementMakerStrategy(RecordingMakerStrategy):
         self.placed_source_ids.append(client_order_id)
 
 
+class TerminalQueryMakerStrategy(RecordingMakerStrategy):
+    def __init__(
+        self,
+        state_prefix: Path,
+        *,
+        source_terminal_query: SourceTerminalQuery,
+    ) -> None:
+        super().__init__(
+            state_prefix,
+            source_terminal_query=source_terminal_query,
+        )
+        self.report_is_exact = True
+
+    def _source_cancel_report_is_exact(
+        self,
+        direction: SourceDirection,
+        event: Any,
+        report: OrderStatusReport,
+    ) -> bool:
+        return self.report_is_exact
+
+
 def _filled_events(quantity: int = 2) -> tuple[Any, Any]:
     instrument = _source_instrument()
     order = TestExecStubs.limit_order(
@@ -212,6 +259,299 @@ def _filled_events(quantity: int = 2) -> tuple[Any, Any]:
     return partial, final
 
 
+def _canceled_source_order(
+    *,
+    quantity: int = 1,
+    fill_prices: tuple[str, ...] = (),
+) -> tuple[Any, Any]:
+    instrument = _source_instrument()
+    account_id = AccountId("BITFINEX-001")
+    venue_order_id = VenueOrderId("V-CANCEL-QUERY")
+    order = TestExecStubs.limit_order(
+        instrument=instrument,
+        order_side=OrderSide.BUY,
+        quantity=instrument.make_qty(quantity),
+        price=instrument.make_price(2400),
+        time_in_force=TimeInForce.GTC,
+        post_only=True,
+        client_order_id=ClientOrderId("O-CANCEL-QUERY"),
+    )
+    order.apply(TestEventStubs.order_submitted(order, account_id=account_id, ts_event=1))
+    order.apply(
+        TestEventStubs.order_accepted(
+            order,
+            account_id=account_id,
+            venue_order_id=venue_order_id,
+            ts_event=2,
+        )
+    )
+    for index, fill_price in enumerate(fill_prices, start=1):
+        order.apply(
+            TestEventStubs.order_filled(
+                order=order,
+                instrument=instrument,
+                account_id=account_id,
+                venue_order_id=venue_order_id,
+                trade_id=TradeId(f"T-CANCEL-QUERY-{index}"),
+                last_qty=instrument.make_qty(1),
+                last_px=instrument.make_price(fill_price),
+                commission=Money(0, instrument.quote_currency),
+                ts_event=2 + index,
+            )
+        )
+    event = TestEventStubs.order_canceled(
+        order,
+        account_id=account_id,
+        ts_event=3 + len(fill_prices),
+    )
+    order.apply(event)
+    return order, event
+
+
+def _cancel_report(order: Any, **overrides: Any) -> OrderStatusReport:
+    values: dict[str, Any] = {
+        "account_id": order.account_id,
+        "instrument_id": order.instrument_id,
+        "client_order_id": order.client_order_id,
+        "venue_order_id": order.venue_order_id,
+        "order_side": order.side,
+        "order_type": order.order_type,
+        "time_in_force": order.time_in_force,
+        "order_status": OrderStatus.CANCELED,
+        "quantity": order.quantity,
+        "filled_qty": order.filled_qty,
+        "price": order.price,
+        "avg_px": None if order.filled_qty.as_decimal() == 0 else Decimal(str(order.avg_px)),
+        "post_only": True,
+        "reduce_only": False,
+        "report_id": UUID4(),
+        "ts_accepted": 2,
+        "ts_last": 4,
+        "ts_init": 5,
+    }
+    values.update(overrides)
+    return OrderStatusReport(**values)
+
+
+def _seed_cancel_store(
+    strategy: RecordingMakerStrategy,
+    *,
+    quantity: int,
+    filled: int = 0,
+) -> JsonStateStore:
+    store = strategy._stores[SourceDirection.LONG]
+    store.begin_source(
+        "O-CANCEL-QUERY",
+        BusinessOrderSide.BUY,
+        D(quantity),
+        source_account_id="BITFINEX-001",
+        hedge_account_id="MT5-001",
+    )
+    if filled:
+        store.reserve_source_fill(
+            fill_key="O-CANCEL-QUERY|V-CANCEL-QUERY|T-CANCEL-QUERY",
+            client_order_id="O-CANCEL-QUERY",
+            trade_id="T-CANCEL-QUERY",
+            source_side=BusinessOrderSide.BUY,
+            fill_ounces=D(filled),
+        )
+    store.update_source_status("O-CANCEL-QUERY", "CANCELED")
+    return store
+
+
+def test_source_cancel_report_requires_exact_cache_and_store_facts(tmp_path: Path) -> None:
+    strategy = RecordingMakerStrategy(tmp_path / "cancel-report-exact.state")
+    store = _seed_cancel_store(strategy, quantity=1)
+    order, event = _canceled_source_order()
+    harness = cast(
+        Any,
+        SimpleNamespace(
+            _stores=strategy._stores,
+            _config=strategy._config,
+            cache=SimpleNamespace(order=lambda _client_order_id: order),
+        ),
+    )
+
+    assert MakerStrategy._source_cancel_report_is_exact(
+        harness,
+        SourceDirection.LONG,
+        event,
+        _cancel_report(order),
+    )
+    # Bitfinex paper terminal rows omit the submitted post-only flag. The cache
+    # still proves the intent; this gate reconciles terminal exposure only.
+    assert MakerStrategy._source_cancel_report_is_exact(
+        harness,
+        SourceDirection.LONG,
+        event,
+        _cancel_report(order, post_only=False),
+    )
+    assert store.halt_reason is not None
+
+    instrument = _source_instrument()
+    mismatches = (
+        {"account_id": AccountId("BITFINEX-OTHER")},
+        {"instrument_id": _hedge_instrument().id},
+        {"client_order_id": ClientOrderId("O-OTHER")},
+        {"venue_order_id": VenueOrderId("V-OTHER")},
+        {"order_side": OrderSide.SELL},
+        {"time_in_force": TimeInForce.IOC},
+        {"order_status": OrderStatus.ACCEPTED},
+        {"quantity": instrument.make_qty(2)},
+        {"filled_qty": instrument.make_qty(1)},
+        {"price": instrument.make_price(2399)},
+        {"avg_px": D(2400)},
+        {"reduce_only": True},
+    )
+    for overrides in mismatches:
+        assert not MakerStrategy._source_cancel_report_is_exact(
+            harness,
+            SourceDirection.LONG,
+            event,
+            _cancel_report(order, **overrides),
+        )
+
+
+def test_source_cancel_report_accepts_an_already_recorded_partial_fill(
+    tmp_path: Path,
+) -> None:
+    strategy = RecordingMakerStrategy(tmp_path / "cancel-report-partial.state")
+    _seed_cancel_store(strategy, quantity=3, filled=2)
+    order, event = _canceled_source_order(
+        quantity=3,
+        fill_prices=("2400.1", "2400.2"),
+    )
+    harness = cast(
+        Any,
+        SimpleNamespace(
+            _stores=strategy._stores,
+            _config=strategy._config,
+            cache=SimpleNamespace(order=lambda _client_order_id: order),
+        ),
+    )
+
+    assert MakerStrategy._source_cancel_report_is_exact(
+        harness,
+        SourceDirection.LONG,
+        event,
+        _cancel_report(order, avg_px=D("2400.15")),
+    )
+    assert not MakerStrategy._source_cancel_report_is_exact(
+        harness,
+        SourceDirection.LONG,
+        event,
+        _cancel_report(order, filled_qty=_source_instrument().make_qty(0), avg_px=None),
+    )
+
+
+def test_canceled_source_queries_once_and_confirms_only_after_exact_report(
+    tmp_path: Path,
+) -> None:
+    requested: list[tuple[ClientOrderId, VenueOrderId, SourceTerminalResult]] = []
+    order, event = _canceled_source_order()
+    report = _cancel_report(order)
+
+    def query(
+        client_order_id: ClientOrderId,
+        venue_order_id: VenueOrderId,
+        complete: SourceTerminalResult,
+    ) -> None:
+        requested.append((client_order_id, venue_order_id, complete))
+
+    strategy = TerminalQueryMakerStrategy(
+        tmp_path / "cancel-query-success.state",
+        source_terminal_query=query,
+    )
+    store = strategy._stores[SourceDirection.LONG]
+    store.begin_source(
+        order.client_order_id.value,
+        BusinessOrderSide.BUY,
+        D(1),
+        source_account_id="BITFINEX-001",
+        hedge_account_id="MT5-001",
+    )
+
+    strategy.on_order_canceled(event)
+    strategy.on_order_canceled(event)
+
+    assert len(requested) == 1
+    active_before_completion = store.active_source_order_id
+    halt_before_completion = store.halt_reason
+    assert active_before_completion == order.client_order_id.value
+    assert halt_before_completion is not None
+    assert strategy._source_terminal_inflight == {order.client_order_id.value}
+    requested[0][2](report)
+
+    assert [(item[0], item[1]) for item in requested] == [
+        (order.client_order_id, order.venue_order_id)
+    ]
+    assert store.active_source_order_id is None
+    assert store.halt_reason is None
+    assert not strategy._global_obligation_block()
+    assert strategy._source_terminal_inflight == set()
+
+
+@pytest.mark.parametrize("failure", ["none", "exception", "inexact"])
+def test_source_terminal_query_failure_keeps_durable_hold(
+    tmp_path: Path,
+    failure: str,
+) -> None:
+    completions: list[SourceTerminalResult] = []
+    order, event = _canceled_source_order()
+    report = _cancel_report(order)
+
+    def query(
+        _client_order_id: ClientOrderId,
+        _venue_order_id: VenueOrderId,
+        complete: SourceTerminalResult,
+    ) -> None:
+        if failure == "exception":
+            raise OSError("injected query failure")
+        completions.append(complete)
+
+    strategy = TerminalQueryMakerStrategy(
+        tmp_path / f"cancel-query-{failure}.state",
+        source_terminal_query=query,
+    )
+    strategy.report_is_exact = failure != "inexact"
+    store = strategy._stores[SourceDirection.LONG]
+    store.begin_source(
+        order.client_order_id.value,
+        BusinessOrderSide.BUY,
+        D(1),
+        source_account_id="BITFINEX-001",
+        hedge_account_id="MT5-001",
+    )
+
+    strategy.on_order_canceled(event)
+    if failure == "exception":
+        assert completions == []
+    else:
+        assert len(completions) == 1
+        completions.pop()(None if failure == "none" else report)
+
+    record = store.source_order(order.client_order_id.value)
+    assert record is not None and record.status == "CANCELED"
+    assert store.active_source_order_id == order.client_order_id.value
+    assert store.halt_reason is not None
+    assert strategy._source_terminal_inflight == set()
+
+
+def _rejected(order: Any, reason: str) -> OrderRejected:
+    template = TestEventStubs.order_rejected(order)
+    return OrderRejected(
+        trader_id=template.trader_id,
+        strategy_id=template.strategy_id,
+        instrument_id=template.instrument_id,
+        client_order_id=template.client_order_id,
+        account_id=template.account_id,
+        reason=reason,
+        event_id=UUID4(),
+        ts_event=template.ts_event,
+        ts_init=template.ts_init,
+    )
+
+
 def _subunit_fill() -> Any:
     instrument = _source_instrument()
     order = TestExecStubs.limit_order(
@@ -234,7 +574,10 @@ def _subunit_fill() -> Any:
 def test_partial_final_duplicate_and_late_fills_keep_pair_and_freeze_both_sides(
     tmp_path: Path,
 ) -> None:
-    strategy = RecordingMakerStrategy(tmp_path / "maker.state")
+    strategy = RecordingMakerStrategy(
+        tmp_path / "maker.state",
+        hedge_client_id=ClientId("HEDGE-CLIENT"),
+    )
     store = strategy._stores[SourceDirection.LONG]
     store.begin_source(
         "O-MAKER-EVENTS",
@@ -256,6 +599,19 @@ def test_partial_final_duplicate_and_late_fills_keep_pair_and_freeze_both_sides(
     strategy.on_order_filled(partial)  # duplicate early fill
     strategy.on_order_filled(final)  # duplicate late fill
 
+    assert [entry[3].source_trade_id for entry in strategy.recorded] == ["T-PARTIAL"]
+    strategy.on_order_filled(
+        cast(
+            Any,
+            SimpleNamespace(
+                instrument_id=_hedge_instrument().id,
+                client_order_id=ClientOrderId("H-RECORDED-1"),
+                trade_id=TradeId("HEDGE-PARTIAL"),
+                last_qty=Quantity.from_int(1),
+            ),
+        )
+    )
+
     assert [entry[3].source_trade_id for entry in strategy.recorded] == [
         "T-PARTIAL",
         "T-FINAL",
@@ -263,14 +619,61 @@ def test_partial_final_duplicate_and_late_fills_keep_pair_and_freeze_both_sides(
     assert all(entry[1] == AccountId("MT5-001") for entry in strategy.recorded)
     assert all(entry[2] == ClientId("HEDGE-CLIENT") for entry in strategy.recorded)
     assert store.rounding_residual_ounces == 0
-    assert store.net_unhedged_ounces == D(2)
+    assert store.net_unhedged_ounces == D(1)
+
+
+def test_unknown_engine_rejection_freezes_source_without_declaring_failure(
+    tmp_path: Path,
+) -> None:
+    requested: list[tuple[ClientOrderId, VenueOrderId]] = []
+
+    def query(
+        client_order_id: ClientOrderId,
+        venue_order_id: VenueOrderId,
+        _complete: SourceTerminalResult,
+    ) -> None:
+        requested.append((client_order_id, venue_order_id))
+
+    strategy = TerminalQueryMakerStrategy(
+        tmp_path / "unknown.state",
+        source_terminal_query=query,
+    )
+    instrument = _source_instrument()
+    order = TestExecStubs.limit_order(
+        instrument=instrument,
+        order_side=OrderSide.BUY,
+        quantity=instrument.make_qty(1),
+        price=instrument.make_price(2400),
+        client_order_id=ClientOrderId("O-MAKER-UNKNOWN"),
+    )
+    store = strategy._stores[SourceDirection.LONG]
+    store.begin_source(
+        order.client_order_id.value,
+        BusinessOrderSide.BUY,
+        D(1),
+        source_account_id="BITFINEX-001",
+        hedge_account_id="MT5-001",
+    )
+    strategy._working_quotes[order.client_order_id.value] = _bound_quote()
+
+    strategy.on_order_rejected(_rejected(order, "UNKNOWN"))
+
+    record = store.source_order(order.client_order_id.value)
+    assert record is not None and record.status == "UNKNOWN"
+    assert store.active_source_order_id == order.client_order_id.value
+    assert not store.can_submit_source()
+    assert strategy.canceled == [SourceDirection.LONG, SourceDirection.SHORT]
+    assert requested == []
 
 
 def test_restart_late_fill_uses_durable_pair_and_keeps_reconciliation_hold(
     tmp_path: Path,
 ) -> None:
     state_prefix = tmp_path / "restart.state"
-    original = RecordingMakerStrategy(state_prefix)
+    original = RecordingMakerStrategy(
+        state_prefix,
+        hedge_client_id=ClientId("HEDGE-CLIENT"),
+    )
     original._stores[SourceDirection.LONG].begin_source(
         "O-MAKER-EVENTS",
         BusinessOrderSide.BUY,
@@ -281,7 +684,10 @@ def test_restart_late_fill_uses_durable_pair_and_keeps_reconciliation_hold(
         hedge_client_id="HEDGE-CLIENT",
     )
 
-    restarted = RecordingMakerStrategy(state_prefix)
+    restarted = RecordingMakerStrategy(
+        state_prefix,
+        hedge_client_id=ClientId("HEDGE-CLIENT"),
+    )
     store = restarted._stores[SourceDirection.LONG]
     assert store.recover_for_start() is not None
     partial, _ = _filled_events()
@@ -293,6 +699,50 @@ def test_restart_late_fill_uses_durable_pair_and_keeps_reconciliation_hold(
     assert store.has_unresolved_hedges()
     assert store.net_unhedged_ounces == D(1)
     assert store.halt_reason is not None
+
+
+@pytest.mark.parametrize(
+    ("configured_client_id", "persisted_client_id"),
+    [
+        (None, "HEDGE-OLD"),
+        (ClientId("HEDGE-CURRENT"), None),
+        (ClientId("HEDGE-CURRENT"), "HEDGE-OLD"),
+    ],
+    ids=["unexpected-persisted", "persisted-missing", "client-drift"],
+)
+def test_maker_durable_hedge_client_mismatch_blocks_before_submit(
+    tmp_path: Path,
+    configured_client_id: ClientId | None,
+    persisted_client_id: str | None,
+) -> None:
+    strategy = RecordingMakerStrategy(
+        tmp_path / f"client-route-{persisted_client_id}.state",
+        hedge_client_id=configured_client_id,
+    )
+    store = strategy._stores[SourceDirection.LONG]
+    store.begin_source(
+        "O-CLIENT-ROUTE",
+        BusinessOrderSide.BUY,
+        D(1),
+        hedge_account_id="MT5-001",
+        hedge_client_id=persisted_client_id,
+    )
+    intent = store.reserve_source_fill(
+        fill_key="O-CLIENT-ROUTE|V|T",
+        client_order_id="O-CLIENT-ROUTE",
+        trade_id="T-CLIENT-ROUTE",
+        source_side=BusinessOrderSide.BUY,
+        fill_ounces=D(1),
+    )
+    assert intent is not None
+
+    strategy._submit_next_pending_hedge()
+
+    assert strategy.recorded == []
+    assert store.intent(intent.intent_id).status is ObligationStatus.BLOCKED
+    source = store.source_order("O-CLIENT-ROUTE")
+    assert source is not None and source.status == "UNKNOWN"
+    assert "durable Maker hedge route" in cast(str, store.halt_reason)
 
 
 def test_subunit_fill_with_no_rounded_intent_still_freezes_and_cancels_both(
@@ -339,6 +789,283 @@ def test_hedge_dispatch_precedes_cancel_and_first_cancel_failure_is_isolated(
     assert strategy._global_obligation_block()
 
 
+def test_maker_two_direction_obligations_share_one_global_mt5_flight(
+    tmp_path: Path,
+) -> None:
+    strategy = RecordingMakerStrategy(
+        tmp_path / "global-flight.state",
+        hedge_client_id=ClientId("HEDGE-CLIENT"),
+    )
+    for direction, side in (
+        (SourceDirection.LONG, BusinessOrderSide.BUY),
+        (SourceDirection.SHORT, BusinessOrderSide.SELL),
+    ):
+        store = strategy._stores[direction]
+        source_id = f"O-{direction.value}"
+        store.begin_source(
+            source_id,
+            side,
+            D(1),
+            source_account_id="BITFINEX-001",
+            hedge_account_id="MT5-001",
+            hedge_client_id="HEDGE-CLIENT",
+        )
+        assert store.reserve_source_fill(
+            fill_key=f"{source_id}|V|T",
+            client_order_id=source_id,
+            trade_id=f"T-{direction.value}",
+            source_side=side,
+            fill_ounces=D(1),
+        ) is not None
+
+    strategy._submit_next_pending_hedge()
+    strategy._submit_next_pending_hedge()
+
+    assert [entry[0] for entry in strategy.recorded] == [SourceDirection.LONG]
+    strategy.on_order_filled(
+        cast(
+            Any,
+            SimpleNamespace(
+                instrument_id=_hedge_instrument().id,
+                client_order_id=ClientOrderId("H-RECORDED-1"),
+                trade_id=TradeId("HT-FIRST"),
+                last_qty=Quantity.from_int(1),
+            ),
+        )
+    )
+
+    assert [entry[0] for entry in strategy.recorded] == [
+        SourceDirection.LONG,
+        SourceDirection.SHORT,
+    ]
+
+
+def test_maker_uses_shared_multi_ticket_planner_for_exact_close_legs(
+    tmp_path: Path,
+) -> None:
+    store = JsonStateStore(tmp_path / "maker-shared-plan.json")
+    store.begin_source(
+        "O-MAKER-PLAN",
+        BusinessOrderSide.BUY,
+        D(2),
+        hedge_account_id="MT5-001",
+        hedge_client_id="HEDGE-CLIENT",
+    )
+    intent = store.reserve_source_fill(
+        fill_key="O-MAKER-PLAN|V|T",
+        client_order_id="O-MAKER-PLAN",
+        trade_id="T-MAKER-PLAN",
+        source_side=BusinessOrderSide.BUY,
+        fill_ounces=D(2),
+    )
+    assert intent is not None
+    positions = [
+        SimpleNamespace(
+            id=PositionId("2"),
+            quantity=Quantity.from_int(1),
+            is_long=True,
+            is_short=False,
+        ),
+        SimpleNamespace(
+            id=PositionId("1"),
+            quantity=Quantity.from_int(1),
+            is_long=True,
+            is_short=False,
+        ),
+    ]
+    calls: list[dict[str, object]] = []
+    submissions: list[PositionId | None] = []
+
+    def market(**kwargs: object) -> object:
+        calls.append(kwargs)
+        return SimpleNamespace(client_order_id=ClientOrderId(f"H-MAKER-{len(calls)}"))
+
+    coordinator = HedgeCoordinator(_source_instrument().id, store)
+    harness = SimpleNamespace(
+        _config=SimpleNamespace(hedge_instrument_id=_hedge_instrument().id),
+        _hedges={SourceDirection.LONG: coordinator},
+        _stores={SourceDirection.LONG: store},
+        cache=SimpleNamespace(
+            quote_tick=lambda _instrument_id: object(),
+            positions_open=lambda **_kwargs: positions,
+        ),
+        order_factory=SimpleNamespace(market=market),
+        log=SimpleNamespace(error=lambda _message: None),
+        _quote_is_fresh=lambda _tick: True,
+        _required_hedge_instrument=lambda: _hedge_instrument(),
+        _hedge_positions=lambda _account_id: positions,
+        submit_order=lambda _order, *, position_id, client_id: submissions.append(position_id),
+    )
+
+    MakerStrategy._submit_hedge(
+        cast(Any, harness),
+        SourceDirection.LONG,
+        AccountId("MT5-001"),
+        ClientId("HEDGE-CLIENT"),
+        intent,
+    )
+    positions.pop()
+    assert coordinator.on_hedge_filled(
+        cast(
+            Any,
+            SimpleNamespace(
+                client_order_id=ClientOrderId("H-MAKER-1"),
+                trade_id=TradeId("HT-MAKER-1"),
+                last_qty=Quantity.from_int(1),
+            ),
+        )
+    )
+    MakerStrategy._submit_hedge(
+        cast(Any, harness),
+        SourceDirection.LONG,
+        AccountId("MT5-001"),
+        ClientId("HEDGE-CLIENT"),
+        store.intent(intent.intent_id),
+    )
+
+    assert [call["reduce_only"] for call in calls] == [True, True]
+    assert submissions == [PositionId("1"), PositionId("2")]
+
+
+@pytest.mark.parametrize("source_missing", [True, False], ids=["source-missing", "source-hold"])
+def test_maker_fresh_hedge_quote_retries_pending_leg_exactly_once(
+    tmp_path: Path,
+    source_missing: bool,
+) -> None:
+    prefix = tmp_path / f"quote-retry-{source_missing}.state"
+    config = _maker_strategy_config(prefix)
+    stores = {
+        direction: JsonStateStore(f"{prefix}.{direction.value}.json")
+        for direction in (SourceDirection.LONG, SourceDirection.SHORT)
+    }
+    hedges = {
+        direction: HedgeCoordinator(config.source_instrument_id, stores[direction])
+        for direction in (SourceDirection.LONG, SourceDirection.SHORT)
+    }
+    store = stores[SourceDirection.LONG]
+    store.begin_source(
+        "O-QUOTE-RETRY",
+        BusinessOrderSide.BUY,
+        D(2),
+        hedge_account_id="MT5-001",
+        hedge_client_id=None,
+    )
+    intent = store.reserve_source_fill(
+        fill_key="O-QUOTE-RETRY|V|T",
+        client_order_id="O-QUOTE-RETRY",
+        trade_id="T-QUOTE-RETRY",
+        source_side=BusinessOrderSide.BUY,
+        fill_ounces=D(2),
+    )
+    assert intent is not None
+    positions = [
+        SimpleNamespace(
+            id=PositionId("2"),
+            quantity=Quantity.from_int(1),
+            is_long=True,
+            is_short=False,
+        ),
+        SimpleNamespace(
+            id=PositionId("1"),
+            quantity=Quantity.from_int(1),
+            is_long=True,
+            is_short=False,
+        ),
+    ]
+    source_tick = _quote(_source_instrument(), "2399", "2400", "5", 1_000_000_000)
+    hedge_tick = _quote(_hedge_instrument(), "2401", "2402", "5", 1_000_000_000)
+    fresh = {"value": True}
+    market_calls: list[dict[str, object]] = []
+    submissions: list[PositionId | None] = []
+    frozen: list[str] = []
+
+    def quote_tick(instrument_id: object) -> Any:
+        if instrument_id == config.hedge_instrument_id:
+            return hedge_tick
+        return None if source_missing else source_tick
+
+    def market(**kwargs: object) -> object:
+        market_calls.append(kwargs)
+        return SimpleNamespace(client_order_id=ClientOrderId(f"H-WAKE-{len(market_calls)}"))
+
+    harness = SimpleNamespace(
+        _config=config,
+        _stores=stores,
+        _hedges=hedges,
+        cache=SimpleNamespace(
+            quote_tick=quote_tick,
+            positions_open=lambda **_kwargs: positions,
+        ),
+        order_factory=SimpleNamespace(market=market),
+        log=SimpleNamespace(error=lambda _message: None),
+        clock=SimpleNamespace(timestamp_ns=lambda: 1_000_000_000),
+        _quote_is_fresh=lambda _tick: fresh["value"],
+        _carry_for_hedge_tick=lambda _tick, _now_ns: CarryConfig(),
+        _quote_carry=CarryConfig(),
+        _required_hedge_instrument=lambda: _hedge_instrument(),
+        _hedge_positions=lambda _account_id: positions,
+        submit_order=lambda _order, *, position_id, client_id: submissions.append(position_id),
+        _try_release_cycle=lambda: False,
+        _inputs_are_fresh=lambda _source, _hedge, _now_ns: True,
+        _global_obligation_block=lambda: True,
+        _freeze_and_cancel_all=lambda reason: frozen.append(reason),
+        _refresh_direction=lambda *_args: (_ for _ in ()).throw(
+            AssertionError("source quote maintenance must stay blocked")
+        ),
+    )
+    harness._durable_hedge_route = lambda direction, client_order_id: (
+        MakerStrategy._durable_hedge_route(
+            cast(Any, harness),
+            direction,
+            client_order_id,
+        )
+    )
+    harness._submit_hedge = lambda direction, account_id, client_id, current: (
+        MakerStrategy._submit_hedge(
+            cast(Any, harness),
+            direction,
+            account_id,
+            client_id,
+            current,
+        )
+    )
+    harness._submit_next_pending_hedge = lambda: MakerStrategy._submit_next_pending_hedge(
+        cast(Any, harness)
+    )
+
+    harness._submit_next_pending_hedge()
+    assert submissions == [PositionId("1")]
+    positions.pop()
+    fresh["value"] = False
+    MakerStrategy.on_order_filled(
+        cast(Any, harness),
+        cast(
+            Any,
+            SimpleNamespace(
+                instrument_id=config.hedge_instrument_id,
+                client_order_id=ClientOrderId("H-WAKE-1"),
+                trade_id=TradeId("HT-WAKE-1"),
+                last_qty=Quantity.from_int(1),
+            ),
+        ),
+    )
+    waiting = store.intent(intent.intent_id)
+    assert submissions == [PositionId("1")]
+    assert waiting.status is ObligationStatus.PENDING
+    assert waiting.hedge_client_order_id is None
+
+    fresh["value"] = True
+    MakerStrategy.on_quote_tick(cast(Any, harness), hedge_tick)
+    MakerStrategy.on_quote_tick(cast(Any, harness), hedge_tick)
+
+    assert submissions == [PositionId("1"), PositionId("2")]
+    submitted = store.intent(intent.intent_id)
+    assert submitted.status is ObligationStatus.SUBMITTING
+    assert submitted.hedge_client_order_id == "H-WAKE-2"
+    if not source_missing:
+        assert frozen == ["stale, closed, or unresolved"] * 2
+
+
 def _seed_filled_two_sided_cycle(
     strategy: RecordingMakerStrategy,
 ) -> tuple[JsonStateStore, JsonStateStore, HedgeIntent]:
@@ -368,16 +1095,17 @@ def test_complete_source_terminals_and_hedge_evidence_release_next_cycle(
 ) -> None:
     strategy = CyclePlacementMakerStrategy(tmp_path / "cycle-complete.state")
     bid_store, ask_store, intent = _seed_filled_two_sided_cycle(strategy)
-    bid_store.bind_hedge_order(intent.intent_id, "H-COMPLETE")
+    hedge_order_id = cast(str, intent.hedge_client_order_id)
     bid_store.apply_hedge_fill(
-        client_order_id="H-COMPLETE",
+        client_order_id=hedge_order_id,
         trade_id="HT-COMPLETE",
         fill_ounces=D(1),
     )
     strategy._finish_or_reject("O-SIBLING", "CANCELED")
 
     assert not strategy._try_release_cycle()
-    assert strategy.confirm_source_reconciled(SourceDirection.SHORT, "O-SIBLING")
+    ask_store.confirm_source_reconciled("O-SIBLING")
+    assert strategy._try_release_cycle()
 
     assert bid_store.source_freeze_reason is None
     assert ask_store.source_freeze_reason is None
@@ -414,9 +1142,9 @@ def test_missing_sibling_terminal_does_not_release_completed_hedge(
 ) -> None:
     strategy = RecordingMakerStrategy(tmp_path / "cycle-missing-sibling.state")
     bid_store, ask_store, intent = _seed_filled_two_sided_cycle(strategy)
-    bid_store.bind_hedge_order(intent.intent_id, "H-COMPLETE")
+    hedge_order_id = cast(str, intent.hedge_client_order_id)
     bid_store.apply_hedge_fill(
-        client_order_id="H-COMPLETE",
+        client_order_id=hedge_order_id,
         trade_id="HT-COMPLETE",
         fill_ounces=D(1),
     )
@@ -433,17 +1161,19 @@ def test_partial_or_rejected_hedge_does_not_release_cycle(
 ) -> None:
     strategy = RecordingMakerStrategy(tmp_path / f"cycle-{hedge_outcome}.state")
     bid_store, _, intent = _seed_filled_two_sided_cycle(strategy)
-    bid_store.bind_hedge_order(intent.intent_id, "H-INCOMPLETE")
+    hedge_order_id = cast(str, intent.hedge_client_order_id)
     if hedge_outcome == "partial":
         bid_store.apply_hedge_fill(
-            client_order_id="H-INCOMPLETE",
+            client_order_id=hedge_order_id,
             trade_id="HT-PARTIAL",
             fill_ounces=D("0.5"),
         )
     else:
-        bid_store.update_hedge_status("H-INCOMPLETE", ObligationStatus.REJECTED)
+        bid_store.update_hedge_status(hedge_order_id, ObligationStatus.REJECTED)
     strategy._finish_or_reject("O-SIBLING", "CANCELED")
-    assert not strategy.confirm_source_reconciled(SourceDirection.SHORT, "O-SIBLING")
+    ask_store = strategy._stores[SourceDirection.SHORT]
+    ask_store.confirm_source_reconciled("O-SIBLING")
+    assert not strategy._try_release_cycle()
 
     assert strategy._global_obligation_block()
     assert bid_store.source_freeze_reason is not None
@@ -455,9 +1185,9 @@ def test_restart_releases_only_from_persisted_complete_cycle_evidence(
     state_prefix = tmp_path / "cycle-restart-complete.state"
     original = RecordingMakerStrategy(state_prefix)
     bid_store, ask_store, intent = _seed_filled_two_sided_cycle(original)
-    bid_store.bind_hedge_order(intent.intent_id, "H-COMPLETE")
+    hedge_order_id = cast(str, intent.hedge_client_order_id)
     bid_store.apply_hedge_fill(
-        client_order_id="H-COMPLETE",
+        client_order_id=hedge_order_id,
         trade_id="HT-COMPLETE",
         fill_ounces=D(1),
     )
@@ -628,7 +1358,10 @@ class _StopHarness:
         self._stale_timer_names: dict[SourceDirection, str] = {}
         self._cost_ts_ns = 0
         self._carry = CarryConfig()
+        self._quote_carry = self._carry
         self._fx = FxConfig()
+        self._cost_snapshot_valid = True
+        self._cost_recovery_after_ns: int = 0
         self._session_ts_ns = 0
         self._hedge_session_open = True
         self.clock: Any = SimpleNamespace(timestamp_ns=lambda: 0)
@@ -661,7 +1394,12 @@ class _StopHarness:
         for direction in (SourceDirection.LONG, SourceDirection.SHORT):
             self._cancel_working(direction, reason=reason)
 
-    def _inputs_are_fresh(self, source_tick: Any, hedge_tick: Any) -> bool:
+    def _inputs_are_fresh(
+        self,
+        source_tick: Any,
+        hedge_tick: Any,
+        now_ns: int,
+    ) -> bool:
         return False
 
     def _direction_for_source_order(
@@ -771,6 +1509,150 @@ def test_cost_change_immediately_cancels_exact_active_ids_without_market_tick() 
     assert len(harness.canceled) == 2
 
 
+class _MakerCostHarness:
+    def __init__(self, state_prefix: Path, *, now_ns: int = 100) -> None:
+        config = _maker_strategy_config(state_prefix)
+        economics = struct_replace(
+            config.economics,
+            carry=CarryConfig(total_trade_fee=D("0.00065")),
+        )
+        self._config = struct_replace(config, economics=economics)
+        self._live_costs_from_adapters = True
+        self._carry = self._config.economics.carry
+        self._quote_carry = self._carry
+        self._fx = FxConfig()
+        self._cost_ts_ns = 0
+        self._cost_snapshot_valid = False
+        self._cost_recovery_after_ns: int = 0
+        self.now_ns = now_ns
+        self.clock = SimpleNamespace(timestamp_ns=lambda: self.now_ns)
+        self.frozen: list[str] = []
+        self.errors: list[str] = []
+        self.log = SimpleNamespace(error=self.errors.append)
+
+    def _freeze_and_cancel_all(self, reason: str) -> None:
+        self.frozen.append(reason)
+
+    def _invalidate_cost_snapshot(self, reason: str) -> None:
+        MakerStrategy._invalidate_cost_snapshot(cast(Any, self), reason)
+
+    def update_cost_snapshot(
+        self,
+        carry: CarryConfig,
+        fx: FxConfig,
+        ts_event_ns: int,
+    ) -> bool:
+        return MakerStrategy.update_cost_snapshot(cast(Any, self), carry, fx, ts_event_ns)
+
+    def on_funding_rate(self, update: FundingRateUpdate) -> None:
+        MakerStrategy.on_funding_rate(cast(Any, self), update)
+
+
+def _maker_funding(rate: str, ts_event: int) -> FundingRateUpdate:
+    return FundingRateUpdate(
+        instrument_id=_source_instrument().id,
+        rate=D(rate),
+        ts_event=ts_event,
+        ts_init=ts_event,
+    )
+
+
+@pytest.mark.parametrize(
+    ("rate", "timestamp", "reason"),
+    [
+        ("0.001", 101, "Bitfinex funding observation is future-dated"),
+        ("1.1", 99, "Bitfinex funding observation is invalid"),
+    ],
+)
+def test_future_or_invalid_live_funding_invalidates_and_freezes_maker(
+    tmp_path: Path,
+    rate: str,
+    timestamp: int,
+    reason: str,
+) -> None:
+    harness = _MakerCostHarness(tmp_path / "bad-live-cost.state")
+
+    harness.on_funding_rate(_maker_funding(rate, timestamp))
+
+    assert not cast(Any, harness)._cost_snapshot_valid
+    assert harness.frozen == [reason]
+    assert harness.errors == [reason]
+
+
+def test_equal_timestamp_cost_conflict_invalidates_until_fresh_newer_snapshot(
+    tmp_path: Path,
+) -> None:
+    harness = _MakerCostHarness(tmp_path / "cost-recovery.state")
+
+    harness.on_funding_rate(_maker_funding("0.001", 99))
+    assert cast(Any, harness)._cost_snapshot_valid
+
+    harness.on_funding_rate(_maker_funding("0.002", 99))
+    assert not cast(Any, harness)._cost_snapshot_valid
+
+    harness.on_funding_rate(_maker_funding("0.003", 100))
+    assert cast(Any, harness)._cost_snapshot_valid
+    assert cast(Any, harness)._cost_ts_ns == 100
+    assert cast(Any, harness)._carry.bitfinex_long == D("0.003")
+    assert harness.frozen == [
+        "Maker costs changed",
+        "Maker costs conflict at one timestamp",
+        "Maker costs changed",
+    ]
+
+
+@pytest.mark.parametrize("failure", ["false", "raises"])
+def test_live_hedge_quantity_failure_precedes_source_persistence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    strategy = RecordingMakerStrategy(tmp_path / f"quantity-{failure}.state")
+    strategy._source_instrument = _source_instrument()
+    monkeypatch.setattr(strategy, "_hedge_positions", lambda _account_id: [])
+
+    def quantity_ready(_quantity: Decimal) -> bool:
+        if failure == "raises":
+            raise RuntimeError("injected quantity failure")
+        return False
+
+    strategy._hedge_quantity_ready = quantity_ready
+    strategy._submit_source(_bound_quote())
+
+    assert strategy._stores[SourceDirection.LONG].source_orders() == ()
+    assert not strategy._stores[SourceDirection.LONG].path.exists()
+
+
+def test_live_hedge_quantity_preflight_checks_each_planned_mt5_ticket() -> None:
+    checked: list[Decimal] = []
+    positions = [
+        SimpleNamespace(
+            id=PositionId(position_id),
+            quantity=Quantity.from_int(1),
+            is_long=True,
+            is_short=False,
+        )
+        for position_id in ("2", "1")
+    ]
+
+    def quantity_ready(quantity: Decimal) -> bool:
+        checked.append(quantity)
+        return len(checked) == 1
+
+    harness = SimpleNamespace(
+        _hedge_quantity_ready=quantity_ready,
+        _hedge_positions=lambda _account_id: positions,
+        log=SimpleNamespace(error=lambda _message: None),
+    )
+
+    assert not MakerStrategy._source_hedge_is_executable(
+        cast(Any, harness),
+        _bound_quote(),
+        D(2),
+    )
+    assert checked == [D(1), D(1)]
+
+
 class _NowClock:
     def timestamp_ns(self) -> int:
         return 2
@@ -801,14 +1683,135 @@ class _QuoteCache:
         return self._ticks[instrument_id]
 
 
+class _LiveQuoteGateHarness:
+    def __init__(self, state_prefix: Path, *, now_ns: int) -> None:
+        self._config = _maker_strategy_config(state_prefix)
+        source = _source_instrument()
+        hedge = _hedge_instrument()
+        self.source_tick = _quote(source, "3999", "4000", "5", now_ns - 1)
+        self.hedge_tick = _quote(hedge, "3999", "4000", "5", now_ns - 1)
+        ticks = {source.id: self.source_tick, hedge.id: self.hedge_tick}
+        self.cache = SimpleNamespace(quote_tick=lambda instrument_id: ticks[instrument_id])
+        self.clock = SimpleNamespace(timestamp_ns=lambda: now_ns)
+        self.ready = False
+        self._live_submission_ready = lambda: self.ready
+        self._live_costs_from_adapters = True
+        self._cost_snapshot_valid = True
+        self._cost_recovery_after_ns = 0
+        self._cost_ts_ns = now_ns - 1
+        self._session_ts_ns = now_ns - 1
+        self._hedge_session_open = True
+        self._carry = CarryConfig(
+            bitfinex_long=D("-0.0007366"),
+            bitfinex_short=D("0.0007366"),
+            total_trade_fee=D("0.00065"),
+        )
+        self._quote_carry = self._carry
+        self._fx = FxConfig()
+        self.canceled: list[SourceDirection] = []
+        self.quote_carries: list[CarryConfig] = []
+        self.errors: list[str] = []
+        self.log = SimpleNamespace(error=self.errors.append)
+
+    def _inputs_are_fresh(
+        self,
+        source_tick: Any,
+        hedge_tick: Any,
+        now_ns: int,
+    ) -> bool:
+        return MakerStrategy._inputs_are_fresh(
+            cast(Any, self),
+            source_tick,
+            hedge_tick,
+            now_ns,
+        )
+
+    def _invalidate_cost_snapshot(self, reason: str) -> None:
+        MakerStrategy._invalidate_cost_snapshot(cast(Any, self), reason)
+
+    def _freeze_and_cancel_all(self, reason: str) -> None:
+        self.canceled.extend((SourceDirection.LONG, SourceDirection.SHORT))
+
+    def _global_obligation_block(self) -> bool:
+        return False
+
+    def _try_release_cycle(self) -> bool:
+        return False
+
+    def _refresh_direction(self, direction: SourceDirection, *_books: Any) -> None:
+        self.quote_carries.append(self._quote_carry)
+
+    def _carry_for_hedge_tick(self, hedge_tick: Any, now_ns: int) -> CarryConfig | None:
+        return MakerStrategy._carry_for_hedge_tick(cast(Any, self), hedge_tick, now_ns)
+
+    def _mt5_swap_spec(
+        self,
+    ) -> tuple[Decimal, Decimal, Decimal, int, tuple[Decimal, ...], str]:
+        return (
+            D("-12.6"),
+            D("-4.6"),
+            D("0.01"),
+            1,
+            (D(0), D(1), D(1), D(3), D(1), D(1), D(0)),
+            "Europe/Athens",
+        )
+
+
+def test_live_readiness_false_cancels_both_quotes_without_source_submit(
+    tmp_path: Path,
+) -> None:
+    now_ns = 1_788_439_200_000_000_000
+    harness = _LiveQuoteGateHarness(tmp_path / "readiness.state", now_ns=now_ns)
+
+    MakerStrategy.on_quote_tick(cast(Any, harness), harness.source_tick)
+
+    assert harness.canceled == [SourceDirection.LONG, SourceDirection.SHORT]
+    assert harness.quote_carries == []
+
+
+def test_live_readiness_exception_logs_type_and_cancels_both_quotes(tmp_path: Path) -> None:
+    now_ns = 1_788_439_200_000_000_000
+    harness = _LiveQuoteGateHarness(tmp_path / "readiness-error.state", now_ns=now_ns)
+
+    def readiness_failure() -> bool:
+        raise ConnectionError("injected readiness failure")
+
+    harness._live_submission_ready = readiness_failure
+
+    MakerStrategy.on_quote_tick(cast(Any, harness), harness.source_tick)
+
+    assert harness.errors == [
+        "Maker live submission readiness failed with ConnectionError",
+    ]
+    assert harness.canceled == [SourceDirection.LONG, SourceDirection.SHORT]
+    assert harness.quote_carries == []
+
+
+def test_live_mt5_swap_normalization_feeds_both_maker_quote_sides(tmp_path: Path) -> None:
+    # 2026-09-03 12:00 UTC is Thursday in Europe/Athens, multiplier one.
+    now_ns = 1_788_439_200_000_000_000
+    harness = _LiveQuoteGateHarness(tmp_path / "swap.state", now_ns=now_ns)
+    harness.ready = True
+
+    MakerStrategy.on_quote_tick(cast(Any, harness), harness.source_tick)
+
+    assert len(harness.quote_carries) == 2
+    assert all(carry.mt5_long_swap == D("-0.0000315") for carry in harness.quote_carries)
+    assert all(carry.mt5_short_swap == D("-0.0000115") for carry in harness.quote_carries)
+
+
 class _QuoteGateHarness:
     def __init__(self, state_prefix: Path, *, blocked: bool, fresh: bool) -> None:
         self._config = _maker_strategy_config(state_prefix)
         self.cache = _QuoteCache()
         self.blocked = blocked
         self.fresh = fresh
+        self.clock: Any = SimpleNamespace(timestamp_ns=lambda: 1_000_000_000)
+        self._quote_carry = CarryConfig()
         self.canceled: list[SourceDirection] = []
         self.refreshed: list[SourceDirection] = []
+        self.freshness_now_ns: list[int] = []
+        self.carry_now_ns: list[int] = []
 
     def _global_obligation_block(self) -> bool:
         return self.blocked
@@ -816,8 +1819,18 @@ class _QuoteGateHarness:
     def _try_release_cycle(self) -> bool:
         return False
 
-    def _inputs_are_fresh(self, source_tick: Any, hedge_tick: Any) -> bool:
+    def _inputs_are_fresh(
+        self,
+        source_tick: Any,
+        hedge_tick: Any,
+        now_ns: int,
+    ) -> bool:
+        self.freshness_now_ns.append(now_ns)
         return self.fresh
+
+    def _carry_for_hedge_tick(self, hedge_tick: Any, now_ns: int) -> CarryConfig:
+        self.carry_now_ns.append(now_ns)
+        return CarryConfig()
 
     def _cancel_working(self, direction: SourceDirection, *, reason: str) -> None:
         assert reason == "stale, closed, or unresolved"
@@ -834,6 +1847,29 @@ class _QuoteGateHarness:
         hedge_book: Any,
     ) -> None:
         self.refreshed.append(direction)
+
+
+def test_quote_decision_uses_one_clock_sample_for_freshness_and_swap(
+    tmp_path: Path,
+) -> None:
+    harness = _QuoteGateHarness(tmp_path / "one-clock.state", blocked=False, fresh=True)
+    clock_values = (100, 102)
+    clock_reads: list[int] = []
+
+    def timestamp_ns() -> int:
+        value = clock_values[len(clock_reads)]
+        clock_reads.append(value)
+        return value
+
+    harness.clock = SimpleNamespace(timestamp_ns=timestamp_ns)
+    tick = harness.cache.quote_tick(harness._config.source_instrument_id)
+
+    MakerStrategy.on_quote_tick(cast(Any, harness), tick)
+
+    assert clock_reads == [100]
+    assert harness.freshness_now_ns == [100]
+    assert harness.carry_now_ns == [100]
+    assert harness.refreshed == [SourceDirection.LONG, SourceDirection.SHORT]
 
 
 def test_completed_hedge_before_sibling_cancel_terminal_cannot_reopen_quotes(
@@ -860,9 +1896,9 @@ def test_completed_hedge_before_sibling_cancel_terminal_cannot_reopen_quotes(
 
     strategy.on_order_filled(full)
     intent = bid_store.intents()[0]
-    bid_store.bind_hedge_order(intent.intent_id, "H-COMPLETE")
+    hedge_order_id = cast(str, intent.hedge_client_order_id)
     bid_store.apply_hedge_fill(
-        client_order_id="H-COMPLETE",
+        client_order_id=hedge_order_id,
         trade_id="HT-COMPLETE",
         fill_ounces=D(1),
     )

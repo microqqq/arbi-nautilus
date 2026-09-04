@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import cast
 
 from py000_nautilus.economics import round_hedge_ounces
-from py000_nautilus.models import BusinessOrderSide, HedgeIntent, ObligationStatus
+from py000_nautilus.models import BusinessOrderSide, HedgeIntent, HedgeLeg, ObligationStatus
 
 
 @dataclass(frozen=True, slots=True)
@@ -23,6 +23,8 @@ class SourceOrderRecord:
     source_client_id: str | None = None
     hedge_account_id: str | None = None
     hedge_client_id: str | None = None
+    hedge_position_id: str | None = None
+    hedge_position_quantity_ounces: Decimal | None = None
     filled_ounces: Decimal = Decimal(0)
     status: str = "SUBMITTING"
 
@@ -136,7 +138,7 @@ class JsonStateStore:
         """Turn any crash-surviving in-flight work into an explicit stop."""
         active = self._state.active_source_order_id
         unresolved = [
-            intent.intent_id
+            intent
             for intent in self._state.hedge_intents.values()
             if intent.status is not ObligationStatus.COMPLETED
         ]
@@ -148,13 +150,19 @@ class JsonStateStore:
             self._state.source_orders[active] = replace(current, status="UNKNOWN")
             details.append(f"source={active}")
         if unresolved:
-            for intent_id in unresolved:
-                current_intent = self._state.hedge_intents[intent_id]
-                self._state.hedge_intents[intent_id] = replace(
-                    current_intent,
-                    status=ObligationStatus.UNKNOWN,
-                )
-            details.append(f"hedges={','.join(unresolved)}")
+            in_flight = {
+                ObligationStatus.PENDING,
+                ObligationStatus.SUBMITTING,
+                ObligationStatus.SUBMITTED,
+                ObligationStatus.ACCEPTED,
+            }
+            for intent in unresolved:
+                if intent.status in in_flight:
+                    self._state.hedge_intents[intent.intent_id] = replace(
+                        intent,
+                        status=ObligationStatus.UNKNOWN,
+                    )
+            details.append(f"hedges={','.join(intent.intent_id for intent in unresolved)}")
         self._state.halt_reason = "restart requires reconciliation: " + " ".join(details)
         self._persist()
         return self._state.halt_reason
@@ -169,11 +177,25 @@ class JsonStateStore:
         source_client_id: str | None = None,
         hedge_account_id: str | None = None,
         hedge_client_id: str | None = None,
+        hedge_position_id: str | None = None,
+        hedge_position_quantity_ounces: Decimal | None = None,
+        source_freeze_reason: str | None = None,
     ) -> None:
         if not self.can_submit_source():
             raise RuntimeError("source submission blocked by persisted state")
         if quantity_ounces <= 0:
             raise ValueError("source quantity must be positive")
+        if source_freeze_reason is not None and not source_freeze_reason:
+            raise ValueError("source freeze reason must not be empty")
+        if (hedge_position_id is None) != (hedge_position_quantity_ounces is None):
+            raise ValueError("hedge position ID and quantity must appear together")
+        if hedge_position_id is not None and not hedge_position_id:
+            raise ValueError("hedge position ID must not be empty")
+        if hedge_position_quantity_ounces is not None and (
+            not hedge_position_quantity_ounces.is_finite()
+            or hedge_position_quantity_ounces <= 0
+        ):
+            raise ValueError("hedge position quantity must be positive and finite")
         record = SourceOrderRecord(
             client_order_id=client_order_id,
             side=side,
@@ -182,9 +204,12 @@ class JsonStateStore:
             source_client_id=source_client_id,
             hedge_account_id=hedge_account_id,
             hedge_client_id=hedge_client_id,
+            hedge_position_id=hedge_position_id,
+            hedge_position_quantity_ounces=hedge_position_quantity_ounces,
         )
         self._state.source_orders[client_order_id] = record
         self._state.active_source_order_id = client_order_id
+        self._state.source_freeze_reason = source_freeze_reason
         self._persist()
 
     def knows_source_order(self, client_order_id: str) -> bool:
@@ -195,6 +220,9 @@ class JsonStateStore:
 
     def source_order(self, client_order_id: str) -> SourceOrderRecord | None:
         return self._state.source_orders.get(client_order_id)
+
+    def source_orders(self) -> tuple[SourceOrderRecord, ...]:
+        return tuple(self._state.source_orders.values())
 
     def update_source_status(self, client_order_id: str, status: str) -> None:
         record = self._state.source_orders.get(client_order_id)
@@ -215,11 +243,16 @@ class JsonStateStore:
         record = self._state.source_orders.get(client_order_id)
         if record is None or record.status not in {"CANCELED", "EXPIRED"}:
             raise ValueError("source order is not awaiting terminal reconciliation")
+        previous_state = deepcopy(self._state)
         if self._state.active_source_order_id == client_order_id:
             self._state.active_source_order_id = None
         if self._state.halt_reason == _source_reconcile_reason(client_order_id):
             self._state.halt_reason = None
-        self._persist()
+        try:
+            self._persist()
+        except Exception:
+            self._state = previous_state
+            raise
 
     def mark_source_unknown(self, client_order_id: str, reason: str) -> None:
         record = self._state.source_orders.get(client_order_id)
@@ -284,6 +317,9 @@ class JsonStateStore:
             source_fill_ounces=fill_ounces,
             hedge_side=hedge_side,
             hedge_quantity_ounces=hedge_ounces,
+            hedge_position_id=record.hedge_position_id,
+            hedge_position_quantity_ounces=record.hedge_position_quantity_ounces,
+            status=ObligationStatus.PENDING,
         )
         self._state.hedge_intents[intent.intent_id] = intent
         self._persist_source_reservation(previous_state)
@@ -291,16 +327,78 @@ class JsonStateStore:
 
     def bind_hedge_order(self, intent_id: str, client_order_id: str) -> None:
         intent = self._state.hedge_intents[intent_id]
+        if (
+            intent.status is not ObligationStatus.PENDING
+            or intent.hedge_client_order_id is not None
+            or not client_order_id
+            or any(
+                client_order_id == existing.hedge_client_order_id
+                or client_order_id in existing.hedge_order_ids
+                for existing in self._state.hedge_intents.values()
+            )
+        ):
+            raise ValueError("hedge order binding requires a pending unique leg")
         self._state.hedge_intents[intent_id] = replace(
             intent,
             hedge_client_order_id=client_order_id,
+            hedge_order_ids=(*intent.hedge_order_ids, client_order_id),
             status=ObligationStatus.SUBMITTING,
         )
+        self._persist()
+
+    def bind_hedge_plan(self, intent_id: str, plan: tuple[HedgeLeg, ...]) -> HedgeIntent:
+        """Durably bind one deterministic multi-ticket plan before its first order."""
+        intent = self._state.hedge_intents[intent_id]
+        if intent.hedge_plan:
+            if intent.hedge_plan != plan:
+                raise ValueError("hedge intent already has a different ticket plan")
+            return intent
+        if (
+            intent.status is not ObligationStatus.PENDING
+            or intent.hedge_client_order_id is not None
+            or intent.hedge_filled_ounces != 0
+        ):
+            raise ValueError("hedge plan must be bound before the first hedge order")
+        if not plan:
+            raise ValueError("hedge plan must contain at least one leg")
+        if any(leg.side is not intent.hedge_side for leg in plan):
+            raise ValueError("hedge plan side does not match the durable intent")
+        remaining = intent.hedge_quantity_ounces - intent.hedge_filled_ounces
+        if sum((leg.quantity_ounces for leg in plan), Decimal(0)) != remaining:
+            raise ValueError("hedge plan quantity does not match the durable intent")
+        planned = replace(
+            intent,
+            hedge_plan=plan,
+            hedge_leg_index=0,
+            hedge_leg_filled_ounces=Decimal(0),
+        )
+        self._state.hedge_intents[intent_id] = planned
+        self._persist()
+        return planned
+
+    def block_hedge_intent(self, intent_id: str, reason: str) -> None:
+        """Persist a known planning block without inventing a venue outcome."""
+        intent = self._state.hedge_intents[intent_id]
+        if intent.status is ObligationStatus.COMPLETED:
+            raise ValueError("completed hedge intent cannot be blocked")
+        if not reason:
+            raise ValueError("hedge block reason must not be empty")
+        self._state.hedge_intents[intent_id] = replace(
+            intent,
+            status=ObligationStatus.BLOCKED,
+        )
+        self._state.halt_reason = f"hedge {intent_id} blocked: {reason}"
         self._persist()
 
     def update_hedge_status(self, client_order_id: str, status: ObligationStatus) -> None:
         intent = self._intent_for_hedge_order(client_order_id)
         if intent is None:
+            return
+        if intent.status in {
+            ObligationStatus.BLOCKED,
+            ObligationStatus.REJECTED,
+            ObligationStatus.UNKNOWN,
+        }:
             return
         self._state.hedge_intents[intent.intent_id] = replace(intent, status=status)
         if status in {ObligationStatus.REJECTED, ObligationStatus.UNKNOWN}:
@@ -326,6 +424,74 @@ class JsonStateStore:
             raise ValueError("hedge fill quantity must be positive")
         self._state.seen_hedge_fills.add(fill_key)
         filled = intent.hedge_filled_ounces + fill_ounces
+        if intent.status in {
+            ObligationStatus.BLOCKED,
+            ObligationStatus.REJECTED,
+            ObligationStatus.UNKNOWN,
+        }:
+            leg_filled = intent.hedge_leg_filled_ounces
+            if intent.hedge_plan and intent.hedge_leg_index < len(intent.hedge_plan):
+                leg_filled += fill_ounces
+            self._state.hedge_intents[intent.intent_id] = replace(
+                intent,
+                hedge_filled_ounces=filled,
+                hedge_leg_filled_ounces=leg_filled,
+                status=ObligationStatus.BLOCKED,
+            )
+            self._state.halt_reason = (
+                f"hedge {client_order_id} filled after unresolved status "
+                f"{intent.status.value}"
+            )
+            self._persist()
+            return True
+        if intent.hedge_plan:
+            if intent.hedge_leg_index >= len(intent.hedge_plan):
+                self._state.hedge_intents[intent.intent_id] = replace(
+                    intent,
+                    hedge_filled_ounces=filled,
+                    status=ObligationStatus.BLOCKED,
+                )
+                self._state.halt_reason = (
+                    f"hedge {client_order_id} filled after its ticket plan completed"
+                )
+                self._persist()
+                return True
+            leg = intent.hedge_plan[intent.hedge_leg_index]
+            expected = leg.quantity_ounces - intent.hedge_leg_filled_ounces
+            if fill_ounces != expected:
+                self._state.hedge_intents[intent.intent_id] = replace(
+                    intent,
+                    hedge_filled_ounces=filled,
+                    hedge_leg_filled_ounces=(
+                        intent.hedge_leg_filled_ounces + fill_ounces
+                    ),
+                    status=ObligationStatus.BLOCKED,
+                )
+                self._state.halt_reason = (
+                    f"hedge {client_order_id} fill quantity {fill_ounces} "
+                    f"does not match planned leg remainder {expected}"
+                )
+                self._persist()
+                return True
+            next_leg_index = intent.hedge_leg_index + 1
+            completed = next_leg_index == len(intent.hedge_plan)
+            self._state.hedge_intents[intent.intent_id] = replace(
+                intent,
+                hedge_filled_ounces=filled,
+                status=(
+                    ObligationStatus.COMPLETED
+                    if completed
+                    else ObligationStatus.PENDING
+                ),
+                # Every planned leg is submitted MARKET/FOK. An exact OrderFilled is
+                # therefore that leg's terminal event; incomplete fills retain this
+                # ID above and enter BLOCKED instead of advancing to another ticket.
+                hedge_client_order_id=None,
+                hedge_leg_index=next_leg_index,
+                hedge_leg_filled_ounces=Decimal(0),
+            )
+            self._persist()
+            return True
         status = (
             ObligationStatus.COMPLETED
             if filled >= intent.hedge_quantity_ounces
@@ -412,6 +578,12 @@ class JsonStateStore:
                 source_client_id=_optional_string(value.get("source_client_id")),
                 hedge_account_id=_optional_string(value.get("hedge_account_id")),
                 hedge_client_id=_optional_string(value.get("hedge_client_id")),
+                hedge_position_id=_optional_string(value.get("hedge_position_id")),
+                hedge_position_quantity_ounces=(
+                    Decimal(str(value["hedge_position_quantity_ounces"]))
+                    if value.get("hedge_position_quantity_ounces") is not None
+                    else None
+                ),
                 filled_ounces=Decimal(str(value["filled_ounces"])),
                 status=str(value["status"]),
             )
@@ -427,9 +599,26 @@ class JsonStateStore:
                 source_fill_ounces=Decimal(str(value["source_fill_ounces"])),
                 hedge_side=BusinessOrderSide(str(value["hedge_side"])),
                 hedge_quantity_ounces=Decimal(str(value["hedge_quantity_ounces"])),
+                hedge_position_id=_optional_string(value.get("hedge_position_id")),
+                hedge_position_quantity_ounces=(
+                    Decimal(str(value["hedge_position_quantity_ounces"]))
+                    if value.get("hedge_position_quantity_ounces") is not None
+                    else None
+                ),
                 status=ObligationStatus(str(value["status"])),
                 hedge_client_order_id=_optional_string(value["hedge_client_order_id"]),
                 hedge_filled_ounces=Decimal(str(value["hedge_filled_ounces"])),
+                hedge_plan=tuple(
+                    _hedge_leg_from_payload(item)
+                    for item in cast(list[dict[str, object]], value.get("hedge_plan", []))
+                ),
+                hedge_leg_index=_exact_int(value.get("hedge_leg_index", 0)),
+                hedge_leg_filled_ounces=Decimal(
+                    str(value.get("hedge_leg_filled_ounces", 0))
+                ),
+                hedge_order_ids=tuple(
+                    str(item) for item in cast(list[object], value.get("hedge_order_ids", []))
+                ),
             )
             for key, value in intents_raw.items()
         }
@@ -449,14 +638,43 @@ def _optional_string(value: object) -> str | None:
     return None if value is None else str(value)
 
 
+def _exact_int(value: object) -> int:
+    if type(value) is not int:
+        raise ValueError("persisted hedge plan index must be an exact int")
+    return value
+
+
 def _source_reconcile_reason(client_order_id: str) -> str:
     return f"source {client_order_id} terminal event requires fill reconciliation"
 
 
+def _hedge_leg_from_payload(value: dict[str, object]) -> HedgeLeg:
+    return HedgeLeg(
+        side=BusinessOrderSide(str(value["side"])),
+        quantity_ounces=Decimal(str(value["quantity_ounces"])),
+        position_id=_optional_string(value.get("position_id")),
+        expected_position_side=(
+            BusinessOrderSide(str(value["expected_position_side"]))
+            if value.get("expected_position_side") is not None
+            else None
+        ),
+        expected_position_quantity_ounces=(
+            Decimal(str(value["expected_position_quantity_ounces"]))
+            if value.get("expected_position_quantity_ounces") is not None
+            else None
+        ),
+    )
+
+
 def _decimal_strings(value: dict[str, object]) -> dict[str, object]:
-    return {
-        key: str(item)
-        if isinstance(item, Decimal | BusinessOrderSide | ObligationStatus)
-        else item
-        for key, item in value.items()
-    }
+    return {key: _json_value(item) for key, item in value.items()}
+
+
+def _json_value(value: object) -> object:
+    if isinstance(value, Decimal | BusinessOrderSide | ObligationStatus):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): _json_value(item) for key, item in value.items()}
+    if isinstance(value, list | tuple):
+        return [_json_value(item) for item in value]
+    return value

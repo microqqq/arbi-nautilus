@@ -4,19 +4,20 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, cast
 
-from nautilus_trader.model.enums import OrderSide
+import pytest
+from nautilus_trader.core.uuid import UUID4
+from nautilus_trader.model.book import OrderBook
+from nautilus_trader.model.data import BookOrder
+from nautilus_trader.model.enums import BookType, OrderSide
+from nautilus_trader.model.events import OrderRejected
 from nautilus_trader.model.identifiers import ClientOrderId, TradeId, VenueOrderId
-from nautilus_trader.model.objects import Money
+from nautilus_trader.model.objects import Money, Price, Quantity
 from nautilus_trader.test_kit.stubs.events import TestEventStubs
 from nautilus_trader.test_kit.stubs.execution import TestExecStubs
 
-from py000_nautilus.app import _source_instrument, _strategy_config
-from py000_nautilus.models import BusinessOrderSide, HedgeIntent
-from py000_nautilus.strategies.taker import (
-    TakerStrategy,
-    _cancel_timer_name,
-    _timer_target_if_active,
-)
+from py000_nautilus.app import _hedge_instrument, _quote, _source_instrument, _strategy_config
+from py000_nautilus.models import BookTop, BusinessOrderSide, HedgeIntent
+from py000_nautilus.strategies.taker import TakerStrategy, _reference_book
 
 
 class RecordingTakerStrategy(TakerStrategy):
@@ -26,6 +27,71 @@ class RecordingTakerStrategy(TakerStrategy):
 
     def _submit_hedge_intent(self, intent: HedgeIntent) -> None:
         self.recorded_intents.append(intent)
+        self.state_store.bind_hedge_order(
+            intent.intent_id,
+            f"H-RECORDED-{len(self.recorded_intents)}",
+        )
+
+
+def _rejected(order: Any, reason: str) -> OrderRejected:
+    template = TestEventStubs.order_rejected(order)
+    return OrderRejected(
+        trader_id=template.trader_id,
+        strategy_id=template.strategy_id,
+        instrument_id=template.instrument_id,
+        client_order_id=template.client_order_id,
+        account_id=template.account_id,
+        reason=reason,
+        event_id=UUID4(),
+        ts_event=template.ts_event,
+        ts_init=template.ts_init,
+    )
+
+
+def _native_book(
+    bids: tuple[tuple[str, str], ...],
+    asks: tuple[tuple[str, str], ...],
+) -> OrderBook:
+    book = OrderBook(_source_instrument().id, BookType.L2_MBP)
+    for index, (price, size) in enumerate(bids):
+        book.add(
+            BookOrder(OrderSide.BUY, Price.from_str(price), Quantity.from_str(size), index),
+            ts_event=1,
+        )
+    for index, (price, size) in enumerate(asks, start=len(bids)):
+        book.add(
+            BookOrder(OrderSide.SELL, Price.from_str(price), Quantity.from_str(size), index),
+            ts_event=1,
+        )
+    return book
+
+
+def test_managed_l2_returns_reference_marginal_prices_and_floored_sizes() -> None:
+    book = _native_book(
+        bids=(("100", "0.6"), ("99.5", "0.7")),
+        asks=(("101", "0.4"), ("101.5", "2.3")),
+    )
+
+    assert _reference_book(book, Decimal(1)) == BookTop(
+        bid=Decimal("99.5"),
+        ask=Decimal("101.5"),
+        bid_size=Decimal(1),
+        ask_size=Decimal(2),
+    )
+
+
+def test_managed_l2_returns_none_when_either_side_is_shallow() -> None:
+    shallow_bid = _native_book(
+        bids=(("100", "0.4"), ("99.5", "0.5")),
+        asks=(("101", "1.1"),),
+    )
+    shallow_ask = _native_book(
+        bids=(("100", "1.1"),),
+        asks=(("101", "0.4"), ("101.5", "0.5")),
+    )
+
+    assert _reference_book(shallow_bid, Decimal(1)) is None
+    assert _reference_book(shallow_ask, Decimal(1)) is None
 
 
 def test_real_partial_final_duplicate_and_late_order_filled_events(tmp_path: Path) -> None:
@@ -66,24 +132,68 @@ def test_real_partial_final_duplicate_and_late_order_filled_events(tmp_path: Pat
     strategy.on_order_filled(partial)  # duplicate partial
     strategy.on_order_filled(final)  # late duplicate after terminal fill
 
-    assert [intent.source_trade_id for intent in strategy.recorded_intents] == [
+    assert [intent.source_trade_id for intent in strategy.state_store.intents()] == [
         "T-PARTIAL",
         "T-FINAL",
     ]
+    assert [intent.source_trade_id for intent in strategy.recorded_intents] == ["T-PARTIAL"]
     assert all(
         intent.hedge_quantity_ounces == Decimal(1)
-        for intent in strategy.recorded_intents
+        for intent in strategy.state_store.intents()
     )
     assert strategy.state_store.rounding_residual_ounces == 0
     assert strategy.state_store.net_unhedged_ounces == Decimal(2)
 
 
-def test_late_timer_for_a_cannot_target_active_b() -> None:
-    timer_a = _cancel_timer_name("O-A")
-    timer_b = _cancel_timer_name("O-B")
+def test_unknown_engine_rejection_keeps_source_live_and_blocked(tmp_path: Path) -> None:
+    strategy = RecordingTakerStrategy(tmp_path / "unknown.json")
+    instrument = _source_instrument()
+    order = TestExecStubs.limit_order(
+        instrument=instrument,
+        order_side=OrderSide.BUY,
+        quantity=instrument.make_qty(1),
+        price=instrument.make_price(2400),
+        client_order_id=ClientOrderId("O-UNKNOWN"),
+    )
+    strategy.state_store.begin_source(
+        order.client_order_id.value,
+        BusinessOrderSide.BUY,
+        Decimal(1),
+    )
 
-    assert _timer_target_if_active(timer_a, "O-B") is None
-    assert _timer_target_if_active(timer_b, "O-B") == "O-B"
+    strategy.on_order_rejected(_rejected(order, "UNKNOWN"))
+
+    record = strategy.state_store.source_order(order.client_order_id.value)
+    assert record is not None and record.status == "UNKNOWN"
+    assert strategy.state_store.active_source_order_id == order.client_order_id.value
+    assert not strategy.state_store.can_submit_source()
+
+
+def test_one_shot_is_disarmed_until_armed_with_a_fresh_store(tmp_path: Path) -> None:
+    strategy = TakerStrategy(_strategy_config(tmp_path / "one-shot.json"), one_shot=True)
+    hedge_tick = _quote(_hedge_instrument(), "2400", "2401", "10", 1_000_000_000)
+
+    assert (strategy.one_shot_armed, strategy.one_shot_claimed) == (False, False)
+    assert not strategy._inputs_are_fresh(1_000_000_000, hedge_tick, 1_000_000_000)
+
+    strategy.arm_one_shot()
+
+    assert (strategy.one_shot_armed, strategy.one_shot_claimed) == (True, False)
+    assert strategy._inputs_are_fresh(1_000_000_000, hedge_tick, 1_000_000_000)
+    with pytest.raises(RuntimeError, match="already armed"):
+        strategy.arm_one_shot()
+
+
+def test_one_shot_refuses_completed_history_even_when_store_gate_is_open(
+    tmp_path: Path,
+) -> None:
+    strategy = TakerStrategy(_strategy_config(tmp_path / "history.json"), one_shot=True)
+    strategy.state_store.begin_source("O-HISTORY", BusinessOrderSide.BUY, Decimal(1))
+    strategy.state_store.update_source_status("O-HISTORY", "REJECTED")
+    assert strategy.state_store.can_submit_source()
+
+    with pytest.raises(RuntimeError, match="fresh state store"):
+        strategy.arm_one_shot()
 
 
 class _StopStore:

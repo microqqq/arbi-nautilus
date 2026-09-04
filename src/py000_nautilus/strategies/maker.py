@@ -1,12 +1,15 @@
 """Thin two-sided Maker strategy built directly on Nautilus order custody."""
 
+from collections.abc import Callable
 from dataclasses import replace
 from decimal import Decimal
+from math import isclose
 from typing import cast
 
 from nautilus_trader.common.events import TimeEvent
-from nautilus_trader.model.data import QuoteTick
-from nautilus_trader.model.enums import OrderSide, TimeInForce
+from nautilus_trader.execution.reports import OrderStatusReport
+from nautilus_trader.model.data import FundingRateUpdate, InstrumentStatus, QuoteTick
+from nautilus_trader.model.enums import OrderSide, OrderStatus, OrderType, TimeInForce
 from nautilus_trader.model.events import (
     OrderAccepted,
     OrderCanceled,
@@ -18,14 +21,26 @@ from nautilus_trader.model.events import (
     OrderRejected,
     OrderSubmitted,
 )
-from nautilus_trader.model.identifiers import AccountId, ClientId, ClientOrderId, InstrumentId
+from nautilus_trader.model.identifiers import (
+    AccountId,
+    ClientId,
+    ClientOrderId,
+    InstrumentId,
+    PositionId,
+    VenueOrderId,
+)
 from nautilus_trader.model.instruments import Instrument
 from nautilus_trader.model.orders import Order
+from nautilus_trader.model.position import Position
 from nautilus_trader.trading.strategy import Strategy
 
 from py000_nautilus.config import CarryConfig, FxConfig, MakerStrategyConfig
-from py000_nautilus.economics import market_inputs_are_fresh
-from py000_nautilus.hedge import HedgeCoordinator
+from py000_nautilus.economics import (
+    market_inputs_are_fresh,
+    normalize_mt5_points_swap,
+    round_hedge_ounces,
+)
+from py000_nautilus.hedge import HedgeCoordinator, HedgePlanningError, plan_hedge_delta
 from py000_nautilus.maker_economics import maker_quote, passive_maker_price
 from py000_nautilus.models import (
     BookTop,
@@ -41,13 +56,32 @@ from py000_nautilus.store import JsonStateStore
 
 _DIRECTIONS = (SourceDirection.LONG, SourceDirection.SHORT)
 
+type SourceTerminalResult = Callable[[OrderStatusReport | None], None]
+type SourceTerminalQuery = Callable[
+    [ClientOrderId, VenueOrderId, SourceTerminalResult],
+    None,
+]
+
 
 class MakerStrategy(Strategy):
     """Maintain one bid and one ask GTC source order, hedging actual fills only."""
 
-    def __init__(self, config: MakerStrategyConfig) -> None:
+    def __init__(
+        self,
+        config: MakerStrategyConfig,
+        *,
+        live_submission_ready: Callable[[], bool] | None = None,
+        hedge_quantity_ready: Callable[[Decimal], bool] | None = None,
+        live_costs_from_adapters: bool = False,
+        source_terminal_query: SourceTerminalQuery | None = None,
+    ) -> None:
         super().__init__(config)
         self._config = config
+        self._live_submission_ready = live_submission_ready
+        self._hedge_quantity_ready = hedge_quantity_ready
+        self._live_costs_from_adapters = live_costs_from_adapters
+        self._source_terminal_query = source_terminal_query
+        self._source_terminal_inflight: set[str] = set()
         self._stores = {
             direction: JsonStateStore(f"{config.store_path_prefix}.{direction.value}.json")
             for direction in _DIRECTIONS
@@ -62,8 +96,11 @@ class MakerStrategy(Strategy):
         self._source_instrument: Instrument | None = None
         self._hedge_instrument: Instrument | None = None
         self._carry = config.economics.carry
+        self._quote_carry = self._carry
         self._fx = config.economics.fx
         self._cost_ts_ns = config.initial_cost_ts_ns
+        self._cost_snapshot_valid = config.initial_cost_ts_ns > 0
+        self._cost_recovery_after_ns = 0
         self._hedge_session_open = config.initial_hedge_session_open
         self._session_ts_ns = config.initial_session_ts_ns
 
@@ -72,18 +109,39 @@ class MakerStrategy(Strategy):
         carry: CarryConfig,
         fx: FxConfig,
         ts_event_ns: int,
-    ) -> None:
-        if ts_event_ns >= self._cost_ts_ns:
-            changed = (
-                ts_event_ns > self._cost_ts_ns
-                or carry != self._carry
-                or fx != self._fx
-            )
-            self._carry = carry
-            self._fx = fx
-            self._cost_ts_ns = ts_event_ns
-            if changed:
-                self._freeze_and_cancel_all("Maker costs changed")
+    ) -> bool:
+        """Install one monotonic funding/FX snapshot and cancel stale quotes."""
+        if type(ts_event_ns) is not int or ts_event_ns <= 0:
+            self._invalidate_cost_snapshot("Maker costs are invalid")
+            return False
+        if ts_event_ns < self._cost_ts_ns:
+            self._invalidate_cost_snapshot("Maker costs moved backwards")
+            return False
+        if ts_event_ns == self._cost_ts_ns:
+            if carry != self._carry or fx != self._fx:
+                self._invalidate_cost_snapshot("Maker costs conflict at one timestamp")
+                return False
+            return self._cost_snapshot_valid
+        if ts_event_ns <= self._cost_recovery_after_ns:
+            return False
+        changed = ts_event_ns > self._cost_ts_ns or carry != self._carry or fx != self._fx
+        self._carry = carry
+        self._quote_carry = carry
+        self._fx = fx
+        self._cost_ts_ns = ts_event_ns
+        self._cost_snapshot_valid = True
+        self._cost_recovery_after_ns = 0
+        if changed:
+            self._freeze_and_cancel_all("Maker costs changed")
+        return True
+
+    def _invalidate_cost_snapshot(self, reason: str) -> None:
+        self._cost_snapshot_valid = False
+        self._cost_recovery_after_ns = max(
+            self._cost_recovery_after_ns,
+            self._cost_ts_ns,
+        )
+        self._freeze_and_cancel_all(reason)
 
     def update_hedge_session(self, is_open: bool, ts_event_ns: int) -> None:
         if ts_event_ns >= self._session_ts_ns:
@@ -101,6 +159,13 @@ class MakerStrategy(Strategy):
             self.log.error("Maker instruments were not found in the Nautilus cache")
             self.stop()
             return
+        if self._live_costs_from_adapters:
+            try:
+                self._mt5_swap_spec()
+            except (KeyError, TypeError, ValueError) as exc:
+                self.log.error(f"MT5 swap specification is unavailable: {exc}")
+                self.stop()
+                return
         for store in self._stores.values():
             reason = store.recover_for_start()
             if reason is not None:
@@ -108,6 +173,9 @@ class MakerStrategy(Strategy):
         self._try_release_cycle()
         self.subscribe_quote_ticks(self._config.source_instrument_id)
         self.subscribe_quote_ticks(self._config.hedge_instrument_id)
+        if self._live_costs_from_adapters:
+            self.subscribe_funding_rates(self._config.source_instrument_id)
+        self.subscribe_instrument_status(self._config.hedge_instrument_id)
 
     def on_stop(self) -> None:
         for direction in _DIRECTIONS:
@@ -119,11 +187,20 @@ class MakerStrategy(Strategy):
             self._config.hedge_instrument_id,
         }:
             return
+        if tick.instrument_id == self._config.hedge_instrument_id:
+            self._submit_next_pending_hedge()
         source_tick = self.cache.quote_tick(self._config.source_instrument_id)
         hedge_tick = self.cache.quote_tick(self._config.hedge_instrument_id)
         if source_tick is None or hedge_tick is None:
             return
-        inputs_fresh = self._inputs_are_fresh(source_tick, hedge_tick)
+        now_ns = cast(int, self.clock.timestamp_ns())
+        inputs_fresh = self._inputs_are_fresh(source_tick, hedge_tick, now_ns)
+        if inputs_fresh:
+            quote_carry = self._carry_for_hedge_tick(hedge_tick, now_ns)
+            if quote_carry is None:
+                inputs_fresh = False
+            else:
+                self._quote_carry = quote_carry
         if inputs_fresh:
             self._try_release_cycle()
         if self._global_obligation_block() or not inputs_fresh:
@@ -133,6 +210,41 @@ class MakerStrategy(Strategy):
         hedge_book = _book_top(hedge_tick)
         for direction in _DIRECTIONS:
             self._refresh_direction(direction, source_book, hedge_book)
+
+    def on_instrument_status(self, status: InstrumentStatus) -> None:
+        if status.instrument_id != self._config.hedge_instrument_id:
+            return
+        self.update_hedge_session(status.is_trading is True, status.ts_event)
+
+    def on_funding_rate(self, funding_rate: FundingRateUpdate) -> None:
+        """Install the source venue's signed next-period funding observation."""
+        if (
+            not self._live_costs_from_adapters
+            or funding_rate.instrument_id != self._config.source_instrument_id
+        ):
+            return
+        ts_event_ns = cast(int, funding_rate.ts_event)
+        if ts_event_ns > cast(int, self.clock.timestamp_ns()):
+            self._invalidate_cost_snapshot("Bitfinex funding observation is future-dated")
+            self.log.error("Bitfinex funding observation is future-dated")
+            return
+        rate = Decimal(str(funding_rate.rate))
+        if not rate.is_finite() or abs(rate) > 1:
+            self._invalidate_cost_snapshot("Bitfinex funding observation is invalid")
+            self.log.error("Bitfinex funding observation is invalid")
+            return
+        static = self._config.economics.carry
+        self.update_cost_snapshot(
+            CarryConfig(
+                bitfinex_long=rate,
+                bitfinex_short=-rate,
+                mt5_long_swap=static.mt5_long_swap,
+                mt5_short_swap=static.mt5_short_swap,
+                total_trade_fee=static.total_trade_fee,
+            ),
+            self._config.economics.fx,
+            ts_event_ns,
+        )
 
     def on_order_submitted(self, event: OrderSubmitted) -> None:
         self._update_order_status(event.client_order_id.value, "SUBMITTED")
@@ -144,10 +256,27 @@ class MakerStrategy(Strategy):
         self._finish_or_reject(event.client_order_id.value, "DENIED")
 
     def on_order_rejected(self, event: OrderRejected) -> None:
+        if event.reason.strip().upper() == "UNKNOWN":
+            client_order_id = event.client_order_id.value
+            direction = self._direction_for_source_order(client_order_id)
+            if direction is not None:
+                self._mark_source_unknown(
+                    client_order_id,
+                    "Nautilus reported an unknown Maker submission outcome",
+                )
+            else:
+                for store in self._stores.values():
+                    store.update_hedge_status(client_order_id, ObligationStatus.UNKNOWN)
+                self._freeze_and_cancel_all("unknown Maker hedge submission outcome")
+            return
         self._finish_or_reject(event.client_order_id.value, "REJECTED")
 
     def on_order_canceled(self, event: OrderCanceled) -> None:
-        self._finish_or_reject(event.client_order_id.value, "CANCELED")
+        client_order_id = event.client_order_id.value
+        direction = self._direction_for_source_order(client_order_id)
+        self._finish_or_reject(client_order_id, "CANCELED")
+        if direction is not None:
+            self._request_source_terminal_query(direction, event)
 
     def on_order_expired(self, event: OrderExpired) -> None:
         self._finish_or_reject(event.client_order_id.value, "EXPIRED")
@@ -181,34 +310,19 @@ class MakerStrategy(Strategy):
             self._freeze_all_best_effort(freeze_reason)
             try:
                 if intent is not None:
-                    route = self._durable_hedge_route(
-                        direction,
-                        event.client_order_id.value,
-                    )
-                    if route is None:
-                        self.log.error(
-                            f"Durable Maker route missing for fill {event.trade_id}"
-                        )
-                    else:
-                        hedge_account_id, hedge_client_id = route
-                        self._submit_hedge(
-                            direction,
-                            hedge_account_id,
-                            hedge_client_id,
-                            intent,
-                        )
+                    self._submit_next_pending_hedge()
             finally:
                 self._cancel_all_best_effort("source fill froze Maker quoting")
             if self._stores[direction].active_source_order_id is None:
                 self._working_quotes.pop(event.client_order_id.value, None)
             return
         if event.instrument_id == self._config.hedge_instrument_id:
-            for store in self._stores.values():
-                store.apply_hedge_fill(
-                    client_order_id=event.client_order_id.value,
-                    trade_id=event.trade_id.value,
-                    fill_ounces=Decimal(str(event.last_qty)),
-                )
+            applied = any(
+                coordinator.on_hedge_filled(event)
+                for coordinator in self._hedges.values()
+            )
+            if applied:
+                self._submit_next_pending_hedge()
             self._try_release_cycle()
 
     def _refresh_direction(
@@ -256,7 +370,7 @@ class MakerStrategy(Strategy):
             self._source_accounts(),
             self._hedge_accounts(),
             self._config.economics,
-            carry=self._carry,
+            carry=self._quote_carry,
             fx=self._fx,
         )
         return self._passive_quote(quote, source_book)
@@ -275,7 +389,7 @@ class MakerStrategy(Strategy):
             (source,),
             (hedge,),
             self._config.economics,
-            carry=self._carry,
+            carry=self._quote_carry,
             fx=self._fx,
         )
         return self._passive_quote(quote, source_book)
@@ -299,10 +413,13 @@ class MakerStrategy(Strategy):
     def _submit_source(self, quote: MakerQuote) -> None:
         instrument = self._required_source_instrument()
         side = OrderSide.BUY if quote.direction is SourceDirection.LONG else OrderSide.SELL
+        source_quantity = instrument.make_qty(quote.quantity_ounces)
+        if not self._source_hedge_is_executable(quote, Decimal(str(source_quantity))):
+            return
         order = self.order_factory.limit(
             instrument_id=self._config.source_instrument_id,
             order_side=side,
-            quantity=instrument.make_qty(quote.quantity_ounces),
+            quantity=source_quantity,
             price=instrument.make_price(quote.source_price_usdt),
             time_in_force=TimeInForce.GTC,
             post_only=True,
@@ -341,6 +458,48 @@ class MakerStrategy(Strategy):
             )
             raise
 
+    def _source_hedge_is_executable(
+        self,
+        quote: MakerQuote,
+        source_quantity_ounces: Decimal,
+    ) -> bool:
+        hedge_side = (
+            BusinessOrderSide.SELL
+            if quote.direction is SourceDirection.LONG
+            else BusinessOrderSide.BUY
+        )
+        max_hedge_ounces = Decimal(abs(round_hedge_ounces(source_quantity_ounces)))
+        if max_hedge_ounces == 0:
+            return True
+        try:
+            plan = plan_hedge_delta(
+                self._hedge_positions(quote.hedge_account.account_id),
+                hedge_side,
+                max_hedge_ounces,
+            )
+        except (HedgePlanningError, TypeError, ValueError) as exc:
+            self.log.error(f"Maker source admission blocked by MT5 position shape: {exc}")
+            return False
+        quantity_ready = self._hedge_quantity_ready
+        if quantity_ready is None:
+            return True
+        for leg in plan:
+            try:
+                admitted = quantity_ready(leg.quantity_ounces)
+            except Exception as exc:
+                self.log.error(
+                    "Maker source admission blocked because MT5 quantity preflight raised "
+                    f"{type(exc).__name__}"
+                )
+                return False
+            if not admitted:
+                self.log.error(
+                    "Maker source admission blocked because MT5 cannot execute hedge leg "
+                    f"quantity {leg.quantity_ounces} ounces"
+                )
+                return False
+        return True
+
     def _requote(self, order: Order, desired: MakerQuote) -> None:
         if cast(bool, order.is_pending_update) or cast(bool, order.is_pending_cancel):
             return
@@ -365,6 +524,53 @@ class MakerStrategy(Strategy):
             params={"leverage": desired.leverage},
         )
 
+    def _submit_next_pending_hedge(self) -> None:
+        """Run one MT5 leg globally across both Maker directions."""
+        queued = [
+            (direction, intent)
+            for direction in _DIRECTIONS
+            for intent in self._stores[direction].intents()
+        ]
+        failed_statuses = {
+            ObligationStatus.BLOCKED,
+            ObligationStatus.REJECTED,
+            ObligationStatus.UNKNOWN,
+        }
+        if any(intent.status in failed_statuses for _, intent in queued):
+            return
+        active_statuses = {
+            ObligationStatus.SUBMITTING,
+            ObligationStatus.SUBMITTED,
+            ObligationStatus.ACCEPTED,
+        }
+        if any(intent.status in active_statuses for _, intent in queued):
+            return
+        pending = next(
+            (
+                (direction, intent)
+                for direction, intent in queued
+                if intent.status is ObligationStatus.PENDING
+                and intent.hedge_client_order_id is None
+            ),
+            None,
+        )
+        if pending is None:
+            return
+        direction, intent = pending
+        route = self._durable_hedge_route(direction, intent.source_client_order_id)
+        if route is None:
+            reason = "durable Maker hedge route is missing or differs from configuration"
+            self._stores[direction].block_hedge_intent(intent.intent_id, reason)
+            self.log.error(f"Maker hedge route blocked for {intent.intent_id}: {reason}")
+            return
+        hedge_account_id, hedge_client_id = route
+        self._submit_hedge(
+            direction,
+            hedge_account_id,
+            hedge_client_id,
+            intent,
+        )
+
     def _submit_hedge(
         self,
         direction: SourceDirection,
@@ -377,14 +583,23 @@ class MakerStrategy(Strategy):
             self.log.error(f"Maker hedge quote unavailable for {intent.intent_id}")
             return
         instrument = self._required_hedge_instrument()
-        side = OrderSide.BUY if intent.hedge_side is BusinessOrderSide.BUY else OrderSide.SELL
-        price = hedge_tick.ask_price if side is OrderSide.BUY else hedge_tick.bid_price
-        order = self.order_factory.limit(
+        coordinator = self._hedges[direction]
+        try:
+            leg = coordinator.next_hedge_leg(
+                intent.intent_id,
+                self._hedge_positions(hedge_account_id),
+            )
+        except HedgePlanningError as exc:
+            self.log.error(f"Maker hedge planning blocked for {intent.intent_id}: {exc}")
+            return
+        side = OrderSide.BUY if leg.side is BusinessOrderSide.BUY else OrderSide.SELL
+        position_id = PositionId(cast(str, leg.position_id)) if leg.is_close else None
+        order = self.order_factory.market(
             instrument_id=self._config.hedge_instrument_id,
             order_side=side,
-            quantity=instrument.make_qty(intent.hedge_quantity_ounces),
-            price=instrument.make_price(Decimal(str(price))),
-            time_in_force=TimeInForce.IOC,
+            quantity=instrument.make_qty(leg.quantity_ounces),
+            time_in_force=TimeInForce.FOK,
+            reduce_only=leg.is_close,
             tags=[
                 f"py000={intent.intent_id}",
                 f"source_trade={intent.source_trade_id}",
@@ -392,13 +607,26 @@ class MakerStrategy(Strategy):
             ],
         )
         store = self._stores[direction]
-        store.bind_hedge_order(intent.intent_id, order.client_order_id.value)
+        coordinator.bind_hedge_leg(intent.intent_id, order.client_order_id.value)
         try:
-            self.submit_order(order, client_id=hedge_client_id)
+            self.submit_order(
+                order,
+                position_id=position_id,
+                client_id=hedge_client_id,
+            )
         except Exception as exc:
             store.update_hedge_status(order.client_order_id.value, ObligationStatus.UNKNOWN)
             self.log.error(f"Maker hedge submission raised {type(exc).__name__}")
             raise
+
+    def _hedge_positions(self, account_id: AccountId) -> list[Position]:
+        return cast(
+            list[Position],
+            self.cache.positions_open(
+                instrument_id=self._config.hedge_instrument_id,
+                account_id=account_id,
+            ),
+        )
 
     def _cancel_working(
         self,
@@ -460,10 +688,11 @@ class MakerStrategy(Strategy):
             self._stale_timer_names.pop(direction, None)
         source_tick = self.cache.quote_tick(self._config.source_instrument_id)
         hedge_tick = self.cache.quote_tick(self._config.hedge_instrument_id)
+        now_ns = cast(int, self.clock.timestamp_ns())
         if (
             source_tick is not None
             and hedge_tick is not None
-            and self._inputs_are_fresh(source_tick, hedge_tick)
+            and self._inputs_are_fresh(source_tick, hedge_tick, now_ns)
         ):
             self._schedule_stale_timer(direction, order_id)
         else:
@@ -476,9 +705,29 @@ class MakerStrategy(Strategy):
             if store.active_source_order_id is not None:
                 self._schedule_stale_timer(direction, store.active_source_order_id)
 
-    def _inputs_are_fresh(self, source_tick: QuoteTick, hedge_tick: QuoteTick) -> bool:
+    def _inputs_are_fresh(
+        self,
+        source_tick: QuoteTick,
+        hedge_tick: QuoteTick,
+        now_ns: int,
+    ) -> bool:
+        if self._live_submission_ready is not None:
+            try:
+                if not self._live_submission_ready():
+                    return False
+            except Exception as exc:
+                self.log.error(
+                    "Maker live submission readiness failed with "
+                    f"{type(exc).__name__}"
+                )
+                return False
+        if not self._cost_snapshot_valid:
+            return False
+        if self._cost_ts_ns > now_ns:
+            self._invalidate_cost_snapshot("Maker costs are future-dated")
+            return False
         return market_inputs_are_fresh(
-            now_ns=cast(int, self.clock.timestamp_ns()),
+            now_ns=now_ns,
             source_ts_ns=cast(int, source_tick.ts_event),
             hedge_ts_ns=cast(int, hedge_tick.ts_event),
             cost_ts_ns=self._cost_ts_ns,
@@ -489,6 +738,69 @@ class MakerStrategy(Strategy):
             max_cost_age_ns=self._config.max_cost_age_ns,
             max_session_age_ns=self._config.max_session_age_ns,
         )
+
+    def _carry_for_hedge_tick(
+        self,
+        hedge_tick: QuoteTick,
+        now_ns: int,
+    ) -> CarryConfig | None:
+        if not self._live_costs_from_adapters:
+            return self._carry
+        try:
+            swap_long_value, swap_short_value, point, mode, swap_rates, timezone = (
+                self._mt5_swap_spec()
+            )
+            swap_long, swap_short = normalize_mt5_points_swap(
+                swap_long=swap_long_value,
+                swap_short=swap_short_value,
+                point=point,
+                ask=Decimal(str(hedge_tick.ask_price)),
+                native_swap_mode=mode,
+                swap_rates=swap_rates,
+                now_ns=now_ns,
+                server_timezone=timezone,
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            self.log.error(f"MT5 swap normalization failed: {exc}")
+            return None
+        return CarryConfig(
+            bitfinex_long=self._carry.bitfinex_long,
+            bitfinex_short=self._carry.bitfinex_short,
+            mt5_long_swap=swap_long,
+            mt5_short_swap=swap_short,
+            total_trade_fee=self._config.economics.carry.total_trade_fee,
+        )
+
+    def _mt5_swap_spec(
+        self,
+    ) -> tuple[Decimal, Decimal, Decimal, int, tuple[Decimal, ...], str]:
+        info = self._required_hedge_instrument().info
+        if not isinstance(info, dict):
+            raise TypeError("MT5 instrument info must be a mapping")
+        swap_long = Decimal(str(info["swap_long"]))
+        swap_short = Decimal(str(info["swap_short"]))
+        point = Decimal(str(info["point"]))
+        mode = info["swap_mode"]
+        native_swap_rates = info["swap_rates"]
+        timezone = info["server_timezone"]
+        if (
+            type(mode) is not int
+            or not isinstance(native_swap_rates, list | tuple)
+            or not isinstance(timezone, str)
+        ):
+            raise TypeError("MT5 swap mode, rates, or timezone has the wrong type")
+        swap_rates = tuple(Decimal(str(rate)) for rate in native_swap_rates)
+        normalize_mt5_points_swap(
+            swap_long=swap_long,
+            swap_short=swap_short,
+            point=point,
+            ask=Decimal(1),
+            native_swap_mode=mode,
+            swap_rates=swap_rates,
+            now_ns=0,
+            server_timezone=timezone,
+        )
+        return swap_long, swap_short, point, mode, swap_rates, timezone
 
     def _quote_is_fresh(self, tick: QuoteTick) -> bool:
         now_ns = cast(int, self.clock.timestamp_ns())
@@ -543,14 +855,140 @@ class MakerStrategy(Strategy):
             for store in self._stores.values()
         )
 
-    def confirm_source_reconciled(
+    def _request_source_terminal_query(
         self,
         direction: SourceDirection,
-        client_order_id: str,
+        event: OrderCanceled,
+    ) -> None:
+        query = self._source_terminal_query
+        client_order_id = event.client_order_id.value
+        venue_order_id = event.venue_order_id
+        if query is None:
+            return
+        if venue_order_id is None:
+            self.log.error("Maker source cancel terminal has no venue order ID")
+            return
+        if client_order_id in self._source_terminal_inflight:
+            return
+        self._source_terminal_inflight.add(client_order_id)
+        try:
+            query(
+                event.client_order_id,
+                venue_order_id,
+                lambda report: self._complete_source_terminal_query(
+                    direction,
+                    event,
+                    report,
+                ),
+            )
+        except Exception as exc:
+            self._source_terminal_inflight.discard(client_order_id)
+            self.log.error(
+                "Maker source terminal query submission failed with "
+                f"{type(exc).__name__}"
+            )
+
+    def _complete_source_terminal_query(
+        self,
+        direction: SourceDirection,
+        event: OrderCanceled,
+        report: OrderStatusReport | None,
+    ) -> None:
+        client_order_id = event.client_order_id.value
+        if client_order_id not in self._source_terminal_inflight:
+            return
+        try:
+            if report is None or not self._source_cancel_report_is_exact(
+                direction,
+                event,
+                report,
+            ):
+                self.log.error("Maker source cancel terminal query was not exact")
+                return
+            self._stores[direction].confirm_source_reconciled(client_order_id)
+            self._try_release_cycle()
+        except Exception as exc:
+            self.log.error(
+                "Maker source terminal query failed with "
+                f"{type(exc).__name__}"
+            )
+        finally:
+            self._source_terminal_inflight.discard(client_order_id)
+
+    def _source_cancel_report_is_exact(
+        self,
+        direction: SourceDirection,
+        event: OrderCanceled,
+        report: OrderStatusReport,
     ) -> bool:
-        """Accept external authoritative cancel/expiry reconciliation evidence."""
-        self._stores[direction].confirm_source_reconciled(client_order_id)
-        return self._try_release_cycle()
+        client_order_id = event.client_order_id
+        venue_order_id = event.venue_order_id
+        record = self._stores[direction].source_order(client_order_id.value)
+        order = self.cache.order(client_order_id)
+        if record is None or order is None or venue_order_id is None:
+            return False
+        source_route = next(
+            (
+                route
+                for route in self._config.source_accounts
+                if route.account_id.value == record.source_account_id
+            ),
+            None,
+        )
+        if source_route is None:
+            return False
+        expected_client_id = (
+            source_route.client_id.value if source_route.client_id is not None else None
+        )
+        expected_side = (
+            OrderSide.BUY if record.side is BusinessOrderSide.BUY else OrderSide.SELL
+        )
+        order_avg = None if order.avg_px is None else Decimal(str(order.avg_px))
+        report_avg = None if report.avg_px is None else Decimal(str(report.avg_px))
+        order_price = None if order.price is None else Decimal(str(order.price))
+        report_price = None if report.price is None else report.price.as_decimal()
+        if record.filled_ounces == 0:
+            average_is_exact = report_avg is None
+        else:
+            average_is_exact = (
+                order_avg is not None
+                and report_avg is not None
+                and isclose(float(order_avg), float(report_avg))
+            )
+        return (
+            record.status == "CANCELED"
+            and record.source_client_id == expected_client_id
+            and event.instrument_id == self._config.source_instrument_id
+            and event.account_id == source_route.account_id
+            and report.instrument_id == self._config.source_instrument_id
+            and report.account_id == source_route.account_id
+            and order.instrument_id == self._config.source_instrument_id
+            and order.account_id == source_route.account_id
+            and report.client_order_id == client_order_id
+            and order.client_order_id == client_order_id
+            and report.venue_order_id == venue_order_id
+            and order.venue_order_id == venue_order_id
+            and report.order_status == OrderStatus.CANCELED
+            and order.status == OrderStatus.CANCELED
+            and order.is_closed
+            and report.order_side == expected_side
+            and order.side == expected_side
+            and report.order_type == OrderType.LIMIT
+            and order.order_type == OrderType.LIMIT
+            and report.time_in_force == TimeInForce.GTC
+            and order.time_in_force == TimeInForce.GTC
+            # This closes exposure; it does not prove venue-enforced post-only.
+            # Bitfinex paper omits that flag from otherwise exact terminal rows.
+            and cast(bool, order.is_post_only)
+            and not report.reduce_only
+            and not cast(bool, order.is_reduce_only)
+            and report.quantity.as_decimal() == record.quantity_ounces
+            and order.quantity.as_decimal() == record.quantity_ounces
+            and report.filled_qty.as_decimal() == record.filled_ounces
+            and order.filled_qty.as_decimal() == record.filled_ounces
+            and report_price == order_price
+            and average_is_exact
+        )
 
     def _try_release_cycle(self) -> bool:
         frozen = {
@@ -661,8 +1099,16 @@ class MakerStrategy(Strategy):
                 f"Durable hedge account {account_id} is not configured",
             )
             return None
-        client_id = ClientId(record.hedge_client_id) if record.hedge_client_id else None
-        return account_id, client_id
+        configured_client_id = (
+            configured.client_id.value if configured.client_id is not None else None
+        )
+        if record.hedge_client_id != configured_client_id:
+            self._stores[direction].mark_source_unknown(
+                client_order_id,
+                "Durable Maker hedge client differs from the configured account route",
+            )
+            return None
+        return account_id, configured.client_id
 
     def _required_source_instrument(self) -> Instrument:
         if self._source_instrument is None:

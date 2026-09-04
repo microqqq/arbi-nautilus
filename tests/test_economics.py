@@ -1,5 +1,6 @@
 """Named counterexamples for active-oracle Taker economics."""
 
+from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
@@ -10,6 +11,7 @@ from py000_nautilus.economics import (
     evaluate_taker,
     long_net_return,
     market_inputs_are_fresh,
+    normalize_mt5_points_swap,
     round_hedge_ounces,
     select_source_account,
     short_net_return,
@@ -17,6 +19,29 @@ from py000_nautilus.economics import (
 from py000_nautilus.models import BookTop, HedgeAccount, SourceAccount, SourceDirection
 
 D = Decimal
+
+
+def _utc_ns(year: int, month: int, day: int, hour: int = 12) -> int:
+    return int(datetime(year, month, day, hour, tzinfo=UTC).timestamp()) * 1_000_000_000
+
+
+def _normalized_swap(
+    ts_utc_ns: int,
+    *,
+    timezone_name: str = "Europe/Athens",
+    mode: int = 1,
+    swap_rates: tuple[Decimal, ...] = (D(0), D(1), D(1), D(3), D(1), D(1), D(0)),
+) -> tuple[Decimal, Decimal]:
+    return normalize_mt5_points_swap(
+        swap_long=D("-12.6"),
+        swap_short=D("-4.6"),
+        point=D("0.01"),
+        ask=D("4000"),
+        native_swap_mode=mode,
+        swap_rates=swap_rates,
+        now_ns=ts_utc_ns,
+        server_timezone=timezone_name,
+    )
 
 
 def _config(
@@ -86,6 +111,36 @@ def test_short_direction_uses_source_bid_and_mt5_ask() -> None:
     assert opportunity.source_quantity_ounces == D(2)
 
 
+def test_direction_filter_preserves_default_short_first_and_can_select_long() -> None:
+    source_book = BookTop(D(100), D(101), D(9), D(9))
+    hedge_book = BookTop(D(100), D(101), D(9), D(9))
+    accounts = (_account("BITFINEX-001", "0"),)
+    hedge = HedgeAccount(D(0), D(5), D(5))
+    config = _config(long_threshold="-1", short_threshold="-1")
+
+    default = evaluate_taker(source_book, hedge_book, accounts, hedge, config)
+    long_only = evaluate_taker(
+        source_book,
+        hedge_book,
+        accounts,
+        hedge,
+        config,
+        allowed_direction=SourceDirection.LONG,
+    )
+    short_only = evaluate_taker(
+        source_book,
+        hedge_book,
+        accounts,
+        hedge,
+        config,
+        allowed_direction=SourceDirection.SHORT,
+    )
+
+    assert default is not None and default.direction is SourceDirection.SHORT
+    assert long_only is not None and long_only.direction is SourceDirection.LONG
+    assert short_only is not None and short_only.direction is SourceDirection.SHORT
+
+
 def test_threshold_is_strictly_greater_not_equal() -> None:
     exact = D(103) / D(101) - D(1)
     opportunity = evaluate_taker(
@@ -128,6 +183,71 @@ def test_migration_fx_boundary_and_oracle_carry_terms_are_side_specific() -> Non
         + D("0.0004")
         - D("0.0005")
     )
+
+
+def test_mt5_points_swap_keeps_both_signed_negative_rates() -> None:
+    # Monday: one normal rollover charge.
+    assert _normalized_swap(_utc_ns(2026, 8, 31)) == (
+        D("-0.0000315"),
+        D("-0.0000115"),
+    )
+
+
+def test_mt5_points_swap_uses_three_on_the_mql_rollover_weekday() -> None:
+    # 2026-09-02 is Wednesday, which is MQL weekday 3.
+    assert _normalized_swap(_utc_ns(2026, 9, 2)) == (
+        D("-0.0000945"),
+        D("-0.0000345"),
+    )
+
+
+def test_mt5_points_swap_uses_broker_native_weekend_multiplier_without_inference() -> None:
+    # Saturday is MQL weekday 6. A deliberately unusual native 3x proves
+    # that normalization indexes the native vector rather than inferring weekends.
+    assert _normalized_swap(
+        _utc_ns(2026, 9, 5),
+        swap_rates=(D(0), D(1), D(1), D(1), D(1), D(1), D(3)),
+    ) == (D("-0.0000945"), D("-0.0000345"))
+
+
+def test_mt5_points_swap_uses_the_server_timezone_for_the_rollover_day() -> None:
+    # Tuesday 22:00 UTC is already Wednesday in Europe/Athens during summer time.
+    timestamp = _utc_ns(2026, 9, 1, 22)
+    athens = _normalized_swap(timestamp, timezone_name="Europe/Athens")
+    utc = _normalized_swap(timestamp, timezone_name="UTC")
+    assert athens == (D("-0.0000945"), D("-0.0000345"))
+    assert utc == (D("-0.0000315"), D("-0.0000115"))
+
+
+def test_mt5_disabled_swap_is_explicit_zero_and_unknown_mode_fails_closed() -> None:
+    timestamp = _utc_ns(2026, 9, 2)
+    assert _normalized_swap(timestamp, mode=0) == (D(0), D(0))
+    with pytest.raises(ValueError, match=r"DISABLED\(0\) or POINTS\(1\)"):
+        _normalized_swap(timestamp, mode=2)
+
+
+def test_mt5_points_swap_rejects_invalid_timezone_and_inputs() -> None:
+    timestamp = _utc_ns(2026, 9, 2)
+    with pytest.raises(ValueError, match="IANA timezone"):
+        _normalized_swap(timestamp, timezone_name="Not/A_Real_Zone")
+    with pytest.raises(ValueError, match="exactly seven"):
+        _normalized_swap(timestamp, swap_rates=(D(0),) * 6)
+    with pytest.raises(ValueError, match=r"swap_rates\[3\].*finite Decimal"):
+        _normalized_swap(
+            timestamp,
+            swap_rates=(D(0), D(1), D(1), D("NaN"), D(1), D(1), D(0)),
+        )
+    with pytest.raises(ValueError, match="finite Decimal"):
+        normalize_mt5_points_swap(
+            swap_long=D("NaN"),
+            swap_short=D("-4.6"),
+            point=D("0.01"),
+            ask=D("4000"),
+            native_swap_mode=1,
+            swap_rates=(D(0), D(1), D(1), D(3), D(1), D(1), D(0)),
+            now_ns=timestamp,
+            server_timezone="Europe/Athens",
+        )
 
 
 def test_account_selection_matches_legacy_sorted_first_and_last() -> None:

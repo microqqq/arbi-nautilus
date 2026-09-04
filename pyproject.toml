@@ -10,6 +10,8 @@ readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
   "nautilus-trader==1.231.0",
+  "pyzmq==27.2.0",
+  "websockets==17.1",
 ]
 
 [project.optional-dependencies]
@@ -22,6 +24,11 @@ dev = [
 [project.scripts]
 py000-sim = "py000_nautilus.app:main"
 py000-maker-sim = "py000_nautilus.app:maker_main"
+py000-mt5-shadow = "py000_nautilus.mt5_v1_observe:main"
+py000-bitfinex-paper-canary = "py000_nautilus.bitfinex_v1_paper_canary:main"
+py000-taker-live = "py000_nautilus.live_taker_entry:main"
+py000-taker-canary = "py000_nautilus.live_taker_canary:main"
+py000-maker-canary = "py000_nautilus.live_maker_canary:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/py000_nautilus"]
