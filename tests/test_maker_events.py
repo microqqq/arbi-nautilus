@@ -9,6 +9,7 @@ from typing import Any, cast
 import pytest
 from msgspec.structs import replace as struct_replace
 from nautilus_trader.core.uuid import UUID4
+from nautilus_trader.model.data import FundingRateUpdate
 from nautilus_trader.model.enums import OrderSide
 from nautilus_trader.model.events import OrderRejected
 from nautilus_trader.model.identifiers import (
@@ -677,12 +678,15 @@ def test_maker_fresh_hedge_quote_retries_pending_leg_exactly_once(
         ),
         order_factory=SimpleNamespace(market=market),
         log=SimpleNamespace(error=lambda _message: None),
+        clock=SimpleNamespace(timestamp_ns=lambda: 1_000_000_000),
         _quote_is_fresh=lambda _tick: fresh["value"],
+        _carry_for_hedge_tick=lambda _tick, _now_ns: CarryConfig(),
+        _quote_carry=CarryConfig(),
         _required_hedge_instrument=lambda: _hedge_instrument(),
         _hedge_positions=lambda _account_id: positions,
         submit_order=lambda _order, *, position_id, client_id: submissions.append(position_id),
         _try_release_cycle=lambda: False,
-        _inputs_are_fresh=lambda _source, _hedge: True,
+        _inputs_are_fresh=lambda _source, _hedge, _now_ns: True,
         _global_obligation_block=lambda: True,
         _freeze_and_cancel_all=lambda reason: frozen.append(reason),
         _refresh_direction=lambda *_args: (_ for _ in ()).throw(
@@ -1031,7 +1035,10 @@ class _StopHarness:
         self._stale_timer_names: dict[SourceDirection, str] = {}
         self._cost_ts_ns = 0
         self._carry = CarryConfig()
+        self._quote_carry = self._carry
         self._fx = FxConfig()
+        self._cost_snapshot_valid = True
+        self._cost_recovery_after_ns: int = 0
         self._session_ts_ns = 0
         self._hedge_session_open = True
         self.clock: Any = SimpleNamespace(timestamp_ns=lambda: 0)
@@ -1064,7 +1071,12 @@ class _StopHarness:
         for direction in (SourceDirection.LONG, SourceDirection.SHORT):
             self._cancel_working(direction, reason=reason)
 
-    def _inputs_are_fresh(self, source_tick: Any, hedge_tick: Any) -> bool:
+    def _inputs_are_fresh(
+        self,
+        source_tick: Any,
+        hedge_tick: Any,
+        now_ns: int,
+    ) -> bool:
         return False
 
     def _direction_for_source_order(
@@ -1174,6 +1186,150 @@ def test_cost_change_immediately_cancels_exact_active_ids_without_market_tick() 
     assert len(harness.canceled) == 2
 
 
+class _MakerCostHarness:
+    def __init__(self, state_prefix: Path, *, now_ns: int = 100) -> None:
+        config = _maker_strategy_config(state_prefix)
+        economics = struct_replace(
+            config.economics,
+            carry=CarryConfig(total_trade_fee=D("0.00065")),
+        )
+        self._config = struct_replace(config, economics=economics)
+        self._live_costs_from_adapters = True
+        self._carry = self._config.economics.carry
+        self._quote_carry = self._carry
+        self._fx = FxConfig()
+        self._cost_ts_ns = 0
+        self._cost_snapshot_valid = False
+        self._cost_recovery_after_ns: int = 0
+        self.now_ns = now_ns
+        self.clock = SimpleNamespace(timestamp_ns=lambda: self.now_ns)
+        self.frozen: list[str] = []
+        self.errors: list[str] = []
+        self.log = SimpleNamespace(error=self.errors.append)
+
+    def _freeze_and_cancel_all(self, reason: str) -> None:
+        self.frozen.append(reason)
+
+    def _invalidate_cost_snapshot(self, reason: str) -> None:
+        MakerStrategy._invalidate_cost_snapshot(cast(Any, self), reason)
+
+    def update_cost_snapshot(
+        self,
+        carry: CarryConfig,
+        fx: FxConfig,
+        ts_event_ns: int,
+    ) -> bool:
+        return MakerStrategy.update_cost_snapshot(cast(Any, self), carry, fx, ts_event_ns)
+
+    def on_funding_rate(self, update: FundingRateUpdate) -> None:
+        MakerStrategy.on_funding_rate(cast(Any, self), update)
+
+
+def _maker_funding(rate: str, ts_event: int) -> FundingRateUpdate:
+    return FundingRateUpdate(
+        instrument_id=_source_instrument().id,
+        rate=D(rate),
+        ts_event=ts_event,
+        ts_init=ts_event,
+    )
+
+
+@pytest.mark.parametrize(
+    ("rate", "timestamp", "reason"),
+    [
+        ("0.001", 101, "Bitfinex funding observation is future-dated"),
+        ("1.1", 99, "Bitfinex funding observation is invalid"),
+    ],
+)
+def test_future_or_invalid_live_funding_invalidates_and_freezes_maker(
+    tmp_path: Path,
+    rate: str,
+    timestamp: int,
+    reason: str,
+) -> None:
+    harness = _MakerCostHarness(tmp_path / "bad-live-cost.state")
+
+    harness.on_funding_rate(_maker_funding(rate, timestamp))
+
+    assert not cast(Any, harness)._cost_snapshot_valid
+    assert harness.frozen == [reason]
+    assert harness.errors == [reason]
+
+
+def test_equal_timestamp_cost_conflict_invalidates_until_fresh_newer_snapshot(
+    tmp_path: Path,
+) -> None:
+    harness = _MakerCostHarness(tmp_path / "cost-recovery.state")
+
+    harness.on_funding_rate(_maker_funding("0.001", 99))
+    assert cast(Any, harness)._cost_snapshot_valid
+
+    harness.on_funding_rate(_maker_funding("0.002", 99))
+    assert not cast(Any, harness)._cost_snapshot_valid
+
+    harness.on_funding_rate(_maker_funding("0.003", 100))
+    assert cast(Any, harness)._cost_snapshot_valid
+    assert cast(Any, harness)._cost_ts_ns == 100
+    assert cast(Any, harness)._carry.bitfinex_long == D("0.003")
+    assert harness.frozen == [
+        "Maker costs changed",
+        "Maker costs conflict at one timestamp",
+        "Maker costs changed",
+    ]
+
+
+@pytest.mark.parametrize("failure", ["false", "raises"])
+def test_live_hedge_quantity_failure_precedes_source_persistence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    strategy = RecordingMakerStrategy(tmp_path / f"quantity-{failure}.state")
+    strategy._source_instrument = _source_instrument()
+    monkeypatch.setattr(strategy, "_hedge_positions", lambda _account_id: [])
+
+    def quantity_ready(_quantity: Decimal) -> bool:
+        if failure == "raises":
+            raise RuntimeError("injected quantity failure")
+        return False
+
+    strategy._hedge_quantity_ready = quantity_ready
+    strategy._submit_source(_bound_quote())
+
+    assert strategy._stores[SourceDirection.LONG].source_orders() == ()
+    assert not strategy._stores[SourceDirection.LONG].path.exists()
+
+
+def test_live_hedge_quantity_preflight_checks_each_planned_mt5_ticket() -> None:
+    checked: list[Decimal] = []
+    positions = [
+        SimpleNamespace(
+            id=PositionId(position_id),
+            quantity=Quantity.from_int(1),
+            is_long=True,
+            is_short=False,
+        )
+        for position_id in ("2", "1")
+    ]
+
+    def quantity_ready(quantity: Decimal) -> bool:
+        checked.append(quantity)
+        return len(checked) == 1
+
+    harness = SimpleNamespace(
+        _hedge_quantity_ready=quantity_ready,
+        _hedge_positions=lambda _account_id: positions,
+        log=SimpleNamespace(error=lambda _message: None),
+    )
+
+    assert not MakerStrategy._source_hedge_is_executable(
+        cast(Any, harness),
+        _bound_quote(),
+        D(2),
+    )
+    assert checked == [D(1), D(1)]
+
+
 class _NowClock:
     def timestamp_ns(self) -> int:
         return 2
@@ -1204,14 +1360,135 @@ class _QuoteCache:
         return self._ticks[instrument_id]
 
 
+class _LiveQuoteGateHarness:
+    def __init__(self, state_prefix: Path, *, now_ns: int) -> None:
+        self._config = _maker_strategy_config(state_prefix)
+        source = _source_instrument()
+        hedge = _hedge_instrument()
+        self.source_tick = _quote(source, "3999", "4000", "5", now_ns - 1)
+        self.hedge_tick = _quote(hedge, "3999", "4000", "5", now_ns - 1)
+        ticks = {source.id: self.source_tick, hedge.id: self.hedge_tick}
+        self.cache = SimpleNamespace(quote_tick=lambda instrument_id: ticks[instrument_id])
+        self.clock = SimpleNamespace(timestamp_ns=lambda: now_ns)
+        self.ready = False
+        self._live_submission_ready = lambda: self.ready
+        self._live_costs_from_adapters = True
+        self._cost_snapshot_valid = True
+        self._cost_recovery_after_ns = 0
+        self._cost_ts_ns = now_ns - 1
+        self._session_ts_ns = now_ns - 1
+        self._hedge_session_open = True
+        self._carry = CarryConfig(
+            bitfinex_long=D("-0.0007366"),
+            bitfinex_short=D("0.0007366"),
+            total_trade_fee=D("0.00065"),
+        )
+        self._quote_carry = self._carry
+        self._fx = FxConfig()
+        self.canceled: list[SourceDirection] = []
+        self.quote_carries: list[CarryConfig] = []
+        self.errors: list[str] = []
+        self.log = SimpleNamespace(error=self.errors.append)
+
+    def _inputs_are_fresh(
+        self,
+        source_tick: Any,
+        hedge_tick: Any,
+        now_ns: int,
+    ) -> bool:
+        return MakerStrategy._inputs_are_fresh(
+            cast(Any, self),
+            source_tick,
+            hedge_tick,
+            now_ns,
+        )
+
+    def _invalidate_cost_snapshot(self, reason: str) -> None:
+        MakerStrategy._invalidate_cost_snapshot(cast(Any, self), reason)
+
+    def _freeze_and_cancel_all(self, reason: str) -> None:
+        self.canceled.extend((SourceDirection.LONG, SourceDirection.SHORT))
+
+    def _global_obligation_block(self) -> bool:
+        return False
+
+    def _try_release_cycle(self) -> bool:
+        return False
+
+    def _refresh_direction(self, direction: SourceDirection, *_books: Any) -> None:
+        self.quote_carries.append(self._quote_carry)
+
+    def _carry_for_hedge_tick(self, hedge_tick: Any, now_ns: int) -> CarryConfig | None:
+        return MakerStrategy._carry_for_hedge_tick(cast(Any, self), hedge_tick, now_ns)
+
+    def _mt5_swap_spec(
+        self,
+    ) -> tuple[Decimal, Decimal, Decimal, int, tuple[Decimal, ...], str]:
+        return (
+            D("-12.6"),
+            D("-4.6"),
+            D("0.01"),
+            1,
+            (D(0), D(1), D(1), D(3), D(1), D(1), D(0)),
+            "Europe/Athens",
+        )
+
+
+def test_live_readiness_false_cancels_both_quotes_without_source_submit(
+    tmp_path: Path,
+) -> None:
+    now_ns = 1_788_439_200_000_000_000
+    harness = _LiveQuoteGateHarness(tmp_path / "readiness.state", now_ns=now_ns)
+
+    MakerStrategy.on_quote_tick(cast(Any, harness), harness.source_tick)
+
+    assert harness.canceled == [SourceDirection.LONG, SourceDirection.SHORT]
+    assert harness.quote_carries == []
+
+
+def test_live_readiness_exception_logs_type_and_cancels_both_quotes(tmp_path: Path) -> None:
+    now_ns = 1_788_439_200_000_000_000
+    harness = _LiveQuoteGateHarness(tmp_path / "readiness-error.state", now_ns=now_ns)
+
+    def readiness_failure() -> bool:
+        raise ConnectionError("injected readiness failure")
+
+    harness._live_submission_ready = readiness_failure
+
+    MakerStrategy.on_quote_tick(cast(Any, harness), harness.source_tick)
+
+    assert harness.errors == [
+        "Maker live submission readiness failed with ConnectionError",
+    ]
+    assert harness.canceled == [SourceDirection.LONG, SourceDirection.SHORT]
+    assert harness.quote_carries == []
+
+
+def test_live_mt5_swap_normalization_feeds_both_maker_quote_sides(tmp_path: Path) -> None:
+    # 2026-09-03 12:00 UTC is Thursday in Europe/Athens, multiplier one.
+    now_ns = 1_788_439_200_000_000_000
+    harness = _LiveQuoteGateHarness(tmp_path / "swap.state", now_ns=now_ns)
+    harness.ready = True
+
+    MakerStrategy.on_quote_tick(cast(Any, harness), harness.source_tick)
+
+    assert len(harness.quote_carries) == 2
+    assert all(carry.mt5_long_swap == D("-0.0000315") for carry in harness.quote_carries)
+    assert all(carry.mt5_short_swap == D("-0.0000115") for carry in harness.quote_carries)
+
+
 class _QuoteGateHarness:
     def __init__(self, state_prefix: Path, *, blocked: bool, fresh: bool) -> None:
         self._config = _maker_strategy_config(state_prefix)
         self.cache = _QuoteCache()
         self.blocked = blocked
         self.fresh = fresh
+        self.clock: Any = SimpleNamespace(timestamp_ns=lambda: 1_000_000_000)
+        self._quote_carry = CarryConfig()
         self.canceled: list[SourceDirection] = []
         self.refreshed: list[SourceDirection] = []
+        self.freshness_now_ns: list[int] = []
+        self.carry_now_ns: list[int] = []
 
     def _global_obligation_block(self) -> bool:
         return self.blocked
@@ -1219,8 +1496,18 @@ class _QuoteGateHarness:
     def _try_release_cycle(self) -> bool:
         return False
 
-    def _inputs_are_fresh(self, source_tick: Any, hedge_tick: Any) -> bool:
+    def _inputs_are_fresh(
+        self,
+        source_tick: Any,
+        hedge_tick: Any,
+        now_ns: int,
+    ) -> bool:
+        self.freshness_now_ns.append(now_ns)
         return self.fresh
+
+    def _carry_for_hedge_tick(self, hedge_tick: Any, now_ns: int) -> CarryConfig:
+        self.carry_now_ns.append(now_ns)
+        return CarryConfig()
 
     def _cancel_working(self, direction: SourceDirection, *, reason: str) -> None:
         assert reason == "stale, closed, or unresolved"
@@ -1237,6 +1524,29 @@ class _QuoteGateHarness:
         hedge_book: Any,
     ) -> None:
         self.refreshed.append(direction)
+
+
+def test_quote_decision_uses_one_clock_sample_for_freshness_and_swap(
+    tmp_path: Path,
+) -> None:
+    harness = _QuoteGateHarness(tmp_path / "one-clock.state", blocked=False, fresh=True)
+    clock_values = (100, 102)
+    clock_reads: list[int] = []
+
+    def timestamp_ns() -> int:
+        value = clock_values[len(clock_reads)]
+        clock_reads.append(value)
+        return value
+
+    harness.clock = SimpleNamespace(timestamp_ns=timestamp_ns)
+    tick = harness.cache.quote_tick(harness._config.source_instrument_id)
+
+    MakerStrategy.on_quote_tick(cast(Any, harness), tick)
+
+    assert clock_reads == [100]
+    assert harness.freshness_now_ns == [100]
+    assert harness.carry_now_ns == [100]
+    assert harness.refreshed == [SourceDirection.LONG, SourceDirection.SHORT]
 
 
 def test_completed_hedge_before_sibling_cancel_terminal_cannot_reopen_quotes(

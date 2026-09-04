@@ -77,7 +77,7 @@ Bitfinex/MT5 data and execution clients with explicit account and venue routes. 
 strategy, so it can exercise bounded adapter startup/reconciliation without submitting or
 canceling an order. Its mutually exclusive `--run-paper` mode accepts only the bound Bitfinex
 paper symbol, wallet, and account, keeps the existing Taker strategy attached, and runs until a
-signal or normal node stop. Maker live composition remains absent.
+signal or normal node stop. Maker now has an offline-buildable live composition but no runnable entry point.
 The live MT5 account and configured magic must be dedicated to this node so an external position
 change cannot invalidate the preflight between a Bitfinex submission and its fill.
 

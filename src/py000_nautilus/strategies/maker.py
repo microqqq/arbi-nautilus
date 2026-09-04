@@ -1,11 +1,12 @@
 """Thin two-sided Maker strategy built directly on Nautilus order custody."""
 
+from collections.abc import Callable
 from dataclasses import replace
 from decimal import Decimal
 from typing import cast
 
 from nautilus_trader.common.events import TimeEvent
-from nautilus_trader.model.data import QuoteTick
+from nautilus_trader.model.data import FundingRateUpdate, InstrumentStatus, QuoteTick
 from nautilus_trader.model.enums import OrderSide, TimeInForce
 from nautilus_trader.model.events import (
     OrderAccepted,
@@ -31,8 +32,12 @@ from nautilus_trader.model.position import Position
 from nautilus_trader.trading.strategy import Strategy
 
 from py000_nautilus.config import CarryConfig, FxConfig, MakerStrategyConfig
-from py000_nautilus.economics import market_inputs_are_fresh
-from py000_nautilus.hedge import HedgeCoordinator, HedgePlanningError
+from py000_nautilus.economics import (
+    market_inputs_are_fresh,
+    normalize_mt5_points_swap,
+    round_hedge_ounces,
+)
+from py000_nautilus.hedge import HedgeCoordinator, HedgePlanningError, plan_hedge_delta
 from py000_nautilus.maker_economics import maker_quote, passive_maker_price
 from py000_nautilus.models import (
     BookTop,
@@ -52,9 +57,19 @@ _DIRECTIONS = (SourceDirection.LONG, SourceDirection.SHORT)
 class MakerStrategy(Strategy):
     """Maintain one bid and one ask GTC source order, hedging actual fills only."""
 
-    def __init__(self, config: MakerStrategyConfig) -> None:
+    def __init__(
+        self,
+        config: MakerStrategyConfig,
+        *,
+        live_submission_ready: Callable[[], bool] | None = None,
+        hedge_quantity_ready: Callable[[Decimal], bool] | None = None,
+        live_costs_from_adapters: bool = False,
+    ) -> None:
         super().__init__(config)
         self._config = config
+        self._live_submission_ready = live_submission_ready
+        self._hedge_quantity_ready = hedge_quantity_ready
+        self._live_costs_from_adapters = live_costs_from_adapters
         self._stores = {
             direction: JsonStateStore(f"{config.store_path_prefix}.{direction.value}.json")
             for direction in _DIRECTIONS
@@ -69,8 +84,11 @@ class MakerStrategy(Strategy):
         self._source_instrument: Instrument | None = None
         self._hedge_instrument: Instrument | None = None
         self._carry = config.economics.carry
+        self._quote_carry = self._carry
         self._fx = config.economics.fx
         self._cost_ts_ns = config.initial_cost_ts_ns
+        self._cost_snapshot_valid = config.initial_cost_ts_ns > 0
+        self._cost_recovery_after_ns = 0
         self._hedge_session_open = config.initial_hedge_session_open
         self._session_ts_ns = config.initial_session_ts_ns
 
@@ -79,18 +97,39 @@ class MakerStrategy(Strategy):
         carry: CarryConfig,
         fx: FxConfig,
         ts_event_ns: int,
-    ) -> None:
-        if ts_event_ns >= self._cost_ts_ns:
-            changed = (
-                ts_event_ns > self._cost_ts_ns
-                or carry != self._carry
-                or fx != self._fx
-            )
-            self._carry = carry
-            self._fx = fx
-            self._cost_ts_ns = ts_event_ns
-            if changed:
-                self._freeze_and_cancel_all("Maker costs changed")
+    ) -> bool:
+        """Install one monotonic funding/FX snapshot and cancel stale quotes."""
+        if type(ts_event_ns) is not int or ts_event_ns <= 0:
+            self._invalidate_cost_snapshot("Maker costs are invalid")
+            return False
+        if ts_event_ns < self._cost_ts_ns:
+            self._invalidate_cost_snapshot("Maker costs moved backwards")
+            return False
+        if ts_event_ns == self._cost_ts_ns:
+            if carry != self._carry or fx != self._fx:
+                self._invalidate_cost_snapshot("Maker costs conflict at one timestamp")
+                return False
+            return self._cost_snapshot_valid
+        if ts_event_ns <= self._cost_recovery_after_ns:
+            return False
+        changed = ts_event_ns > self._cost_ts_ns or carry != self._carry or fx != self._fx
+        self._carry = carry
+        self._quote_carry = carry
+        self._fx = fx
+        self._cost_ts_ns = ts_event_ns
+        self._cost_snapshot_valid = True
+        self._cost_recovery_after_ns = 0
+        if changed:
+            self._freeze_and_cancel_all("Maker costs changed")
+        return True
+
+    def _invalidate_cost_snapshot(self, reason: str) -> None:
+        self._cost_snapshot_valid = False
+        self._cost_recovery_after_ns = max(
+            self._cost_recovery_after_ns,
+            self._cost_ts_ns,
+        )
+        self._freeze_and_cancel_all(reason)
 
     def update_hedge_session(self, is_open: bool, ts_event_ns: int) -> None:
         if ts_event_ns >= self._session_ts_ns:
@@ -108,6 +147,13 @@ class MakerStrategy(Strategy):
             self.log.error("Maker instruments were not found in the Nautilus cache")
             self.stop()
             return
+        if self._live_costs_from_adapters:
+            try:
+                self._mt5_swap_spec()
+            except (KeyError, TypeError, ValueError) as exc:
+                self.log.error(f"MT5 swap specification is unavailable: {exc}")
+                self.stop()
+                return
         for store in self._stores.values():
             reason = store.recover_for_start()
             if reason is not None:
@@ -115,6 +161,9 @@ class MakerStrategy(Strategy):
         self._try_release_cycle()
         self.subscribe_quote_ticks(self._config.source_instrument_id)
         self.subscribe_quote_ticks(self._config.hedge_instrument_id)
+        if self._live_costs_from_adapters:
+            self.subscribe_funding_rates(self._config.source_instrument_id)
+        self.subscribe_instrument_status(self._config.hedge_instrument_id)
 
     def on_stop(self) -> None:
         for direction in _DIRECTIONS:
@@ -132,7 +181,14 @@ class MakerStrategy(Strategy):
         hedge_tick = self.cache.quote_tick(self._config.hedge_instrument_id)
         if source_tick is None or hedge_tick is None:
             return
-        inputs_fresh = self._inputs_are_fresh(source_tick, hedge_tick)
+        now_ns = cast(int, self.clock.timestamp_ns())
+        inputs_fresh = self._inputs_are_fresh(source_tick, hedge_tick, now_ns)
+        if inputs_fresh:
+            quote_carry = self._carry_for_hedge_tick(hedge_tick, now_ns)
+            if quote_carry is None:
+                inputs_fresh = False
+            else:
+                self._quote_carry = quote_carry
         if inputs_fresh:
             self._try_release_cycle()
         if self._global_obligation_block() or not inputs_fresh:
@@ -142,6 +198,41 @@ class MakerStrategy(Strategy):
         hedge_book = _book_top(hedge_tick)
         for direction in _DIRECTIONS:
             self._refresh_direction(direction, source_book, hedge_book)
+
+    def on_instrument_status(self, status: InstrumentStatus) -> None:
+        if status.instrument_id != self._config.hedge_instrument_id:
+            return
+        self.update_hedge_session(status.is_trading is True, status.ts_event)
+
+    def on_funding_rate(self, funding_rate: FundingRateUpdate) -> None:
+        """Install the source venue's signed next-period funding observation."""
+        if (
+            not self._live_costs_from_adapters
+            or funding_rate.instrument_id != self._config.source_instrument_id
+        ):
+            return
+        ts_event_ns = cast(int, funding_rate.ts_event)
+        if ts_event_ns > cast(int, self.clock.timestamp_ns()):
+            self._invalidate_cost_snapshot("Bitfinex funding observation is future-dated")
+            self.log.error("Bitfinex funding observation is future-dated")
+            return
+        rate = Decimal(str(funding_rate.rate))
+        if not rate.is_finite() or abs(rate) > 1:
+            self._invalidate_cost_snapshot("Bitfinex funding observation is invalid")
+            self.log.error("Bitfinex funding observation is invalid")
+            return
+        static = self._config.economics.carry
+        self.update_cost_snapshot(
+            CarryConfig(
+                bitfinex_long=rate,
+                bitfinex_short=-rate,
+                mt5_long_swap=static.mt5_long_swap,
+                mt5_short_swap=static.mt5_short_swap,
+                total_trade_fee=static.total_trade_fee,
+            ),
+            self._config.economics.fx,
+            ts_event_ns,
+        )
 
     def on_order_submitted(self, event: OrderSubmitted) -> None:
         self._update_order_status(event.client_order_id.value, "SUBMITTED")
@@ -263,7 +354,7 @@ class MakerStrategy(Strategy):
             self._source_accounts(),
             self._hedge_accounts(),
             self._config.economics,
-            carry=self._carry,
+            carry=self._quote_carry,
             fx=self._fx,
         )
         return self._passive_quote(quote, source_book)
@@ -282,7 +373,7 @@ class MakerStrategy(Strategy):
             (source,),
             (hedge,),
             self._config.economics,
-            carry=self._carry,
+            carry=self._quote_carry,
             fx=self._fx,
         )
         return self._passive_quote(quote, source_book)
@@ -306,10 +397,13 @@ class MakerStrategy(Strategy):
     def _submit_source(self, quote: MakerQuote) -> None:
         instrument = self._required_source_instrument()
         side = OrderSide.BUY if quote.direction is SourceDirection.LONG else OrderSide.SELL
+        source_quantity = instrument.make_qty(quote.quantity_ounces)
+        if not self._source_hedge_is_executable(quote, Decimal(str(source_quantity))):
+            return
         order = self.order_factory.limit(
             instrument_id=self._config.source_instrument_id,
             order_side=side,
-            quantity=instrument.make_qty(quote.quantity_ounces),
+            quantity=source_quantity,
             price=instrument.make_price(quote.source_price_usdt),
             time_in_force=TimeInForce.GTC,
             post_only=True,
@@ -347,6 +441,48 @@ class MakerStrategy(Strategy):
                 f"Maker source submission raised {type(exc).__name__}",
             )
             raise
+
+    def _source_hedge_is_executable(
+        self,
+        quote: MakerQuote,
+        source_quantity_ounces: Decimal,
+    ) -> bool:
+        hedge_side = (
+            BusinessOrderSide.SELL
+            if quote.direction is SourceDirection.LONG
+            else BusinessOrderSide.BUY
+        )
+        max_hedge_ounces = Decimal(abs(round_hedge_ounces(source_quantity_ounces)))
+        if max_hedge_ounces == 0:
+            return True
+        try:
+            plan = plan_hedge_delta(
+                self._hedge_positions(quote.hedge_account.account_id),
+                hedge_side,
+                max_hedge_ounces,
+            )
+        except (HedgePlanningError, TypeError, ValueError) as exc:
+            self.log.error(f"Maker source admission blocked by MT5 position shape: {exc}")
+            return False
+        quantity_ready = self._hedge_quantity_ready
+        if quantity_ready is None:
+            return True
+        for leg in plan:
+            try:
+                admitted = quantity_ready(leg.quantity_ounces)
+            except Exception as exc:
+                self.log.error(
+                    "Maker source admission blocked because MT5 quantity preflight raised "
+                    f"{type(exc).__name__}"
+                )
+                return False
+            if not admitted:
+                self.log.error(
+                    "Maker source admission blocked because MT5 cannot execute hedge leg "
+                    f"quantity {leg.quantity_ounces} ounces"
+                )
+                return False
+        return True
 
     def _requote(self, order: Order, desired: MakerQuote) -> None:
         if cast(bool, order.is_pending_update) or cast(bool, order.is_pending_cancel):
@@ -536,10 +672,11 @@ class MakerStrategy(Strategy):
             self._stale_timer_names.pop(direction, None)
         source_tick = self.cache.quote_tick(self._config.source_instrument_id)
         hedge_tick = self.cache.quote_tick(self._config.hedge_instrument_id)
+        now_ns = cast(int, self.clock.timestamp_ns())
         if (
             source_tick is not None
             and hedge_tick is not None
-            and self._inputs_are_fresh(source_tick, hedge_tick)
+            and self._inputs_are_fresh(source_tick, hedge_tick, now_ns)
         ):
             self._schedule_stale_timer(direction, order_id)
         else:
@@ -552,9 +689,29 @@ class MakerStrategy(Strategy):
             if store.active_source_order_id is not None:
                 self._schedule_stale_timer(direction, store.active_source_order_id)
 
-    def _inputs_are_fresh(self, source_tick: QuoteTick, hedge_tick: QuoteTick) -> bool:
+    def _inputs_are_fresh(
+        self,
+        source_tick: QuoteTick,
+        hedge_tick: QuoteTick,
+        now_ns: int,
+    ) -> bool:
+        if self._live_submission_ready is not None:
+            try:
+                if not self._live_submission_ready():
+                    return False
+            except Exception as exc:
+                self.log.error(
+                    "Maker live submission readiness failed with "
+                    f"{type(exc).__name__}"
+                )
+                return False
+        if not self._cost_snapshot_valid:
+            return False
+        if self._cost_ts_ns > now_ns:
+            self._invalidate_cost_snapshot("Maker costs are future-dated")
+            return False
         return market_inputs_are_fresh(
-            now_ns=cast(int, self.clock.timestamp_ns()),
+            now_ns=now_ns,
             source_ts_ns=cast(int, source_tick.ts_event),
             hedge_ts_ns=cast(int, hedge_tick.ts_event),
             cost_ts_ns=self._cost_ts_ns,
@@ -565,6 +722,69 @@ class MakerStrategy(Strategy):
             max_cost_age_ns=self._config.max_cost_age_ns,
             max_session_age_ns=self._config.max_session_age_ns,
         )
+
+    def _carry_for_hedge_tick(
+        self,
+        hedge_tick: QuoteTick,
+        now_ns: int,
+    ) -> CarryConfig | None:
+        if not self._live_costs_from_adapters:
+            return self._carry
+        try:
+            swap_long_value, swap_short_value, point, mode, swap_rates, timezone = (
+                self._mt5_swap_spec()
+            )
+            swap_long, swap_short = normalize_mt5_points_swap(
+                swap_long=swap_long_value,
+                swap_short=swap_short_value,
+                point=point,
+                ask=Decimal(str(hedge_tick.ask_price)),
+                native_swap_mode=mode,
+                swap_rates=swap_rates,
+                now_ns=now_ns,
+                server_timezone=timezone,
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            self.log.error(f"MT5 swap normalization failed: {exc}")
+            return None
+        return CarryConfig(
+            bitfinex_long=self._carry.bitfinex_long,
+            bitfinex_short=self._carry.bitfinex_short,
+            mt5_long_swap=swap_long,
+            mt5_short_swap=swap_short,
+            total_trade_fee=self._config.economics.carry.total_trade_fee,
+        )
+
+    def _mt5_swap_spec(
+        self,
+    ) -> tuple[Decimal, Decimal, Decimal, int, tuple[Decimal, ...], str]:
+        info = self._required_hedge_instrument().info
+        if not isinstance(info, dict):
+            raise TypeError("MT5 instrument info must be a mapping")
+        swap_long = Decimal(str(info["swap_long"]))
+        swap_short = Decimal(str(info["swap_short"]))
+        point = Decimal(str(info["point"]))
+        mode = info["swap_mode"]
+        native_swap_rates = info["swap_rates"]
+        timezone = info["server_timezone"]
+        if (
+            type(mode) is not int
+            or not isinstance(native_swap_rates, list | tuple)
+            or not isinstance(timezone, str)
+        ):
+            raise TypeError("MT5 swap mode, rates, or timezone has the wrong type")
+        swap_rates = tuple(Decimal(str(rate)) for rate in native_swap_rates)
+        normalize_mt5_points_swap(
+            swap_long=swap_long,
+            swap_short=swap_short,
+            point=point,
+            ask=Decimal(1),
+            native_swap_mode=mode,
+            swap_rates=swap_rates,
+            now_ns=0,
+            server_timezone=timezone,
+        )
+        return swap_long, swap_short, point, mode, swap_rates, timezone
 
     def _quote_is_fresh(self, tick: QuoteTick) -> bool:
         now_ns = cast(int, self.clock.timestamp_ns())
