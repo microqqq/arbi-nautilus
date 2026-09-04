@@ -491,7 +491,12 @@ class BitfinexV1DataClient(LiveMarketDataClient):
             return ()
         payload = frame[1]
         if payload == "hb" and len(frame) == 2:
-            if channel_id in {self._channel_id, self._funding_channel_id}:
+            if channel_id == self._channel_id:
+                # Bound-channel FIFO makes this a local re-observation, not a price change.
+                if self._publish_quotes and self._book.is_actionable:
+                    return (self._quote_tick(),)
+                return ()
+            if channel_id == self._funding_channel_id:
                 return ()
             pending_ack_count = self._pending_subscription_ack_count()
             if pending_ack_count:

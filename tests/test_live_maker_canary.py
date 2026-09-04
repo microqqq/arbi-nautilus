@@ -62,7 +62,7 @@ from py000_nautilus.models import (
 from py000_nautilus.mt5_v1_data import Mt5V1DataClientConfig
 from py000_nautilus.mt5_v1_execution import Mt5V1ExecClientConfig
 from py000_nautilus.mt5_v1_transport import Mt5V1Transport
-from py000_nautilus.strategies.maker import SourceTerminalResult
+from py000_nautilus.strategies.maker import MakerStrategy, SourceTerminalResult
 
 D = Decimal
 SOURCE_ID = InstrumentId.from_str("XAUTUSDT-PERP.BITFINEX")
@@ -1146,6 +1146,95 @@ def test_post_rest_freshness_timeout_holds_before_mutation(
     assert result.reason == "Maker readiness timed out"
     assert result.source_order_id is None
     assert not strategy.armed and not strategy.claimed
+
+
+def test_wait_ready_accepts_same_bbo_source_refresh_within_cross_leg_window(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        now_ns = 10_000_000_000
+        config = _profile(tmp_path).strategy_config
+        source_instrument = _source_instrument()
+        hedge_instrument = _hedge_instrument()
+        stale_source = _quote(
+            source_instrument,
+            "2000",
+            "2001",
+            "2",
+            now_ns - config.max_quote_age_ns - 1,
+        )
+        hedge = _quote(
+            hedge_instrument,
+            "2000",
+            "2001",
+            "2",
+            now_ns - config.max_cross_leg_skew_ns,
+        )
+        ticks = {SOURCE_ID: stale_source, HEDGE_ID: hedge}
+
+        class Strategy:
+            _config = config
+            cache = SimpleNamespace(quote_tick=ticks.get)
+            clock = SimpleNamespace(timestamp_ns=lambda: now_ns)
+            is_running = True
+            _live_submission_ready = staticmethod(lambda: True)
+            _cost_snapshot_valid = True
+            _cost_ts_ns = now_ns - 1
+            _session_ts_ns = now_ns - 1
+            _hedge_session_open = True
+
+            def _inputs_are_fresh(
+                self, source_tick: Any, hedge_tick: Any, timestamp_ns: int,
+            ) -> bool:
+                return MakerStrategy._inputs_are_fresh(
+                    cast(Any, self), source_tick, hedge_tick, timestamp_ns
+                )
+
+        class ConnectedEngine:
+            @staticmethod
+            def check_connected() -> bool:
+                return True
+
+        class Node:
+            kernel = SimpleNamespace(
+                data_engine=ConnectedEngine(),
+                exec_engine=ConnectedEngine(),
+            )
+
+            @staticmethod
+            def is_running() -> bool:
+                return True
+
+        async def run_node() -> None:
+            await asyncio.Event().wait()
+
+        node_task = asyncio.create_task(run_node())
+        readiness = asyncio.create_task(
+            canary._wait_ready(
+                cast(Any, Node()), cast(Any, Strategy()), node_task, timeout=1.0
+            )
+        )
+        try:
+            await asyncio.sleep(0.02)
+            assert not readiness.done()
+
+            heartbeat_source = _quote(
+                source_instrument, "2000", "2001", "2", now_ns
+            )
+            assert heartbeat_source.bid_price == stale_source.bid_price
+            assert heartbeat_source.ask_price == stale_source.ask_price
+            assert heartbeat_source.bid_size == stale_source.bid_size
+            assert heartbeat_source.ask_size == stale_source.ask_size
+            ticks[SOURCE_ID] = heartbeat_source
+
+            await asyncio.wait_for(readiness, timeout=0.5)
+        finally:
+            if not readiness.done():
+                readiness.cancel()
+            node_task.cancel()
+            await asyncio.gather(readiness, node_task, return_exceptions=True)
+
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize("direction", [SourceDirection.LONG, SourceDirection.SHORT])
