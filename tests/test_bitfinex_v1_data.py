@@ -927,25 +927,183 @@ def test_unknown_channel_duplicate_ack_and_bad_crc_fail_immediately() -> None:
     asyncio.run(scenario())
 
 
-def test_unknown_heartbeat_reports_safe_channel_state_and_stays_fail_closed() -> None:
+def test_unknown_book_heartbeat_is_ignored_while_subscription_ack_is_pending() -> None:
+    async def scenario() -> None:
+        client = _client(_FakeTransport())
+        client._subscription_requested = True
+        client._publish_quotes = True
+
+        assert client._consume_frame([CHANNEL_ID, "hb"]) == ()
+        client._consume_frame(_subscription())
+        snapshot = client._consume_frame(CAPTURE[0])
+
+        assert client._channel_id == CHANNEL_ID
+        assert len(snapshot) == 1
+        assert isinstance(snapshot[0], QuoteTick)
+        assert client.book_is_actionable
+
+    asyncio.run(scenario())
+
+
+def test_single_pending_subscription_rejects_heartbeat_candidate_ack_mismatch() -> None:
     async def scenario() -> None:
         client = _client(_FakeTransport())
         client._subscription_requested = True
 
-        with pytest.raises(BitfinexV1DataError) as before_ack:
+        assert client._consume_frame([CHANNEL_ID, "hb"]) == ()
+        with pytest.raises(
+            BitfinexV1DataError,
+            match="subscription ACK does not match pre-ACK heartbeat channel",
+        ):
+            client._consume_frame(_subscription(channel_id=CHANNEL_ID + 1))
+
+        assert client._channel_id is None
+        assert client._pre_ack_heartbeat_channel_ids == {CHANNEL_ID}
+
+    asyncio.run(scenario())
+
+
+def test_single_pending_subscription_rejects_second_heartbeat_candidate() -> None:
+    async def scenario() -> None:
+        client = _client(_FakeTransport())
+        client._subscription_requested = True
+
+        assert client._consume_frame([CHANNEL_ID, "hb"]) == ()
+        assert client._consume_frame([CHANNEL_ID, "hb"]) == ()
+        with pytest.raises(BitfinexV1DataError, match="Bitfinex unknown hb"):
+            client._consume_frame([CHANNEL_ID + 1, "hb"])
+
+        assert client._pre_ack_heartbeat_channel_ids == {CHANNEL_ID}
+
+    asyncio.run(scenario())
+
+
+def test_two_pending_subscriptions_resolve_heartbeat_candidates_one_by_one() -> None:
+    async def scenario() -> None:
+        client = _client(_FakeTransport())
+        client._subscription_requested = True
+        client._funding_subscription_requested = True
+
+        assert client._consume_frame([CHANNEL_ID, "hb"]) == ()
+        assert client._consume_frame([FUNDING_CHANNEL_ID, "hb"]) == ()
+        assert client._pre_ack_heartbeat_channel_ids == {CHANNEL_ID, FUNDING_CHANNEL_ID}
+
+        client._consume_frame(_funding_subscription())
+        assert client._pre_ack_heartbeat_channel_ids == {CHANNEL_ID}
+        client._consume_frame(_subscription())
+
+        assert client._channel_id == CHANNEL_ID
+        assert client._funding_channel_id == FUNDING_CHANNEL_ID
+        assert client._pre_ack_heartbeat_channel_ids == set()
+
+    asyncio.run(scenario())
+
+
+def test_disconnect_clears_pre_ack_heartbeat_candidates() -> None:
+    async def scenario() -> None:
+        client = _client(_FakeTransport())
+        client._subscription_requested = True
+        assert client._consume_frame([CHANNEL_ID, "hb"]) == ()
+
+        await client._disconnect()
+
+        assert client._pre_ack_heartbeat_channel_ids == set()
+
+    asyncio.run(scenario())
+
+
+def test_unknown_funding_heartbeat_is_ignored_while_subscription_ack_is_pending() -> None:
+    async def scenario() -> None:
+        client = _client(_FakeTransport())
+        client._funding_subscription_requested = True
+        client._publish_funding = True
+
+        assert client._consume_frame([FUNDING_CHANNEL_ID, "hb"]) == ()
+        client._consume_frame(_funding_subscription())
+
+        assert client._funding_channel_id == FUNDING_CHANNEL_ID
+        assert isinstance(
+            client._consume_frame([FUNDING_CHANNEL_ID, _funding_payload()])[0],
+            FundingRateUpdate,
+        )
+
+    asyncio.run(scenario())
+
+
+def test_unknown_book_heartbeat_is_ignored_with_funding_bound_and_book_ack_pending() -> None:
+    async def scenario() -> None:
+        client = _client(_FakeTransport())
+        client._funding_subscription_requested = True
+        client._consume_frame(_funding_subscription())
+        client._subscription_requested = True
+
+        assert client._consume_frame([CHANNEL_ID, "hb"]) == ()
+        client._consume_frame(_subscription())
+
+        assert client._funding_channel_id == FUNDING_CHANNEL_ID
+        assert client._channel_id == CHANNEL_ID
+        assert client._consume_frame(CAPTURE[0]) == ()
+        assert client.book_is_actionable
+
+    asyncio.run(scenario())
+
+
+def test_reader_accepts_book_heartbeat_before_ack_then_processes_snapshot() -> None:
+    async def scenario() -> None:
+        fake = _FakeTransport()
+        client = _client(fake)
+        client.connect()
+        await _wait_until(lambda: client.is_connected)
+
+        await client._ensure_funding_subscription()
+        await fake.queue.put(_funding_subscription())
+        await _wait_until(lambda: client._funding_channel_id == FUNDING_CHANNEL_ID)
+
+        await client._ensure_book_subscription()
+        await fake.queue.put([CHANNEL_ID, "hb"])
+        await fake.queue.put(_subscription())
+        await fake.queue.put(CAPTURE[0])
+        await _wait_until(lambda: client.book_is_actionable)
+
+        assert client.is_connected
+        assert client.last_failure is None
+        assert client._channel_id == CHANNEL_ID
+        await client._disconnect()
+
+    asyncio.run(scenario())
+
+
+def test_unknown_non_heartbeat_stays_fail_closed_while_subscription_ack_is_pending() -> None:
+    async def scenario() -> None:
+        client = _client(_FakeTransport())
+        client._subscription_requested = True
+
+        with pytest.raises(BitfinexV1DataError, match="unexpected channel"):
+            client._consume_frame(CAPTURE[0])
+
+    asyncio.run(scenario())
+
+
+def test_unknown_heartbeat_stays_fail_closed_without_pending_subscription_ack() -> None:
+    async def scenario() -> None:
+        client = _client(_FakeTransport())
+
+        with pytest.raises(BitfinexV1DataError) as without_requests:
             client._consume_frame([CHANNEL_ID, "hb"])
-        assert str(before_ack.value) == (
-            "Bitfinex unknown hb requested=book:1,funding:0 deferred=book:0,funding:0 "
+        assert str(without_requests.value) == (
+            "Bitfinex unknown hb requested=book:0,funding:0 deferred=book:0,funding:0 "
             "channels=book:None,funding:None,pend_book:None,pend_funding:None,in:474371"
         )
 
+        client._subscription_requested = True
         client._consume_frame(_subscription())
-        assert client._consume_frame([CHANNEL_ID, "hb"]) == ()
-        with pytest.raises(BitfinexV1DataError) as after_ack:
+        client._funding_subscription_requested = True
+        client._consume_frame(_funding_subscription())
+        with pytest.raises(BitfinexV1DataError) as all_bound:
             client._consume_frame([CHANNEL_ID + 2, "hb"])
-        assert str(after_ack.value) == (
-            "Bitfinex unknown hb requested=book:1,funding:0 deferred=book:0,funding:0 "
-            "channels=book:474371,funding:None,pend_book:None,pend_funding:None,in:474373"
+        assert str(all_bound.value) == (
+            "Bitfinex unknown hb requested=book:1,funding:1 deferred=book:0,funding:0 "
+            "channels=book:474371,funding:474372,pend_book:None,pend_funding:None,in:474373"
         )
 
     asyncio.run(scenario())
@@ -958,14 +1116,16 @@ def test_reader_disconnects_on_unknown_heartbeat_and_retains_diagnostic() -> Non
         client.connect()
         await _wait_until(lambda: client.is_connected)
         await client._subscribe_quote_ticks(_quote_command())
+        await fake.queue.put(_subscription())
+        await _wait_until(lambda: client._channel_id == CHANNEL_ID)
 
-        await fake.queue.put([CHANNEL_ID, "hb"])
+        await fake.queue.put([CHANNEL_ID + 2, "hb"])
         await _wait_until(lambda: fake.closed and not client.is_connected)
 
         assert client.last_failure == (
             "BitfinexV1DataError: Bitfinex unknown hb requested=book:1,funding:0 "
-            "deferred=book:0,funding:0 channels=book:None,funding:None,pend_book:None,"
-            "pend_funding:None,in:474371"
+            "deferred=book:0,funding:0 channels=book:474371,funding:None,pend_book:None,"
+            "pend_funding:None,in:474373"
         )
 
     asyncio.run(scenario())
