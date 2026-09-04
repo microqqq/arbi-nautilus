@@ -408,6 +408,40 @@ def test_close_preflight_requires_the_exact_opposite_pair(
     )
 
 
+def test_runtime_hold_preserves_complete_bitfinex_channel_diagnostic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    diagnostic = (
+        "BitfinexV1DataError: Bitfinex unknown hb requested=book:1,funding:1 "
+        "deferred=book:0,funding:0 channels=book:None,funding:474372,pend_book:None,"
+        "pend_funding:None,in:474371"
+    )
+    strategy = SimpleNamespace(config=_profile(tmp_path).strategy_config)
+    node = SimpleNamespace(is_running=lambda: True)
+    monkeypatch.setattr(
+        canary,
+        "_clients",
+        lambda _node: (
+            SimpleNamespace(is_connected=True),
+            SimpleNamespace(is_connected=True),
+        ),
+    )
+    monkeypatch.setattr(
+        canary,
+        "_data_clients",
+        lambda _node: (
+            SimpleNamespace(is_connected=False, last_failure=diagnostic),
+            SimpleNamespace(is_connected=True),
+        ),
+    )
+
+    assert len(diagnostic) <= 180
+    assert canary._runtime_hold(cast(Any, node), cast(Any, strategy)) == (
+        f"bitfinex_data_disconnected_before_source_claim:{diagnostic}"
+    )
+
+
 def test_existing_state_holds_before_credentials_or_builder(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
