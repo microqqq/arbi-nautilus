@@ -12,7 +12,7 @@ from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.execution.reports import OrderStatusReport
 from nautilus_trader.model.data import FundingRateUpdate
 from nautilus_trader.model.enums import OrderSide, OrderStatus, TimeInForce
-from nautilus_trader.model.events import OrderRejected
+from nautilus_trader.model.events import OrderExpired, OrderRejected
 from nautilus_trader.model.identifiers import (
     AccountId,
     ClientId,
@@ -263,6 +263,10 @@ def _canceled_source_order(
     *,
     quantity: int = 1,
     fill_prices: tuple[str, ...] = (),
+    time_in_force: TimeInForce = TimeInForce.GTC,
+    post_only: bool = True,
+    reduce_only: bool = False,
+    expired: bool = False,
 ) -> tuple[Any, Any]:
     instrument = _source_instrument()
     account_id = AccountId("BITFINEX-001")
@@ -272,8 +276,9 @@ def _canceled_source_order(
         order_side=OrderSide.BUY,
         quantity=instrument.make_qty(quantity),
         price=instrument.make_price(2400),
-        time_in_force=TimeInForce.GTC,
-        post_only=True,
+        time_in_force=time_in_force,
+        post_only=post_only,
+        reduce_only=reduce_only,
         client_order_id=ClientOrderId("O-CANCEL-QUERY"),
     )
     order.apply(TestEventStubs.order_submitted(order, account_id=account_id, ts_event=1))
@@ -299,11 +304,25 @@ def _canceled_source_order(
                 ts_event=2 + index,
             )
         )
-    event = TestEventStubs.order_canceled(
-        order,
-        account_id=account_id,
-        ts_event=3 + len(fill_prices),
-    )
+    if expired:
+        template = TestEventStubs.order_expired(order, ts_event=3 + len(fill_prices))
+        event = OrderExpired(
+            trader_id=template.trader_id,
+            strategy_id=template.strategy_id,
+            instrument_id=template.instrument_id,
+            client_order_id=template.client_order_id,
+            venue_order_id=template.venue_order_id,
+            account_id=account_id,
+            event_id=UUID4(),
+            ts_event=template.ts_event,
+            ts_init=template.ts_init,
+        )
+    else:
+        event = TestEventStubs.order_canceled(
+            order,
+            account_id=account_id,
+            ts_event=3 + len(fill_prices),
+        )
     order.apply(event)
     return order, event
 
@@ -322,8 +341,8 @@ def _cancel_report(order: Any, **overrides: Any) -> OrderStatusReport:
         "filled_qty": order.filled_qty,
         "price": order.price,
         "avg_px": None if order.filled_qty.as_decimal() == 0 else Decimal(str(order.avg_px)),
-        "post_only": True,
-        "reduce_only": False,
+        "post_only": bool(order.is_post_only),
+        "reduce_only": bool(order.is_reduce_only),
         "report_id": UUID4(),
         "ts_accepted": 2,
         "ts_last": 4,
@@ -338,6 +357,7 @@ def _seed_cancel_store(
     *,
     quantity: int,
     filled: int = 0,
+    terminal: str = "CANCELED",
 ) -> JsonStateStore:
     store = strategy._stores[SourceDirection.LONG]
     store.begin_source(
@@ -355,7 +375,7 @@ def _seed_cancel_store(
             source_side=BusinessOrderSide.BUY,
             fill_ounces=D(filled),
         )
-    store.update_source_status("O-CANCEL-QUERY", "CANCELED")
+    store.update_source_status("O-CANCEL-QUERY", terminal)
     return store
 
 
@@ -442,6 +462,91 @@ def test_source_cancel_report_accepts_an_already_recorded_partial_fill(
         event,
         _cancel_report(order, filled_qty=_source_instrument().make_qty(0), avg_px=None),
     )
+
+
+@pytest.mark.parametrize(
+    ("expired", "terminal", "status"),
+    [
+        (False, "CANCELED", OrderStatus.CANCELED),
+        (True, "EXPIRED", OrderStatus.EXPIRED),
+    ],
+)
+def test_source_terminal_report_accepts_exact_ioc_reduce_only_shape(
+    tmp_path: Path,
+    expired: bool,
+    terminal: str,
+    status: OrderStatus,
+) -> None:
+    strategy = RecordingMakerStrategy(tmp_path / "cancel-report-ioc.state")
+    _seed_cancel_store(strategy, quantity=1, terminal=terminal)
+    order, event = _canceled_source_order(
+        time_in_force=TimeInForce.IOC,
+        post_only=False,
+        reduce_only=True,
+        expired=expired,
+    )
+    harness = cast(
+        Any,
+        SimpleNamespace(
+            _stores=strategy._stores,
+            _config=strategy._config,
+            cache=SimpleNamespace(order=lambda _client_order_id: order),
+        ),
+    )
+
+    assert MakerStrategy._source_cancel_report_is_exact(
+        harness,
+        SourceDirection.LONG,
+        event,
+        _cancel_report(order, order_status=status),
+    )
+    assert not MakerStrategy._source_cancel_report_is_exact(
+        harness,
+        SourceDirection.LONG,
+        event,
+        _cancel_report(order, order_status=status, reduce_only=False),
+    )
+    assert not MakerStrategy._source_cancel_report_is_exact(
+        harness,
+        SourceDirection.LONG,
+        event,
+        _cancel_report(order, order_status=status, post_only=True),
+    )
+
+
+def test_expired_source_queries_once_and_reconciles_only_after_report(tmp_path: Path) -> None:
+    requested: list[SourceTerminalResult] = []
+
+    def query(
+        _client_order_id: ClientOrderId,
+        _venue_order_id: VenueOrderId,
+        complete: SourceTerminalResult,
+    ) -> None:
+        requested.append(complete)
+
+    strategy = TerminalQueryMakerStrategy(
+        tmp_path / "expire-query.state", source_terminal_query=query
+    )
+    order, event = _canceled_source_order(
+        time_in_force=TimeInForce.IOC,
+        post_only=False,
+        reduce_only=True,
+        expired=True,
+    )
+    store = strategy._stores[SourceDirection.LONG]
+    store.begin_source(
+        order.client_order_id.value,
+        BusinessOrderSide.BUY,
+        D(1),
+        source_account_id="BITFINEX-001",
+        hedge_account_id="MT5-001",
+    )
+
+    strategy.on_order_expired(event)
+    assert len(requested) == 1 and store.active_source_order_id == order.client_order_id.value
+    requested[0](_cancel_report(order, order_status=OrderStatus.EXPIRED))
+    observed: Any = store
+    assert observed.active_source_order_id is None and observed.halt_reason is None
 
 
 def test_canceled_source_queries_once_and_confirms_only_after_exact_report(
