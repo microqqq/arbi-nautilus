@@ -10,7 +10,9 @@ from typing import Any, cast
 import pytest
 from msgspec.structs import replace as struct_replace
 from nautilus_trader.config import RoutingConfig
+from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.model.enums import OrderSide, OrderType, TimeInForce
+from nautilus_trader.model.events import OrderCancelRejected
 from nautilus_trader.model.identifiers import (
     AccountId,
     ClientId,
@@ -184,6 +186,126 @@ def _roundtrip_strategy(
         live_costs_from_adapters=False,
         source_terminal_query=lambda *_args: None,
     )
+
+
+class _RoundtripCancelProbe(canary.MakerRoundtripStrategy):
+    def __init__(self, profile: canary.LiveMakerCanaryProfile) -> None:
+        super().__init__(
+            profile.strategy_config,
+            direction=SourceDirection.LONG,
+            live_submission_ready=lambda: True,
+            hedge_quantity_ready=lambda _quantity: True,
+            live_costs_from_adapters=False,
+            source_terminal_query=lambda *_args: None,
+        )
+        self.owned: Order | None = None
+        self.cancel_calls = 0
+        self._test_cache = SimpleNamespace(order=self._order)
+
+    @property
+    def cache(self) -> Any:
+        return self._test_cache
+
+    def _order(self, client_order_id: ClientOrderId) -> Order | None:
+        if self.owned is None or self.owned.client_order_id != client_order_id:
+            return None
+        return self.owned
+
+    def cancel_order(self, *_args: object, **_kwargs: object) -> None:
+        self.cancel_calls += 1
+
+
+def _submitted_roundtrip_source(
+    strategy: _RoundtripCancelProbe,
+) -> tuple[Order, AccountId]:
+    instrument = _source_instrument()
+    order = TestExecStubs.limit_order(
+        instrument=instrument,
+        order_side=OrderSide.BUY,
+        quantity=instrument.make_qty(2),
+        price=instrument.make_price(2_000),
+        client_order_id=ClientOrderId("O-ROUNDTRIP-CLEANUP"),
+    )
+    account = AccountId(f"BITFINEX-PAPER-{USER_ID}")
+    submitted = TestEventStubs.order_submitted(order, account_id=account)
+    order.apply(submitted)
+    strategy.owned = order
+    strategy._stores[strategy.direction].begin_source(
+        order.client_order_id.value,
+        BusinessOrderSide.BUY,
+        D(2),
+    )
+    strategy.on_order_submitted(submitted)
+    strategy.claimed = True
+    return order, account
+
+
+def _cancel_rejected(
+    order: Order,
+    account: AccountId,
+    reason: str,
+) -> OrderCancelRejected:
+    return OrderCancelRejected(
+        trader_id=order.trader_id,
+        strategy_id=order.strategy_id,
+        instrument_id=order.instrument_id,
+        client_order_id=order.client_order_id,
+        venue_order_id=None,
+        account_id=account,
+        reason=reason,
+        event_id=UUID4(),
+        ts_event=2,
+        ts_init=2,
+    )
+
+
+def _two_leg_inflight_hedge(
+    strategy: canary.MakerRoundtripStrategy,
+) -> tuple[Any, HedgeIntent, Any]:
+    store = strategy._stores[strategy.direction]
+    source_route = strategy._config.source_accounts[0]
+    hedge_route = strategy._config.hedge_accounts[0]
+    store.begin_source(
+        "O-CLEANUP-HEDGE",
+        BusinessOrderSide.BUY,
+        D(2),
+        source_account_id=source_route.account_id.value,
+        source_client_id=source_route.client_id.value if source_route.client_id else None,
+        hedge_account_id=hedge_route.account_id.value,
+        hedge_client_id=hedge_route.client_id.value if hedge_route.client_id else None,
+    )
+    intent = store.reserve_source_fill(
+        fill_key="O-CLEANUP-HEDGE|V|T",
+        client_order_id="O-CLEANUP-HEDGE",
+        trade_id="T-CLEANUP-HEDGE",
+        source_side=BusinessOrderSide.BUY,
+        fill_ounces=D(2),
+    )
+    assert intent is not None
+    store.bind_hedge_plan(
+        intent.intent_id,
+        (
+            HedgeLeg(BusinessOrderSide.SELL, D(1)),
+            HedgeLeg(BusinessOrderSide.SELL, D(1)),
+        ),
+    )
+    hedge = _hedge_instrument()
+    order = TestExecStubs.market_order(
+        instrument=hedge,
+        order_side=OrderSide.SELL,
+        quantity=hedge.make_qty(1),
+        client_order_id=ClientOrderId("H-CLEANUP-LEG-1"),
+        time_in_force=TimeInForce.FOK,
+    )
+    store.bind_hedge_order(intent.intent_id, order.client_order_id.value)
+    store.update_hedge_status(order.client_order_id.value, ObligationStatus.ACCEPTED)
+    event = TestEventStubs.order_filled(
+        order=order,
+        instrument=hedge,
+        last_qty=hedge.make_qty(1),
+        commission=Money(0, hedge.quote_currency),
+    )
+    return store, intent, event
 
 
 def _bound_quote(profile: canary.LiveMakerCanaryProfile) -> MakerQuote:
@@ -1391,6 +1513,95 @@ def test_roundtrip_final_gate_requires_external_exact_flat(
     assert flatten_calls == [None]
 
 
+@pytest.mark.parametrize(
+    (
+        "bitfinex_ack_ms",
+        "bitfinex_rest_seconds",
+        "mt5_mutation_ms",
+        "mt5_poll_ms",
+        "mt5_request_ms",
+        "mt5_pagination_ms",
+        "connection_seconds",
+        "expected_seconds",
+    ),
+    [
+        (10_000, 10, 15_000, 250, 1_000, 30_000, 2.0, 80.0),
+        (60_000, 60, 50, 250, 50, 50, 1.0, 241.0),
+        (100, 1, 60_000, 60_000, 60_000, 60_000, 1.0, 421.0),
+        (100, 1, 50, 250, 50, 50, 60.0, 13.0),
+        (100, 1, 50, 60_000, 50, 50, 1.0, 61.3),
+    ],
+)
+def test_roundtrip_lifecycle_passes_bounded_sequential_cleanup_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    bitfinex_ack_ms: int,
+    bitfinex_rest_seconds: int,
+    mt5_mutation_ms: int,
+    mt5_poll_ms: int,
+    mt5_request_ms: int,
+    mt5_pagination_ms: int,
+    connection_seconds: float,
+    expected_seconds: float,
+) -> None:
+    base = _profile(tmp_path)
+    profile = struct_replace(
+        base,
+        bitfinex_exec_config=struct_replace(
+            base.bitfinex_exec_config,
+            mutation_ack_timeout_ms=bitfinex_ack_ms,
+            rest_timeout_secs=bitfinex_rest_seconds,
+        ),
+        mt5_exec_config=struct_replace(
+            base.mt5_exec_config,
+            mutation_timeout_ms=mt5_mutation_ms,
+            event_poll_interval_ms=mt5_poll_ms,
+            request_timeout_ms=mt5_request_ms,
+            event_pagination_timeout_ms=mt5_pagination_ms,
+            snapshot_refresh_interval_ms=max(1_000, mt5_poll_ms),
+        ),
+        connection_timeout_seconds=connection_seconds,
+    )
+    strategy = _roundtrip_strategy(tmp_path)
+    cleanup_timeouts: list[float] = []
+
+    class Node:
+        async def run_async(self) -> None:
+            await asyncio.Event().wait()
+
+    async def stop_before_arm(*_args: object) -> None:
+        raise PaperCanaryError("stop before arm")
+
+    async def cleanup(_strategy: object, _task: object, timeout: float) -> None:
+        cleanup_timeouts.append(timeout)
+
+    async def shutdown(_node: object, task: asyncio.Task[None], _timeout: float) -> None:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    monkeypatch.setattr(canary, "_wait_ready", stop_before_arm)
+    monkeypatch.setattr(canary, "_cleanup_roundtrip_sources", cleanup)
+    monkeypatch.setattr(canary, "_shutdown", shutdown)
+
+    with pytest.raises(PaperCanaryError, match="stop before arm"):
+        asyncio.run(
+            canary._run_roundtrip_lifecycle(
+                cast(Any, Node()),
+                strategy,
+                cast(Any, object()),
+                profile,
+                tmp_path / "roundtrip-budget.jsonl",
+                StringIO(),
+                1,
+            )
+        )
+
+    assert cleanup_timeouts == [pytest.approx(expected_seconds)]
+    assert cleanup_timeouts[0] >= mt5_mutation_ms / 1_000
+    assert cleanup_timeouts[0] >= min(connection_seconds * 2, 12.0) + 1.0
+    assert cleanup_timeouts[0] <= 421.0
+
+
 def test_roundtrip_timeout_cleanup_marks_unproved_gtc_unknown(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1421,6 +1632,173 @@ def test_roundtrip_timeout_cleanup_marks_unproved_gtc_unknown(
     assert record is not None and record.status == "UNKNOWN"
     assert store.halt_reason == "roundtrip shutdown did not prove terminal"
     assert cancellations == [strategy.direction, strategy.close_direction]
+    failure = canary._roundtrip_failure(
+        strategy, tmp_path / "roundtrip.jsonl", "timeout", True
+    )
+    assert failure.outcome == "HOLD"
+
+
+def test_roundtrip_pre_ack_stale_cancel_is_sent_immediately_on_acceptance(
+    tmp_path: Path,
+) -> None:
+    strategy = _RoundtripCancelProbe(_profile(tmp_path))
+    order, account = _submitted_roundtrip_source(strategy)
+    strategy._cancel_working(strategy.direction, reason="stale quote")
+    assert strategy.cancel_calls == 0
+
+    accepted = TestEventStubs.order_accepted(
+        order,
+        account_id=account,
+        venue_order_id=VenueOrderId("V-ROUNDTRIP-CLEANUP"),
+    )
+    order.apply(accepted)
+    strategy.on_order_accepted(accepted)
+
+    assert strategy.cancel_calls == 1
+    strategy._cancel_working(strategy.direction, reason="cleanup")
+    strategy._send_required_cancel_once(strategy.direction, "cleanup")
+    assert strategy.cancel_calls == 1
+
+
+def test_roundtrip_cleanup_loop_sends_deferred_cancel_after_venue_id_arrives(
+    tmp_path: Path,
+) -> None:
+    strategy = _RoundtripCancelProbe(_profile(tmp_path))
+    order, account = _submitted_roundtrip_source(strategy)
+    store = strategy._stores[strategy.direction]
+
+    async def exercise() -> None:
+        async def wait_forever() -> None:
+            await asyncio.Event().wait()
+
+        node_task = asyncio.create_task(wait_forever())
+        cleanup = asyncio.create_task(canary._cleanup_roundtrip_sources(strategy, node_task, 0.04))
+        try:
+            await asyncio.sleep(0.01)
+            assert strategy.cancel_calls == 0
+            accepted = TestEventStubs.order_accepted(
+                order,
+                account_id=account,
+                venue_order_id=VenueOrderId("V-ROUNDTRIP-CLEANUP"),
+            )
+            order.apply(accepted)
+            store.update_source_status(order.client_order_id.value, "ACCEPTED")
+            await cleanup
+        finally:
+            node_task.cancel()
+            await asyncio.gather(node_task, return_exceptions=True)
+
+    asyncio.run(exercise())
+
+    assert strategy.cancel_calls == 1
+    record = store.source_order(order.client_order_id.value)
+    assert record is not None and record.status == "UNKNOWN"
+
+
+def test_roundtrip_cleanup_never_retries_unknown_cancel_outcome(tmp_path: Path) -> None:
+    strategy = _RoundtripCancelProbe(_profile(tmp_path))
+    order, account = _submitted_roundtrip_source(strategy)
+    store = strategy._stores[strategy.direction]
+    accepted = TestEventStubs.order_accepted(
+        order,
+        account_id=account,
+        venue_order_id=VenueOrderId("V-ROUNDTRIP-CLEANUP"),
+    )
+    order.apply(accepted)
+    strategy.on_order_accepted(accepted)
+    strategy._cancel_working(strategy.direction, reason="cleanup")
+    assert strategy.cancel_calls == 1
+    strategy.on_order_cancel_rejected(_cancel_rejected(order, account, "UNKNOWN"))
+    strategy._cancel_working(strategy.direction, reason="cleanup retry")
+    strategy._send_required_cancel_once(strategy.direction, "cleanup retry")
+
+    assert strategy.cancel_calls == 1
+    record = store.source_order(order.client_order_id.value)
+    assert record is not None and record.status == "UNKNOWN"
+    assert store.halt_reason == "maker cancel rejected"
+
+
+def test_roundtrip_cleanup_blocks_second_leg_after_inflight_fill(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    strategy = _roundtrip_strategy(tmp_path)
+    store, intent, fill = _two_leg_inflight_hedge(strategy)
+    submissions: list[object] = []
+    monkeypatch.setattr(
+        strategy,
+        "_submit_hedge",
+        lambda *_args, **_kwargs: submissions.append(object()),
+    )
+
+    async def exercise() -> None:
+        async def wait_forever() -> None:
+            await asyncio.Event().wait()
+
+        task = asyncio.create_task(wait_forever())
+        cleanup = asyncio.create_task(canary._cleanup_roundtrip_sources(strategy, task, 1.0))
+        try:
+            while not strategy.cleanup_started:
+                await asyncio.sleep(0)
+            strategy.on_order_filled(fill)
+            await asyncio.wait_for(cleanup, 0.1)
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(exercise())
+
+    blocked = store.intent(intent.intent_id)
+    assert submissions == []
+    assert blocked.status is ObligationStatus.BLOCKED
+    assert blocked.hedge_client_order_id is None and blocked.hedge_leg_index == 1
+    assert store.halt_reason == (
+        f"hedge {intent.intent_id} blocked: "
+        "roundtrip cleanup cannot start another MT5 leg"
+    )
+
+
+def test_roundtrip_cleanup_blocks_new_pending_leg_near_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    strategy = _roundtrip_strategy(tmp_path)
+    store, intent, fill = _two_leg_inflight_hedge(strategy)
+    submissions: list[object] = []
+    monkeypatch.setattr(
+        strategy,
+        "_submit_hedge",
+        lambda *_args, **_kwargs: submissions.append(object()),
+    )
+
+    async def exercise() -> None:
+        async def wait_forever() -> None:
+            await asyncio.Event().wait()
+
+        task = asyncio.create_task(wait_forever())
+        cleanup = asyncio.create_task(canary._cleanup_roundtrip_sources(strategy, task, 0.08))
+        try:
+            while not strategy.cleanup_started:
+                await asyncio.sleep(0)
+            await asyncio.sleep(0.06)
+            assert store.apply_hedge_fill(
+                client_order_id=fill.client_order_id.value,
+                trade_id=fill.trade_id.value,
+                fill_ounces=fill.last_qty.as_decimal(),
+            )
+            await cleanup
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(exercise())
+
+    blocked = store.intent(intent.intent_id)
+    assert submissions == []
+    assert blocked.status is ObligationStatus.BLOCKED
+    assert blocked.hedge_client_order_id is None
+    assert store.halt_reason is not None
+    assert store.halt_reason.endswith("roundtrip cleanup cannot start another MT5 leg")
 
 
 def test_roundtrip_cleanup_waits_for_hedge_after_source_is_terminal(tmp_path: Path) -> None:
@@ -1451,4 +1829,7 @@ def test_roundtrip_cleanup_waits_for_hedge_after_source_is_terminal(tmp_path: Pa
 
     held = store.intent(intent.intent_id)
     assert held.status is ObligationStatus.BLOCKED
-    assert store.halt_reason == f"hedge {intent.intent_id} blocked: roundtrip shutdown timed out"
+    assert store.halt_reason == (
+        f"hedge {intent.intent_id} blocked: "
+        "roundtrip cleanup cannot start another MT5 leg"
+    )

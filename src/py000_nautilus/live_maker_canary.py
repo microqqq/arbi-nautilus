@@ -326,6 +326,9 @@ class MakerRoundtripStrategy(MakerStrategy):
         self.armed = False
         self.claimed = False
         self._triggered = False
+        self.cleanup_started = False
+        self._cancel_required: set[str] = set()
+        self._cancel_sent: set[str] = set()
 
     @property
     def source_order_id(self) -> str | None:
@@ -368,7 +371,7 @@ class MakerRoundtripStrategy(MakerStrategy):
             if self.armed:
                 MakerStrategy.on_quote_tick(self, tick)
         elif tick.instrument_id == self._config.hedge_instrument_id:
-            MakerStrategy._submit_next_pending_hedge(self)
+            self._submit_next_pending_hedge()
 
     def _passive_quote(self, quote: MakerQuote | None, book: BookTop) -> MakerQuote | None:
         if quote is None or quote.direction is not self.direction:
@@ -384,6 +387,68 @@ class MakerRoundtripStrategy(MakerStrategy):
             MakerStrategy._submit_source(self, quote)
         finally:
             self.claimed = self.source_order_id is not None
+
+    def _cancel_working(
+        self,
+        direction: SourceDirection,
+        *,
+        expected_order_id: str | None = None,
+        reason: str,
+    ) -> None:
+        store = self._stores[direction]
+        active_id = store.active_source_order_id
+        if active_id is None or (expected_order_id is not None and active_id != expected_order_id):
+            return
+        if active_id in self._cancel_sent:
+            return
+        order = self.cache.order(ClientOrderId(active_id))
+        if order is None:
+            MakerStrategy._cancel_working(self, direction, reason=reason)
+            return
+        self._cancel_required.add(active_id)
+        self._send_required_cancel_once(direction, reason)
+
+    def _send_required_cancel_once(self, direction: SourceDirection, reason: str) -> None:
+        store = self._stores[direction]
+        active_id = store.active_source_order_id
+        if active_id is None or active_id not in self._cancel_required:
+            return
+        if active_id in self._cancel_sent:
+            return
+        order = self.cache.order(ClientOrderId(active_id))
+        if order is None or order.is_closed or order.venue_order_id is None:
+            return
+        if cast(bool, order.is_pending_cancel):
+            self._cancel_sent.add(active_id)
+            return
+        self._cancel_sent.add(active_id)
+        MakerStrategy._cancel_working(self, direction, reason=reason)
+
+    def on_order_accepted(self, event: OrderAccepted) -> None:
+        direction = self._direction_for_source_order(event.client_order_id.value)
+        try:
+            MakerStrategy.on_order_accepted(self, event)
+        finally:
+            if direction is not None:
+                self._send_required_cancel_once(direction, "roundtrip deferred cancel")
+
+    def _submit_next_pending_hedge(self) -> None:
+        if not self.cleanup_started:
+            MakerStrategy._submit_next_pending_hedge(self)
+            return
+        self._block_cleanup_pending_hedges()
+
+    def _block_cleanup_pending_hedges(self) -> None:
+        for store in self._stores.values():
+            for intent in store.intents():
+                if (
+                    intent.status is ObligationStatus.PENDING
+                    and intent.hedge_client_order_id is None
+                ):
+                    store.block_hedge_intent(
+                        intent.intent_id,
+                        "roundtrip cleanup cannot start another MT5 leg",
+                    )
 
     def submit_flatten_once(self) -> bool:
         store = self._stores[self.close_direction]
@@ -845,9 +910,29 @@ async def _run_roundtrip_lifecycle(
     finally:
         strategy.armed = False
         try:
-            await _cleanup_roundtrip_sources(strategy, task, min(connection_timeout * 2, 12.0))
+            budget = _roundtrip_cleanup_budget_seconds(profile)
+            await _cleanup_roundtrip_sources(strategy, task, budget)
         finally:
             await _shutdown(node, task, connection_timeout)
+
+
+def _roundtrip_cleanup_budget_seconds(profile: LiveMakerCanaryProfile) -> float:
+    connection_timeout = float(profile.connection_timeout_seconds)
+    bitfinex_ack = profile.bitfinex_exec_config.mutation_ack_timeout_ms / 1_000
+    mt5 = profile.mt5_exec_config
+    source_settlement = 2 * (
+        bitfinex_ack + profile.bitfinex_exec_config.rest_timeout_secs
+    )
+    hedge_settlement = (
+        4 * mt5.request_timeout_ms
+        + max(mt5.mutation_timeout_ms, mt5.event_poll_interval_ms)
+        + 2 * mt5.event_pagination_timeout_ms
+    ) / 1_000
+    return 1.0 + max(
+        min(connection_timeout * 2, 12.0),
+        source_settlement,
+        hedge_settlement,
+    )
 
 
 async def _wait_roundtrip_phase(
@@ -890,13 +975,25 @@ async def _cleanup_roundtrip_sources(
     task: asyncio.Task[None],
     timeout: float,
 ) -> None:
+    strategy.cleanup_started = True
+    strategy._block_cleanup_pending_hedges()
     directions = (strategy.direction, strategy.close_direction)
     for direction in directions:
         strategy._cancel_working(direction, reason="roundtrip shutdown")
     deadline = asyncio.get_running_loop().time() + timeout
+    waiting = {
+        ObligationStatus.SUBMITTING,
+        ObligationStatus.SUBMITTED,
+        ObligationStatus.ACCEPTED,
+        ObligationStatus.UNKNOWN,
+    }
     while asyncio.get_running_loop().time() < deadline and not task.done():
+        strategy._block_cleanup_pending_hedges()
+        for direction in directions:
+            strategy._send_required_cancel_once(direction, "roundtrip shutdown")
         if all(
-            store.active_source_order_id is None and not store.has_unresolved_hedges()
+            store.active_source_order_id is None
+            and not any(intent.status in waiting for intent in store.intents())
             for store in (strategy._stores[direction] for direction in directions)
         ):
             return
