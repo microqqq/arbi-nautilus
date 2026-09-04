@@ -9,3 +9,6 @@ __pycache__/
 build/
 dist/
 *.state.json
+.env
+runtime/
+mt5_ea/*.ex5

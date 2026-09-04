@@ -18,14 +18,21 @@ from nautilus_trader.model.events import (
     OrderRejected,
     OrderSubmitted,
 )
-from nautilus_trader.model.identifiers import AccountId, ClientId, ClientOrderId, InstrumentId
+from nautilus_trader.model.identifiers import (
+    AccountId,
+    ClientId,
+    ClientOrderId,
+    InstrumentId,
+    PositionId,
+)
 from nautilus_trader.model.instruments import Instrument
 from nautilus_trader.model.orders import Order
+from nautilus_trader.model.position import Position
 from nautilus_trader.trading.strategy import Strategy
 
 from py000_nautilus.config import CarryConfig, FxConfig, MakerStrategyConfig
 from py000_nautilus.economics import market_inputs_are_fresh
-from py000_nautilus.hedge import HedgeCoordinator
+from py000_nautilus.hedge import HedgeCoordinator, HedgePlanningError
 from py000_nautilus.maker_economics import maker_quote, passive_maker_price
 from py000_nautilus.models import (
     BookTop,
@@ -119,6 +126,8 @@ class MakerStrategy(Strategy):
             self._config.hedge_instrument_id,
         }:
             return
+        if tick.instrument_id == self._config.hedge_instrument_id:
+            self._submit_next_pending_hedge()
         source_tick = self.cache.quote_tick(self._config.source_instrument_id)
         hedge_tick = self.cache.quote_tick(self._config.hedge_instrument_id)
         if source_tick is None or hedge_tick is None:
@@ -194,34 +203,19 @@ class MakerStrategy(Strategy):
             self._freeze_all_best_effort(freeze_reason)
             try:
                 if intent is not None:
-                    route = self._durable_hedge_route(
-                        direction,
-                        event.client_order_id.value,
-                    )
-                    if route is None:
-                        self.log.error(
-                            f"Durable Maker route missing for fill {event.trade_id}"
-                        )
-                    else:
-                        hedge_account_id, hedge_client_id = route
-                        self._submit_hedge(
-                            direction,
-                            hedge_account_id,
-                            hedge_client_id,
-                            intent,
-                        )
+                    self._submit_next_pending_hedge()
             finally:
                 self._cancel_all_best_effort("source fill froze Maker quoting")
             if self._stores[direction].active_source_order_id is None:
                 self._working_quotes.pop(event.client_order_id.value, None)
             return
         if event.instrument_id == self._config.hedge_instrument_id:
-            for store in self._stores.values():
-                store.apply_hedge_fill(
-                    client_order_id=event.client_order_id.value,
-                    trade_id=event.trade_id.value,
-                    fill_ounces=Decimal(str(event.last_qty)),
-                )
+            applied = any(
+                coordinator.on_hedge_filled(event)
+                for coordinator in self._hedges.values()
+            )
+            if applied:
+                self._submit_next_pending_hedge()
             self._try_release_cycle()
 
     def _refresh_direction(
@@ -378,6 +372,53 @@ class MakerStrategy(Strategy):
             params={"leverage": desired.leverage},
         )
 
+    def _submit_next_pending_hedge(self) -> None:
+        """Run one MT5 leg globally across both Maker directions."""
+        queued = [
+            (direction, intent)
+            for direction in _DIRECTIONS
+            for intent in self._stores[direction].intents()
+        ]
+        failed_statuses = {
+            ObligationStatus.BLOCKED,
+            ObligationStatus.REJECTED,
+            ObligationStatus.UNKNOWN,
+        }
+        if any(intent.status in failed_statuses for _, intent in queued):
+            return
+        active_statuses = {
+            ObligationStatus.SUBMITTING,
+            ObligationStatus.SUBMITTED,
+            ObligationStatus.ACCEPTED,
+        }
+        if any(intent.status in active_statuses for _, intent in queued):
+            return
+        pending = next(
+            (
+                (direction, intent)
+                for direction, intent in queued
+                if intent.status is ObligationStatus.PENDING
+                and intent.hedge_client_order_id is None
+            ),
+            None,
+        )
+        if pending is None:
+            return
+        direction, intent = pending
+        route = self._durable_hedge_route(direction, intent.source_client_order_id)
+        if route is None:
+            reason = "durable Maker hedge route is missing or differs from configuration"
+            self._stores[direction].block_hedge_intent(intent.intent_id, reason)
+            self.log.error(f"Maker hedge route blocked for {intent.intent_id}: {reason}")
+            return
+        hedge_account_id, hedge_client_id = route
+        self._submit_hedge(
+            direction,
+            hedge_account_id,
+            hedge_client_id,
+            intent,
+        )
+
     def _submit_hedge(
         self,
         direction: SourceDirection,
@@ -390,12 +431,23 @@ class MakerStrategy(Strategy):
             self.log.error(f"Maker hedge quote unavailable for {intent.intent_id}")
             return
         instrument = self._required_hedge_instrument()
-        side = OrderSide.BUY if intent.hedge_side is BusinessOrderSide.BUY else OrderSide.SELL
+        coordinator = self._hedges[direction]
+        try:
+            leg = coordinator.next_hedge_leg(
+                intent.intent_id,
+                self._hedge_positions(hedge_account_id),
+            )
+        except HedgePlanningError as exc:
+            self.log.error(f"Maker hedge planning blocked for {intent.intent_id}: {exc}")
+            return
+        side = OrderSide.BUY if leg.side is BusinessOrderSide.BUY else OrderSide.SELL
+        position_id = PositionId(cast(str, leg.position_id)) if leg.is_close else None
         order = self.order_factory.market(
             instrument_id=self._config.hedge_instrument_id,
             order_side=side,
-            quantity=instrument.make_qty(intent.hedge_quantity_ounces),
+            quantity=instrument.make_qty(leg.quantity_ounces),
             time_in_force=TimeInForce.FOK,
+            reduce_only=leg.is_close,
             tags=[
                 f"py000={intent.intent_id}",
                 f"source_trade={intent.source_trade_id}",
@@ -403,13 +455,26 @@ class MakerStrategy(Strategy):
             ],
         )
         store = self._stores[direction]
-        store.bind_hedge_order(intent.intent_id, order.client_order_id.value)
+        coordinator.bind_hedge_leg(intent.intent_id, order.client_order_id.value)
         try:
-            self.submit_order(order, client_id=hedge_client_id)
+            self.submit_order(
+                order,
+                position_id=position_id,
+                client_id=hedge_client_id,
+            )
         except Exception as exc:
             store.update_hedge_status(order.client_order_id.value, ObligationStatus.UNKNOWN)
             self.log.error(f"Maker hedge submission raised {type(exc).__name__}")
             raise
+
+    def _hedge_positions(self, account_id: AccountId) -> list[Position]:
+        return cast(
+            list[Position],
+            self.cache.positions_open(
+                instrument_id=self._config.hedge_instrument_id,
+                account_id=account_id,
+            ),
+        )
 
     def _cancel_working(
         self,
@@ -672,8 +737,16 @@ class MakerStrategy(Strategy):
                 f"Durable hedge account {account_id} is not configured",
             )
             return None
-        client_id = ClientId(record.hedge_client_id) if record.hedge_client_id else None
-        return account_id, client_id
+        configured_client_id = (
+            configured.client_id.value if configured.client_id is not None else None
+        )
+        if record.hedge_client_id != configured_client_id:
+            self._stores[direction].mark_source_unknown(
+                client_order_id,
+                "Durable Maker hedge client differs from the configured account route",
+            )
+            return None
+        return account_id, configured.client_id
 
     def _required_source_instrument(self) -> Instrument:
         if self._source_instrument is None:

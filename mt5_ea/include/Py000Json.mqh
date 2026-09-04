@@ -20,6 +20,8 @@ struct Py000Request
    string client_request_id;
    string side;
    string quantity_lots;
+   string position_ticket;
+   string position_identifier;
    string after_cursor;
    int limit;
 };
@@ -543,6 +545,8 @@ bool Py000JsonParseRequest(const string source, Py000Request &request, string &e
       else if(key == "client_request_id") request.client_request_id = value;
       else if(key == "side") request.side = value;
       else if(key == "quantity_lots") request.quantity_lots = value;
+      else if(key == "position_ticket") request.position_ticket = value;
+      else if(key == "position_identifier") request.position_identifier = value;
       else if(key == "after_cursor") request.after_cursor = value;
       else
       {
@@ -567,6 +571,7 @@ bool Py000JsonParseRequest(const string source, Py000Request &request, string &e
    if(request.op == "hello") expected = 4;
    else if(request.op == "get_snapshot") expected = 5;
    else if(request.op == "submit_market_delta") expected = 8;
+   else if(request.op == "close_position") expected = 10;
    else if(request.op == "get_execution_events") expected = 7;
    else
    {
@@ -586,6 +591,12 @@ bool Py000JsonParseRequest(const string source, Py000Request &request, string &e
          && (!Py000JsonWasSeen(seen, "client_request_id")
             || !Py000JsonWasSeen(seen, "side")
             || !Py000JsonWasSeen(seen, "quantity_lots")))
+      || (request.op == "close_position"
+         && (!Py000JsonWasSeen(seen, "client_request_id")
+            || !Py000JsonWasSeen(seen, "side")
+            || !Py000JsonWasSeen(seen, "quantity_lots")
+            || !Py000JsonWasSeen(seen, "position_ticket")
+            || !Py000JsonWasSeen(seen, "position_identifier")))
       || (request.op == "get_execution_events"
          && (!Py000JsonWasSeen(seen, "after_cursor")
             || !Py000JsonWasSeen(seen, "limit"))))
@@ -599,6 +610,16 @@ bool Py000JsonParseRequest(const string source, Py000Request &request, string &e
          || !Py000JsonPositiveDecimal(request.quantity_lots)))
    {
       error = "SCHEMA: submit_market_delta fields invalid";
+      return false;
+   }
+   if(request.op == "close_position"
+      && (!Py000JsonSafeToken(request.client_request_id)
+         || (request.side != "buy" && request.side != "sell")
+         || !Py000JsonPositiveDecimal(request.quantity_lots)
+         || !Py000JsonCanonicalUint64(request.position_ticket, true)
+         || !Py000JsonCanonicalUint64(request.position_identifier, true)))
+   {
+      error = "SCHEMA: close_position fields invalid";
       return false;
    }
    if(request.op == "get_execution_events"

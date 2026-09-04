@@ -267,8 +267,8 @@ string Py000HelloResponse(const Py000Request &request)
 {
    string recovery = g_py000_journal_ready && g_py000_execution_recovery_ready
       ? "ready" : "blocked";
-   string data = "{\"capabilities\":[\"get_execution_events\",\"get_snapshot\","
-      + "\"hello\",\"submit_market_delta\"],\"identity\":"
+   string data = "{\"capabilities\":[\"close_position\",\"get_execution_events\","
+      + "\"get_snapshot\",\"hello\",\"submit_market_delta\"],\"identity\":"
       + Py000IdentityJson() + ",\"recovery_state\":" + Py000Quoted(recovery) + "}";
    return Py000ResponsePrefix(request.request_id, request.op, true)
       + ",\"data\":" + data + "}";
@@ -343,6 +343,8 @@ bool Py000BuildSymbolSpecJson(string &json)
    string point, tick_size, tick_value, tick_value_profit, tick_value_loss;
    string contract_size, volume_min, volume_max, volume_step, volume_limit;
    string margin_initial, margin_maintenance, swap_long, swap_short;
+   string swap_sunday, swap_monday, swap_tuesday, swap_wednesday;
+   string swap_thursday, swap_friday, swap_saturday;
    string currency_base = SymbolInfoString(_Symbol, SYMBOL_CURRENCY_BASE);
    string currency_margin = SymbolInfoString(_Symbol, SYMBOL_CURRENCY_MARGIN);
    string currency_profit = SymbolInfoString(_Symbol, SYMBOL_CURRENCY_PROFIT);
@@ -360,6 +362,13 @@ bool Py000BuildSymbolSpecJson(string &json)
       || !Py000DecimalFromDouble(SymbolInfoDouble(_Symbol, SYMBOL_MARGIN_MAINTENANCE), 8, margin_maintenance)
       || !Py000DecimalFromDouble(SymbolInfoDouble(_Symbol, SYMBOL_SWAP_LONG), 8, swap_long)
       || !Py000DecimalFromDouble(SymbolInfoDouble(_Symbol, SYMBOL_SWAP_SHORT), 8, swap_short)
+      || !Py000DecimalFromDouble(SymbolInfoDouble(_Symbol, SYMBOL_SWAP_SUNDAY), 8, swap_sunday)
+      || !Py000DecimalFromDouble(SymbolInfoDouble(_Symbol, SYMBOL_SWAP_MONDAY), 8, swap_monday)
+      || !Py000DecimalFromDouble(SymbolInfoDouble(_Symbol, SYMBOL_SWAP_TUESDAY), 8, swap_tuesday)
+      || !Py000DecimalFromDouble(SymbolInfoDouble(_Symbol, SYMBOL_SWAP_WEDNESDAY), 8, swap_wednesday)
+      || !Py000DecimalFromDouble(SymbolInfoDouble(_Symbol, SYMBOL_SWAP_THURSDAY), 8, swap_thursday)
+      || !Py000DecimalFromDouble(SymbolInfoDouble(_Symbol, SYMBOL_SWAP_FRIDAY), 8, swap_friday)
+      || !Py000DecimalFromDouble(SymbolInfoDouble(_Symbol, SYMBOL_SWAP_SATURDAY), 8, swap_saturday)
       || !Py000JsonVisibleIdentifier(currency_base, 16)
       || !Py000JsonVisibleIdentifier(currency_margin, 16)
       || !Py000JsonVisibleIdentifier(currency_profit, 16))
@@ -380,6 +389,13 @@ bool Py000BuildSymbolSpecJson(string &json)
       + ",\"symbol\":" + Py000Quoted(_Symbol)
       + ",\"swap_long\":" + Py000Quoted(swap_long)
       + ",\"swap_mode\":" + IntegerToString((int)SymbolInfoInteger(_Symbol, SYMBOL_SWAP_MODE))
+      + ",\"swap_rates\":[" + Py000Quoted(swap_sunday)
+      + "," + Py000Quoted(swap_monday)
+      + "," + Py000Quoted(swap_tuesday)
+      + "," + Py000Quoted(swap_wednesday)
+      + "," + Py000Quoted(swap_thursday)
+      + "," + Py000Quoted(swap_friday)
+      + "," + Py000Quoted(swap_saturday) + "]"
       + ",\"swap_short\":" + Py000Quoted(swap_short)
       + ",\"tick_size\":" + Py000Quoted(tick_size)
       + ",\"tick_value\":" + Py000Quoted(tick_value)
@@ -466,7 +482,7 @@ bool Py000BuildSnapshotData(string &json)
    datetime server_quote_time = TimeCurrent();
    datetime session_sample_time = TimeTradeServer();
    datetime observed_utc = TimeGMT();
-   string symbol_spec, account, positions, session;
+   string symbol_spec, account, positions, session, max_order_lots;
    MqlTick tick;
    bool tick_available = SymbolInfoTick(_Symbol, tick);
    bool terminal_connected = (bool)TerminalInfoInteger(TERMINAL_CONNECTED);
@@ -477,6 +493,9 @@ bool Py000BuildSnapshotData(string &json)
       || !Py000BuildSymbolSpecJson(symbol_spec)
       || !Py000BuildAccountJson(account)
       || !Py000BuildPositionsJson(positions)
+      || !Py000DecimalFromDouble(
+         g_py000_execution_max_order_lots, 8, max_order_lots
+      )
       || !Py000BuildSessionJson(
          session_sample_time, terminal_connected, tick_available, tick, session
       ))
@@ -503,6 +522,8 @@ bool Py000BuildSnapshotData(string &json)
    json = "{\"account\":" + account
       + ",\"authority_flags\":" + flags
       + ",\"execution_enabled\":" + Py000Bool(g_py000_identity.execution_enabled)
+      + ",\"execution_limits\":{\"max_order_lots\":"
+      + Py000Quoted(max_order_lots) + "}"
       + ",\"identity\":" + Py000IdentityJson()
       + ",\"positions\":" + positions
       + ",\"recovery_state\":" + Py000Quoted(recovery)
@@ -526,20 +547,32 @@ string Py000SnapshotResponse(const Py000Request &request)
 }
 bool Py000JournalEventJson(const Py000JournalEvent &event, string &json)
 {
+   if(event.event_type != "stream_started"
+      && !Py000JournalCloseTargetValid(
+         event.position_ticket, event.position_identifier
+      ))
+      return false;
    string payload = "";
+   string close_target = "";
+   if(Py000JournalHasCloseTarget(event))
+      close_target = ",\"position_identifier\":"
+         + Py000Quoted(event.position_identifier)
+         + ",\"position_ticket\":" + Py000Quoted(event.position_ticket);
    if(event.event_type == "stream_started")
       payload = "{\"ea_build_id\":" + Py000Quoted(event.ea_build_id)
          + ",\"execution_enabled\":" + Py000Bool(event.execution_enabled) + "}";
    else if(event.event_type == "submission_reserved")
       payload = "{\"client_request_id\":" + Py000Quoted(event.client_request_id)
          + ",\"side\":" + Py000Quoted(event.side)
-         + ",\"quantity_lots\":" + Py000Quoted(event.quantity_lots) + "}";
+         + ",\"quantity_lots\":" + Py000Quoted(event.quantity_lots)
+         + close_target + "}";
    else if(event.event_type == "order_rejected" || event.event_type == "order_unknown")
       payload = "{\"client_request_id\":" + Py000Quoted(event.client_request_id)
          + ",\"side\":" + Py000Quoted(event.side)
          + ",\"quantity_lots\":" + Py000Quoted(event.quantity_lots)
          + ",\"reason\":" + Py000Quoted(event.reason)
-         + ",\"broker_retcode\":" + Py000Quoted(event.broker_retcode) + "}";
+         + ",\"broker_retcode\":" + Py000Quoted(event.broker_retcode)
+         + close_target + "}";
    else if(event.event_type == "order_filled")
       payload = "{\"client_request_id\":" + Py000Quoted(event.client_request_id)
          + ",\"side\":" + Py000Quoted(event.side)
@@ -550,7 +583,8 @@ bool Py000JournalEventJson(const Py000JournalEvent &event, string &json)
          + ",\"venue_deal_id\":" + Py000Quoted(event.venue_deal_id)
          + ",\"venue_position_id\":" + Py000Quoted(event.venue_position_id)
          + ",\"commission\":" + Py000Quoted(event.commission)
-         + ",\"broker_retcode\":" + Py000Quoted(event.broker_retcode) + "}";
+         + ",\"broker_retcode\":" + Py000Quoted(event.broker_retcode)
+         + close_target + "}";
    else
       return false;
    json = "{\"boot_id\":" + Py000Quoted(event.boot_id)
@@ -711,7 +745,7 @@ string Py000HandleRequest(const string source)
          );
       if(request.op == "get_snapshot")
          response = Py000SnapshotResponse(request);
-      else if(request.op == "submit_market_delta")
+      else if(request.op == "submit_market_delta" || request.op == "close_position")
          response = Py000SubmitResponse(request);
       else
          response = Py000EventsResponse(request);

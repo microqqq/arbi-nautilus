@@ -29,15 +29,22 @@ The current source also contains one deliberately narrow execution candidate:
 
 - the EA defaults to `DISABLED` and arms only under explicit `DEMO` mode on a
   hedging demo account;
-- the only native trading path is one bounded `MARKET` + `FOK` call, with a durable
-  reservation before `OrderSend` and terminal `order_rejected`, `order_filled`, or
-  `order_unknown` evidence afterward;
-- the Nautilus execution client accepts only `MARKET` + `FOK`, converts ounces to
-  exact lots without rounding, submits once, consumes the journal contiguously, and
-  leaves timeout or `order_unknown` pending;
+- the only native trading path is one bounded `MARKET` + `FOK` call, used either to
+  open exposure or to reduce one exact hedging ticket; both paths durably reserve before
+  `OrderSend` and record terminal `order_rejected`, `order_filled`, or `order_unknown`
+  evidence afterward;
+- the Nautilus execution client accepts ordinary opens or `reduce_only` orders carrying
+  an exact `PositionId`, converts ounces to exact lots without rounding, submits once,
+  consumes the journal contiguously, and leaves timeout or `order_unknown` pending;
 - every connect binds an operator-supplied `expected_stream_id`, projects the complete
   retained journal without replaying historical terminal events, and verifies a stable
   journal/snapshot cut before admitting execution;
+- the snapshot exposes the EA's configured single-order ceiling as the closed
+  `execution_limits.max_order_lots` value. Execution binds it to
+  `expected_max_order_lots`, intersects it with the broker volume maximum, and rejects
+  an oversized order locally before transport. Before creating a Bitfinex source order,
+  live Taker also checks its maximum possible hedge against that same current MT5
+  quantity rule; MT5 execution repeats the check after any source fill;
 - `UNKNOWN`, a dangling reservation, blocked recovery, mismatched FOK quantity, or any
   same-symbol foreign-magic position keeps execution on HOLD and makes reconciliation
   reports fail explicitly. The existing poll loop refreshes the snapshot at a bounded
@@ -47,22 +54,121 @@ The current source also contains one deliberately narrow execution candidate:
   exact single-order report. Filled orders preserve native MT5 order, deal, and position IDs;
   rejected orders use a stable stream/account-scoped synthetic venue ID. HEDGING positions
   missing from the current snapshot report FLAT against their exact cached PositionId rather
-  than an anonymous net position. Cancel/modify, production composition, and strategy wiring
-  remain intentionally absent.
+  than an anonymous net position. This reconciliation report is not a broker close command.
+  Cancel/modify and production deployment remain intentionally absent. General Taker and Maker
+  hedges apply signed deltas across MT5 HEDGING positions in deterministic PositionId order: each
+  opposing ticket is closed with an exact reduce-only order, then at most one residual position is
+  opened after all planned closes finish. MT5 legs are globally serialized per strategy instance;
+  position-shape drift, rejection, or UNKNOWN persists HOLD and stops the remaining legs. Multiple
+  Bitfinex partial fills are durably queued behind the same single-flight boundary. The bounded
+  one-shot `--close-existing` canary remains restricted to one exact ticket; a multi-ticket close
+  canary remains outside this checkpoint.
+- the MT5 client publishes snapshot-backed equity, used margin, and free margin as a Nautilus
+  `AccountState` before reconciliation. Live readiness requires both venue accounts to be
+  registered; an inconsistent account equation fails closed.
 
 The strategy layer keeps venue roles explicit: Taker submits `LIMIT` + `IOC` on the
 Bitfinex source leg, Maker maintains `LIMIT` + `GTC` + post-only source quotes, and both
 MT5 hedge legs submit `MARKET` + `FOK` to match the currently verified adapter. They are
-still not wired into a live composition.
+not yet deployed. A thin, offline-buildable Taker composition now binds the four existing
+Bitfinex/MT5 data and execution clients with explicit account and venue routes. The
+`py000-taker-live` entry point validates that composition offline by default. Its explicit
+`--rehearse` mode reads only the three `BFX_TEST_*` values and connects after removing the
+strategy, so it can exercise bounded adapter startup/reconciliation without submitting or
+canceling an order. Its mutually exclusive `--run-paper` mode accepts only the bound Bitfinex
+paper symbol, wallet, and account, keeps the existing Taker strategy attached, and runs until a
+signal or normal node stop. Maker live composition remains absent.
+The live MT5 account and configured magic must be dedicated to this node so an external position
+change cannot invalidate the preflight between a Bitfinex submission and its fill.
+
+## Taker startup and costs
+
+Live costs stay inside the venue boundaries already owned by Nautilus. The Bitfinex data client
+subscribes to `status` with `deriv:<symbol>` and publishes `NEXT_FUNDING_ACCRUED` as a native
+`FundingRateUpdate`; a missing, future-dated, stale, or conflicting update keeps source admission
+closed. The MT5 data client exposes its validated POINTS swap specification through the instrument,
+and Taker normalizes the signed long/short daily rates from that specification, the current MT5 ask,
+the broker server timezone, and the broker-native seven-item Sunday-through-Saturday `swap_rates`
+vector.
+
+The active legacy strategy's combined fee (`0.00065`) and implicit USD/USDT parity (`1:1`) remain
+ordinary strategy configuration. They are not fabricated as periodically refreshed venue facts.
+There is no cost-file producer, daemon, database, or extra lifecycle.
+
+Offline validation builds and disposes the node without reading `.env` or opening either venue:
+
+```bash
+uv run py000-taker-live --profile /path/to/taker-profile.json
+```
+
+`--rehearse` is an explicit authenticated network action, but still starts no strategy. It proves
+only adapter connection, reconciliation, portfolio initialization, and clean shutdown—not live
+strategy readiness.
+
+`--run-paper` is an authenticated paper-only action and is not an unattended daemon or production
+deployment. The entry point does not clear or rewrite HOLD, submit recovery orders, or auto-close
+positions; restart or cancel uncertainty remains on HOLD for manual review. The first attached soak
+requires separate authorization.
+
+The attached cap-bound Taker-paper EA candidate defaults to build ID
+`py000-mt5-ea-v1-taker-paper` and `InpMaxOrderLots=0.02`. Its six-source manifest is
+`9a361346c2b18c388287df62f3a3fe49b6adb02eb6348392aa120493af14820a`; the isolated
+MetaEditor build completed with 0 errors and 0 warnings and produced
+`PY000_Nautilus_MT5_taker_paper_9a361346.ex5` (SHA-256
+`a1f78a5dce41affb72780d1654049a38afe7d286c38eea0978a28d4e31b45b55`). It was attached
+to the paper account on ports 6001/6002 and passed a strategy-free rehearsal on 2026-09-03:
+all four clients connected, both accounts registered, reconciliation and portfolio
+initialization succeeded, and the node shut down cleanly with zero open positions. No strategy
+or order ran in that rehearsal. The final current source exposes the broker-native
+`swap_rates` vector as exactly seven values ordered Sunday through Saturday. Its source manifest is
+`e8126bf3ef0b42d01facdd2ef30f048972062b5ca38c81b84717156fb74cad00`. MetaEditor
+compiled it with 0 errors and 0 warnings as
+`PY000_Nautilus_MT5_taker_paper_e8126bf3.ex5` (SHA-256
+`686c5386e15fc74b6b622b133225c33b70f72768296912e1a3132ea738c2b551`). After the e812
+build was attached, a fresh read-only `hello` and snapshot authenticated the full manifest,
+journal stream, 0.02-lot ceiling, server timezone, and native `[0,1,1,3,1,1,0]` swap vector;
+recovery was ready and the account had zero positions and zero margin. The first strategy-free
+rehearsal ended at the original 10-second connection-stage limit about half a second before the
+Bitfinex paper execution session finished authenticating. No strategy or order ran. With the
+paper profile's bounded stage timeout corrected to 20 seconds, a fresh rehearsal connected all
+four clients, reconciled both venues, initialized a zero-open-order/zero-open-position portfolio,
+and shut down cleanly with `REHEARSED / adapter_startup_rehearsed`. A final read-only check found
+only `stream_started` in the current EA boot and no mutation event. Any canary still requires
+separate, explicit authorization.
+
+The thin `py000-taker-canary` entry point is now available for that next checkpoint. Its default
+mode is offline and disarmed: it validates the separate canary profile and builds the existing
+Taker composition without reading credentials or opening a connection. The profile fixes every
+source, hedge, and risk quantity at exactly 2oz while leaving the rehearsal profile at zero
+capacity. The dedicated paper profile currently uses a deliberately permissive `-0.005` long
+threshold so the canary tests execution flow rather than profitability. An explicitly authorized
+`--execute` run, always with a fresh strategy-state path, permits one source `LIMIT` + `IOC` attempt in
+the selected `long` or `short` direction, persistently closes the source gate before submission,
+and lets the existing fill-driven Taker submit the opposite MT5 `MARKET` + `FOK` hedge. In open
+mode, only exact 2oz fills on both legs, no open orders, and exact opposite final positions produce
+`PASSED_PAIRED`; that successful mode deliberately leaves the pair open. With `--close-existing`,
+the start must instead be one exact opposite 2oz pair with one exact MT5 ticket. Both source and
+hedge orders must be reduce-only, and only a fully flat reconciled result produces `PASSED_FLAT`;
+multi-ticket close canary execution is outside this checkpoint. Partial or uncertain outcomes freeze
+that run's state for operator review and never auto-unwind. Before execution, the dedicated MT5 test account must also be
+manually checked for orders from other programs or manual trading because the v1 snapshot exposes
+positions and this EA's journal, but not an account-wide pending-order list.
+
+Offline preparation only:
+
+```bash
+uv run py000-taker-canary --profile runtime/taker-paper-canary.json --direction long
+```
 
 ## Bitfinex public read-side v1 candidate
 
 The repository now contains one deliberately small, offline-testable Nautilus live-data
 candidate for the production `tXAUTF0:USTF0` or paper
 `tTESTXAUTF0:TESTUSDTF0` profile, each mapped explicitly to the canonical
-`XAUTUSDT-PERP.BITFINEX` instrument. It subscribes only to the public `P0`/`F0`/`len=25`
-book, enables Bitfinex checksum flag `131072`, maintains the two 25-level sides,
-and publishes data only after the immediately preceding book state passes the venue CRC.
+`XAUTUSDT-PERP.BITFINEX` instrument. It subscribes to the public `P0`/`F0`/`len=25`
+book plus the exact derivative-status key, enables Bitfinex checksum flag `131072`, and maintains
+the two 25-level sides. It publishes the complete atomic initial snapshot as the baseline. After
+any delta it withholds the changed book until that state passes the venue CRC.
 Quote subscribers receive the true BBO; depth subscribers receive a native Nautilus
 `OrderBookDeltas` L2 snapshot (`CLEAR` plus 25 levels per side). A malformed frame, wrong
 subscription contract or channel, incomplete book, checksum mismatch, or transport loss
@@ -76,14 +182,15 @@ lot size are fixed at one because this client supports only the one-ounce XAUT c
 The emitted `QuoteTick` always retains Nautilus's standard best-bid/best-ask meaning. The
 Taker consumes the managed native L2 book, walks exact cumulative quantities to its
 configured reference depth, and produces no opportunity when either side is insufficient.
-It evaluates only on a new CRC-backed source-depth callback, never on a later hedge tick
-against retained source data.
+It evaluates only on a new actionable source-depth callback—either the atomic initial snapshot or
+a post-update CRC-verified state—never on a later hedge tick against retained source data.
 
 The checked-in 11-frame fixture is a bounded public wire capture. Factory and node
 construction are tested without opening a socket. This public client has no credentials,
 ordering, or account state. It has no retry supervisor or live probe, and is not
-live-qualified. A future live composition must also require current client connectivity
-because Nautilus retains the last cached market data after a feed disconnect.
+live-qualified. Any runnable composition must require current client connectivity because
+Nautilus retains the last cached market data after a feed disconnect; the offline Taker builder
+already installs that independent readiness gate.
 
 ## Bitfinex private execution v1 candidate
 
@@ -94,8 +201,13 @@ and authenticated REST user info must match both the configured user ID and pape
 before the private socket opens. It supports only Taker `LIMIT` + `IOC` and Maker
 post-only `LIMIT` + `GTC`, with integer per-order leverage, price-only Maker modify, and
 native-ID cancel. A CID is persisted before `OrderSubmitted` and before the single wire
-send. Only `tu` creates fills; its venue fee, liquidity side, and delayed pre-modify price
-are preserved. Every successful submit, modify, and cancel send has an independent ACK
+send. Production creates fills only from the final `tu`, preserving its venue fee and liquidity
+side. On the dedicated Bitfinex paper symbol, the earlier `te` execution event creates a prompt
+zero-commission fill with explicit fee-unavailable provenance so the MT5 hedge is not delayed;
+a later `tu` must match and is deduplicated. If both streamed trade events are absent but a
+same-process cached order has an exact fully-executed history delta, Nautilus reconciliation can
+infer the missing fill before the canary continues. Every successful submit, modify, and cancel
+send has an independent ACK
 deadline; silence or an ambiguous send becomes sticky `UNKNOWN` without a retry. A stream
 gap with an unresolved order cannot hot-reconnect.
 
@@ -109,8 +221,11 @@ and its persisted CID. Factory and offline node construction are covered, as is 
 
 This remains a candidate, not live qualification. In-flight strategy state stays on HOLD
 after process restart until the strategy store and reconciled Nautilus cache are joined
-explicitly. Same-process hot reconnect and a complete two-venue live composition remain
-absent. Nautilus's default startup reconciliation must remain enabled. Paper and production
+explicitly. Same-process hot reconnect and a continuously runnable two-venue composition remain
+absent. The offline and ordinary open-mode Taker builders keep startup reconciliation enabled and
+disable synthetic missing-order generation. Close-only canary mode narrowly enables cold position
+reconstruction for exactly the configured source and hedge instruments and claims only the source
+position for the Taker strategy. Paper and production
 must use separate account IDs, CID/state paths, and caches; the shared canonical instrument
 ID means the two profiles must never run concurrently in one node.
 
@@ -123,12 +238,12 @@ uv run py000-bitfinex-paper-canary --output /new/path/bitfinex-preflight.jsonl
 ```
 
 Mutation requires `--execute`, an unused CID-state path, a clean target symbol, sufficient
-`TESTUSDTF0` balance for 1x, current CRC-backed data, connected data/execution clients, and
+`TESTUSDTF0` balance for 1x, current actionable book data, connected data/execution clients, and
 successful Nautilus startup reconciliation. The final account snapshot completes before the
-paper-book subscription starts. Because Bitfinex emits a checksum on a book iteration rather
-than immediately after an otherwise idle initial snapshot, the first CRC-backed quote has its
-own bounded 60-second wait; connection, REST, reconciliation, and mutation operations retain
-their separate 10-second default. It then
+paper-book subscription starts. The complete initial snapshot can satisfy the actionable quote
+wait immediately; any later delta again requires a matching checksum before publication. The quote
+wait remains independently bounded at 60 seconds, while connection, REST, reconciliation, and
+mutation operations retain their separate 10-second default. It then
 submits exactly one `BUY 2` post-only
 `LIMIT/GTC` at 5% below the current bid and sends one native-ID cancel immediately after the
 acceptance event. It never changes the quantity, side, or leverage; never retries a mutation;
@@ -197,6 +312,23 @@ untouched. Its private mode-0600 records are
 This validates only the bounded DEMO `MARKET` + `FOK` path, not strategy parity or
 production execution.
 
+The first explicitly authorized 6001/6002 open-to-close canary for the exact-ticket
+extension stopped before `OrderSend`: MQL `ZeroMemory` left the open request's omitted
+close-target strings as `NULL`, while the new journal presence check compared them with
+`""`. No reservation event was appended, no order or position was created, and the
+account balance/equity remained unchanged; the client did not retry. The corrected source
+uses string length for optional-target presence. Its manifest is
+`1fcc4a3ff232167292234f798409202441b7881b34b463dd9141d3bd23db5224`; MetaEditor compiled
+the candidate with 0 errors and 0 warnings. After deployment, a fresh read-only admission
+and two consecutive action-time session samples passed. The separately authorized canary
+filled `BUY 0.01` at `4427.69`, resolved position ticket/identifier `10338497947`, then
+filled one exact-target `SELL 0.01` close at `4427.35`. Both broker retcodes were `10009`;
+there were no mutation retries. Journal sequences 14 through 17 are exactly open reserved,
+open filled, close reserved, and close filled. The final snapshot is empty with margin zero,
+balance/equity `79292.95`, and recovery ready. This validates one DEMO exact-close path,
+while the separate strategy wiring remains offline-tested only; neither grants production
+authority.
+
 ## Scope boundary
 
 The simulations validate Taker direction and return terms plus Maker bid/ask
@@ -217,9 +349,102 @@ therefore tests that distinction explicitly and generalizes `0.2` as two
 instrument ticks, rather than claiming executable callee provenance.
 
 It does **not** establish complete oracle or live parity. The bounded Bitfinex private
-command/event and startup-report slices exist, but strategy-state restart release, hot
-reconnect, and live composition remain unimplemented. MT5 `MARKET` + `IOC` partial-fill handling also
-remains unimplemented; the isolated DEMO `MARKET` + `FOK` candidate is not strategy parity.
+command/event and startup-report slices exist, but strategy-state restart release, hot reconnect,
+dynamic venue margin capacity, and a continuously runnable production strategy mode remain
+unimplemented. The only runnable strategy path is the separately authorized fixed-2oz one-shot
+canary described above. Its first paper execution filled the 2oz Bitfinex source order but exposed
+the missing-`tu` propagation gap before an automatic hedge; a bounded compensating MT5 hedge restored
+an exact opposite test position. That incident remains `UNKNOWN` with paired recovery evidence—not
+`PASSED_PAIRED`. After the `te` paper-fill fix and a fresh state path, the authorized 2026-09-03
+rerun returned `PASSED_PAIRED / exact_2oz_pair_reconciled`: Bitfinex BUY 2oz
+(`243269180012` / trade `1967905585`) drove the MT5 SELL 0.02-lot hedge
+(`10349046774` / deal `10065080588`). Final reconciliation and an independent account snapshot
+both showed zero open orders and exact opposite `+2oz / -2oz` positions. The general
+Taker startup entry validates exact four-client wiring and can rehearse the adapters only after
+removing the strategy. MT5 `MARKET` + `IOC`
+partial-fill handling also remains unimplemented; the isolated DEMO `MARKET` + `FOK` candidate
+is not full strategy parity.
+
+The first authorized close canary did not qualify. Its Bitfinex `SELL 2` IOC was accepted and
+fully executed by the venue with reduce-only flag `1024` (order `243271104376`, trade
+`1967947277`, price `4466.9`), but the private stream supplied no authoritative terminal to the
+strategy before the bounded deadline. Local state therefore correctly remained `SUBMITTED` with
+zero observed fill and the run ended `UNKNOWN`; no automatic MT5 close occurred. One separately
+bounded exact-ticket recovery then bought `0.02` lots against position `10349046774` (order
+`10349852165`, deal `10065921857`, price `4482.89`, retcode `10009`). An independent read proved
+both venues flat, zero Bitfinex active orders, zero MT5 margin, and MT5 recovery ready. This is
+`UNKNOWN + RECOVERED_FLAT`, not `PASSED_FLAT`; the incident state is preserved and close
+requalification requires fresh open and close state paths after the silent-terminal reconciliation
+fix is verified.
+
+That fresh requalification completed on 2026-09-04 against the current reader-fix tree. One
+pre-arm readiness window expired without creating state or sending an order. The next fresh open
+run returned `PASSED_PAIRED`: Bitfinex BUY 2oz (`243337564815` / trade `1967999385`, price
+`4476.8`) drove MT5 SELL 0.02 lot (`10350460228` / deal `10066556793`, price `4479.48`). A
+first close signal window at the realistic `0.0005` short threshold returned `NO_ATTEMPT` with no
+state or mutation. Restoring the test-only short threshold to `-0.005` then produced
+`PASSED_FLAT`: Bitfinex SELL 2oz reduce-only (`243326255693` / trade `1967999516`, price
+`4470.4`, flags `1024`) drove an exact-ticket MT5 BUY 0.02-lot close (`10350506592` / deal
+`10066605263`, price `4478.78`, target position `10350460228`). No ambiguous mutation was
+retried. Final reconciliation passed, and a separate post-run read found Bitfinex position zero,
+zero Bitfinex active orders, no MT5 positions, and MT5 recovery/session ready. This qualifies the
+bounded paper/demo open-close path on the recorded working tree, not continuous or production
+operation. The mode-0600 evidence record is
+`runtime/taker-paper-readerfix-cycle-20260904.json`.
+
+The canary readiness deadline now emits one bounded, value-free snapshot of the missing gate
+names, input ages, and callback counters. It does not include hold text, account values, prices,
+quantities, or credentials; a diagnostic failure falls back to a fixed redacted reason. This
+changes diagnosis only: readiness limits are unchanged, the gate is never armed on timeout, and
+there is no automatic retry.
+
+The separately authorized mirror run on 2026-09-04 exercised SHORT open followed by LONG close.
+The source SELL 2oz filled on Bitfinex (`243321477533` / trade `1968172784`, price `4470.1`),
+and the MT5 journal independently proved the BUY 0.02-lot hedge filled (`10351975608` / deal
+`10068147732`, price `4482.55`). The run nevertheless remains `UNKNOWN`, not `PASSED_PAIRED`,
+because the local strategy did not consume that terminal: a periodic MT5 snapshot timed out after
+the hedge submit, and the one-second client deadline reset the transport while the synchronous EA
+mutation occupied the single REP service. The source order was not retried. An independently
+verified exact pair was then closed with one fresh LONG close profile whose MT5 data and execution
+request timeouts were set to five seconds. That close returned `PASSED_FLAT`: Bitfinex BUY 2oz
+reduce-only (`243362148837` / trade `1968172833`, price `4475.9`, flags `1024`) drove the exact
+MT5 SELL 0.02-lot close (`10352033578` / deal `10068208788`, price `4478.21`, target position
+`10351975608`). A separate final read found Bitfinex position zero, zero Bitfinex active orders,
+no MT5 positions, and MT5 recovery/session ready. The timeout override is a bounded test-profile
+mitigation, not a complete transport fix. The mode-0600 record is
+`runtime/taker-paper-readerfix-mirror-cycle-20260904.json`.
+
+A fresh mirror requalification then used separate open and close state files with five-second
+MT5 data and execution deadlines. Its SHORT open returned `PASSED_PAIRED`: Bitfinex SELL 2oz
+(`243343249726` / trade `1968172875`, price `4467.1`) drove MT5 BUY 0.02 lot
+(`10352076527` / deal `10068253576`, price `4477.71`). An independent read proved the exact
+`-2oz / +2oz` pair and zero active source orders. The LONG close subsequently returned
+`PASSED_FLAT`: Bitfinex BUY 2oz reduce-only (`243357267718` / trade `1968172895`, price
+`4471.6`, flags `1024`) drove the exact-ticket MT5 SELL 0.02-lot close (`10352105294` / deal
+`10068283910`, price `4472.43`, target position `10352076527`). No mutation was retried, and
+a separate final read found both accounts flat, zero Bitfinex active orders, and MT5
+recovery/session ready. During the MT5 close, however, the periodic DataClient snapshot still
+exceeded the five-second deadline; the DataClient failed closed, cancelled its PUB task, closed
+its transport, and remained disconnected for the rest of the run. The independent ExecClient
+later consumed the durable terminal; no ExecClient transport error was observed, so submit
+timeout recovery is not claimed. The timing is consistent with the synchronous mutation occupying
+the single REP service beyond the DataClient deadline, but that queue occupancy was not directly
+instrumented. The one-shot outcomes are therefore valid, but the shared single-REP
+continuous-operation boundary remains unqualified; five seconds is mitigation, not a structural
+fix. The mode-0600 record is
+`runtime/taker-paper-rep5s-mirror-requalification-20260904.json`.
+
+The subsequent adapter-side repair keeps the Data and Exec sockets independent but serializes
+their requests through one event-loop/REP-address lane, matching the EA's single-threaded REP
+service. Query deadlines now begin only when a request reaches that lane, while MT5 mutations use
+a separate 15-second deadline. A periodic snapshot timeout makes Data readiness unavailable but
+keeps PUB and the retry loop alive; only a later validated snapshot restores admission. Execution
+query timeouts likewise hold admission until a valid poll, while mutation timeout remains sticky
+`UNKNOWN` and is never replayed. Deterministic offline tests cover the delayed-mutation collision,
+production composition wiring, recovery, and hard-error fail-closed boundaries. This code repair
+does not rewrite the earlier evidence record or by itself qualify continuous live operation; that
+still requires one fresh, explicitly authorized canary.
+
 Dynamic venue margin capacity, authoritative cancel reconciliation, and Maker query closure
 remain live gates. The private Bitfinex candidate applies the strategy's validated integer
 per-order leverage; the simulated venue still uses configured account leverage. The
@@ -227,10 +452,13 @@ shared leverage helper preserves legacy floor division when its result is at
 least one and intentionally clamps smaller results to one as a migration safety
 guard; that edge is not claimed as bitwise legacy parity.
 
-Initial funding/swap/FX and MT5-session snapshots exist for the backtests. Live
-composition must refresh them through `update_cost_snapshot` and
-`update_hedge_session`; changed costs, future-dated facts, closed sessions, and
-stale/skewed inputs withdraw active Maker quotes and fail closed. Any Maker
+Initial funding/swap/FX and MT5-session snapshots exist for the backtests. The live Taker starts
+with its session closed and its cost timestamp unset, consumes MT5 `InstrumentStatus`, subscribes
+to Bitfinex `FundingRateUpdate`, derives POINTS swap from the current MT5 instrument snapshot and
+quote, and independently requires both data clients plus both execution clients to be ready before
+a source decision. Future-dated or stale funding, an invalid swap specification, a closed session,
+or stale/skewed quotes keep Taker admission closed. Static fee and 1:1 USD/USDT parity remain
+ordinary legacy strategy configuration; no passive cost file or producer exists. Any Maker
 source fill also reserves its fill/hedge obligation first, then persists a
 two-sided fill freeze and cancels both working quotes. A cycle releases without
 timeouts only after every known source order has authoritative terminal

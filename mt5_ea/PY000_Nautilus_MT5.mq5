@@ -9,13 +9,13 @@
 input string InpPubBind = "tcp://127.0.0.1:6101";
 input string InpRepBind = "tcp://127.0.0.1:6102";
 input ulong InpMagic = 900000001;
-input string InpEaBuildId = "py000-mt5-ea-v1-demo-canary";
+input string InpEaBuildId = "py000-mt5-ea-v1-taker-paper";
 input string InpDeclaredSourceSha256 =
    "0000000000000000000000000000000000000000000000000000000000000000";
 input string InpServerTimezone = "Europe/Athens";
 input int InpSessionFreshnessSeconds = 10;
 input Py000ExecutionMode InpExecutionMode = PY000_EXECUTION_DISABLED;
-input double InpMaxOrderLots = 0.01;
+input double InpMaxOrderLots = 0.02;
 input ulong InpDeviationPoints = 20;
 input int InpPumpMaxRequests = 8;
 input int InpPumpBudgetMicros = 2000;

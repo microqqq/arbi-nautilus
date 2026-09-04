@@ -31,6 +31,7 @@ from nautilus_trader.model.objects import Currency, Price, Quantity
 from py000_nautilus.mt5_v1_protocol import Binding, Identity, JsonObject, RecoveryState
 from py000_nautilus.mt5_v1_transport import (
     Mt5V1RemoteError,
+    Mt5V1RequestTimeout,
     Mt5V1Transport,
 )
 
@@ -107,9 +108,7 @@ def instrument_from_snapshot(
     price_increment = _fixed_decimal(tick_size, digits, "tick_size")
     size_precision = _decimal_places(size_step)
     size_increment = Quantity.from_str(_fixed_decimal(size_step, size_precision, "size_step"))
-    lot_size = Quantity.from_str(
-        _fixed_decimal(contract_size, size_precision, "contract_size")
-    )
+    lot_size = Quantity.from_str(_fixed_decimal(contract_size, size_precision, "contract_size"))
     observed_ns = int(cast(str, cast(JsonObject, snapshot["time"])["observed_utc_ms"])) * 1_000_000
     return Cfd(
         instrument_id=instrument_id,
@@ -135,6 +134,12 @@ def instrument_from_snapshot(
             "canonical_quantity": "ounce",
             "mt5_contract_size_ounces": str(contract_size),
             "mt5_volume_step_lots": str(volume_step),
+            "point": cast(str, spec["point"]),
+            "swap_long": cast(str, spec["swap_long"]),
+            "swap_short": cast(str, spec["swap_short"]),
+            "swap_mode": cast(int, spec["swap_mode"]),
+            "swap_rates": tuple(cast(list[str], spec["swap_rates"])),
+            "server_timezone": identity.server_timezone,
             "margin_and_fees_authoritative": False,
         },
     )
@@ -278,6 +283,7 @@ class Mt5V1DataClient(LiveMarketDataClient):
             rep_url=config.rep_url,
             topic=config.expected_symbol,
             request_timeout_ms=config.request_timeout_ms,
+            loop=loop,
         )
         self._identity: Identity | None = None
         self._snapshot: JsonObject | None = None
@@ -293,6 +299,7 @@ class Mt5V1DataClient(LiveMarketDataClient):
         self._last_identity_matched_pub_mono_ns: int | None = None
         self._last_validated_identity: Identity | None = None
         self._last_failure: str | None = None
+        self._snapshot_refresh_healthy = False
 
     @property
     def committed_snapshot_count(self) -> int:
@@ -316,6 +323,10 @@ class Mt5V1DataClient(LiveMarketDataClient):
     def last_failure(self) -> str | None:
         return self._last_failure
 
+    @property
+    def snapshot_refresh_healthy(self) -> bool:
+        return self._snapshot_refresh_healthy
+
     def connect(self) -> None:
         """Connect, then start background readers only after Nautilus marks success."""
         self._log.info("Connecting...")
@@ -328,6 +339,7 @@ class Mt5V1DataClient(LiveMarketDataClient):
 
     async def _connect(self) -> None:
         self._last_failure = None
+        self._snapshot_refresh_healthy = False
         self._last_identity_matched_pub_mono_ns = None
         self._last_validated_identity = None
         try:
@@ -367,6 +379,7 @@ class Mt5V1DataClient(LiveMarketDataClient):
         await self._transport.close()
         self._identity = None
         self._snapshot = None
+        self._snapshot_refresh_healthy = False
 
     async def _subscribe_quote_ticks(self, command: SubscribeQuoteTicks) -> None:
         self._require_instrument(command.instrument_id)
@@ -406,7 +419,10 @@ class Mt5V1DataClient(LiveMarketDataClient):
         try:
             while self._running:
                 await asyncio.sleep(self._mt5_config.snapshot_interval_ms / 1_000)
-                await self._refresh_snapshot(allow_rehandshake=True)
+                try:
+                    await self._refresh_snapshot(allow_rehandshake=True)
+                except Mt5V1RequestTimeout as exc:
+                    self._mark_snapshot_timeout(exc)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -452,6 +468,8 @@ class Mt5V1DataClient(LiveMarketDataClient):
         self._identity = identity
         self._last_validated_identity = identity
         self._snapshot = snapshot
+        self._snapshot_refresh_healthy = True
+        self._last_failure = None
         if self._status_subscribed:
             self._handle_data(
                 status_from_snapshot(
@@ -461,6 +479,12 @@ class Mt5V1DataClient(LiveMarketDataClient):
                 )
             )
         self._committed_snapshot_count += 1
+
+    def _mark_snapshot_timeout(self, exc: Mt5V1RequestTimeout) -> None:
+        self._snapshot_refresh_healthy = False
+        self._last_failure = f"{type(exc).__name__}: {exc}"[:300]
+        self._log.warning("MT5 periodic snapshot timed out; keeping PUB alive for recovery")
+        self._publish_unavailable("mt5_snapshot_request_timeout")
 
     def _publish_pub(self, topic: bytes, message: JsonObject) -> None:
         if not self._quote_subscribed or self._snapshot is None or self._instrument is None:
@@ -492,32 +516,35 @@ class Mt5V1DataClient(LiveMarketDataClient):
         if not self._running:
             return
         self._running = False
+        self._snapshot_refresh_healthy = False
         self._last_failure = f"{type(exc).__name__}: {exc}"[:300]
         self._log.exception(message, exc)
-        if self._status_subscribed:
-            now = self._clock.timestamp_ns()
-            self._handle_data(
-                InstrumentStatus(
-                    instrument_id=self._mt5_config.instrument_id,
-                    action=MarketStatusAction.NOT_AVAILABLE_FOR_TRADING,
-                    ts_event=now,
-                    ts_init=now,
-                    reason="mt5_data_client_disconnected",
-                    trading_event=None,
-                    is_trading=False,
-                    is_quoting=None,
-                    is_short_sell_restricted=None,
-                )
-            )
+        self._publish_unavailable("mt5_data_client_disconnected")
         sibling = (
-            self._snapshot_task
-            if asyncio.current_task() is self._pub_task
-            else self._pub_task
+            self._snapshot_task if asyncio.current_task() is self._pub_task else self._pub_task
         )
         if sibling is not None:
             sibling.cancel()
         await self._transport.close()
         self._set_connected(False)
+
+    def _publish_unavailable(self, reason: str) -> None:
+        if not self._status_subscribed:
+            return
+        now = self._clock.timestamp_ns()
+        self._handle_data(
+            InstrumentStatus(
+                instrument_id=self._mt5_config.instrument_id,
+                action=MarketStatusAction.NOT_AVAILABLE_FOR_TRADING,
+                ts_event=now,
+                ts_init=now,
+                reason=reason,
+                trading_event=None,
+                is_trading=False,
+                is_quoting=None,
+                is_short_sell_restricted=None,
+            )
+        )
 
     def _validate_identity(self, identity: Identity, recovery: RecoveryState) -> None:
         config = self._mt5_config
@@ -608,19 +635,28 @@ def _validate_config(config: Mt5V1DataClientConfig) -> None:
 
 def _snapshot_instrument_signature(snapshot: JsonObject) -> tuple[object, ...]:
     spec = cast(JsonObject, snapshot["symbol_spec"])
-    return tuple(
-        spec[key]
-        for key in (
-            "symbol",
-            "contract_size",
-            "currency_base",
-            "currency_profit",
-            "digits",
-            "tick_size",
-            "volume_min",
-            "volume_max",
-            "volume_step",
-        )
+    identity = Identity.from_wire(snapshot["identity"])
+    return (
+        *(
+            spec[key]
+            for key in (
+                "symbol",
+                "contract_size",
+                "currency_base",
+                "currency_profit",
+                "digits",
+                "point",
+                "swap_long",
+                "swap_short",
+                "swap_mode",
+                "tick_size",
+                "volume_min",
+                "volume_max",
+                "volume_step",
+            )
+        ),
+        tuple(cast(list[object], spec["swap_rates"])),
+        identity.server_timezone,
     )
 
 

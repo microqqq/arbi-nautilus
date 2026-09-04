@@ -21,6 +21,7 @@ from py000_nautilus.mt5_v1_protocol import (
     UINT64_MAX,
     VERSION,
     Binding,
+    ClosePositionRequest,
     ExecutionEventsRequest,
     HelloRequest,
     Identity,
@@ -109,6 +110,7 @@ def snapshot() -> JsonObject:
             "terminal_connected": True,
             "terminal_trade_allowed": True,
         },
+        "execution_limits": {"max_order_lots": "100"},
         "positions": [],
         "session": {
             "freshness": "fresh",
@@ -138,6 +140,7 @@ def snapshot() -> JsonObject:
             "symbol": "XAUUSD",
             "swap_long": "-1.25",
             "swap_mode": 1,
+            "swap_rates": ["0", "1", "1", "3", "1", "1", "0"],
             "swap_short": "0.5",
             "tick_size": "0.01",
             "tick_value": "1",
@@ -198,21 +201,41 @@ def decode_request(raw: str | bytes) -> Request:
     if op == "get_snapshot":
         closed_object(data, "get_snapshot request", base | {"binding"})
         return SnapshotRequest(request_id=request_id, binding=binding)
-    if op == "submit_market_delta":
+    if op in {"submit_market_delta", "close_position"}:
+        target_keys = (
+            {"position_ticket", "position_identifier"} if op == "close_position" else set()
+        )
         closed_object(
             data,
-            "submit_market_delta request",
-            base | {"binding", "client_request_id", "side", "quantity_lots"},
+            f"{op} request",
+            base | {"binding", "client_request_id", "side", "quantity_lots"} | target_keys,
         )
         side = data["side"]
         if side not in {"buy", "sell"} or type(side) is not str:
             raise WireError("SCHEMA_MISMATCH", "side must be buy or sell")
-        return SubmitMarketDeltaRequest(
-            request_id=request_id,
-            binding=binding,
-            client_request_id=validated_safe_token(data["client_request_id"], "client_request_id"),
-            side=cast(Literal["buy", "sell"], side),
-            quantity_lots=decimal_string(data["quantity_lots"], "quantity_lots", positive=True),
+        client_request_id = validated_safe_token(data["client_request_id"], "client_request_id")
+        validated_side = cast(Literal["buy", "sell"], side)
+        quantity_lots = decimal_string(data["quantity_lots"], "quantity_lots", positive=True)
+        if op == "submit_market_delta":
+            return SubmitMarketDeltaRequest(
+                request_id,
+                binding,
+                client_request_id,
+                validated_side,
+                quantity_lots,
+            )
+        return ClosePositionRequest(
+            request_id,
+            binding,
+            client_request_id,
+            validated_side,
+            quantity_lots,
+            position_ticket=uint64_string(
+                data["position_ticket"], "position_ticket", positive=True
+            ),
+            position_identifier=uint64_string(
+                data["position_identifier"], "position_identifier", positive=True
+            ),
         )
     closed_object(data, "events request", base | {"binding", "after_cursor", "limit"})
     return ExecutionEventsRequest(
@@ -262,12 +285,22 @@ def submission_event(
     client_request_id: str = "delta-1",
     side: Literal["buy", "sell"] = "buy",
     quantity_lots: str = "0.01",
+    position_ticket: str | None = None,
+    position_identifier: str | None = None,
 ) -> JsonObject:
     payload: JsonObject = {
         "client_request_id": client_request_id,
         "quantity_lots": quantity_lots,
         "side": side,
     }
+    assert (position_ticket is None) == (position_identifier is None)
+    if position_ticket is not None and position_identifier is not None:
+        payload.update(
+            {
+                "position_identifier": position_identifier,
+                "position_ticket": position_ticket,
+            }
+        )
     if event_type in {"order_rejected", "order_unknown"}:
         payload.update(
             {
@@ -287,6 +320,8 @@ def submission_event(
                 "venue_position_id": "700000003",
             }
         )
+        if position_identifier is not None:
+            payload["venue_position_id"] = position_identifier
     return {
         "boot_id": boot_id,
         "event_seq": str(sequence),
@@ -295,6 +330,38 @@ def submission_event(
         "payload": payload,
         "stream_id": stream_id,
     }
+
+
+def close_request(
+    current: Identity,
+    *,
+    request_id: str = "close-1",
+    client_request_id: str = "close-1",
+) -> ClosePositionRequest:
+    return ClosePositionRequest(
+        request_id=request_id,
+        binding=current.binding(),
+        client_request_id=client_request_id,
+        side="sell",
+        quantity_lots="0.01",
+        position_ticket="700000001",
+        position_identifier="800000001",
+    )
+
+
+def close_outcome(
+    request: ClosePositionRequest,
+    event_type: Literal["order_rejected", "order_filled", "order_unknown"],
+) -> JsonObject:
+    return submission_event(
+        2,
+        event_type,
+        client_request_id=request.client_request_id,
+        side=request.side,
+        quantity_lots=request.quantity_lots,
+        position_ticket=request.position_ticket,
+        position_identifier=request.position_identifier,
+    )
 
 
 def error_response(*, request_id: str, op: str, code: str, message: str) -> JsonObject:
@@ -339,6 +406,21 @@ def success_response(request: Request, data: JsonObject) -> JsonObject:
             message=str(exc),
         )
     return response
+
+
+def unchecked_submit_response(
+    request: SubmitMarketDeltaRequest | ClosePositionRequest,
+    current: Identity,
+    outcome: JsonObject,
+) -> JsonObject:
+    return {
+        "data": {"identity": current.to_wire(), "outcome": outcome},
+        "ok": True,
+        "op": request.op,
+        "protocol": PROTOCOL,
+        "request_id": request.request_id,
+        "version": VERSION,
+    }
 
 
 @dataclass(slots=True)
@@ -566,7 +648,7 @@ class Mt5V1ReferenceModel:
                 raise WireError("BINDING_MISMATCH", "request binding does not match current EA")
             if isinstance(request, SnapshotRequest):
                 return success_response(request, self._snapshot_data())
-            if isinstance(request, SubmitMarketDeltaRequest):
+            if isinstance(request, SubmitMarketDeltaRequest | ClosePositionRequest):
                 raise WireError("EXECUTION_DISABLED", "v1 package cannot execute orders")
             if self.recovery_state == "blocked":
                 raise WireError("RECOVERY_BLOCKED", "journal recovery is blocked")
@@ -625,8 +707,9 @@ class Mt5V1ReferenceModel:
         }
 
 
-def test_protocol_has_exact_four_operations() -> None:
+def test_protocol_has_exact_five_operations() -> None:
     assert {
+        "close_position",
         "hello",
         "get_snapshot",
         "submit_market_delta",
@@ -726,7 +809,7 @@ def test_positive_decimal_string_boundaries(value: object, valid: bool) -> None:
             decimal_string(value, "quantity", positive=True)
 
 
-def test_round_trip_all_four_request_shapes() -> None:
+def test_round_trip_all_five_request_shapes() -> None:
     current = identity()
     requests: list[Request] = [
         HelloRequest(request_id="r-hello"),
@@ -738,6 +821,7 @@ def test_round_trip_all_four_request_shapes() -> None:
             side="sell",
             quantity_lots="0.01",
         ),
+        close_request(current, request_id="r-close"),
         ExecutionEventsRequest(
             request_id="r-events",
             binding=current.binding(),
@@ -768,6 +852,11 @@ def test_constructed_request_validation_normalizes_adversarial_types() -> None:
             "r", valid_binding, "delta", cast(Literal["buy", "sell"], "hold"), "0.01"
         ),
         SubmitMarketDeltaRequest("r", valid_binding, "delta", "buy", "0"),
+        ClosePositionRequest("r", valid_binding, "close", "sell", "0.01", "0", "800000001"),
+        ClosePositionRequest(
+            "r", valid_binding, "close", "sell", "0.01", "0700000001", "800000001"
+        ),
+        ClosePositionRequest("r", valid_binding, "close", "sell", "0.01", "700000001", ""),
         ExecutionEventsRequest("r", valid_binding, "01", 1),
         ExecutionEventsRequest("r", valid_binding, "0", cast(int, True)),
         ExecutionEventsRequest("r", valid_binding, "0", MAX_EVENTS_LIMIT + 1),
@@ -813,6 +902,61 @@ def test_identity_execution_enabled_round_trips_and_snapshot_must_agree() -> Non
     cast(JsonObject, mismatch["data"])["execution_enabled"] = False
     with pytest.raises(WireError, match="differs from identity") as caught:
         decode_response_for(request, encode_json(mismatch))
+    assert caught.value.code == "SCHEMA_MISMATCH"
+
+
+@pytest.mark.parametrize("max_order_lots", ["0", "-0.01", "0.000000001"])
+def test_snapshot_execution_limit_must_be_positive_and_at_most_eight_decimals(
+    max_order_lots: str,
+) -> None:
+    current = model()
+    request = SnapshotRequest(request_id="snapshot-limit", binding=current.identity.binding())
+    response = current.handle(wire(request))
+    limits = cast(JsonObject, cast(JsonObject, response["data"])["execution_limits"])
+    limits["max_order_lots"] = max_order_lots
+
+    with pytest.raises(WireError, match="max_order_lots") as caught:
+        decode_response_for(request, encode_json(response))
+
+    assert caught.value.code == "SCHEMA_MISMATCH"
+
+
+@pytest.mark.parametrize("max_order_lots", ["0.015", "101"])
+def test_snapshot_execution_limit_is_a_ceiling_not_a_broker_grid_value(
+    max_order_lots: str,
+) -> None:
+    current = model()
+    request = SnapshotRequest(request_id="snapshot-limit", binding=current.identity.binding())
+    response = current.handle(wire(request))
+    limits = cast(JsonObject, cast(JsonObject, response["data"])["execution_limits"])
+    limits["max_order_lots"] = max_order_lots
+
+    assert decode_response_for(request, encode_json(response)) == response
+
+
+@pytest.mark.parametrize(
+    "swap_rates",
+    [
+        ["0"] * 6,
+        ["0"] * 8,
+        ["0", "1", "1", "2", "1", "1", "0"],
+        ["0", "1", "1", 3, "1", "1", "0"],
+        ["0", "1", "1", "NaN", "1", "1", "0"],
+        ["0", "1", "1", "3e0", "1", "1", "0"],
+        {"sunday": "0"},
+    ],
+)
+def test_snapshot_swap_rates_are_exactly_seven_closed_mql5_ratios(
+    swap_rates: object,
+) -> None:
+    current = model()
+    request = SnapshotRequest(request_id="snapshot-swap-rates", binding=current.identity.binding())
+    response = current.handle(wire(request))
+    spec = cast(JsonObject, cast(JsonObject, response["data"])["symbol_spec"])
+    spec["swap_rates"] = swap_rates
+
+    with pytest.raises(WireError, match="swap_rates") as caught:
+        decode_response_for(request, encode_json(response))
     assert caught.value.code == "SCHEMA_MISMATCH"
 
 
@@ -1112,6 +1256,90 @@ def test_submit_accepts_each_strict_terminal_outcome(
     )
     assert response["ok"] is True
     assert decode_response_for(request, encode_json(response)) == response
+
+
+@pytest.mark.parametrize("event_type", ["order_rejected", "order_filled", "order_unknown"])
+def test_close_accepts_each_strict_terminal_outcome_with_exact_target(
+    event_type: Literal["order_rejected", "order_filled", "order_unknown"],
+) -> None:
+    current = identity(execution_enabled=True)
+    request = close_request(current, request_id=f"close-{event_type}")
+    outcome = close_outcome(request, event_type)
+    response = success_response(
+        request,
+        {"identity": current.to_wire(), "outcome": outcome},
+    )
+
+    assert response["ok"] is True
+    assert decode_response_for(request, encode_json(response)) == response
+
+
+@pytest.mark.parametrize(
+    ("event_type", "mutation", "field", "invalid", "code"),
+    [
+        ("order_filled", "drop", "position_ticket", None, "SCHEMA_MISMATCH"),
+        ("order_filled", "drop", "position_identifier", None, "SCHEMA_MISMATCH"),
+        ("order_filled", "replace", "position_ticket", "0", "SCHEMA_MISMATCH"),
+        ("order_filled", "replace", "position_identifier", "01", "SCHEMA_MISMATCH"),
+        ("order_filled", "replace", "position_ticket", "700000099", "BINDING_MISMATCH"),
+        ("order_rejected", "replace", "position_identifier", "800000099", "BINDING_MISMATCH"),
+        ("order_filled", "replace", "venue_position_id", "800000099", "SCHEMA_MISMATCH"),
+    ],
+)
+def test_close_event_target_is_atomic_canonical_and_bound(
+    event_type: Literal["order_rejected", "order_filled", "order_unknown"],
+    mutation: str,
+    field: str,
+    invalid: str | None,
+    code: str,
+) -> None:
+    current = identity(execution_enabled=True)
+    request = close_request(current, request_id=f"invalid-close-target-{field}-{mutation}")
+    outcome = close_outcome(request, event_type)
+    payload = cast(JsonObject, outcome["payload"])
+    if mutation == "drop":
+        del payload[field]
+    else:
+        assert invalid is not None
+        payload[field] = invalid
+
+    with pytest.raises(WireError) as caught:
+        decode_response_for(
+            request,
+            encode_json(unchecked_submit_response(request, current, outcome)),
+        )
+    assert caught.value.code == code
+
+
+def test_submit_kinds_cannot_exchange_legacy_and_close_outcomes() -> None:
+    current = identity(execution_enabled=True)
+    market = SubmitMarketDeltaRequest(
+        request_id="market-with-close-outcome",
+        binding=current.binding(),
+        client_request_id="shared-1",
+        side="sell",
+        quantity_lots="0.01",
+    )
+    close = close_request(
+        current,
+        request_id="close-with-market-outcome",
+        client_request_id="shared-1",
+    )
+    close_terminal = close_outcome(close, "order_rejected")
+    market_outcome = submission_event(
+        2,
+        "order_rejected",
+        client_request_id="shared-1",
+        side="sell",
+    )
+
+    for request, outcome in ((market, close_terminal), (close, market_outcome)):
+        with pytest.raises(WireError) as caught:
+            decode_response_for(
+                request,
+                encode_json(unchecked_submit_response(request, current, outcome)),
+            )
+        assert caught.value.code == "BINDING_MISMATCH"
 
 
 def test_submit_accepts_idempotent_terminal_outcome_from_an_older_boot() -> None:
@@ -1435,9 +1663,7 @@ def test_snapshot_session_open_requires_schedule_connection_and_fresh_tick() -> 
         decode_response_for(request, encode_json(stale))
 
     disconnected = deepcopy(valid)
-    disconnected_flags = cast(
-        JsonObject, cast(JsonObject, disconnected["data"])["authority_flags"]
-    )
+    disconnected_flags = cast(JsonObject, cast(JsonObject, disconnected["data"])["authority_flags"])
     disconnected_flags["terminal_connected"] = False
     with pytest.raises(WireError, match="overstates"):
         decode_response_for(request, encode_json(disconnected))
@@ -1474,6 +1700,13 @@ def test_snapshot_and_pub_nested_objects_are_closed() -> None:
     with pytest.raises(WireError) as snapshot_error:
         decode_response_for(snapshot_request, encode_json(changed))
     assert snapshot_error.value.code == "SCHEMA_MISMATCH"
+
+    changed = deepcopy(snapshot_response)
+    changed_limits = cast(JsonObject, cast(JsonObject, changed["data"])["execution_limits"])
+    changed_limits["unknown"] = "rejected"
+    with pytest.raises(WireError) as limit_error:
+        decode_response_for(snapshot_request, encode_json(changed))
+    assert limit_error.value.code == "SCHEMA_MISMATCH"
 
     tick = current.pub_tick(
         event_time_ms="1788282000100",
@@ -1609,6 +1842,23 @@ def test_ea_execution_surface_is_demo_only_and_bounded() -> None:
     assert "ACCOUNT_TRADE_MODE_DEMO" in source
     assert "ACCOUNT_MARGIN_MODE_RETAIL_HEDGING" in source
     assert "ORDER_FILLING_FOK" in source
+    assert '\\"execution_limits\\"' in source
+    assert '\\"max_order_lots\\"' in source
+    assert "g_py000_execution_max_order_lots" in source
+    assert "canonical_max_order_lots = NormalizeDouble(max_order_lots, 8)" in source
+    assert "g_py000_execution_max_order_lots = canonical_max_order_lots" in source
+    for weekday in (
+        "SUNDAY",
+        "MONDAY",
+        "TUESDAY",
+        "WEDNESDAY",
+        "THURSDAY",
+        "FRIDAY",
+        "SATURDAY",
+    ):
+        assert f"SYMBOL_SWAP_{weekday}" in source
+    assert '\\"swap_rates\\"' in source
+    assert "SYMBOL_SWAP_ROLLOVER3DAYS" not in source
     assert "submission_reserved" in source
     assert source.index("Py000JournalAppendReserved(") < source.index("OrderSend(")
     execution_source = (EA_ROOT / "include" / "Py000Execution.mqh").read_text(encoding="utf-8")
@@ -1632,6 +1882,18 @@ def test_ea_execution_surface_is_demo_only_and_bounded() -> None:
     assert "mt5_symbol_info_tick_vs_time_trade_server" in source
     assert "mt5_time_current_last_known_quote" in source
     assert "ea_source_sha256" not in source
+
+
+def test_ea_open_journal_treats_null_close_fields_as_absent() -> None:
+    journal_source = (EA_ROOT / "include" / "Py000Journal.mqh").read_text(encoding="utf-8")
+
+    # ZeroMemory initializes MQL string members to NULL, which is distinct from "".
+    # submit_market_delta omits both close-target fields, so presence must use length.
+    assert "bool ticket_present = StringLen(position_ticket) > 0;" in journal_source
+    assert "bool identifier_present = StringLen(position_identifier) > 0;" in journal_source
+    assert "if(StringLen(position_ticket) > 0)" in journal_source
+    assert 'position_ticket != ""' not in journal_source
+    assert 'position_identifier != ""' not in journal_source
 
 
 def test_ea_volume_validation_covers_decimal_accumulation_error() -> None:
@@ -1710,7 +1972,7 @@ def test_transport_fatal_diagnostics_do_not_read_stale_errno() -> None:
     ea_source = (ROOT / "mt5_ea" / "PY000_Nautilus_MT5.mq5").read_text()
     zmq_source = (ROOT / "mt5_ea" / "include" / "Py000Zmq.mqh").read_text()
 
-    assert 'reason, zmq_errno()' not in ea_source
+    assert "reason, zmq_errno()" not in ea_source
     assert "Py000FailTransport(fatal_reason, fatal_has_errno, fatal_errno);" in ea_source
     assert 'fatal_reason = "multipart frame budget exceeded";' in zmq_source
     assert 'fatal_reason = "multipart byte budget exceeded";' in zmq_source

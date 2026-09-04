@@ -58,12 +58,13 @@ from nautilus_trader.model.identifiers import (
     VenueOrderId,
 )
 from nautilus_trader.model.instruments import Instrument
-from nautilus_trader.model.objects import Money
+from nautilus_trader.model.objects import AccountBalance, Money
 from nautilus_trader.model.orders import Order
 
 from py000_nautilus.mt5_v1_protocol import Binding, Identity, JsonObject, RecoveryState
 from py000_nautilus.mt5_v1_transport import (
     Mt5V1RemoteError,
+    Mt5V1RequestTimeout,
     Mt5V1Transport,
     Mt5V1TransportError,
 )
@@ -85,12 +86,19 @@ class Mt5V1ExecClientConfig(LiveExecClientConfig, kw_only=True, frozen=True):
     expected_magic: str
     expected_ea_build_id: str
     expected_source_sha256: str
+    expected_max_order_lots: Decimal
     expected_stream_id: str
     expected_server_timezone: str = "Europe/Athens"
     request_timeout_ms: int = 1_000
+    mutation_timeout_ms: int = 15_000
     event_poll_interval_ms: int = 250
     snapshot_refresh_interval_ms: int = 1_000
     event_page_limit: int = 100
+
+
+def mt5_v1_execution_account_id(client_id: ClientId, expected_account_id: str) -> AccountId:
+    """Return the sole Nautilus account identity used by one MT5 v1 client."""
+    return AccountId(f"{client_id.value}-{expected_account_id}")
 
 
 class _ExecutionTransport(Protocol):
@@ -106,6 +114,17 @@ class _ExecutionTransport(Protocol):
         side: Literal["buy", "sell"],
         quantity_lots: str,
     ) -> JsonObject: ...
+
+    async def close_position(
+        self,
+        binding: Binding,
+        *,
+        client_request_id: str,
+        side: Literal["buy", "sell"],
+        quantity_lots: str,
+        position_ticket: str,
+        position_identifier: str,
+    ) -> JsonObject: ...
     async def execution_events(
         self,
         binding: Binding,
@@ -120,8 +139,14 @@ class _Pending:
     order: Order
     instrument: Instrument
     quantity_lots: Decimal
+    position_ticket: str | None = None
+    position_identifier: str | None = None
     unknown: bool = False
     accepted: bool = False
+
+    @property
+    def is_close(self) -> bool:
+        return self.position_ticket is not None
 
 
 @dataclass(frozen=True, slots=True)
@@ -200,16 +225,37 @@ def _project_journal(events: list[JsonObject], *, current_boot_id: str) -> _Jour
         if reservation["boot_id"] != event_boot_id:
             raise Mt5V1ExecutionError("terminal execution event changed EA boot")
         reserved_payload = cast(JsonObject, reservation["payload"])
-        if (
-            payload["side"] != reserved_payload["side"]
-            or payload["quantity_lots"] != reserved_payload["quantity_lots"]
-        ):
+        if _submission_signature(payload) != _submission_signature(reserved_payload):
             raise Mt5V1ExecutionError("terminal execution payload differs from its reservation")
+        _validate_close_fill_target(event_type, reserved_payload, payload)
         terminals[request_id] = event
 
     if active_boot_id is not None and active_boot_id != current_boot_id:
         raise Mt5V1ExecutionError("execution journal does not end at the current EA boot")
     return _JournalProjection(reservations=reservations, terminals=terminals)
+
+
+def _submission_signature(payload: JsonObject) -> tuple[object, ...]:
+    return (
+        payload["side"],
+        payload["quantity_lots"],
+        payload.get("position_ticket"),
+        payload.get("position_identifier"),
+    )
+
+
+def _validate_close_fill_target(
+    event_type: str,
+    reservation: JsonObject,
+    terminal: JsonObject,
+) -> None:
+    position_identifier = reservation.get("position_identifier")
+    if (
+        event_type == "order_filled"
+        and position_identifier is not None
+        and terminal["venue_position_id"] != position_identifier
+    ):
+        raise Mt5V1ExecutionError("MT5 close fill does not match reserved target position")
 
 
 def quantity_to_lots(
@@ -259,13 +305,15 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
             clock=clock,
             config=config,
         )
-        self._set_account_id(AccountId(f"{client_id.value}-{config.expected_account_id}"))
+        self._set_account_id(mt5_v1_execution_account_id(client_id, config.expected_account_id))
         self._mt5_config = config
         self._transport: _ExecutionTransport = transport or Mt5V1Transport(
             pub_url=config.pub_url,
             rep_url=config.rep_url,
             topic=config.expected_symbol,
             request_timeout_ms=config.request_timeout_ms,
+            mutation_timeout_ms=config.mutation_timeout_ms,
+            loop=loop,
         )
         self._identity: Identity | None = None
         self._bound_stream_id: str | None = None
@@ -284,6 +332,7 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
         self._running = False
         self._poll_task: asyncio.Task[None] | None = None
         self._last_failure: str | None = None
+        self._transient_request_failure: str | None = None
 
     @property
     def pending_client_order_ids(self) -> tuple[str, ...]:
@@ -300,6 +349,16 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
     @property
     def execution_hold_reason(self) -> str | None:
         return self._execution_hold_reason
+
+    def can_execute_quantity(self, quantity_ounces: Decimal) -> bool:
+        """Return whether the installed MT5 snapshot can express this ounce quantity."""
+        if not self.execution_admitted or type(quantity_ounces) is not Decimal:
+            return False
+        try:
+            self._quantity_to_current_lots(quantity_ounces)
+        except (ArithmeticError, KeyError, TypeError, ValueError, Mt5V1ExecutionError):
+            return False
+        return True
 
     def connect(self) -> None:
         self.create_task(
@@ -331,6 +390,7 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
             self._seen_request_ids = set(projection.seen_request_ids) | set(self._pending)
             self._recovery_state = recovery
             self._recover_local_pending_from_journal()
+            self._transient_request_failure = None
             self._refresh_execution_hold()
             self._schedule_snapshot_refresh()
             self._last_failure = None
@@ -342,6 +402,7 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
             self._execution_spec = None
             self._next_snapshot_refresh_at = None
             self._execution_hold_reason = "MT5 execution is not connected"
+            self._transient_request_failure = None
             await self._transport.close()
             raise
 
@@ -363,13 +424,21 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
         self._execution_spec = None
         self._next_snapshot_refresh_at = None
         self._execution_hold_reason = "MT5 execution is not connected"
+        self._transient_request_failure = None
 
     async def _submit_order(self, command: SubmitOrder) -> None:
         order = command.order
         if order.order_type != OrderType.MARKET or order.time_in_force != TimeInForce.FOK:
             self._deny(order, "MT5 v1 execution supports MARKET FOK orders only")
             return
-        if order.is_reduce_only or order.is_quote_quantity or order.exec_algorithm_id is not None:
+        is_close = order.is_reduce_only or command.position_id is not None
+        if order.is_reduce_only != (command.position_id is not None):
+            self._deny(
+                order,
+                "MT5 close requires both reduce-only and an exact position ID",
+            )
+            return
+        if order.is_quote_quantity or order.exec_algorithm_id is not None:
             self._deny(order, "MT5 v1 execution does not support additional order semantics")
             return
         async with self._state_lock:
@@ -378,9 +447,13 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
                 self._deny(order, "MT5 execution journal already contains this order ID")
                 return
             try:
-                await self._refresh_snapshot_if_due()
+                await self._refresh_snapshot_if_due(force=is_close)
             except asyncio.CancelledError:
                 raise
+            except Mt5V1RequestTimeout as exc:
+                self._mark_transient_request_timeout(exc)
+                self._deny(order, f"MT5 snapshot refresh failed: {type(exc).__name__}: {exc}")
+                return
             except Exception as exc:
                 self._deny(order, f"MT5 snapshot refresh failed: {type(exc).__name__}: {exc}")
                 return
@@ -391,7 +464,7 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
                 self._deny(order, "MT5 execution is blocked by an unresolved UNKNOWN submission")
                 return
             try:
-                pending = self._prepare(order)
+                pending = self._prepare(order, position_id=command.position_id)
             except Mt5V1ExecutionError as exc:
                 self._deny(order, str(exc))
                 return
@@ -404,12 +477,25 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
             self._pending[request_id] = pending
             self._seen_request_ids.add(request_id)
             try:
-                data = await self._transport.submit_market_delta(
-                    self._require_identity().binding(),
-                    client_request_id=request_id,
-                    side="buy" if order.side == OrderSide.BUY else "sell",
-                    quantity_lots=format(pending.quantity_lots, "f"),
-                )
+                side: Literal["buy", "sell"] = "buy" if order.side == OrderSide.BUY else "sell"
+                if pending.is_close:
+                    assert pending.position_ticket is not None
+                    assert pending.position_identifier is not None
+                    data = await self._transport.close_position(
+                        self._require_identity().binding(),
+                        client_request_id=request_id,
+                        side=side,
+                        quantity_lots=format(pending.quantity_lots, "f"),
+                        position_ticket=pending.position_ticket,
+                        position_identifier=pending.position_identifier,
+                    )
+                else:
+                    data = await self._transport.submit_market_delta(
+                        self._require_identity().binding(),
+                        client_request_id=request_id,
+                        side=side,
+                        quantity_lots=format(pending.quantity_lots, "f"),
+                    )
                 if Identity.from_wire(data["identity"]) != self._require_identity():
                     raise Mt5V1ExecutionError("submit identity changed")
                 outcome = cast(JsonObject, data["outcome"])
@@ -425,8 +511,10 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
                 raise
             except Exception as exc:
                 pending.unknown = True
-                self._refresh_execution_hold()
                 self._last_failure = f"{type(exc).__name__}: {exc}"[:300]
+                if isinstance(exc, Mt5V1RequestTimeout):
+                    self._transient_request_failure = self._last_failure
+                self._refresh_execution_hold()
                 if not isinstance(exc, TimeoutError | Mt5V1TransportError):
                     raise
 
@@ -467,6 +555,8 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
                 await self._poll_once()
             except asyncio.CancelledError:
                 raise
+            except Mt5V1RequestTimeout as exc:
+                self._mark_transient_request_timeout(exc)
             except Mt5V1RemoteError as exc:
                 self._last_failure = f"{type(exc).__name__}: {exc}"[:300]
                 if self._identity is not None:
@@ -474,10 +564,9 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
                 return
             except Mt5V1TransportError as exc:
                 self._last_failure = f"{type(exc).__name__}: {exc}"[:300]
-                deadline = self._next_snapshot_refresh_at
-                if deadline is not None and self._loop.time() >= deadline:
+                if self._identity is not None:
                     await self._fail_closed_disconnect()
-                    return
+                return
             except Exception as exc:
                 self._last_failure = f"{type(exc).__name__}: {exc}"[:300]
                 if self._identity is not None:
@@ -494,11 +583,17 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
         self._execution_spec = None
         self._next_snapshot_refresh_at = None
         self._execution_hold_reason = "MT5 execution is not connected"
+        self._transient_request_failure = None
 
     async def _poll_once(self) -> None:
         async with self._state_lock:
-            await self._consume_event_pages()
-            await self._refresh_snapshot_if_due()
+            try:
+                await self._consume_event_pages()
+                await self._refresh_snapshot_if_due()
+            except Mt5V1RequestTimeout as exc:
+                self._mark_transient_request_timeout(exc)
+                return
+            self._clear_transient_request_timeout()
 
     async def _consume_event_pages(self, *, expected_outcome: JsonObject | None = None) -> None:
         identity = self._require_identity()
@@ -571,6 +666,12 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
         if filled_lots != pending.quantity_lots:
             pending.unknown = True
             raise Mt5V1ExecutionError("partial or mismatched MT5 fill is UNKNOWN")
+        if (
+            pending.position_identifier is not None
+            and payload["venue_position_id"] != pending.position_identifier
+        ):
+            pending.unknown = True
+            raise Mt5V1ExecutionError("MT5 close fill does not match reserved target position")
         ts_event = int(cast(str, event["event_time_ms"])) * 1_000_000
         venue_order_id = VenueOrderId(cast(str, payload["venue_order_id"]))
         if not pending.accepted:
@@ -582,6 +683,8 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
                 ts_event,
             )
             pending.accepted = True
+        self._pending.pop(str(pending.order.client_order_id))
+        self._refresh_execution_hold()
         self.generate_order_filled(
             pending.order.strategy_id,
             pending.order.instrument_id,
@@ -598,8 +701,6 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
             LiquiditySide.NO_LIQUIDITY_SIDE,
             ts_event,
         )
-        self._pending.pop(str(pending.order.client_order_id))
-        self._refresh_execution_hold()
 
     async def _read_complete_journal(
         self,
@@ -670,25 +771,61 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
                 expected_spec=self._execution_spec,
             )
             await self._verify_unchanged_journal_tail(identity, self._cursor)
+            self._install_snapshot(snapshot)
+            self._refresh_execution_hold()
+            self._schedule_snapshot_refresh()
+        except Mt5V1RequestTimeout:
+            raise
         except BaseException as exc:
             self._last_failure = f"{type(exc).__name__}: {exc}"[:300]
             await self._fail_closed_disconnect()
             raise
-        self._install_snapshot(snapshot)
-        self._refresh_execution_hold()
-        self._schedule_snapshot_refresh()
 
     def _install_snapshot(self, snapshot: JsonObject) -> None:
-        self._snapshot = snapshot
-        self._foreign_position_ids = tuple(
+        account = cast(JsonObject, snapshot["account"])
+        equity = Decimal(cast(str, account["equity"]))
+        margin = Decimal(cast(str, account["margin"]))
+        margin_free = Decimal(cast(str, account["margin_free"]))
+        if margin < 0:
+            raise Mt5V1ExecutionError("MT5 account margin cannot be negative")
+        try:
+            balance = AccountBalance(
+                Money(equity, USD),
+                Money(margin, USD),
+                Money(margin_free, USD),
+            )
+        except ValueError as exc:
+            raise Mt5V1ExecutionError(
+                "MT5 account equity, margin, and free margin are inconsistent"
+            ) from exc
+        foreign_position_ids = tuple(
             cast(str, position["identifier"])
             for position in cast(list[JsonObject], snapshot["positions"])
             if position["magic"] != self._mt5_config.expected_magic
         )
 
+        self._snapshot = snapshot
+        self._foreign_position_ids = foreign_position_ids
+        self.generate_account_state(
+            balances=[balance],
+            margins=[],
+            reported=True,
+            ts_event=int(cast(str, cast(JsonObject, snapshot["time"])["observed_utc_ms"]))
+            * 1_000_000,
+            info={
+                "mt5_balance": cast(str, account["balance"]),
+                "mt5_equity": cast(str, account["equity"]),
+                "mt5_margin": cast(str, account["margin"]),
+                "mt5_margin_free": cast(str, account["margin_free"]),
+                "mt5_margin_level": cast(str, account["margin_level"]),
+                "mt5_leverage": cast(int, account["leverage"]),
+            },
+        )
+
     @staticmethod
     def _snapshot_execution_spec(snapshot: JsonObject) -> tuple[object, ...]:
         spec = cast(JsonObject, snapshot["symbol_spec"])
+        limits = cast(JsonObject, snapshot["execution_limits"])
         fields = (
             "symbol",
             "contract_size",
@@ -706,7 +843,7 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
             "volume_min",
             "volume_step",
         )
-        return tuple(spec[field] for field in fields)
+        return (*tuple(spec[field] for field in fields), limits["max_order_lots"])
 
     def _record_reservation(self, event: JsonObject) -> None:
         payload = cast(JsonObject, event["payload"])
@@ -727,11 +864,9 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
         if reservation["boot_id"] != event["boot_id"]:
             raise Mt5V1ExecutionError("terminal execution event changed EA boot")
         reserved_payload = cast(JsonObject, reservation["payload"])
-        if (
-            payload["side"] != reserved_payload["side"]
-            or payload["quantity_lots"] != reserved_payload["quantity_lots"]
-        ):
+        if _submission_signature(payload) != _submission_signature(reserved_payload):
             raise Mt5V1ExecutionError("terminal execution payload differs from its reservation")
+        _validate_close_fill_target(cast(str, event["event_type"]), reserved_payload, payload)
         self._terminal_events[request_id] = event
 
     def _recover_local_pending_from_journal(self) -> None:
@@ -771,9 +906,22 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
             reasons.append("a local submission is unresolved")
         if self._foreign_position_ids:
             reasons.append("snapshot contains foreign-magic position(s)")
+        if self._transient_request_failure is not None:
+            reasons.append("MT5 REP request path is temporarily unavailable")
         self._execution_hold_reason = "; ".join(reasons) if reasons else None
 
-    def _prepare(self, order: Order) -> _Pending:
+    def _mark_transient_request_timeout(self, exc: Mt5V1RequestTimeout) -> None:
+        self._transient_request_failure = f"{type(exc).__name__}: {exc}"[:300]
+        self._last_failure = self._transient_request_failure
+        self._refresh_execution_hold()
+
+    def _clear_transient_request_timeout(self) -> None:
+        self._transient_request_failure = None
+        if not any(pending.unknown for pending in self._pending.values()):
+            self._last_failure = None
+        self._refresh_execution_hold()
+
+    def _prepare(self, order: Order, *, position_id: PositionId | None) -> _Pending:
         if order.instrument_id != self._mt5_config.instrument_id:
             raise Mt5V1ExecutionError("order instrument is outside the configured MT5 boundary")
         instrument = self._instrument_provider.find(order.instrument_id) or self._cache.instrument(
@@ -781,18 +929,74 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
         )
         if instrument is None or instrument.lot_size is None:
             raise Mt5V1ExecutionError("canonical MT5 instrument or lot_size is unavailable")
+        lots = self._quantity_to_current_lots(
+            Decimal(str(order.quantity)),
+            instrument=instrument,
+        )
+        spec = cast(JsonObject, self._require_snapshot()["symbol_spec"])
+        volume_min = Decimal(cast(str, spec["volume_min"]))
+        volume_step = Decimal(cast(str, spec["volume_step"]))
+        if position_id is None:
+            return _Pending(order=order, instrument=instrument, quantity_lots=lots)
+        identifier = position_id.value
+        matches = [
+            position
+            for position in cast(list[JsonObject], self._require_snapshot()["positions"])
+            if position["identifier"] == identifier
+        ]
+        if len(matches) != 1:
+            raise Mt5V1ExecutionError("close target is absent or duplicated in the live snapshot")
+        target = matches[0]
+        if target["magic"] != self._mt5_config.expected_magic:
+            raise Mt5V1ExecutionError("close target has foreign magic")
+        expected_order_side = "sell" if target["side"] == "buy" else "buy"
+        actual_order_side = "buy" if order.side == OrderSide.BUY else "sell"
+        if actual_order_side != expected_order_side:
+            raise Mt5V1ExecutionError("close order side does not oppose the target position")
+        target_lots = Decimal(cast(str, target["volume_lots"]))
+        if lots > target_lots:
+            raise Mt5V1ExecutionError("close quantity exceeds the live target position")
+        remaining_lots = target_lots - lots
+        if remaining_lots and (remaining_lots < volume_min or remaining_lots % volume_step != 0):
+            raise Mt5V1ExecutionError("close would leave an invalid MT5 lot remainder")
+        return _Pending(
+            order=order,
+            instrument=instrument,
+            quantity_lots=lots,
+            position_ticket=cast(str, target["ticket"]),
+            position_identifier=identifier,
+        )
+
+    def _quantity_to_current_lots(
+        self,
+        quantity_ounces: Decimal,
+        *,
+        instrument: Instrument | None = None,
+    ) -> Decimal:
+        if instrument is None:
+            instrument = self._instrument_provider.find(
+                self._mt5_config.instrument_id
+            ) or self._cache.instrument(self._mt5_config.instrument_id)
+        if instrument is None or instrument.lot_size is None:
+            raise Mt5V1ExecutionError("canonical MT5 instrument or lot_size is unavailable")
         spec = cast(JsonObject, self._require_snapshot()["symbol_spec"])
         lot_size = Decimal(str(instrument.lot_size))
         if lot_size != Decimal(cast(str, spec["contract_size"])):
             raise Mt5V1ExecutionError("instrument lot_size differs from MT5 contract_size")
-        lots = quantity_to_lots(
-            Decimal(str(order.quantity)),
-            lot_size=lot_size,
-            volume_min=Decimal(cast(str, spec["volume_min"])),
-            volume_max=Decimal(cast(str, spec["volume_max"])),
-            volume_step=Decimal(cast(str, spec["volume_step"])),
+        volume_min = Decimal(cast(str, spec["volume_min"]))
+        limits = cast(JsonObject, self._require_snapshot()["execution_limits"])
+        volume_max = min(
+            Decimal(cast(str, spec["volume_max"])),
+            Decimal(cast(str, limits["max_order_lots"])),
         )
-        return _Pending(order=order, instrument=instrument, quantity_lots=lots)
+        volume_step = Decimal(cast(str, spec["volume_step"]))
+        return quantity_to_lots(
+            quantity_ounces,
+            lot_size=lot_size,
+            volume_min=volume_min,
+            volume_max=volume_max,
+            volume_step=volume_step,
+        )
 
     def _match_pending(self, payload: JsonObject) -> _Pending:
         request_id = cast(str, payload["client_request_id"])
@@ -801,7 +1005,13 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
             raise Mt5V1ExecutionError("execution event has no local pending order")
         side = "buy" if pending.order.side == OrderSide.BUY else "sell"
         quantity_lots = Decimal(cast(str, payload["quantity_lots"]))
-        if payload["side"] != side or quantity_lots != pending.quantity_lots:
+        target = (payload.get("position_ticket"), payload.get("position_identifier"))
+        expected_target = (pending.position_ticket, pending.position_identifier)
+        if (
+            payload["side"] != side
+            or quantity_lots != pending.quantity_lots
+            or target != expected_target
+        ):
             pending.unknown = True
             raise Mt5V1ExecutionError("execution event differs from the local submission")
         return pending
@@ -847,6 +1057,13 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
             or snapshot["execution_enabled"] is not True
             or snapshot["recovery_state"] != recovery
             or cast(JsonObject, snapshot["account"])["currency"] != "USD"
+            or Decimal(
+                cast(
+                    str,
+                    cast(JsonObject, snapshot["execution_limits"])["max_order_lots"],
+                )
+            )
+            != self._mt5_config.expected_max_order_lots
         ):
             raise Mt5V1ExecutionError("MT5 execution snapshot is inconsistent")
         actual_spec = self._snapshot_execution_spec(snapshot)
@@ -972,7 +1189,12 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
             cancel_reason = None
         elif event_type == "order_rejected":
             venue_order_id = self._synthetic_rejected_venue_order_id(request_id)
-            venue_position_id = None
+            position_identifier = reserved.get("position_identifier")
+            venue_position_id = (
+                PositionId(cast(str, position_identifier))
+                if position_identifier is not None
+                else None
+            )
             filled_qty = instrument.make_qty(0)
             status = OrderStatus.REJECTED
             avg_px = None
@@ -992,6 +1214,7 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
             quantity=quantity,
             filled_qty=filled_qty,
             avg_px=avg_px,
+            reduce_only="position_identifier" in reserved,
             cancel_reason=cancel_reason,
             report_id=UUID4(),
             ts_accepted=timestamp,
@@ -1203,8 +1426,24 @@ def _validate_config(config: Mt5V1ExecClientConfig) -> None:
         or config.expected_stream_id != config.expected_stream_id.strip()
     ):
         raise ValueError("expected_stream_id must be a non-empty trimmed token")
+    expected_max_order_lots = config.expected_max_order_lots
+    if (
+        type(expected_max_order_lots) is not Decimal
+        or not expected_max_order_lots.is_finite()
+        or expected_max_order_lots <= 0
+    ):
+        raise ValueError(
+            "expected_max_order_lots must be a positive finite Decimal with at most 8 places"
+        )
+    exponent = expected_max_order_lots.normalize().as_tuple().exponent
+    if not isinstance(exponent, int) or exponent < -8:
+        raise ValueError(
+            "expected_max_order_lots must be a positive finite Decimal with at most 8 places"
+        )
     if not 50 <= config.request_timeout_ms <= 60_000:
         raise ValueError("request_timeout_ms is outside the supported range")
+    if not config.request_timeout_ms <= config.mutation_timeout_ms <= 60_000:
+        raise ValueError("mutation_timeout_ms must cover request_timeout_ms and be at most 60000")
     if not 50 <= config.event_poll_interval_ms <= 60_000:
         raise ValueError("event_poll_interval_ms is outside the supported range")
     if not 1_000 <= config.snapshot_refresh_interval_ms <= 60_000:

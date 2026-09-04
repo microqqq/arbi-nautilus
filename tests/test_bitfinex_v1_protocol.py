@@ -10,15 +10,18 @@ from py000_nautilus.bitfinex_v1_protocol import (
     MAX_AUTH_NONCE,
     MAX_CID,
     POST_ONLY_FLAG,
+    REDUCE_ONLY_FLAG,
     BitfinexV1ProtocolError,
     Notification,
     OrderEvent,
     OrderSnapshot,
     PositionEvent,
+    TradeExecution,
     TradeUpdate,
     WalletEvent,
     auth_message,
     cancel_order_op,
+    parse_interim_trade_message,
     parse_private_message,
     submit_order_op,
     update_order_op,
@@ -140,6 +143,28 @@ def test_taker_submit_is_ioc_and_has_no_implicit_post_only_flag() -> None:
     }
 
 
+def test_reduce_only_submit_is_exact_ioc_flag() -> None:
+    message = submit_order_op(
+        symbol=SYMBOL,
+        amount=Decimal("-2"),
+        price=Decimal("4012.3"),
+        cid=123458,
+        order_type="IOC",
+        leverage=9,
+        reduce_only=True,
+    )
+
+    assert message[3] == {
+        "type": "IOC",
+        "symbol": SYMBOL,
+        "amount": "-2",
+        "price": "4012.3",
+        "cid": 123458,
+        "lev": 9,
+        "flags": REDUCE_ONLY_FLAG,
+    }
+
+
 def test_submit_rejects_float_zero_and_post_only_ioc() -> None:
     with pytest.raises(BitfinexV1ProtocolError, match="Decimal"):
         submit_order_op(
@@ -166,6 +191,30 @@ def test_submit_rejects_float_zero_and_post_only_ioc() -> None:
             order_type="IOC",
             post_only=True,
         )
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"post_only": True, "reduce_only": True}, "mutually exclusive"),
+        ({"reduce_only": True, "order_type": "LIMIT"}, "only for an IOC"),
+        ({"reduce_only": 1}, "exact bool"),
+    ],
+)
+def test_submit_rejects_invalid_reduce_only_semantics(
+    kwargs: dict[str, object],
+    message: str,
+) -> None:
+    arguments: dict[str, object] = {
+        "symbol": SYMBOL,
+        "amount": Decimal("-2"),
+        "price": Decimal("4012.3"),
+        "cid": 123459,
+        "order_type": "IOC",
+        **kwargs,
+    }
+    with pytest.raises(BitfinexV1ProtocolError, match=message):
+        submit_order_op(**arguments)  # type: ignore[arg-type]
 
 
 def test_submit_enforces_int45_cid_and_bitfinex_leverage_range() -> None:
@@ -312,7 +361,7 @@ def test_tu_uses_exact_one_and_minus_one_for_maker_taker() -> None:
             parse_private_message([0, "tu", row])
 
 
-def test_te_shape_requires_null_fee_facts_and_is_not_a_private_fill_message() -> None:
+def test_te_preserves_execution_facts_but_normalizes_zero_cid_to_absent() -> None:
     row = [
         1234,
         SYMBOL,
@@ -327,6 +376,19 @@ def test_te_shape_requires_null_fee_facts_and_is_not_a_private_fill_message() ->
         None,
         0,
     ]
+    execution = parse_interim_trade_message([0, "te", row])
+    assert execution == TradeExecution(
+        trade_id=1234,
+        symbol=SYMBOL,
+        ts_event_ms=1_700_000_000_123,
+        venue_order_id=9876,
+        execution_qty=Decimal("0.25"),
+        execution_price=Decimal("4001.5"),
+        order_type="LIMIT",
+        order_price=Decimal("4001.4"),
+        maker=False,
+        client_order_id=None,
+    )
     validate_interim_trade_message([0, "te", row])
     with pytest.raises(BitfinexV1ProtocolError, match="fee facts"):
         validate_interim_trade_message([0, "te", [*row[:9], Decimal("-0.1"), "USD", 0]])

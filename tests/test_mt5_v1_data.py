@@ -27,6 +27,7 @@ from py000_nautilus.mt5_v1_data import (
     Mt5V1DataClientConfig,
     Mt5V1DataError,
     Mt5V1LiveDataClientFactory,
+    _snapshot_instrument_signature,
     instrument_from_snapshot,
     quote_from_pub,
     server_wall_ms_to_utc_ns,
@@ -45,6 +46,7 @@ from py000_nautilus.mt5_v1_protocol import (
 )
 from py000_nautilus.mt5_v1_transport import (
     Mt5V1RemoteError,
+    Mt5V1RequestTimeout,
     Mt5V1Transport,
     Mt5V1TransportError,
 )
@@ -114,7 +116,56 @@ def test_snapshot_builds_canonical_ounce_instrument() -> None:
     assert str(instrument.max_quantity) == "10000"
     assert instrument.info["canonical_quantity"] == "ounce"
     assert instrument.info["mt5_contract_size_ounces"] == "100"
+    assert instrument.info["point"] == "0.01"
+    assert instrument.info["swap_long"] == "-1.25"
+    assert instrument.info["swap_short"] == "0.5"
+    assert instrument.info["swap_mode"] == 1
+    assert instrument.info["swap_rates"] == ("0", "1", "1", "3", "1", "1", "0")
+    assert isinstance(instrument.info["swap_rates"], tuple)
+    assert instrument.info["server_timezone"] == "Europe/Athens"
     assert instrument.info["margin_and_fees_authoritative"] is False
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("point", "0.001"),
+        ("swap_long", "-2.5"),
+        ("swap_short", "1.5"),
+        ("swap_mode", 2),
+    ],
+)
+def test_instrument_signature_covers_swap_inputs(field: str, replacement: object) -> None:
+    original = _snapshot()
+    changed = _snapshot()
+    cast(JsonObject, changed["symbol_spec"])[field] = replacement
+
+    assert _snapshot_instrument_signature(changed) != _snapshot_instrument_signature(original)
+
+
+def test_instrument_signature_covers_native_swap_rates() -> None:
+    original = _snapshot()
+    changed = _snapshot()
+    cast(JsonObject, changed["symbol_spec"])["swap_rates"] = [
+        "0",
+        "1",
+        "1",
+        "1",
+        "3",
+        "1",
+        "0",
+    ]
+
+    assert _snapshot_instrument_signature(changed) != _snapshot_instrument_signature(original)
+
+
+def test_instrument_signature_covers_server_timezone() -> None:
+    original = _snapshot()
+    changed = _snapshot()
+    changed_identity = cast(JsonObject, changed["identity"])
+    changed_identity["server_timezone"] = "UTC"
+
+    assert _snapshot_instrument_signature(changed) != _snapshot_instrument_signature(original)
 
 
 def test_pub_tick_uses_athens_wall_clock_and_zero_unknown_sizes() -> None:
@@ -156,15 +207,18 @@ def test_pub_tick_uses_asymmetric_stale_and_future_boundaries() -> None:
     reference_utc_ms = 1_788_271_200_000
 
     for delta_ms in (-15_000, 1_000):
-        assert quote_from_pub(
-            _tick_at_utc_ms(reference_utc_ms + delta_ms),
-            instrument,
-            reference_utc_ms=reference_utc_ms,
-            now_utc_ms=reference_utc_ms,
-            timezone_name="Europe/Athens",
-            ts_init=9,
-            max_tick_age_ms=15_000,
-        ) is not None
+        assert (
+            quote_from_pub(
+                _tick_at_utc_ms(reference_utc_ms + delta_ms),
+                instrument,
+                reference_utc_ms=reference_utc_ms,
+                now_utc_ms=reference_utc_ms,
+                timezone_name="Europe/Athens",
+                ts_init=9,
+                max_tick_age_ms=15_000,
+            )
+            is not None
+        )
 
     with pytest.raises(Mt5V1DataError, match="stale"):
         quote_from_pub(
@@ -405,6 +459,8 @@ class _FakeTransport:
     def __init__(self, identity: Identity, snapshot: JsonObject) -> None:
         self.identity = identity
         self.current_snapshot = snapshot
+        self.snapshot_results: list[JsonObject | BaseException] = []
+        self.snapshot_calls = 0
         self.queue: asyncio.Queue[tuple[bytes, JsonObject]] = asyncio.Queue()
         self.opened = False
         self.closed = False
@@ -426,6 +482,12 @@ class _FakeTransport:
     async def snapshot(self, binding: Binding) -> JsonObject:
         if binding != self.identity.binding():
             raise AssertionError("unexpected binding")
+        self.snapshot_calls += 1
+        if self.snapshot_results:
+            result = self.snapshot_results.pop(0)
+            if isinstance(result, BaseException):
+                raise result
+            return result
         return self.current_snapshot
 
     async def recv_pub(self) -> tuple[bytes, JsonObject]:
@@ -557,6 +619,151 @@ def test_public_connect_immediate_reader_failure_stays_disconnected() -> None:
         await _wait_until(lambda: fake.closed)
         assert client.is_connected is False
         assert client._running is False
+
+    asyncio.run(scenario())
+
+
+def test_periodic_snapshot_timeout_marks_unavailable_then_recovers() -> None:
+    async def scenario() -> None:
+        clock = TestComponentStubs.clock()
+        msgbus = TestComponentStubs.msgbus()
+        cache = TestComponentStubs.cache()
+        engine = DataEngine(msgbus=msgbus, cache=cache, clock=clock)
+        identity = _identity()
+        snapshot = _fresh_snapshot(identity, clock.timestamp_ns() // 1_000_000)
+        fake = _FakeTransport(identity, snapshot)
+        client = Mt5V1DataClient(
+            loop=asyncio.get_running_loop(),
+            name="MT5",
+            config=_config(snapshot_interval_ms=250),
+            msgbus=msgbus,
+            cache=cache,
+            clock=clock,
+            instrument_provider=InstrumentProvider(),
+            transport=fake,
+        )
+        status_command = SubscribeInstrumentStatus(
+            instrument_id=INSTRUMENT_ID,
+            client_id=ClientId("MT5"),
+            venue=Venue("MT5"),
+            command_id=UUID4(),
+            ts_init=clock.timestamp_ns(),
+        )
+        quote_command = SubscribeQuoteTicks(
+            instrument_id=INSTRUMENT_ID,
+            client_id=ClientId("MT5"),
+            venue=Venue("MT5"),
+            command_id=UUID4(),
+            ts_init=clock.timestamp_ns(),
+        )
+        try:
+            await client._connect()
+            client._finish_connect()
+            await client._subscribe_instrument_status(status_command)
+            await client._subscribe_quote_ticks(quote_command)
+            initially_healthy = client.snapshot_refresh_healthy
+            assert initially_healthy is True
+            fake.snapshot_results.extend(
+                [
+                    Mt5V1RequestTimeout("synthetic periodic timeout"),
+                    snapshot,
+                ]
+            )
+
+            await _wait_until(
+                lambda: fake.snapshot_calls >= 2 and not client.snapshot_refresh_healthy,
+                attempts=100,
+            )
+
+            status = cache.instrument_status(INSTRUMENT_ID)
+            assert isinstance(status, InstrumentStatus)
+            assert status.action == MarketStatusAction.NOT_AVAILABLE_FOR_TRADING
+            assert status.reason == "mt5_snapshot_request_timeout"
+            assert client.is_connected is True
+            assert client._running is True
+            assert fake.opened is True
+            assert fake.closed is False
+            timeout_failure = client.last_failure
+            assert timeout_failure is not None
+            pub_task = client._pub_task
+            assert pub_task is not None and not pub_task.done()
+            await fake.queue.put((b"XAUUSD", _fresh_pub(0, identity, snapshot)))
+            await _wait_until(lambda: cache.quote_tick(INSTRUMENT_ID) is not None)
+
+            await _wait_until(
+                lambda: fake.snapshot_calls >= 3 and client.snapshot_refresh_healthy,
+                attempts=100,
+            )
+            status = cache.instrument_status(INSTRUMENT_ID)
+            assert isinstance(status, InstrumentStatus)
+            assert status.action == MarketStatusAction.TRADING
+            assert client.committed_snapshot_count == 2
+            recovery_failure = client.last_failure
+            assert recovery_failure is None
+            assert fake.closed is False
+        finally:
+            await client._disconnect()
+            client._set_connected(False)
+            engine.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_startup_snapshot_timeout_still_fails_closed() -> None:
+    async def scenario() -> None:
+        clock = TestComponentStubs.clock()
+        identity = _identity()
+        snapshot = _fresh_snapshot(identity, clock.timestamp_ns() // 1_000_000)
+        fake = _FakeTransport(identity, snapshot)
+        fake.snapshot_results.append(Mt5V1RequestTimeout("synthetic startup timeout"))
+        client = Mt5V1DataClient(
+            loop=asyncio.get_running_loop(),
+            name="MT5",
+            config=_config(),
+            msgbus=TestComponentStubs.msgbus(),
+            cache=TestComponentStubs.cache(),
+            clock=clock,
+            instrument_provider=InstrumentProvider(),
+            transport=fake,
+        )
+
+        with pytest.raises(Mt5V1RequestTimeout, match="startup timeout"):
+            await client._connect()
+
+        assert client.snapshot_refresh_healthy is False
+        assert fake.opened is True
+        assert fake.closed is True
+
+    asyncio.run(scenario())
+
+
+def test_periodic_non_timeout_transport_error_still_fails_closed() -> None:
+    async def scenario() -> None:
+        clock = TestComponentStubs.clock()
+        identity = _identity()
+        snapshot = _fresh_snapshot(identity, clock.timestamp_ns() // 1_000_000)
+        fake = _FakeTransport(identity, snapshot)
+        client = Mt5V1DataClient(
+            loop=asyncio.get_running_loop(),
+            name="MT5",
+            config=_config(snapshot_interval_ms=250),
+            msgbus=TestComponentStubs.msgbus(),
+            cache=TestComponentStubs.cache(),
+            clock=clock,
+            instrument_provider=InstrumentProvider(),
+            transport=fake,
+        )
+        await client._connect()
+        client._set_connected(True)
+        client._running = True
+        fake.snapshot_results.append(Mt5V1TransportError("synthetic hard failure"))
+
+        await client._run_snapshots()
+
+        assert client.snapshot_refresh_healthy is False
+        assert client.is_connected is False
+        assert client._running is False
+        assert fake.closed is True
 
     asyncio.run(scenario())
 

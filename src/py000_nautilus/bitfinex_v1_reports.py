@@ -8,6 +8,7 @@ from itertools import chain
 
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.execution.reports import FillReport, OrderStatusReport, PositionStatusReport
+from nautilus_trader.model.currencies import USD
 from nautilus_trader.model.enums import (
     LiquiditySide,
     OrderSide,
@@ -27,6 +28,7 @@ from nautilus_trader.model.objects import Money, Price, Quantity
 
 from py000_nautilus.bitfinex_v1_protocol import (
     POST_ONLY_FLAG,
+    REDUCE_ONLY_FLAG,
     OrderSnapshot,
     OrderState,
     TradeUpdate,
@@ -100,6 +102,8 @@ def map_fill_reports(
     """Map final ``tu``-equivalent trade rows, ignoring unowned history."""
     _timestamp(ts_init, "ts_init")
     expected_fee_currency = _text(fee_currency, "fee_currency")
+    if expected_fee_currency != USD.code:
+        raise BitfinexV1ReportError("Bitfinex XAUT trade fee currency must be USD")
     by_trade: dict[int, TradeUpdate] = {}
     for row in rows:
         trade = parse_private_message([0, "tu", row])
@@ -135,11 +139,11 @@ def map_fill_reports(
                 f"Bitfinex trade fee currency must be {expected_fee_currency}"
             )
         try:
-            commission = Money(-trade.fee, instrument.quote_currency)
+            commission = Money(-trade.fee, USD)
         except ValueError as exc:
-            raise BitfinexV1ReportError("Bitfinex fee loses quote-currency precision") from exc
+            raise BitfinexV1ReportError("Bitfinex fee loses USD precision") from exc
         if commission.as_decimal() != -trade.fee:
-            raise BitfinexV1ReportError("Bitfinex fee loses quote-currency precision")
+            raise BitfinexV1ReportError("Bitfinex fee loses USD precision")
         reports.append(
             FillReport(
                 account_id=account_id,
@@ -258,7 +262,7 @@ def _order_report(
     ts_init: int,
 ) -> OrderStatusReport:
     _exact_symbol(state.symbol, instrument)
-    if state.flags not in {0, POST_ONLY_FLAG}:
+    if state.flags not in {0, POST_ONLY_FLAG, REDUCE_ONLY_FLAG}:
         raise BitfinexV1ReportError(f"unsupported Bitfinex order flags {state.flags}")
     if state.order_type == "LIMIT":
         time_in_force = TimeInForce.GTC
@@ -268,6 +272,8 @@ def _order_report(
         raise BitfinexV1ReportError(f"unsupported Bitfinex order type {state.order_type!r}")
     if state.flags == POST_ONLY_FLAG and time_in_force != TimeInForce.GTC:
         raise BitfinexV1ReportError("post-only Bitfinex order must be LIMIT/GTC")
+    if state.flags == REDUCE_ONLY_FLAG and time_in_force != TimeInForce.IOC:
+        raise BitfinexV1ReportError("reduce-only Bitfinex order must be LIMIT/IOC")
     if state.tif_expiry_ms is not None:
         raise BitfinexV1ReportError("Bitfinex v1 does not support expiring orders")
     if state.original_qty == 0:
@@ -315,10 +321,9 @@ def _order_report(
         price=price,
         avg_px=avg_px,
         post_only=state.flags == POST_ONLY_FLAG,
+        reduce_only=state.flags == REDUCE_ONLY_FLAG,
         cancel_reason=(
-            state.status
-            if order_status in {OrderStatus.CANCELED, OrderStatus.REJECTED}
-            else None
+            state.status if order_status in {OrderStatus.CANCELED, OrderStatus.REJECTED} else None
         ),
         report_id=UUID4(),
         ts_accepted=ts_accepted,

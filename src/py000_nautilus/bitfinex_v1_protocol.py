@@ -9,6 +9,7 @@ from decimal import Decimal
 from typing import Literal, cast
 
 AUTH_CHANNEL = 0
+REDUCE_ONLY_FLAG = 1024
 POST_ONLY_FLAG = 4096
 MAX_CID = 2**45 - 1
 MAX_AUTH_NONCE = 9_007_199_254_740_991
@@ -66,6 +67,22 @@ class TradeUpdate:
     maker: bool
     fee: Decimal
     fee_currency: str
+    client_order_id: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class TradeExecution:
+    """Fee-pending execution facts from Bitfinex's low-latency ``te`` event."""
+
+    trade_id: int
+    symbol: str
+    ts_event_ms: int
+    venue_order_id: int
+    execution_qty: Decimal
+    execution_price: Decimal
+    order_type: str
+    order_price: Decimal
+    maker: bool
     client_order_id: int | None
 
 
@@ -152,6 +169,7 @@ def submit_order_op(
     order_type: Literal["LIMIT", "IOC"],
     leverage: int | None = None,
     post_only: bool = False,
+    reduce_only: bool = False,
 ) -> list[object]:
     """Build ``on`` for the two source-leg forms used by PY000."""
     raw_symbol = _text(symbol, "symbol")
@@ -162,8 +180,14 @@ def submit_order_op(
         raise BitfinexV1ProtocolError("order_type must be LIMIT or IOC")
     if type(post_only) is not bool:
         raise BitfinexV1ProtocolError("post_only must be an exact bool")
+    if type(reduce_only) is not bool:
+        raise BitfinexV1ProtocolError("reduce_only must be an exact bool")
+    if post_only and reduce_only:
+        raise BitfinexV1ProtocolError("post-only and reduce-only are mutually exclusive")
     if post_only and order_type != "LIMIT":
         raise BitfinexV1ProtocolError("post-only is valid only for the LIMIT source order")
+    if reduce_only and order_type != "IOC":
+        raise BitfinexV1ProtocolError("reduce-only is valid only for an IOC order")
 
     payload: dict[str, object] = {
         "type": order_type,
@@ -176,6 +200,8 @@ def submit_order_op(
         payload["lev"] = _leverage(leverage)
     if post_only:
         payload["flags"] = POST_ONLY_FLAG
+    elif reduce_only:
+        payload["flags"] = REDUCE_ONLY_FLAG
     return [AUTH_CHANNEL, "on", None, payload]
 
 
@@ -239,27 +265,40 @@ def parse_private_message(message: object) -> PrivateMessage:
     raise BitfinexV1ProtocolError(f"unsupported private message type {message_type!r}")
 
 
-def validate_interim_trade_message(message: object) -> None:
-    """Validate the non-authoritative ``te`` shape without treating it as a fill."""
+def parse_interim_trade_message(message: object) -> TradeExecution:
+    """Parse the fee-pending execution facts carried by a channel-0 ``te`` event."""
     frame = _array(message, "interim trade message", exact=3)
     if _exact_int(frame[0], "channel") != AUTH_CHANNEL or frame[1] != "te":
         raise BitfinexV1ProtocolError("interim trade message must be channel-0 te")
     row = _array(frame[2], "interim trade", minimum=12)
-    _positive_int(row[0], "trade.id")
-    _text(row[1], "trade.symbol")
-    _nonnegative_int(row[2], "trade.mts_create")
-    _positive_int(row[3], "trade.order_id")
-    if _decimal(row[4], "trade.exec_amount") == 0:
-        raise BitfinexV1ProtocolError("trade.exec_amount must be non-zero")
-    if _decimal(row[5], "trade.exec_price") <= 0:
-        raise BitfinexV1ProtocolError("trade.exec_price must be positive")
-    _text(row[6], "trade.order_type")
-    _decimal(row[7], "trade.order_price")
-    if _exact_int(row[8], "trade.maker") not in {-1, 1}:
+    maker_value = _exact_int(row[8], "trade.maker")
+    if maker_value not in {-1, 1}:
         raise BitfinexV1ProtocolError("trade.maker must be exact -1 or 1")
     if row[9] is not None or row[10] is not None:
         raise BitfinexV1ProtocolError("interim trade must not contain final fee facts")
-    _optional_te_cid(row[11], "trade.cid")
+    execution_qty = _decimal(row[4], "trade.exec_amount")
+    execution_price = _decimal(row[5], "trade.exec_price")
+    if execution_qty == 0 or execution_price <= 0:
+        raise BitfinexV1ProtocolError(
+            "trade quantity must be non-zero and execution price positive"
+        )
+    return TradeExecution(
+        trade_id=_positive_int(row[0], "trade.id"),
+        symbol=_text(row[1], "trade.symbol"),
+        ts_event_ms=_nonnegative_int(row[2], "trade.mts_create"),
+        venue_order_id=_positive_int(row[3], "trade.order_id"),
+        execution_qty=execution_qty,
+        execution_price=execution_price,
+        order_type=_text(row[6], "trade.order_type"),
+        order_price=_decimal(row[7], "trade.order_price"),
+        maker=maker_value == 1,
+        client_order_id=_optional_te_cid(row[11], "trade.cid"),
+    )
+
+
+def validate_interim_trade_message(message: object) -> None:
+    """Validate a ``te`` frame for callers which do not consume its execution facts."""
+    parse_interim_trade_message(message)
 
 
 def _parse_order(value: object) -> OrderState:
@@ -453,11 +492,7 @@ def _optional_positive_int(value: object, label: str) -> int | None:
 
 
 def _optional_cid(value: object, label: str) -> int | None:
-    return (
-        None
-        if value is None
-        else _bounded_positive_int(value, label, maximum=MAX_CID)
-    )
+    return None if value is None else _bounded_positive_int(value, label, maximum=MAX_CID)
 
 
 def _optional_te_cid(value: object, label: str) -> int | None:
@@ -466,7 +501,7 @@ def _optional_te_cid(value: object, label: str) -> int | None:
     parsed = _nonnegative_int(value, label)
     if parsed > MAX_CID:
         raise BitfinexV1ProtocolError(f"{label} exceeds maximum {MAX_CID}")
-    return parsed
+    return None if parsed == 0 else parsed
 
 
 def _optional_nonnegative_int(value: object, label: str) -> int | None:
@@ -510,6 +545,7 @@ __all__ = [
     "MAX_AUTH_NONCE",
     "MAX_CID",
     "POST_ONLY_FLAG",
+    "REDUCE_ONLY_FLAG",
     "BitfinexV1ProtocolError",
     "Notification",
     "OrderEvent",
@@ -518,11 +554,13 @@ __all__ = [
     "PositionEvent",
     "PositionState",
     "PrivateMessage",
+    "TradeExecution",
     "TradeUpdate",
     "WalletBalance",
     "WalletEvent",
     "auth_message",
     "cancel_order_op",
+    "parse_interim_trade_message",
     "parse_private_message",
     "submit_order_op",
     "update_order_op",

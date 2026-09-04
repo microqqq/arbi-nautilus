@@ -2,10 +2,17 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from decimal import Decimal
+from typing import Any
 
 import pytest
 from nautilus_trader.config import RoutingConfig
-from nautilus_trader.model.enums import LiquiditySide, OrderSide, OrderStatus, PositionSide
+from nautilus_trader.model.enums import (
+    LiquiditySide,
+    OrderSide,
+    OrderStatus,
+    PositionSide,
+    TimeInForce,
+)
 from nautilus_trader.model.identifiers import AccountId, ClientOrderId
 
 from py000_nautilus.bitfinex_v1_data import (
@@ -15,7 +22,7 @@ from py000_nautilus.bitfinex_v1_data import (
     BitfinexV1DataClientConfig,
     instrument_from_config,
 )
-from py000_nautilus.bitfinex_v1_protocol import POST_ONLY_FLAG
+from py000_nautilus.bitfinex_v1_protocol import POST_ONLY_FLAG, REDUCE_ONLY_FLAG
 from py000_nautilus.bitfinex_v1_reports import (
     BitfinexV1ReportError,
     map_fill_reports,
@@ -101,7 +108,7 @@ def _trade_row(
     price: str = "3926.75",
     maker: int = 1,
     fee: str = "-0.10",
-    currency: str = "USTF0",
+    currency: str = "USD",
     symbol: str = RAW_SYMBOL,
     timestamp: int = 1_700_000_000_120,
 ) -> list[object]:
@@ -224,6 +231,56 @@ def test_order_status_mapping_covers_active_partial_and_history_terminals(instru
     assert all(report.venue_position_id is None for report in reports)
 
 
+def test_order_status_mapping_preserves_reduce_only_ioc(instrument) -> None:  # type: ignore[no-untyped-def]
+    report = map_order_status_reports(
+        active_rows=[],
+        history_rows=[
+            _order_row(
+                cid=107,
+                remaining="0",
+                original="-2",
+                status="EXECUTED @ 3926.75(-2)",
+                order_type="IOC",
+                flags=REDUCE_ONLY_FLAG,
+            )
+        ],
+        instrument=instrument,
+        account_id=ACCOUNT_ID,
+        cid_lookup=_lookup(107),
+        ts_init=TS_INIT,
+    )[0]
+
+    assert report.time_in_force == TimeInForce.IOC
+    assert report.reduce_only
+    assert not report.post_only
+
+
+@pytest.mark.parametrize(
+    ("flags", "order_type", "message"),
+    [
+        (REDUCE_ONLY_FLAG | POST_ONLY_FLAG, "IOC", "unsupported"),
+        (2048, "IOC", "unsupported"),
+        (REDUCE_ONLY_FLAG, "LIMIT", "reduce-only"),
+        (POST_ONLY_FLAG, "IOC", "post-only"),
+    ],
+)
+def test_order_status_mapping_rejects_nonclosed_flag_semantics(
+    instrument: Any,
+    flags: int,
+    order_type: str,
+    message: str,
+) -> None:
+    with pytest.raises(BitfinexV1ReportError, match=message):
+        map_order_status_reports(
+            active_rows=[_order_row(flags=flags, order_type=order_type)],
+            history_rows=[],
+            instrument=instrument,
+            account_id=ACCOUNT_ID,
+            cid_lookup=_lookup(101),
+            ts_init=TS_INIT,
+        )
+
+
 def test_order_mapping_is_exact_about_precision_ownership_and_duplicate_ids(instrument) -> None:  # type: ignore[no-untyped-def]
     with pytest.raises(BitfinexV1ReportError, match=r"active.*CID"):
         map_order_status_reports(
@@ -274,7 +331,7 @@ def test_fill_mapping_uses_tu_semantics_and_deduplicates_stably(instrument) -> N
         instrument=instrument,
         account_id=ACCOUNT_ID,
         cid_lookup=_lookup(101),
-        fee_currency="USTF0",
+        fee_currency="USD",
         ts_init=TS_INIT,
     )
 
@@ -283,23 +340,24 @@ def test_fill_mapping_uses_tu_semantics_and_deduplicates_stably(instrument) -> N
     assert reports[0].last_qty.as_decimal() == Decimal("0.25")
     assert reports[0].last_px.as_decimal() == Decimal("3926.75")
     assert reports[0].commission.as_decimal() == Decimal("0.10")
+    assert reports[0].commission.currency.code == "USD"
     assert reports[0].liquidity_side == LiquiditySide.MAKER
     assert reports[0].venue_position_id is None
     assert reports[1].order_side == OrderSide.BUY
     assert reports[1].liquidity_side == LiquiditySide.TAKER
 
 
-def test_paper_fill_currency_maps_to_canonical_usdt_commission() -> None:
+def test_paper_fill_currency_maps_to_canonical_usd_commission() -> None:
     report = map_fill_reports(
-        rows=[_trade_row(symbol=PAPER_RAW_SYMBOL, currency="TESTUSDTF0")],
+        rows=[_trade_row(symbol=PAPER_RAW_SYMBOL, currency="USD")],
         instrument=_instrument(PAPER_RAW_SYMBOL),
         account_id=ACCOUNT_ID,
         cid_lookup=_lookup(101),
-        fee_currency="TESTUSDTF0",
+        fee_currency="USD",
         ts_init=TS_INIT,
     )[0]
 
-    assert report.commission.currency.code == "USDT"
+    assert report.commission.currency.code == "USD"
     assert report.commission.as_decimal() == Decimal("0.10")
 
 
@@ -310,7 +368,7 @@ def test_fill_mapping_ignores_unknown_cids_and_rejects_conflicting_trade_ids(ins
             instrument=instrument,
             account_id=ACCOUNT_ID,
             cid_lookup=_lookup(),
-            fee_currency="USTF0",
+            fee_currency="USD",
             ts_init=TS_INIT,
         )
         == []
@@ -322,16 +380,37 @@ def test_fill_mapping_ignores_unknown_cids_and_rejects_conflicting_trade_ids(ins
             instrument=instrument,
             account_id=ACCOUNT_ID,
             cid_lookup=_lookup(101),
-            fee_currency="USTF0",
+            fee_currency="USD",
             ts_init=TS_INIT,
         )
-    with pytest.raises(BitfinexV1ReportError, match="USTF0"):
+    with pytest.raises(BitfinexV1ReportError, match="USD"):
         map_fill_reports(
-            rows=[_trade_row(currency="USD")],
+            rows=[_trade_row(currency="USTF0")],
+            instrument=instrument,
+            account_id=ACCOUNT_ID,
+            cid_lookup=_lookup(101),
+            fee_currency="USD",
+            ts_init=TS_INIT,
+        )
+
+
+def test_fill_mapping_rejects_non_usd_config_and_usd_precision_loss(instrument) -> None:  # type: ignore[no-untyped-def]
+    with pytest.raises(BitfinexV1ReportError, match="fee currency must be USD"):
+        map_fill_reports(
+            rows=[_trade_row()],
             instrument=instrument,
             account_id=ACCOUNT_ID,
             cid_lookup=_lookup(101),
             fee_currency="USTF0",
+            ts_init=TS_INIT,
+        )
+    with pytest.raises(BitfinexV1ReportError, match="fee loses USD precision"):
+        map_fill_reports(
+            rows=[_trade_row(fee="-0.001")],
+            instrument=instrument,
+            account_id=ACCOUNT_ID,
+            cid_lookup=_lookup(101),
+            fee_currency="USD",
             ts_init=TS_INIT,
         )
 

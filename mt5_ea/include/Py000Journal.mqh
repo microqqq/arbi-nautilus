@@ -13,6 +13,8 @@ struct Py000JournalEvent
    string client_request_id;
    string side;
    string quantity_lots;
+   string position_ticket;
+   string position_identifier;
    string reason;
    string broker_retcode;
    string filled_quantity_lots;
@@ -128,6 +130,25 @@ bool Py000JournalIsOrderEvent(const string event_type)
 {
    return event_type == "submission_reserved" || Py000JournalIsTerminal(event_type);
 }
+bool Py000JournalHasCloseTarget(const Py000JournalEvent &event)
+{
+   return StringLen(event.position_ticket) > 0
+      && StringLen(event.position_identifier) > 0;
+}
+bool Py000JournalCloseTargetValid(
+   const string position_ticket,
+   const string position_identifier
+)
+{
+   // ZeroMemory leaves MQL strings as NULL, and NULL is not equal to "".
+   // Length is the canonical presence check for both NULL and empty strings.
+   bool ticket_present = StringLen(position_ticket) > 0;
+   bool identifier_present = StringLen(position_identifier) > 0;
+   return ticket_present == identifier_present
+      && (!ticket_present
+         || (Py000JsonCanonicalUint64(position_ticket, true)
+            && Py000JsonCanonicalUint64(position_identifier, true)));
+}
 int Py000JournalReservedIndex(const string client_request_id)
 {
    for(int index = 0; index < ArraySize(g_py000_journal_events); index++)
@@ -158,6 +179,10 @@ bool Py000JournalValidateExecutionHistory()
                return false;
          continue;
       }
+      if(!Py000JournalCloseTargetValid(
+            current.position_ticket, current.position_identifier
+         ))
+         return false;
       if(current.event_type == "submission_reserved")
       {
          for(int prior = 0; prior < index; prior++)
@@ -177,7 +202,15 @@ bool Py000JournalValidateExecutionHistory()
       }
       if(reserved < 0
          || g_py000_journal_events[reserved].side != current.side
-         || g_py000_journal_events[reserved].quantity_lots != current.quantity_lots)
+         || g_py000_journal_events[reserved].quantity_lots != current.quantity_lots
+         || g_py000_journal_events[reserved].position_ticket
+            != current.position_ticket
+         || g_py000_journal_events[reserved].position_identifier
+            != current.position_identifier)
+         return false;
+      if(current.event_type == "order_filled"
+         && Py000JournalHasCloseTarget(current)
+         && current.venue_position_id != current.position_identifier)
          return false;
    }
    for(int index = 0; index < ArraySize(g_py000_journal_events); index++)
@@ -275,53 +308,83 @@ bool Py000JournalParseEvent(
    }
    if(event.event_type == "submission_reserved")
    {
-      if(count != 10 || !Py000JsonSafeToken(parts[6])
+      bool close_event = count == 12;
+      if((count != 10 && !close_event) || !Py000JsonSafeToken(parts[6])
          || (parts[7] != "buy" && parts[7] != "sell")
-         || !Py000JsonPositiveDecimal(parts[8]))
+         || !Py000JsonPositiveDecimal(parts[8])
+         || (close_event
+            && (!Py000JsonCanonicalUint64(parts[9], true)
+               || !Py000JsonCanonicalUint64(parts[10], true))))
          return false;
       event.client_request_id = parts[6];
       event.side = parts[7];
       event.quantity_lots = parts[8];
+      if(close_event)
+      {
+         event.position_ticket = parts[9];
+         event.position_identifier = parts[10];
+      }
       return true;
    }
    if(event.event_type == "order_rejected" || event.event_type == "order_unknown")
    {
-      if(count != 12 || !Py000JsonSafeToken(parts[6])
+      bool close_event = count == 14;
+      int reason_index = close_event ? 11 : 9;
+      int retcode_index = close_event ? 12 : 10;
+      if((count != 12 && !close_event) || !Py000JsonSafeToken(parts[6])
          || (parts[7] != "buy" && parts[7] != "sell")
          || !Py000JsonPositiveDecimal(parts[8])
-         || !Py000JsonSafeToken(parts[9])
-         || !Py000JsonCanonicalUint64(parts[10], false))
+         || (close_event
+            && (!Py000JsonCanonicalUint64(parts[9], true)
+               || !Py000JsonCanonicalUint64(parts[10], true)))
+         || !Py000JsonSafeToken(parts[reason_index])
+         || !Py000JsonCanonicalUint64(parts[retcode_index], false))
          return false;
       event.client_request_id = parts[6];
       event.side = parts[7];
       event.quantity_lots = parts[8];
-      event.reason = parts[9];
-      event.broker_retcode = parts[10];
+      if(close_event)
+      {
+         event.position_ticket = parts[9];
+         event.position_identifier = parts[10];
+      }
+      event.reason = parts[reason_index];
+      event.broker_retcode = parts[retcode_index];
       return true;
    }
    if(event.event_type == "order_filled")
    {
-      if(count != 17 || !Py000JsonSafeToken(parts[6])
+      bool close_event = count == 19;
+      int filled_index = close_event ? 11 : 9;
+      if((count != 17 && !close_event) || !Py000JsonSafeToken(parts[6])
          || (parts[7] != "buy" && parts[7] != "sell")
          || !Py000JsonPositiveDecimal(parts[8])
-         || !Py000JsonPositiveDecimal(parts[9])
-         || !Py000JsonPositiveDecimal(parts[10])
-         || !Py000JsonCanonicalUint64(parts[11], true)
-         || !Py000JsonCanonicalUint64(parts[12], true)
-         || !Py000JsonCanonicalUint64(parts[13], true)
-         || !Py000JsonSignedDecimal(parts[14])
-         || !Py000JsonCanonicalUint64(parts[15], false))
+         || (close_event
+            && (!Py000JsonCanonicalUint64(parts[9], true)
+               || !Py000JsonCanonicalUint64(parts[10], true)))
+         || !Py000JsonPositiveDecimal(parts[filled_index])
+         || !Py000JsonPositiveDecimal(parts[filled_index + 1])
+         || !Py000JsonCanonicalUint64(parts[filled_index + 2], true)
+         || !Py000JsonCanonicalUint64(parts[filled_index + 3], true)
+         || !Py000JsonCanonicalUint64(parts[filled_index + 4], true)
+         || !Py000JsonSignedDecimal(parts[filled_index + 5])
+         || !Py000JsonCanonicalUint64(parts[filled_index + 6], false))
          return false;
       event.client_request_id = parts[6];
       event.side = parts[7];
       event.quantity_lots = parts[8];
-      event.filled_quantity_lots = parts[9];
-      event.fill_price = parts[10];
-      event.venue_order_id = parts[11];
-      event.venue_deal_id = parts[12];
-      event.venue_position_id = parts[13];
-      event.commission = parts[14];
-      event.broker_retcode = parts[15];
+      if(close_event)
+      {
+         event.position_ticket = parts[9];
+         event.position_identifier = parts[10];
+      }
+      event.filled_quantity_lots = parts[filled_index];
+      event.fill_price = parts[filled_index + 1];
+      event.venue_order_id = parts[filled_index + 2];
+      event.venue_deal_id = parts[filled_index + 3];
+      event.venue_position_id = parts[filled_index + 4];
+      event.commission = parts[filled_index + 5];
+      event.broker_retcode = parts[filled_index + 6];
       return true;
    }
    return false;
@@ -466,6 +529,8 @@ bool Py000JournalAppendReserved(
    const string client_request_id,
    const string side,
    const string quantity_lots,
+   const string position_ticket,
+   const string position_identifier,
    Py000JournalEvent &event
 )
 {
@@ -475,6 +540,7 @@ bool Py000JournalAppendReserved(
       || !Py000JsonSafeToken(client_request_id)
       || (side != "buy" && side != "sell")
       || !Py000JsonPositiveDecimal(quantity_lots)
+      || !Py000JournalCloseTargetValid(position_ticket, position_identifier)
       || Py000JournalReservedIndex(client_request_id) >= 0
       || Py000JournalOutcomeIndex(client_request_id) >= 0)
       return false;
@@ -485,6 +551,8 @@ bool Py000JournalAppendReserved(
       + g_py000_journal_stream_id + "|" + boot_id
       + "|submission_reserved|" + client_request_id + "|" + side
       + "|" + quantity_lots;
+   if(StringLen(position_ticket) > 0)
+      body += "|" + position_ticket + "|" + position_identifier;
    if(!Py000JournalWriteLine(
          Py000JournalEventsFile(),
          body + "|" + Py000JournalChecksum(body),
@@ -501,6 +569,8 @@ bool Py000JournalAppendReserved(
    event.client_request_id = client_request_id;
    event.side = side;
    event.quantity_lots = quantity_lots;
+   event.position_ticket = position_ticket;
+   event.position_identifier = position_identifier;
    return Py000JournalStoreEvent(event);
 }
 bool Py000JournalPrepareTerminal(
@@ -528,6 +598,8 @@ bool Py000JournalPrepareTerminal(
    event.client_request_id = client_request_id;
    event.side = g_py000_journal_events[reserved].side;
    event.quantity_lots = g_py000_journal_events[reserved].quantity_lots;
+   event.position_ticket = g_py000_journal_events[reserved].position_ticket;
+   event.position_identifier = g_py000_journal_events[reserved].position_identifier;
    return true;
 }
 bool Py000JournalAppendRejectedOrUnknown(
@@ -553,8 +625,10 @@ bool Py000JournalAppendRejectedOrUnknown(
    string body = "E|" + event.event_seq + "|" + event.event_time_ms + "|"
       + event.stream_id + "|" + event.boot_id + "|" + event.event_type
       + "|" + event.client_request_id + "|" + event.side + "|"
-      + event.quantity_lots + "|" + event.reason + "|"
-      + event.broker_retcode;
+      + event.quantity_lots;
+   if(Py000JournalHasCloseTarget(event))
+      body += "|" + event.position_ticket + "|" + event.position_identifier;
+   body += "|" + event.reason + "|" + event.broker_retcode;
    if(!Py000JournalWriteLine(
          Py000JournalEventsFile(),
          body + "|" + Py000JournalChecksum(body),
@@ -609,7 +683,10 @@ bool Py000JournalAppendFilled(
    string body = "E|" + event.event_seq + "|" + event.event_time_ms + "|"
       + event.stream_id + "|" + event.boot_id + "|" + event.event_type
       + "|" + event.client_request_id + "|" + event.side + "|"
-      + event.quantity_lots + "|" + event.filled_quantity_lots + "|"
+      + event.quantity_lots;
+   if(Py000JournalHasCloseTarget(event))
+      body += "|" + event.position_ticket + "|" + event.position_identifier;
+   body += "|" + event.filled_quantity_lots + "|"
       + event.fill_price + "|" + event.venue_order_id + "|"
       + event.venue_deal_id + "|" + event.venue_position_id + "|"
       + event.commission + "|" + event.broker_retcode;

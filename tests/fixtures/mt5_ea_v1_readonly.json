@@ -164,6 +164,7 @@
         "ok": true,
         "data": {
           "capabilities": [
+            "close_position",
             "get_execution_events",
             "get_snapshot",
             "hello",
@@ -232,6 +233,9 @@
       "trade_allowed": true,
       "trade_expert": true
     },
+    "execution_limits": {
+      "max_order_lots": "100"
+    },
     "positions": [
       {
         "ticket": "700000001",
@@ -266,6 +270,15 @@
       "stops_level": 0,
       "swap_long": "-1.25",
       "swap_mode": 1,
+      "swap_rates": [
+        "0",
+        "1",
+        "1",
+        "3",
+        "1",
+        "1",
+        "0"
+      ],
       "swap_short": "0.5",
       "tick_size": "0.01",
       "tick_value": "1",

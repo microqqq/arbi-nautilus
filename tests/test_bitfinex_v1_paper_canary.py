@@ -460,14 +460,14 @@ def test_arm_rechecks_price_and_submits_nothing_when_quote_expires(
     harness._quote = object()
 
     def stale_price() -> Decimal:
-        raise PaperCanaryError("the CRC-backed quote is stale")
+        raise PaperCanaryError("the actionable quote is stale")
 
     monkeypatch.setattr(strategy, "planned_price", stale_price)
     strategy.arm(Decimal("100000"))
 
     assert strategy.order is None
     assert strategy.outcome == "FAILED"
-    assert strategy.reason == "the CRC-backed quote is stale"
+    assert strategy.reason == "the actionable quote is stale"
 
 
 def test_partial_fill_waits_for_cancel_and_can_never_become_a_pass() -> None:
@@ -989,7 +989,7 @@ def test_actionable_quote_must_be_refreshed_after_a_stale_preflight_quote() -> N
             nonlocal calls
             calls += 1
             if not fresh:
-                raise PaperCanaryError("the CRC-backed quote is stale")
+                raise PaperCanaryError("the actionable quote is stale")
             return Decimal("4370")
 
         strategy = SimpleNamespace(
@@ -1013,13 +1013,13 @@ def test_actionable_quote_must_be_refreshed_after_a_stale_preflight_quote() -> N
 def test_actionable_quote_wait_is_bounded() -> None:
     async def scenario() -> None:
         def stale_price() -> Decimal:
-            raise PaperCanaryError("the CRC-backed quote is stale")
+            raise PaperCanaryError("the actionable quote is stale")
 
         strategy = SimpleNamespace(
             quote_ready=asyncio.Event(),
             planned_price=stale_price,
         )
-        with pytest.raises(PaperCanaryError, match="fresh CRC-backed quote"):
+        with pytest.raises(PaperCanaryError, match="fresh actionable quote"):
             await canary._await_actionable_quote(cast(Any, strategy), 0.01)
 
     asyncio.run(scenario())

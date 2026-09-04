@@ -225,7 +225,7 @@ class PaperCanaryStrategy(Strategy):
             raise PaperCanaryError("paper canary quote subscription already started")
         self.subscribe_quote_ticks(INSTRUMENT_ID, client_id=CLIENT_ID)
         self._quote_subscribed = True
-        self.reason = "waiting_for_crc_quote"
+        self.reason = "waiting_for_actionable_quote"
 
     def on_quote_tick(self, tick: QuoteTick) -> None:
         if tick.instrument_id != INSTRUMENT_ID:
@@ -246,10 +246,10 @@ class PaperCanaryStrategy(Strategy):
 
     def planned_price(self) -> Decimal:
         if self._quote is None or self._instrument is None:
-            raise PaperCanaryError("a current CRC-backed quote is required")
+            raise PaperCanaryError("a current actionable quote is required")
         age = cast(int, self.clock.timestamp_ns()) - self._quote.ts_init
         if age < 0 or age > self._config.max_quote_age_ns:
-            raise PaperCanaryError("the CRC-backed quote is stale")
+            raise PaperCanaryError("the actionable quote is stale")
         bid, ask = self._quote.bid_price.as_decimal(), self._quote.ask_price.as_decimal()
         tick = self._instrument.price_increment.as_decimal()
         price = ((bid * Decimal("0.95")) / tick).to_integral_value(ROUND_FLOOR) * tick
@@ -900,7 +900,7 @@ async def _await_actionable_quote(
             await asyncio.wait_for(strategy.quote_ready.wait(), remaining)
         except TimeoutError:
             break
-    raise PaperCanaryError("a fresh CRC-backed quote did not arrive")
+    raise PaperCanaryError("a fresh actionable quote did not arrive")
 
 
 def _post_mutation_evidence(
@@ -1116,7 +1116,7 @@ def main() -> int:
         "--quote-timeout",
         type=float,
         default=DEFAULT_FIRST_CHECKSUM_TIMEOUT,
-        help="independent wait for the paper book's first CRC-backed quote",
+        help="independent wait for the paper book's first actionable quote",
     )
     args = parser.parse_args()
     try:

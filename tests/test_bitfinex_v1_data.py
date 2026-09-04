@@ -13,14 +13,21 @@ from nautilus_trader.config import RoutingConfig, TradingNodeConfig
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.data.engine import DataEngine
 from nautilus_trader.data.messages import (
+    SubscribeFundingRates,
     SubscribeOrderBook,
     SubscribeQuoteTicks,
+    UnsubscribeFundingRates,
     UnsubscribeOrderBook,
     UnsubscribeQuoteTicks,
 )
 from nautilus_trader.live.config import LiveExecEngineConfig
 from nautilus_trader.live.node import TradingNode
-from nautilus_trader.model.data import OrderBookDelta, OrderBookDeltas, QuoteTick
+from nautilus_trader.model.data import (
+    FundingRateUpdate,
+    OrderBookDelta,
+    OrderBookDeltas,
+    QuoteTick,
+)
 from nautilus_trader.model.enums import BookAction, BookType, RecordFlag
 from nautilus_trader.model.identifiers import ClientId, InstrumentId, Symbol, TraderId, Venue
 from nautilus_trader.model.instruments import CryptoPerpetual
@@ -49,6 +56,7 @@ RAW_CAPTURE = cast(
 )
 CAPTURE = [json.loads(frame, parse_float=Decimal) for frame in RAW_CAPTURE]
 CHANNEL_ID = 474_371
+FUNDING_CHANNEL_ID = 474_372
 
 
 def _config(**changes: object) -> BitfinexV1DataClientConfig:
@@ -161,6 +169,51 @@ def _subscription(
     }
 
 
+def _funding_subscription(
+    channel_id: int = FUNDING_CHANNEL_ID,
+    *,
+    symbol: str = RAW_SYMBOL,
+) -> dict[str, object]:
+    return {
+        "event": "subscribed",
+        "channel": "status",
+        "chanId": channel_id,
+        "key": f"deriv:{symbol}",
+    }
+
+
+def _funding_payload(
+    *,
+    timestamp_ms: object = 1_788_439_852_000,
+    rate: object = Decimal("-0.00073345"),
+) -> list[object]:
+    return [
+        timestamp_ms,
+        None,
+        Decimal("4477.35"),
+        Decimal("4476.6"),
+        None,
+        Decimal("-60319661.40911106"),
+        None,
+        1_788_451_200_000,
+        rate,
+        5_578,
+        None,
+        Decimal("-0.00092158"),
+        None,
+        None,
+        Decimal("4476.6"),
+        None,
+        None,
+        Decimal("8.6061607"),
+        None,
+        None,
+        None,
+        Decimal("0.0005"),
+        Decimal("0.0025"),
+    ]
+
+
 def _quote_command() -> SubscribeQuoteTicks:
     return SubscribeQuoteTicks(
         instrument_id=INSTRUMENT_ID,
@@ -173,6 +226,26 @@ def _quote_command() -> SubscribeQuoteTicks:
 
 def _quote_unsubscribe_command() -> UnsubscribeQuoteTicks:
     return UnsubscribeQuoteTicks(
+        instrument_id=INSTRUMENT_ID,
+        client_id=ClientId("BITFINEX"),
+        venue=Venue("BITFINEX"),
+        command_id=UUID4(),
+        ts_init=0,
+    )
+
+
+def _funding_command() -> SubscribeFundingRates:
+    return SubscribeFundingRates(
+        instrument_id=INSTRUMENT_ID,
+        client_id=ClientId("BITFINEX"),
+        venue=Venue("BITFINEX"),
+        command_id=UUID4(),
+        ts_init=0,
+    )
+
+
+def _funding_unsubscribe_command() -> UnsubscribeFundingRates:
+    return UnsubscribeFundingRates(
         instrument_id=INSTRUMENT_ID,
         client_id=ClientId("BITFINEX"),
         venue=Venue("BITFINEX"),
@@ -273,9 +346,9 @@ def test_delta_delete_is_side_specific_and_active_level_can_switch_side() -> Non
     assert Decimal("4456") not in book._asks
 
 
-def test_book_rejects_malformed_snapshot_delta_and_unverified_quote() -> None:
+def test_book_rejects_malformed_snapshot_delta_and_unavailable_quote() -> None:
     book = BitfinexP0Book()
-    with pytest.raises(BitfinexV1DataError, match="latest CRC"):
+    with pytest.raises(BitfinexV1DataError, match="actionable"):
         book.quote()
     with pytest.raises(BitfinexV1DataError, match="50 levels"):
         book.apply_snapshot([])
@@ -283,6 +356,19 @@ def test_book_rejects_malformed_snapshot_delta_and_unverified_quote() -> None:
         book.apply_delta([1, 1, 1])
     with pytest.raises(BitfinexV1DataError, match="three fields"):
         book.apply_snapshot([[1, 1]] * 50)
+
+
+def test_atomic_snapshot_is_actionable_until_a_delta_requires_crc() -> None:
+    book = BitfinexP0Book()
+    book.apply_snapshot(CAPTURE[0][1])
+
+    assert book.quote()[0] == Decimal("4455.2")
+
+    book.apply_delta(CAPTURE[1][1])
+
+    assert not book.is_actionable
+    with pytest.raises(BitfinexV1DataError, match="actionable"):
+        book.quote()
 
 
 def test_instrument_comes_only_from_complete_strict_config() -> None:
@@ -374,23 +460,22 @@ def test_subscription_is_exact_and_send_failure_rolls_back() -> None:
         assert fake.sent[-1] == {"event": "unsubscribe", "chanId": CHANNEL_ID}
         assert client._channel_id is None
         await client._subscribe_quote_ticks(_quote_command())
-        assert fake.sent[-2:] == [
-            {"event": "conf", "flags": 131_072},
-            {
-                "event": "subscribe",
-                "channel": "book",
-                "symbol": RAW_SYMBOL,
-                "prec": "P0",
-                "freq": "F0",
-                "len": "25",
-                "subId": "py000-xaut-book-v1",
-            },
-        ]
+        assert fake.sent[-1] == {
+            "event": "subscribe",
+            "channel": "book",
+            "symbol": RAW_SYMBOL,
+            "prec": "P0",
+            "freq": "F0",
+            "len": "25",
+            "subId": "py000-xaut-book-v1",
+        }
         assert client._consume_frame([CHANNEL_ID, "hb"]) == ()
         assert client._consume_frame(
             [CHANNEL_ID, [Decimal("4455"), 1, Decimal("0.1")]]
         ) == ()
-        client._consume_frame({"event": "unsubscribed", "chanId": CHANNEL_ID})
+        client._consume_frame(
+            {"event": "unsubscribed", "status": "OK", "chanId": CHANNEL_ID}
+        )
         client._consume_frame(_subscription(channel_id=CHANNEL_ID + 1))
         assert client._channel_id == CHANNEL_ID + 1
         assert client._pending_unsubscribe_channel_id is None
@@ -421,6 +506,289 @@ def test_subscription_is_exact_and_send_failure_rolls_back() -> None:
         assert not stale.is_connected
         assert stale._channel_id is None
         assert unsubscribe_failed.closed
+
+    asyncio.run(scenario())
+
+
+def test_book_and_funding_share_transport_with_independent_lifecycles() -> None:
+    async def scenario() -> None:
+        fake = _FakeTransport()
+        client = _client(fake)
+        await fake.open()
+        client._set_connected(True)
+        client._running = True
+
+        await client._subscribe_quote_ticks(_quote_command())
+        client._consume_frame(_subscription())
+        await client._subscribe_funding_rates(_funding_command())
+        assert fake.sent == [
+            {"event": "conf", "flags": 131_072},
+            {
+                "event": "subscribe",
+                "channel": "book",
+                "symbol": RAW_SYMBOL,
+                "prec": "P0",
+                "freq": "F0",
+                "len": "25",
+                "subId": "py000-xaut-book-v1",
+            },
+            {
+                "event": "subscribe",
+                "channel": "status",
+                "key": f"deriv:{RAW_SYMBOL}",
+            },
+        ]
+        client._consume_frame(_funding_subscription())
+
+        updates = client._consume_frame([FUNDING_CHANNEL_ID, _funding_payload()])
+        assert len(updates) == 1
+        funding = updates[0]
+        assert isinstance(funding, FundingRateUpdate)
+        assert funding.instrument_id == INSTRUMENT_ID
+        assert str(funding.rate) == "-0.00073345"
+        assert funding.ts_event == 1_788_439_852_000_000_000
+
+        await client._unsubscribe_quote_ticks(_quote_unsubscribe_command())
+        assert fake.sent[-1] == {"event": "unsubscribe", "chanId": CHANNEL_ID}
+        assert client._funding_channel_id == FUNDING_CHANNEL_ID
+        assert isinstance(
+            client._consume_frame([FUNDING_CHANNEL_ID, _funding_payload()])[0],
+            FundingRateUpdate,
+        )
+        client._consume_frame(
+            {"event": "unsubscribed", "status": "OK", "chanId": CHANNEL_ID}
+        )
+
+        await client._unsubscribe_funding_rates(_funding_unsubscribe_command())
+        assert fake.sent[-1] == {
+            "event": "unsubscribe",
+            "chanId": FUNDING_CHANNEL_ID,
+        }
+        assert cast(Any, client)._channel_id is None
+        assert cast(Any, client)._funding_channel_id is None
+        client._consume_frame(
+            {
+                "event": "unsubscribed",
+                "status": "OK",
+                "chanId": FUNDING_CHANNEL_ID,
+            }
+        )
+        await client._disconnect()
+
+    asyncio.run(scenario())
+
+
+def test_funding_first_book_arm_and_deferred_cancel_keep_channel_routes_isolated() -> None:
+    async def scenario() -> None:
+        fake = _FakeTransport()
+        client = _client(fake)
+        await fake.open()
+        client._set_connected(True)
+        client._running = True
+
+        # Match the one-shot Taker lifecycle: funding is live before the book is armed.
+        await client._subscribe_funding_rates(_funding_command())
+        client._consume_frame(_funding_subscription())
+        assert isinstance(
+            client._consume_frame([FUNDING_CHANNEL_ID, _funding_payload()])[0],
+            FundingRateUpdate,
+        )
+
+        await client._subscribe_order_book_deltas(_book_command())
+        assert client._channel_id is None
+        assert client._funding_channel_id == FUNDING_CHANNEL_ID
+        assert client._consume_frame([FUNDING_CHANNEL_ID, "hb"]) == ()
+        assert isinstance(
+            client._consume_frame([FUNDING_CHANNEL_ID, _funding_payload()])[0],
+            FundingRateUpdate,
+        )
+
+        # If shutdown races the book ACK, only that book channel is retired. Funding
+        # remains routable throughout the deferred unsubscribe handshake.
+        await client._unsubscribe_order_book_deltas(_book_unsubscribe_command())
+        client._consume_frame(_subscription())
+        await _wait_until(lambda: fake.sent[-1].get("event") == "unsubscribe")
+        assert fake.sent[-1] == {"event": "unsubscribe", "chanId": CHANNEL_ID}
+        assert client._channel_id is None
+        assert cast(Any, client)._pending_unsubscribe_channel_id == CHANNEL_ID
+        assert client._consume_frame(CAPTURE[0]) == ()
+        assert isinstance(
+            client._consume_frame([FUNDING_CHANNEL_ID, _funding_payload()])[0],
+            FundingRateUpdate,
+        )
+        client._consume_frame(
+            {"event": "unsubscribed", "status": "OK", "chanId": CHANNEL_ID}
+        )
+        assert cast(Any, client)._pending_unsubscribe_channel_id is None
+        assert client._funding_channel_id == FUNDING_CHANNEL_ID
+        await client._disconnect()
+
+    asyncio.run(scenario())
+
+
+def test_funding_subscription_ack_is_bound_to_exact_key_and_unique_channel() -> None:
+    async def scenario() -> None:
+        client = _client(_FakeTransport())
+        client._funding_subscription_requested = True
+
+        with pytest.raises(BitfinexV1DataError, match="wrong key"):
+            client._consume_frame(_funding_subscription(symbol="tBTCF0:USTF0"))
+
+        client._channel_id = CHANNEL_ID
+        with pytest.raises(BitfinexV1DataError, match="reused"):
+            client._consume_frame(_funding_subscription(channel_id=CHANNEL_ID))
+
+        client._consume_frame(_funding_subscription())
+        with pytest.raises(BitfinexV1DataError, match="repeated"):
+            client._consume_frame(_funding_subscription(channel_id=FUNDING_CHANNEL_ID + 1))
+
+        unsolicited = _client(_FakeTransport())
+        with pytest.raises(BitfinexV1DataError, match="unsolicited.*funding"):
+            unsolicited._consume_frame(_funding_subscription())
+
+    asyncio.run(scenario())
+
+
+def test_unsubscribe_before_ack_is_deferred_without_closing_shared_transport() -> None:
+    async def scenario() -> None:
+        fake = _FakeTransport()
+        client = _client(fake)
+        await fake.open()
+        client._set_connected(True)
+        client._running = True
+
+        await client._subscribe_quote_ticks(_quote_command())
+        client._consume_frame(_subscription())
+        await client._subscribe_funding_rates(_funding_command())
+        await client._unsubscribe_funding_rates(_funding_unsubscribe_command())
+        assert fake.sent[-1]["event"] == "subscribe"
+
+        client._consume_frame(_funding_subscription())
+        await _wait_until(lambda: fake.sent[-1].get("event") == "unsubscribe")
+        assert fake.sent[-1] == {
+            "event": "unsubscribe",
+            "chanId": FUNDING_CHANNEL_ID,
+        }
+        assert client._channel_id == CHANNEL_ID
+        assert client._consume_frame([CHANNEL_ID, "hb"]) == ()
+        assert client.is_connected
+
+        client._consume_frame(
+            {
+                "event": "unsubscribed",
+                "status": "OK",
+                "chanId": FUNDING_CHANNEL_ID,
+            }
+        )
+        await client._disconnect()
+
+    asyncio.run(scenario())
+
+
+def test_unsubscribe_ack_must_explicitly_confirm_success() -> None:
+    async def scenario() -> None:
+        client = _client(_FakeTransport())
+        client._pending_funding_unsubscribe_channel_id = FUNDING_CHANNEL_ID
+
+        with pytest.raises(BitfinexV1DataError, match="not acknowledged"):
+            client._consume_frame(
+                {
+                    "event": "unsubscribed",
+                    "status": "ERROR",
+                    "chanId": FUNDING_CHANNEL_ID,
+                }
+            )
+
+        assert client._pending_funding_unsubscribe_channel_id == FUNDING_CHANNEL_ID
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("frame", "message"),
+    [
+        (
+            [FUNDING_CHANNEL_ID, _funding_payload()[:8]],
+            "does not contain its funding field",
+        ),
+        (
+            [FUNDING_CHANNEL_ID, _funding_payload(timestamp_ms=True)],
+            "timestamp must be an integer",
+        ),
+        (
+            [FUNDING_CHANNEL_ID, _funding_payload(timestamp_ms=0)],
+            "timestamp is invalid",
+        ),
+        (
+            [FUNDING_CHANNEL_ID, _funding_payload(rate="-0.0001")],
+            "must be a JSON number",
+        ),
+        (
+            [FUNDING_CHANNEL_ID, _funding_payload(rate=Decimal("NaN"))],
+            "must be finite",
+        ),
+        (
+            [FUNDING_CHANNEL_ID, _funding_payload(rate=Decimal("1.1"))],
+            "outside",
+        ),
+        ([FUNDING_CHANNEL_ID, _funding_payload(), 1], "status frame is malformed"),
+    ],
+)
+def test_funding_frame_is_strict(frame: list[object], message: str) -> None:
+    async def scenario() -> None:
+        client = _client(_FakeTransport())
+        client._funding_channel_id = FUNDING_CHANNEL_ID
+        client._publish_funding = True
+        with pytest.raises(BitfinexV1DataError, match=message):
+            client._consume_frame(frame)
+
+    asyncio.run(scenario())
+
+
+def test_funding_frame_ignores_documented_tail_extensions() -> None:
+    async def scenario() -> None:
+        client = _client(_FakeTransport())
+        client._funding_channel_id = FUNDING_CHANNEL_ID
+        client._publish_funding = True
+        payload = [*_funding_payload(), "future-field"]
+
+        updates = client._consume_frame([FUNDING_CHANNEL_ID, payload])
+
+        assert len(updates) == 1
+        assert isinstance(updates[0], FundingRateUpdate)
+        assert str(updates[0].rate) == "-0.00073345"
+
+    asyncio.run(scenario())
+
+
+def test_failed_public_funding_subscription_rolls_back_and_can_retry() -> None:
+    async def scenario() -> None:
+        fake = _FakeTransport()
+        fake.fail_send_at = 1
+        client = _client(fake)
+        await fake.open()
+        client._set_connected(True)
+        client._running = True
+
+        client.subscribe_funding_rates(_funding_command())
+        await _wait_until(lambda: fake.closed and not client.is_connected)
+        assert INSTRUMENT_ID not in client.subscribed_funding_rates()
+        assert not client._funding_subscription_requested
+
+        fake.fail_send_at = None
+        fake.sent.clear()
+        await fake.open()
+        client._set_connected(True)
+        client._running = True
+        client.subscribe_funding_rates(_funding_command())
+        await _wait_until(lambda: len(fake.sent) == 2)
+        assert fake.sent[-1] == {
+            "event": "subscribe",
+            "channel": "status",
+            "key": f"deriv:{RAW_SYMBOL}",
+        }
+        assert client.subscribed_funding_rates() == [INSTRUMENT_ID]
+        await client._disconnect()
 
     asyncio.run(scenario())
 
@@ -525,7 +893,9 @@ def test_server_ended_subscription_disconnects_the_reader() -> None:
         await _wait_until(lambda: client.is_connected)
         await client._subscribe_quote_ticks(_quote_command())
         await fake.queue.put(_subscription())
-        await fake.queue.put({"event": "unsubscribed", "chanId": CHANNEL_ID})
+        await fake.queue.put(
+            {"event": "unsubscribed", "status": "OK", "chanId": CHANNEL_ID}
+        )
         await _wait_until(lambda: fake.closed and not client.is_connected)
         assert client.last_failure is not None
         assert "unexpectedly ended" in client.last_failure
@@ -536,7 +906,13 @@ def test_server_ended_subscription_disconnects_the_reader() -> None:
 def test_unknown_channel_duplicate_ack_and_bad_crc_fail_immediately() -> None:
     async def scenario() -> None:
         client = _client(_FakeTransport())
-        with pytest.raises(BitfinexV1DataError, match="unexpected channel"):
+        with pytest.raises(
+            BitfinexV1DataError,
+            match=(
+                r"unexpected channel 474371 \(book=None, funding=None, "
+                r"pending_book=None, pending_funding=None\)"
+            ),
+        ):
             client._consume_frame(CAPTURE[0])
         client._subscription_requested = True
         client._consume_frame(_subscription())
@@ -551,7 +927,7 @@ def test_unknown_channel_duplicate_ack_and_bad_crc_fail_immediately() -> None:
     asyncio.run(scenario())
 
 
-def test_client_publishes_bbo_and_native_depth_only_after_successful_checksum() -> None:
+def test_client_publishes_atomic_snapshot_then_revalidates_deltas_with_crc() -> None:
     async def scenario() -> None:
         clock = TestComponentStubs.clock()
         msgbus = TestComponentStubs.msgbus()
@@ -576,16 +952,9 @@ def test_client_publishes_bbo_and_native_depth_only_after_successful_checksum() 
             engine.execute(_book_command())
             await _wait_until(lambda: len(fake.sent) == 2)
             await fake.queue.put(_subscription())
-            for frame in CAPTURE[:-1]:
-                await fake.queue.put(frame)
-            await asyncio.sleep(0.01)
-            assert cache.quote_tick(INSTRUMENT_ID) is None
-            pending = cache.order_book(INSTRUMENT_ID)
-            assert pending is not None
-            assert pending.bids() == []
-            assert pending.asks() == []
-            await fake.queue.put(CAPTURE[-1])
+            await fake.queue.put(CAPTURE[0])
             await _wait_until(lambda: cache.quote_tick(INSTRUMENT_ID) is not None)
+            assert client.book_is_actionable
             quote = cache.quote_tick(INSTRUMENT_ID)
             assert isinstance(quote, QuoteTick)
             assert str(quote.bid_price) == "4455.2"
@@ -594,6 +963,20 @@ def test_client_publishes_bbo_and_native_depth_only_after_successful_checksum() 
             assert str(quote.ask_size) == "0.17296923"
             book = cache.order_book(INSTRUMENT_ID)
             assert book is not None
+            assert book.book_type == BookType.L2_MBP
+            assert len(book.bids()) == len(book.asks()) == 25
+
+            for frame in CAPTURE[1:-1]:
+                await fake.queue.put(frame)
+            await _wait_until(lambda: not client.book_is_actionable)
+            await fake.queue.put(CAPTURE[-1])
+            await _wait_until(lambda: client.book_is_actionable)
+            quote = cache.quote_tick(INSTRUMENT_ID)
+            assert isinstance(quote, QuoteTick)
+            assert str(quote.bid_price) == "4455.2"
+            assert str(quote.bid_size) == "0.11766725"
+            assert str(quote.ask_price) == "4456.0"
+            assert str(quote.ask_size) == "0.17296923"
             assert book.book_type == BookType.L2_MBP
             assert len(book.bids()) == len(book.asks()) == 25
             assert str(book.best_bid_price()) == "4455.2"
@@ -635,7 +1018,7 @@ def test_quote_tick_rejects_instrument_precision_loss(
     asyncio.run(scenario())
 
 
-def test_reader_checksum_failure_disconnects_and_publishes_nothing() -> None:
+def test_reader_checksum_failure_disconnects_after_atomic_snapshot() -> None:
     async def scenario() -> None:
         fake = _FakeTransport()
         client = _client(fake)

@@ -27,6 +27,7 @@ JOURNAL_NAMESPACE_PREFIX = "PY000_MT5_V1_"
 
 OPS = frozenset(
     {
+        "close_position",
         "hello",
         "get_snapshot",
         "submit_market_delta",
@@ -474,6 +475,18 @@ class SubmitMarketDeltaRequest:
 
 
 @dataclass(frozen=True, slots=True)
+class ClosePositionRequest:
+    request_id: str
+    binding: Binding
+    client_request_id: str
+    side: Literal["buy", "sell"]
+    quantity_lots: str
+    position_ticket: str
+    position_identifier: str
+    op: Literal["close_position"] = "close_position"
+
+
+@dataclass(frozen=True, slots=True)
 class ExecutionEventsRequest:
     request_id: str
     binding: Binding
@@ -482,14 +495,24 @@ class ExecutionEventsRequest:
     op: Literal["get_execution_events"] = "get_execution_events"
 
 
-type Request = HelloRequest | SnapshotRequest | SubmitMarketDeltaRequest | ExecutionEventsRequest
+type Request = (
+    HelloRequest
+    | SnapshotRequest
+    | SubmitMarketDeltaRequest
+    | ClosePositionRequest
+    | ExecutionEventsRequest
+)
 
 
 def validate_request(request: object) -> Request:
     """Validate one constructed request and normalize all failures to WireError."""
     if not isinstance(
         request,
-        HelloRequest | SnapshotRequest | SubmitMarketDeltaRequest | ExecutionEventsRequest,
+        HelloRequest
+        | SnapshotRequest
+        | SubmitMarketDeltaRequest
+        | ClosePositionRequest
+        | ExecutionEventsRequest,
     ):
         raise WireError("SCHEMA_MISMATCH", "request has an unsupported dataclass type")
     validated_identifier(request.request_id, "request.request_id", max_length=64)
@@ -497,6 +520,7 @@ def validate_request(request: object) -> Request:
         HelloRequest: "hello",
         SnapshotRequest: "get_snapshot",
         SubmitMarketDeltaRequest: "submit_market_delta",
+        ClosePositionRequest: "close_position",
         ExecutionEventsRequest: "get_execution_events",
     }.get(type(request))
     if expected_op is None or type(request.op) is not str or request.op != expected_op:
@@ -506,11 +530,18 @@ def validate_request(request: object) -> Request:
     if type(request.binding) is not Binding:
         raise WireError("SCHEMA_MISMATCH", "request binding has an invalid type")
     Binding.from_wire(request.binding.to_wire())
-    if isinstance(request, SubmitMarketDeltaRequest):
+    if isinstance(request, SubmitMarketDeltaRequest | ClosePositionRequest):
         validated_safe_token(request.client_request_id, "request.client_request_id")
         if type(request.side) is not str or request.side not in {"buy", "sell"}:
             raise WireError("SCHEMA_MISMATCH", "request side must be buy or sell")
         decimal_string(request.quantity_lots, "request.quantity_lots", positive=True)
+        if isinstance(request, ClosePositionRequest):
+            uint64_string(request.position_ticket, "request.position_ticket", positive=True)
+            uint64_string(
+                request.position_identifier,
+                "request.position_identifier",
+                positive=True,
+            )
     elif isinstance(request, ExecutionEventsRequest):
         uint64_string(request.after_cursor, "request.after_cursor")
         exact_int(request.limit, "request.limit", minimum=1, maximum=MAX_EVENTS_LIMIT)
@@ -528,7 +559,7 @@ def request_to_wire(request: Request) -> JsonObject:
     if isinstance(request, HelloRequest):
         return value
     value["binding"] = request.binding.to_wire()
-    if isinstance(request, SubmitMarketDeltaRequest):
+    if isinstance(request, SubmitMarketDeltaRequest | ClosePositionRequest):
         value.update(
             {
                 "client_request_id": request.client_request_id,
@@ -536,6 +567,13 @@ def request_to_wire(request: Request) -> JsonObject:
                 "side": request.side,
             }
         )
+        if isinstance(request, ClosePositionRequest):
+            value.update(
+                {
+                    "position_identifier": request.position_identifier,
+                    "position_ticket": request.position_ticket,
+                }
+            )
     elif isinstance(request, ExecutionEventsRequest):
         value.update({"after_cursor": request.after_cursor, "limit": request.limit})
     return value
@@ -633,6 +671,7 @@ def _validate_symbol_spec(value: object) -> None:
                 "symbol",
                 "swap_long",
                 "swap_mode",
+                "swap_rates",
                 "swap_short",
                 "tick_size",
                 "tick_value",
@@ -671,6 +710,19 @@ def _validate_symbol_spec(value: object) -> None:
             f"snapshot.symbol_spec.{field}",
             max_length=16,
         )
+    swap_rates = data["swap_rates"]
+    if not isinstance(swap_rates, list) or len(swap_rates) != 7:
+        raise WireError(
+            "SCHEMA_MISMATCH",
+            "snapshot.symbol_spec.swap_rates must be a seven-item array",
+        )
+    for index, value in enumerate(swap_rates):
+        rate = decimal_string(value, f"snapshot.symbol_spec.swap_rates[{index}]")
+        if Decimal(rate) not in {Decimal(0), Decimal(1), Decimal(3)}:
+            raise WireError(
+                "SCHEMA_MISMATCH",
+                f"snapshot.symbol_spec.swap_rates[{index}] must be 0, 1, or 3",
+            )
     exact_int(data["digits"], "snapshot.symbol_spec.digits", minimum=0, maximum=16)
     for field in (
         "expiration_mode",
@@ -687,6 +739,24 @@ def _validate_symbol_spec(value: object) -> None:
             f"snapshot.symbol_spec.{field}",
             minimum=0,
             maximum=2**31 - 1,
+        )
+
+
+def _validate_execution_limits(value: object) -> None:
+    data = closed_object(
+        value,
+        "snapshot.execution_limits",
+        frozenset({"max_order_lots"}),
+    )
+    max_order_lots = decimal_string(
+        data["max_order_lots"],
+        "snapshot.execution_limits.max_order_lots",
+        positive=True,
+    )
+    if "." in max_order_lots and len(max_order_lots.rsplit(".", maxsplit=1)[1]) > 8:
+        raise WireError(
+            "SCHEMA_MISMATCH",
+            "snapshot.execution_limits.max_order_lots exceeds 8 decimal places",
         )
 
 
@@ -826,6 +896,7 @@ def _validate_snapshot_data(value: object) -> None:
                 "account",
                 "authority_flags",
                 "execution_enabled",
+                "execution_limits",
                 "identity",
                 "positions",
                 "recovery_state",
@@ -842,6 +913,7 @@ def _validate_snapshot_data(value: object) -> None:
             "SCHEMA_MISMATCH",
             "snapshot execution_enabled differs from identity",
         )
+    _validate_execution_limits(data["execution_limits"])
     _validated_recovery_state(data["recovery_state"], "snapshot.recovery_state")
     _validate_time_provenance(data["time"], identity)
     _validate_authority_flags(data["authority_flags"])
@@ -873,12 +945,22 @@ def _validate_submission_payload(
     event_type: str,
 ) -> JsonObject:
     base = frozenset({"client_request_id", "side", "quantity_lots"})
+    close_target = frozenset({"position_identifier", "position_ticket"})
+    if not isinstance(value, dict):
+        raise WireError("SCHEMA_MISMATCH", f"{event_type} payload must be an object")
+    supplied_target = close_target & value.keys()
+    if supplied_target and supplied_target != close_target:
+        raise WireError(
+            "SCHEMA_MISMATCH",
+            f"{event_type} payload must carry both close target fields",
+        )
+    target_keys = close_target if supplied_target else frozenset()
     if event_type == "submission_reserved":
-        keys = base
+        keys = base | target_keys
     elif event_type in {"order_rejected", "order_unknown"}:
-        keys = base | {"reason", "broker_retcode"}
+        keys = base | target_keys | {"reason", "broker_retcode"}
     else:
-        keys = base | {
+        keys = base | target_keys | {
             "broker_retcode",
             "commission",
             "fill_price",
@@ -892,6 +974,17 @@ def _validate_submission_payload(
     if type(payload["side"]) is not str or payload["side"] not in {"buy", "sell"}:
         raise WireError("SCHEMA_MISMATCH", "event.payload.side must be buy or sell")
     decimal_string(payload["quantity_lots"], "event.payload.quantity_lots", positive=True)
+    if target_keys:
+        uint64_string(
+            payload["position_identifier"],
+            "event.payload.position_identifier",
+            positive=True,
+        )
+        uint64_string(
+            payload["position_ticket"],
+            "event.payload.position_ticket",
+            positive=True,
+        )
     if event_type in {"order_rejected", "order_unknown"}:
         validated_safe_token(payload["reason"], "event.payload.reason")
         uint64_string(payload["broker_retcode"], "event.payload.broker_retcode")
@@ -906,6 +999,11 @@ def _validate_submission_payload(
         for field in ("venue_order_id", "venue_deal_id", "venue_position_id"):
             uint64_string(payload[field], f"event.payload.{field}", positive=True)
         uint64_string(payload["broker_retcode"], "event.payload.broker_retcode")
+        if target_keys and payload["venue_position_id"] != payload["position_identifier"]:
+            raise WireError(
+                "SCHEMA_MISMATCH",
+                "close fill venue_position_id differs from position_identifier",
+            )
     return payload
 
 
@@ -1077,7 +1175,7 @@ def decode_response_for(request: Request, raw: str | bytes) -> JsonObject:
     identity = Identity.from_wire(data["identity"])
     if identity.binding() != request.binding:
         raise WireError("BINDING_MISMATCH", "response identity differs from request binding")
-    if isinstance(request, SubmitMarketDeltaRequest):
+    if isinstance(request, SubmitMarketDeltaRequest | ClosePositionRequest):
         outcome = cast(JsonObject, data["outcome"])
         payload = cast(JsonObject, outcome["payload"])
         expected = {
@@ -1085,6 +1183,25 @@ def decode_response_for(request: Request, raw: str | bytes) -> JsonObject:
             "quantity_lots": request.quantity_lots,
             "side": request.side,
         }
+        if isinstance(request, ClosePositionRequest):
+            if "position_identifier" not in payload or "position_ticket" not in payload:
+                raise WireError("BINDING_MISMATCH", "close outcome omits its target position")
+            if (
+                outcome["event_type"] == "order_filled"
+                and payload["venue_position_id"] != request.position_identifier
+            ):
+                raise WireError(
+                    "BINDING_MISMATCH",
+                    "close fill differs from its target position",
+                )
+            expected.update(
+                {
+                    "position_identifier": request.position_identifier,
+                    "position_ticket": request.position_ticket,
+                }
+            )
+        elif "position_identifier" in payload or "position_ticket" in payload:
+            raise WireError("BINDING_MISMATCH", "market delta outcome contains a close target")
         if any(payload[field] != value for field, value in expected.items()):
             raise WireError("BINDING_MISMATCH", "submit outcome differs from request")
     elif isinstance(request, ExecutionEventsRequest):

@@ -13,15 +13,23 @@ from nautilus_trader.common.enums import LogColor
 from nautilus_trader.common.providers import InstrumentProvider
 from nautilus_trader.config import LiveDataClientConfig
 from nautilus_trader.data.messages import (
+    SubscribeFundingRates,
     SubscribeOrderBook,
     SubscribeQuoteTicks,
+    UnsubscribeFundingRates,
     UnsubscribeOrderBook,
     UnsubscribeQuoteTicks,
 )
 from nautilus_trader.live.data_client import LiveDataClient, LiveMarketDataClient
 from nautilus_trader.live.factories import LiveDataClientFactory
 from nautilus_trader.model.currencies import USDT
-from nautilus_trader.model.data import BookOrder, OrderBookDelta, OrderBookDeltas, QuoteTick
+from nautilus_trader.model.data import (
+    BookOrder,
+    FundingRateUpdate,
+    OrderBookDelta,
+    OrderBookDeltas,
+    QuoteTick,
+)
 from nautilus_trader.model.enums import BookAction, BookType, OrderSide, RecordFlag
 from nautilus_trader.model.identifiers import ClientId, InstrumentId, Symbol, Venue
 from nautilus_trader.model.instruments import CryptoPerpetual
@@ -36,6 +44,9 @@ PAPER_RAW_SYMBOL = "tTESTXAUTF0:TESTUSDTF0"
 SUPPORTED_RAW_SYMBOLS = frozenset({RAW_SYMBOL, PAPER_RAW_SYMBOL})
 _CHECKSUM_FLAG = 131_072
 _BOOK_SUB_ID = "py000-xaut-book-v1"
+_DERIV_STATUS_TIMESTAMP_INDEX = 0
+_DERIV_STATUS_FUNDING_INDEX = 8
+_DERIV_STATUS_MIN_SIZE = _DERIV_STATUS_FUNDING_INDEX + 1
 
 
 def _subscription(raw_symbol: str) -> dict[str, object]:
@@ -47,6 +58,14 @@ def _subscription(raw_symbol: str) -> dict[str, object]:
         "freq": "F0",
         "len": "25",
         "subId": _BOOK_SUB_ID,
+    }
+
+
+def _funding_subscription(raw_symbol: str) -> dict[str, object]:
+    return {
+        "event": "subscribe",
+        "channel": "status",
+        "key": f"deriv:{raw_symbol}",
     }
 
 
@@ -83,13 +102,17 @@ class BitfinexP0Book:
         self._bids: dict[Decimal, Decimal] = {}
         self._asks: dict[Decimal, Decimal] = {}
         self._has_snapshot = False
-        self._verified = False
+        self._actionable = False
+
+    @property
+    def is_actionable(self) -> bool:
+        return self._actionable
 
     def clear(self) -> None:
         self._bids.clear()
         self._asks.clear()
         self._has_snapshot = False
-        self._verified = False
+        self._actionable = False
 
     def apply_snapshot(self, value: list[object]) -> None:
         if len(value) != 50:
@@ -105,7 +128,9 @@ class BitfinexP0Book:
             raise BitfinexV1DataError("Bitfinex snapshot must contain 25 levels per side")
         self._bids, self._asks = bids, asks
         self._has_snapshot = True
-        self._verified = False
+        # The venue delivers the initial book atomically in one WebSocket frame.
+        # Any state derived from later deltas still requires the following CRC.
+        self._actionable = True
 
     def apply_delta(self, value: list[object]) -> None:
         if not self._has_snapshot:
@@ -118,7 +143,7 @@ class BitfinexP0Book:
             self._bids.pop(price, None)
             self._asks.pop(price, None)
             (self._bids if amount > 0 else self._asks)[price] = amount
-        self._verified = False
+        self._actionable = False
 
     def verify(self, venue_checksum: int) -> bool:
         if not self._has_snapshot or len(self._bids) < 25 or len(self._asks) < 25:
@@ -129,8 +154,8 @@ class BitfinexP0Book:
         for (bid_price, bid_amount), (ask_price, ask_amount) in zip(bids, asks, strict=True):
             values.extend((bid_price, bid_amount, ask_price, ask_amount))
         payload = ":".join(_crc_token(value) for value in values).encode("utf-8")
-        self._verified = zlib.crc32(payload) == (venue_checksum & 0xFFFF_FFFF)
-        return self._verified
+        self._actionable = zlib.crc32(payload) == (venue_checksum & 0xFFFF_FFFF)
+        return self._actionable
 
     def quote(self) -> tuple[Decimal, Decimal, Decimal, Decimal]:
         bids, asks = self.levels()
@@ -144,8 +169,8 @@ class BitfinexP0Book:
         tuple[tuple[Decimal, Decimal], ...],
         tuple[tuple[Decimal, Decimal], ...],
     ]:
-        if not self._verified:
-            raise BitfinexV1DataError("Bitfinex book has not passed its latest CRC")
+        if not self._actionable:
+            raise BitfinexV1DataError("Bitfinex book has no actionable snapshot or latest CRC")
         bids = tuple(sorted(self._bids.items(), reverse=True)[:25])
         asks = tuple((price, abs(size)) for price, size in sorted(self._asks.items())[:25])
         if bids[0][0] >= asks[0][0]:
@@ -202,15 +227,26 @@ class BitfinexV1DataClient(LiveMarketDataClient):
         self._bfx_config = config
         self._instrument = instrument_from_config(config, ts_init=clock.timestamp_ns())
         self._subscription = _subscription(config.raw_symbol)
+        self._funding_subscription = _funding_subscription(config.raw_symbol)
         self._transport = transport or BitfinexV1Transport(
             config.url, open_timeout_ms=config.open_timeout_ms
         )
         self._book = BitfinexP0Book()
+        self._configuration_lock = asyncio.Lock()
+        self._checksum_configured = False
         self._channel_id: int | None = None
         self._pending_unsubscribe_channel_id: int | None = None
+        self._unsubscribe_book_on_ack = False
+        self._book_unsubscribe_task: asyncio.Task[None] | None = None
+        self._funding_channel_id: int | None = None
+        self._pending_funding_unsubscribe_channel_id: int | None = None
+        self._unsubscribe_funding_on_ack = False
+        self._funding_unsubscribe_task: asyncio.Task[None] | None = None
         self._subscription_requested = False
+        self._funding_subscription_requested = False
         self._publish_quotes = False
         self._publish_deltas = False
+        self._publish_funding = False
         self._running = False
         self._reader_task: asyncio.Task[None] | None = None
         self._last_failure: str | None = None
@@ -218,6 +254,10 @@ class BitfinexV1DataClient(LiveMarketDataClient):
     @property
     def last_failure(self) -> str | None:
         return self._last_failure
+
+    @property
+    def book_is_actionable(self) -> bool:
+        return self._book.is_actionable
 
     def connect(self) -> None:
         self.create_task(
@@ -247,12 +287,30 @@ class BitfinexV1DataClient(LiveMarketDataClient):
             self._reader_task.cancel()
             await asyncio.gather(self._reader_task, return_exceptions=True)
         self._reader_task = None
+        deferred = tuple(
+            task
+            for task in (self._book_unsubscribe_task, self._funding_unsubscribe_task)
+            if task is not None and task is not asyncio.current_task()
+        )
+        for task in deferred:
+            task.cancel()
+        if deferred:
+            await asyncio.gather(*deferred, return_exceptions=True)
+        self._book_unsubscribe_task = None
+        self._funding_unsubscribe_task = None
         await self._transport.close()
+        self._checksum_configured = False
         self._channel_id = None
         self._pending_unsubscribe_channel_id = None
+        self._unsubscribe_book_on_ack = False
+        self._funding_channel_id = None
+        self._pending_funding_unsubscribe_channel_id = None
+        self._unsubscribe_funding_on_ack = False
         self._subscription_requested = False
+        self._funding_subscription_requested = False
         self._publish_quotes = False
         self._publish_deltas = False
+        self._publish_funding = False
         self._clear_base_subscriptions()
         self._book.clear()
 
@@ -277,15 +335,60 @@ class BitfinexV1DataClient(LiveMarketDataClient):
         await self._ensure_book_subscription()
 
     async def _ensure_book_subscription(self) -> None:
+        task = self._book_unsubscribe_task
+        if task is not None:
+            try:
+                await task
+            finally:
+                if self._book_unsubscribe_task is task:
+                    self._book_unsubscribe_task = None
         if self._subscription_requested:
+            self._unsubscribe_book_on_ack = False
             return
         self._subscription_requested = True
+        self._unsubscribe_book_on_ack = False
         try:
-            await self._transport.send_json({"event": "conf", "flags": _CHECKSUM_FLAG})
+            await self._ensure_checksum_configured()
             await self._transport.send_json(self._subscription)
         except BaseException as exc:
             await self._fail_closed(exc)
             raise
+
+    async def _subscribe_funding_rates(self, command: SubscribeFundingRates) -> None:
+        try:
+            self._require_instrument(command.instrument_id)
+        except Exception:
+            self._remove_subscription_funding_rates(command.instrument_id)
+            raise
+        self._publish_funding = True
+        await self._ensure_funding_subscription()
+
+    async def _ensure_funding_subscription(self) -> None:
+        task = self._funding_unsubscribe_task
+        if task is not None:
+            try:
+                await task
+            finally:
+                if self._funding_unsubscribe_task is task:
+                    self._funding_unsubscribe_task = None
+        if self._funding_subscription_requested:
+            self._unsubscribe_funding_on_ack = False
+            return
+        self._funding_subscription_requested = True
+        self._unsubscribe_funding_on_ack = False
+        try:
+            await self._ensure_checksum_configured()
+            await self._transport.send_json(self._funding_subscription)
+        except BaseException as exc:
+            await self._fail_closed(exc)
+            raise
+
+    async def _ensure_checksum_configured(self) -> None:
+        async with self._configuration_lock:
+            if self._checksum_configured:
+                return
+            await self._transport.send_json({"event": "conf", "flags": _CHECKSUM_FLAG})
+            self._checksum_configured = True
 
     async def _unsubscribe_quote_ticks(self, command: UnsubscribeQuoteTicks) -> None:
         self._require_instrument(command.instrument_id)
@@ -297,22 +400,43 @@ class BitfinexV1DataClient(LiveMarketDataClient):
         self._publish_deltas = False
         await self._unsubscribe_book_if_unused()
 
+    async def _unsubscribe_funding_rates(self, command: UnsubscribeFundingRates) -> None:
+        self._require_instrument(command.instrument_id)
+        self._publish_funding = False
+        if not self._funding_subscription_requested:
+            return
+        channel_id = self._funding_channel_id
+        if channel_id is None:
+            self._unsubscribe_funding_on_ack = True
+            return
+        self._funding_subscription_requested = False
+        self._funding_channel_id = None
+        self._pending_funding_unsubscribe_channel_id = channel_id
+        await self._send_unsubscribe(channel_id)
+
     async def _unsubscribe_book_if_unused(self) -> None:
         if self._publish_quotes or self._publish_deltas:
             return
-        self._subscription_requested = False
         self._book.clear()
+        if not self._subscription_requested:
+            return
         channel_id = self._channel_id
+        if channel_id is None:
+            self._unsubscribe_book_on_ack = True
+            return
+        self._subscription_requested = False
         self._channel_id = None
-        if channel_id is not None:
-            self._pending_unsubscribe_channel_id = channel_id
-            try:
-                await self._transport.send_json(
-                    {"event": "unsubscribe", "chanId": channel_id}
-                )
-            except BaseException as exc:
-                await self._fail_closed(exc)
-                raise
+        self._pending_unsubscribe_channel_id = channel_id
+        await self._send_unsubscribe(channel_id)
+
+    async def _send_unsubscribe(self, channel_id: int) -> None:
+        try:
+            await self._transport.send_json(
+                {"event": "unsubscribe", "chanId": channel_id}
+            )
+        except BaseException as exc:
+            await self._fail_closed(exc)
+            raise
 
     async def _read_loop(self) -> None:
         try:
@@ -328,11 +452,20 @@ class BitfinexV1DataClient(LiveMarketDataClient):
     async def _fail_closed(self, exc: BaseException) -> None:
         self._last_failure = f"{type(exc).__name__}: {exc}"[:300]
         self._running = False
+        self._checksum_configured = False
         self._subscription_requested = False
+        self._funding_subscription_requested = False
         self._publish_quotes = False
         self._publish_deltas = False
+        self._publish_funding = False
         self._channel_id = None
         self._pending_unsubscribe_channel_id = None
+        self._unsubscribe_book_on_ack = False
+        self._book_unsubscribe_task = None
+        self._funding_channel_id = None
+        self._pending_funding_unsubscribe_channel_id = None
+        self._unsubscribe_funding_on_ack = False
+        self._funding_unsubscribe_task = None
         self._clear_base_subscriptions()
         self._book.clear()
         self._set_connected(False)
@@ -341,38 +474,92 @@ class BitfinexV1DataClient(LiveMarketDataClient):
     def _consume_frame(
         self,
         frame: dict[str, object] | list[object],
-    ) -> tuple[QuoteTick | OrderBookDeltas, ...]:
+    ) -> tuple[QuoteTick | OrderBookDeltas | FundingRateUpdate, ...]:
         if isinstance(frame, dict):
             self._consume_control(frame)
             return ()
         if len(frame) not in {2, 3}:
             raise BitfinexV1DataError("Bitfinex channel frame has invalid length")
         channel_id = _integer(frame[0], "channel id")
-        if channel_id == self._pending_unsubscribe_channel_id:
+        if channel_id in {
+            self._pending_unsubscribe_channel_id,
+            self._pending_funding_unsubscribe_channel_id,
+        }:
             return ()
-        if channel_id != self._channel_id:
-            raise BitfinexV1DataError("Bitfinex frame belongs to an unexpected channel")
         payload = frame[1]
         if payload == "hb" and len(frame) == 2:
-            return ()
+            if channel_id in {self._channel_id, self._funding_channel_id}:
+                return ()
+            raise BitfinexV1DataError("Bitfinex frame belongs to an unexpected channel")
+        if channel_id == self._channel_id:
+            return self._consume_book_frame(frame)
+        if channel_id == self._funding_channel_id:
+            return self._consume_funding_frame(frame)
+        raise BitfinexV1DataError(
+            "Bitfinex frame belongs to an unexpected channel "
+            f"{channel_id} (book={self._channel_id}, funding={self._funding_channel_id}, "
+            f"pending_book={self._pending_unsubscribe_channel_id}, "
+            f"pending_funding={self._pending_funding_unsubscribe_channel_id})"
+        )
+
+    def _consume_book_frame(
+        self,
+        frame: list[object],
+    ) -> tuple[QuoteTick | OrderBookDeltas, ...]:
+        payload = frame[1]
         if payload == "cs" and len(frame) == 3:
             checksum = _integer(frame[2], "checksum")
             if not self._book.verify(checksum):
                 raise BitfinexV1DataError("Bitfinex book checksum mismatch")
-            timestamp = self._clock.timestamp_ns()
-            result: list[QuoteTick | OrderBookDeltas] = []
-            if self._publish_quotes:
-                result.append(self._quote_tick(timestamp))
-            if self._publish_deltas:
-                result.append(self._order_book_snapshot(timestamp))
-            return tuple(result)
-        if len(frame) != 2 or not isinstance(payload, list) or not payload:
-            raise BitfinexV1DataError("Bitfinex book frame is malformed")
-        if isinstance(payload[0], list):
-            self._book.apply_snapshot(payload)
         else:
-            self._book.apply_delta(payload)
-        return ()
+            if len(frame) != 2 or not isinstance(payload, list) or not payload:
+                raise BitfinexV1DataError("Bitfinex book frame is malformed")
+            if isinstance(payload[0], list):
+                self._book.apply_snapshot(payload)
+            else:
+                self._book.apply_delta(payload)
+                return ()
+        timestamp = self._clock.timestamp_ns()
+        result: list[QuoteTick | OrderBookDeltas] = []
+        if self._publish_quotes:
+            result.append(self._quote_tick(timestamp))
+        if self._publish_deltas:
+            result.append(self._order_book_snapshot(timestamp))
+        return tuple(result)
+
+    def _consume_funding_frame(
+        self,
+        frame: list[object],
+    ) -> tuple[FundingRateUpdate, ...]:
+        if len(frame) != 2:
+            raise BitfinexV1DataError("Bitfinex derivatives status frame is malformed")
+        payload = frame[1]
+        if not isinstance(payload, list) or len(payload) < _DERIV_STATUS_MIN_SIZE:
+            raise BitfinexV1DataError(
+                "Bitfinex derivatives status does not contain its funding field"
+            )
+        timestamp_ms = _integer(
+            payload[_DERIV_STATUS_TIMESTAMP_INDEX],
+            "derivatives status timestamp",
+        )
+        if not 0 < timestamp_ms <= (2**64 - 1) // 1_000_000:
+            raise BitfinexV1DataError("Bitfinex derivatives status timestamp is invalid")
+        rate = _decimal(
+            payload[_DERIV_STATUS_FUNDING_INDEX],
+            "next funding accrued",
+        )
+        if abs(rate) > 1:
+            raise BitfinexV1DataError("Bitfinex next funding accrued is outside [-1, 1]")
+        if not self._publish_funding:
+            return ()
+        return (
+            FundingRateUpdate(
+                instrument_id=self._instrument.id,
+                rate=rate,
+                ts_event=timestamp_ms * 1_000_000,
+                ts_init=self._clock.timestamp_ns(),
+            ),
+        )
 
     def _consume_control(self, frame: dict[str, object]) -> None:
         event = frame.get("event")
@@ -386,37 +573,94 @@ class BitfinexV1DataClient(LiveMarketDataClient):
         if event == "conf" and frame.get("status") == "OK":
             return
         if event == "subscribed":
-            if not self._subscription_requested:
-                raise BitfinexV1DataError("unsolicited Bitfinex subscription")
-            if self._channel_id is not None:
-                raise BitfinexV1DataError("Bitfinex repeated the book subscription")
-            for key, expected in self._subscription.items():
-                if key == "event":
-                    continue
-                if frame.get(key) != expected:
-                    label = "book" if key in {"channel", "symbol"} else key
-                    raise BitfinexV1DataError(f"Bitfinex subscribed with wrong {label}")
-            channel_id = _integer(frame.get("chanId"), "subscription channel id")
-            if channel_id <= 0:
-                raise BitfinexV1DataError("Bitfinex subscription channel must be positive")
-            if channel_id == self._pending_unsubscribe_channel_id:
-                raise BitfinexV1DataError("Bitfinex reused a channel before unsubscribe completed")
-            self._channel_id = channel_id
-            self._book.clear()
+            self._consume_subscribed(frame)
             return
         if event == "unsubscribed":
-            channel_id = _integer(frame.get("chanId"), "unsubscribe channel id")
-            if channel_id == self._pending_unsubscribe_channel_id:
-                self._pending_unsubscribe_channel_id = None
-                return
-            if channel_id != self._channel_id:
-                raise BitfinexV1DataError("Bitfinex unsubscribed the wrong channel")
+            self._consume_unsubscribed(frame)
+            return
+        raise BitfinexV1DataError(f"unsupported Bitfinex control event {event!r}")
+
+    def _consume_subscribed(self, frame: dict[str, object]) -> None:
+        channel = frame.get("channel")
+        if channel == "book":
+            requested = self._subscription
+            if not self._subscription_requested:
+                raise BitfinexV1DataError("unsolicited Bitfinex book subscription")
+            if self._channel_id is not None:
+                raise BitfinexV1DataError("Bitfinex repeated the book subscription")
+        elif channel == "status":
+            requested = self._funding_subscription
+            if not self._funding_subscription_requested:
+                raise BitfinexV1DataError("unsolicited Bitfinex funding subscription")
+            if self._funding_channel_id is not None:
+                raise BitfinexV1DataError("Bitfinex repeated the funding subscription")
+        else:
+            raise BitfinexV1DataError("Bitfinex subscribed an unsupported channel")
+
+        for key, expected in requested.items():
+            if key == "event":
+                continue
+            if frame.get(key) != expected:
+                label = "book" if key in {"channel", "symbol"} else key
+                raise BitfinexV1DataError(f"Bitfinex subscribed with wrong {label}")
+        channel_id = _integer(frame.get("chanId"), "subscription channel id")
+        if channel_id <= 0:
+            raise BitfinexV1DataError("Bitfinex subscription channel must be positive")
+        occupied = {
+            self._channel_id,
+            self._pending_unsubscribe_channel_id,
+            self._funding_channel_id,
+            self._pending_funding_unsubscribe_channel_id,
+        }
+        if channel_id in occupied:
+            raise BitfinexV1DataError("Bitfinex reused an active or pending channel")
+
+        if channel == "book":
+            self._channel_id = channel_id
+            self._book.clear()
+            if self._unsubscribe_book_on_ack:
+                self._unsubscribe_book_on_ack = False
+                self._subscription_requested = False
+                self._channel_id = None
+                self._pending_unsubscribe_channel_id = channel_id
+                self._book_unsubscribe_task = self.create_task(
+                    self._send_unsubscribe(channel_id),
+                    log_msg="bitfinex-v1-book-unsubscribe",
+                )
+        else:
+            self._funding_channel_id = channel_id
+            if self._unsubscribe_funding_on_ack:
+                self._unsubscribe_funding_on_ack = False
+                self._funding_subscription_requested = False
+                self._funding_channel_id = None
+                self._pending_funding_unsubscribe_channel_id = channel_id
+                self._funding_unsubscribe_task = self.create_task(
+                    self._send_unsubscribe(channel_id),
+                    log_msg="bitfinex-v1-funding-unsubscribe",
+                )
+
+    def _consume_unsubscribed(self, frame: dict[str, object]) -> None:
+        if frame.get("status") != "OK":
+            raise BitfinexV1DataError("Bitfinex unsubscribe was not acknowledged")
+        channel_id = _integer(frame.get("chanId"), "unsubscribe channel id")
+        if channel_id == self._pending_unsubscribe_channel_id:
+            self._pending_unsubscribe_channel_id = None
+            return
+        if channel_id == self._pending_funding_unsubscribe_channel_id:
+            self._pending_funding_unsubscribe_channel_id = None
+            return
+        if channel_id == self._channel_id:
             if self._subscription_requested or self._publish_quotes or self._publish_deltas:
                 raise BitfinexV1DataError("Bitfinex unexpectedly ended the book subscription")
             self._channel_id = None
             self._book.clear()
             return
-        raise BitfinexV1DataError(f"unsupported Bitfinex control event {event!r}")
+        if channel_id == self._funding_channel_id:
+            if self._funding_subscription_requested or self._publish_funding:
+                raise BitfinexV1DataError("Bitfinex unexpectedly ended the funding subscription")
+            self._funding_channel_id = None
+            return
+        raise BitfinexV1DataError("Bitfinex unsubscribed the wrong channel")
 
     def _quote_tick(self, timestamp: int | None = None) -> QuoteTick:
         bid, bid_size, ask, ask_size = self._book.quote()
@@ -487,6 +731,7 @@ class BitfinexV1DataClient(LiveMarketDataClient):
     def _clear_base_subscriptions(self) -> None:
         self._remove_subscription_quote_ticks(self._instrument.id)
         self._remove_subscription_order_book_deltas(self._instrument.id)
+        self._remove_subscription_funding_rates(self._instrument.id)
 
     def _require_instrument(self, instrument_id: InstrumentId) -> None:
         if instrument_id != self._instrument.id:

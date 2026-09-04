@@ -158,7 +158,7 @@ def _trade_frame(cid: int, *, trade_id: int, order_price: str) -> list[object]:
             Decimal(order_price),
             1,
             Decimal("-0.10"),
-            "USTF0",
+            "USD",
             cid,
         ],
     ]
