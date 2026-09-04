@@ -279,7 +279,11 @@ class MakerStrategy(Strategy):
             self._request_source_terminal_query(direction, event)
 
     def on_order_expired(self, event: OrderExpired) -> None:
-        self._finish_or_reject(event.client_order_id.value, "EXPIRED")
+        client_order_id = event.client_order_id.value
+        direction = self._direction_for_source_order(client_order_id)
+        self._finish_or_reject(client_order_id, "EXPIRED")
+        if direction is not None:
+            self._request_source_terminal_query(direction, event)
 
     def on_order_modify_rejected(self, event: OrderModifyRejected) -> None:
         self._mark_source_unknown(event.client_order_id.value, "maker modify rejected")
@@ -858,7 +862,7 @@ class MakerStrategy(Strategy):
     def _request_source_terminal_query(
         self,
         direction: SourceDirection,
-        event: OrderCanceled,
+        event: OrderCanceled | OrderExpired,
     ) -> None:
         query = self._source_terminal_query
         client_order_id = event.client_order_id.value
@@ -891,7 +895,7 @@ class MakerStrategy(Strategy):
     def _complete_source_terminal_query(
         self,
         direction: SourceDirection,
-        event: OrderCanceled,
+        event: OrderCanceled | OrderExpired,
         report: OrderStatusReport | None,
     ) -> None:
         client_order_id = event.client_order_id.value
@@ -918,7 +922,7 @@ class MakerStrategy(Strategy):
     def _source_cancel_report_is_exact(
         self,
         direction: SourceDirection,
-        event: OrderCanceled,
+        event: OrderCanceled | OrderExpired,
         report: OrderStatusReport,
     ) -> bool:
         client_order_id = event.client_order_id
@@ -955,8 +959,22 @@ class MakerStrategy(Strategy):
                 and report_avg is not None
                 and isclose(float(order_avg), float(report_avg))
             )
+        terminal_name, terminal_status = (
+            ("CANCELED", OrderStatus.CANCELED)
+            if isinstance(event, OrderCanceled)
+            else ("EXPIRED", OrderStatus.EXPIRED)
+        )
+        order_shape_is_exact = (
+            order.time_in_force == TimeInForce.GTC
+            and cast(bool, order.is_post_only)
+            and not cast(bool, order.is_reduce_only)
+        ) or (
+            order.time_in_force == TimeInForce.IOC
+            and not cast(bool, order.is_post_only)
+            and cast(bool, order.is_reduce_only)
+        )
         return (
-            record.status == "CANCELED"
+            record.status == terminal_name
             and record.source_client_id == expected_client_id
             and event.instrument_id == self._config.source_instrument_id
             and event.account_id == source_route.account_id
@@ -968,20 +986,19 @@ class MakerStrategy(Strategy):
             and order.client_order_id == client_order_id
             and report.venue_order_id == venue_order_id
             and order.venue_order_id == venue_order_id
-            and report.order_status == OrderStatus.CANCELED
-            and order.status == OrderStatus.CANCELED
+            and report.order_status == terminal_status
+            and order.status == terminal_status
             and order.is_closed
             and report.order_side == expected_side
             and order.side == expected_side
             and report.order_type == OrderType.LIMIT
             and order.order_type == OrderType.LIMIT
-            and report.time_in_force == TimeInForce.GTC
-            and order.time_in_force == TimeInForce.GTC
+            and report.time_in_force == order.time_in_force
             # This closes exposure; it does not prove venue-enforced post-only.
             # Bitfinex paper omits that flag from otherwise exact terminal rows.
-            and cast(bool, order.is_post_only)
-            and not report.reduce_only
-            and not cast(bool, order.is_reduce_only)
+            and order_shape_is_exact
+            and (cast(bool, order.is_post_only) or not report.post_only)
+            and report.reduce_only == cast(bool, order.is_reduce_only)
             and report.quantity.as_decimal() == record.quantity_ounces
             and order.quantity.as_decimal() == record.quantity_ounces
             and report.filled_qty.as_decimal() == record.filled_ounces

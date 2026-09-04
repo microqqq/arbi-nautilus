@@ -11,6 +11,7 @@ from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from decimal import ROUND_FLOOR, Decimal
+from functools import partial
 from pathlib import Path
 from typing import Literal, TextIO, cast
 
@@ -19,8 +20,9 @@ from nautilus_trader.common.config import NautilusConfig
 from nautilus_trader.execution.reports import OrderStatusReport
 from nautilus_trader.live.node import TradingNode
 from nautilus_trader.model.data import QuoteTick
+from nautilus_trader.model.enums import OrderSide, OrderType, TimeInForce
 from nautilus_trader.model.events import OrderAccepted, OrderCanceled, OrderFilled
-from nautilus_trader.model.identifiers import ClientOrderId, VenueOrderId
+from nautilus_trader.model.identifiers import AccountId, ClientId, ClientOrderId, VenueOrderId
 from nautilus_trader.model.orders import Order
 
 from py000_nautilus.bitfinex_v1_cids import BitfinexV1CidStore
@@ -41,16 +43,26 @@ from py000_nautilus.bitfinex_v1_paper_canary import (
 from py000_nautilus.bitfinex_v1_rest import BitfinexV1RestClient
 from py000_nautilus.config import MakerStrategyConfig
 from py000_nautilus.economics import expected_leverage
+from py000_nautilus.hedge import HedgePlanningError, plan_hedge_delta
 from py000_nautilus.live_maker import BITFINEX_CLIENT_ID, build_live_maker_node
 from py000_nautilus.live_taker_entry import _dispose_node, load_bitfinex_test_credentials
-from py000_nautilus.models import BookTop, MakerQuote, SourceDirection
+from py000_nautilus.models import (
+    BookTop,
+    BusinessOrderSide,
+    HedgeIntent,
+    MakerQuote,
+    ObligationStatus,
+    SourceDirection,
+)
 from py000_nautilus.mt5_v1_data import Mt5V1DataClientConfig
 from py000_nautilus.mt5_v1_execution import Mt5V1ExecClientConfig
 from py000_nautilus.strategies.maker import MakerStrategy, SourceTerminalQuery
 
 D = Decimal
 QUANTITY = D(2)
-type Outcome = Literal["VALIDATED", "PASSED", "HOLD", "FAILED", "UNKNOWN", "FILLED_HOLD"]
+type Outcome = Literal[
+    "VALIDATED", "PASSED", "PASSED_FLAT", "HOLD", "FAILED", "UNKNOWN", "FILLED_HOLD"
+]
 
 
 class LiveMakerCanaryProfile(NautilusConfig, frozen=True):
@@ -287,6 +299,213 @@ class MakerCanaryStrategy(MakerStrategy):
         pass
 
 
+class MakerRoundtripStrategy(MakerStrategy):
+    """One selected Maker fill and one IOC flatten using normal Maker custody."""
+
+    def __init__(
+        self,
+        config: MakerStrategyConfig,
+        *,
+        direction: SourceDirection,
+        live_submission_ready: Callable[[], bool],
+        hedge_quantity_ready: Callable[[Decimal], bool],
+        live_costs_from_adapters: bool,
+        source_terminal_query: SourceTerminalQuery,
+    ) -> None:
+        super().__init__(
+            config,
+            live_submission_ready=live_submission_ready,
+            hedge_quantity_ready=hedge_quantity_ready,
+            live_costs_from_adapters=live_costs_from_adapters,
+            source_terminal_query=source_terminal_query,
+        )
+        self.direction = direction
+        self.close_direction = (
+            SourceDirection.SHORT if direction is SourceDirection.LONG else SourceDirection.LONG
+        )
+        self.armed = False
+        self.claimed = False
+        self._triggered = False
+
+    @property
+    def source_order_id(self) -> str | None:
+        records = self._stores[self.direction].source_orders()
+        return records[0].client_order_id if len(records) == 1 else None
+
+    def arm(self) -> None:
+        if self.armed or self.claimed or self._triggered:
+            raise PaperCanaryError("Maker roundtrip can be armed only once")
+        self.armed = True
+
+    def trigger_cached_once(self) -> bool:
+        if not self.armed or self.claimed or self._triggered:
+            raise PaperCanaryError("Maker roundtrip cached trigger is not armed")
+        self._triggered = True
+        try:
+            tick = self.cache.quote_tick(self._config.source_instrument_id)
+            if tick is None:
+                raise PaperCanaryError("Maker roundtrip source quote is unavailable")
+            self.on_quote_tick(tick)
+        finally:
+            self.armed = False
+        return self.claimed
+
+    def _near_touch_price(self, book: BookTop) -> Decimal:
+        increment = self._required_source_instrument().price_increment.as_decimal()
+        if increment <= 0 or book.bid <= 0 or book.ask <= book.bid:
+            raise PaperCanaryError("Maker roundtrip source book is invalid")
+        price = (
+            book.ask - increment if self.direction is SourceDirection.LONG else book.bid + increment
+        )
+        if price <= 0 or not (
+            price < book.ask if self.direction is SourceDirection.LONG else price > book.bid
+        ):
+            raise PaperCanaryError("Maker roundtrip cannot form a passive price")
+        return cast(Decimal, price)
+
+    def on_quote_tick(self, tick: QuoteTick) -> None:
+        if not self.claimed:
+            if self.armed:
+                MakerStrategy.on_quote_tick(self, tick)
+        elif tick.instrument_id == self._config.hedge_instrument_id:
+            MakerStrategy._submit_next_pending_hedge(self)
+
+    def _passive_quote(self, quote: MakerQuote | None, book: BookTop) -> MakerQuote | None:
+        if quote is None or quote.direction is not self.direction:
+            return None
+        return replace(quote, source_price_usdt=self._near_touch_price(book))
+
+    def _submit_source(self, quote: MakerQuote) -> None:
+        if self.claimed or not self.armed or quote.direction is not self.direction:
+            return
+        if quote.quantity_ounces != QUANTITY:
+            raise PaperCanaryError("Maker roundtrip source quantity changed")
+        try:
+            MakerStrategy._submit_source(self, quote)
+        finally:
+            self.claimed = self.source_order_id is not None
+
+    def submit_flatten_once(self) -> bool:
+        store = self._stores[self.close_direction]
+        if store.source_orders():
+            return False
+        source_route, hedge_route = self._config.source_accounts[0], self._config.hedge_accounts[0]
+        source = self._source_account(source_route.account_id)
+        hedge = self._hedge_account(hedge_route.account_id)
+        expected = QUANTITY if self.direction is SourceDirection.LONG else -QUANTITY
+        tick = self.cache.quote_tick(self._config.source_instrument_id)
+        if (
+            source.position_ounces != expected
+            or hedge.position_ounces != -expected
+            or tick is None
+            or not self._quote_is_fresh(tick)
+        ):
+            return False
+        top_size = (
+            tick.bid_size.as_decimal()
+            if self.close_direction is SourceDirection.SHORT
+            else tick.ask_size.as_decimal()
+        )
+        if top_size < QUANTITY:
+            return False
+        price = (
+            tick.bid_price.as_decimal()
+            if self.close_direction is SourceDirection.SHORT
+            else tick.ask_price.as_decimal()
+        )
+        quote = MakerQuote(self.close_direction, source, hedge, price, price, QUANTITY, D(), 1)
+        instrument = self._required_source_instrument()
+        quantity = instrument.make_qty(QUANTITY)
+        if not self._source_hedge_is_executable(quote, Decimal(str(quantity))):
+            return False
+        hedge_side = (
+            BusinessOrderSide.SELL
+            if self.close_direction is SourceDirection.LONG
+            else BusinessOrderSide.BUY
+        )
+        try:
+            plan = plan_hedge_delta(
+                self._hedge_positions(hedge_route.account_id), hedge_side, QUANTITY
+            )
+        except (HedgePlanningError, TypeError, ValueError):
+            return False
+        if not plan or any(not leg.is_close for leg in plan):
+            return False
+        side = OrderSide.SELL if self.close_direction is SourceDirection.SHORT else OrderSide.BUY
+        order = self.order_factory.limit(
+            instrument_id=self._config.source_instrument_id,
+            order_side=side,
+            quantity=quantity,
+            price=instrument.make_price(price),
+            time_in_force=TimeInForce.IOC,
+            post_only=False,
+            reduce_only=True,
+            tags=["py000=maker-roundtrip-close"],
+        )
+        store.begin_source(
+            order.client_order_id.value,
+            BusinessOrderSide.SELL if side is OrderSide.SELL else BusinessOrderSide.BUY,
+            Decimal(str(order.quantity)),
+            source_account_id=source_route.account_id.value,
+            source_client_id=source_route.client_id.value if source_route.client_id else None,
+            hedge_account_id=hedge_route.account_id.value,
+            hedge_client_id=hedge_route.client_id.value if hedge_route.client_id else None,
+        )
+        try:
+            self.submit_order(order, client_id=source_route.client_id, params={"leverage": 1})
+        except Exception as exc:
+            store.mark_source_unknown(order.client_order_id.value, type(exc).__name__)
+            raise
+        return True
+
+    def _submit_hedge(
+        self,
+        direction: SourceDirection,
+        hedge_account_id: AccountId,
+        hedge_client_id: ClientId | None,
+        intent: HedgeIntent,
+    ) -> None:
+        if direction is self.close_direction:
+            coordinator = self._hedges[direction]
+            try:
+                coordinator.next_hedge_leg(
+                    intent.intent_id, self._hedge_positions(hedge_account_id)
+                )
+            except HedgePlanningError:
+                return
+            plan = self._stores[direction].intent(intent.intent_id).hedge_plan
+            if any(not leg.is_close for leg in plan):
+                self._stores[direction].block_hedge_intent(
+                    intent.intent_id, "roundtrip close cannot open an MT5 residual"
+                )
+                return
+        MakerStrategy._submit_hedge(
+            self, direction, hedge_account_id, hedge_client_id, intent
+        )
+
+    def phase_exact(self, direction: SourceDirection, *, closing: bool) -> bool:
+        store = self._stores[direction]
+        records = store.source_orders()
+        if len(records) != 1:
+            return False
+        record, intents = records[0], store.intents()
+        expected_side = (
+            BusinessOrderSide.BUY if direction is SourceDirection.LONG else BusinessOrderSide.SELL
+        )
+        return bool(
+            record.side is expected_side
+            and record.quantity_ounces == record.filled_ounces == QUANTITY
+            and record.status == "FILLED"
+            and intents
+            and store.cycle_evidence_complete()
+            and sum((intent.hedge_filled_ounces for intent in intents), D()) == QUANTITY
+            and all(
+                intent.hedge_plan and all(leg.is_close is closing for leg in intent.hedge_plan)
+                for intent in intents
+            )
+        )
+
+
 def parse_maker_canary_profile(raw: bytes | str) -> LiveMakerCanaryProfile:
     profile = cast(LiveMakerCanaryProfile, LiveMakerCanaryProfile.parse(raw))
     validate_maker_canary_profile(profile)
@@ -363,8 +582,18 @@ def run_maker_canary(
     environment: Mapping[str, str] | None = None,
     env_file: Path | None = None,
     node_builder: Callable[..., tuple[TradingNode, MakerStrategy]] = build_live_maker_node,
+    roundtrip_direction: SourceDirection | None = None,
 ) -> MakerCanaryResult:
     validate_maker_canary_profile(profile)
+    if roundtrip_direction is SourceDirection.SHORT:
+        economics = profile.strategy_config.economics
+        profile = struct_replace(
+            profile,
+            strategy_config=struct_replace(
+                profile.strategy_config,
+                economics=struct_replace(economics, bid=economics.ask, ask=economics.bid),
+            ),
+        )
     if (
         isinstance(signal_timeout_seconds, bool)
         or not isinstance(signal_timeout_seconds, int | float)
@@ -377,7 +606,7 @@ def run_maker_canary(
         raise ValueError("Maker canary transcript and state paths must be distinct")
     transcript, loop = _new_transcript(output), asyncio.new_event_loop()
     node: TradingNode | None = None
-    strategy: MakerCanaryStrategy | None = None
+    strategy: MakerCanaryStrategy | MakerRoundtripStrategy | None = None
     rest: BitfinexV1RestClient | None = None
     lock: TextIO | None = None
     evidence_attempted = False
@@ -390,7 +619,7 @@ def run_maker_canary(
             "execute": execute,
             "symbol": PAPER_RAW_SYMBOL,
             "quantity": "2",
-            "direction": "LONG",
+            "direction": (roundtrip_direction or SourceDirection.LONG).name,
             "ts_utc_ns": time.time_ns(),
         },
     )
@@ -417,6 +646,11 @@ def run_maker_canary(
                 raise PaperCanaryError("paper_account_identity_mismatch")
             if first.holds:
                 raise PaperCanaryError(first.holds[0])
+        factory = (
+            partial(MakerRoundtripStrategy, direction=roundtrip_direction)
+            if roundtrip_direction is not None
+            else MakerCanaryStrategy
+        )
         node, built = node_builder(
             bitfinex_data_config=profile.bitfinex_data_config,
             bitfinex_exec_config=struct_replace(
@@ -427,13 +661,25 @@ def run_maker_canary(
             strategy_config=profile.strategy_config,
             loop=loop,
             connection_timeout_seconds=float(profile.connection_timeout_seconds),
-            strategy_factory=MakerCanaryStrategy,
+            strategy_factory=factory,
         )
-        if not isinstance(built, MakerCanaryStrategy):
+        expected_type = MakerRoundtripStrategy if roundtrip_direction else MakerCanaryStrategy
+        if type(built) is not expected_type:
             raise RuntimeError("Maker canary builder returned the wrong strategy")
-        strategy = built
+        strategy = cast(MakerCanaryStrategy | MakerRoundtripStrategy, built)
         if not execute:
-            result = MakerCanaryResult("VALIDATED", "one_long_2oz_maker_built_disarmed", output)
+            reason = (
+                "one_direction_2oz_roundtrip_built_disarmed"
+                if roundtrip_direction
+                else "one_long_2oz_maker_built_disarmed"
+            )
+            result = MakerCanaryResult("VALIDATED", reason, output)
+        elif isinstance(strategy, MakerRoundtripStrategy):
+            result = loop.run_until_complete(
+                _run_roundtrip_lifecycle(
+                    node, strategy, rest, profile, output, transcript, signal_timeout_seconds
+                )
+            )
         else:
             snapshot, reason = loop.run_until_complete(
                 _run_lifecycle(
@@ -495,9 +741,13 @@ def run_maker_canary(
                 loop.close()
         except Exception:
             outcome: Outcome = (
-                "FILLED_HOLD"
-                if result.outcome == "FILLED_HOLD" or (strategy and strategy.filled)
-                else ("UNKNOWN" if strategy and strategy.claimed else "FAILED")
+                "HOLD"
+                if roundtrip_direction
+                else (
+                    "FILLED_HOLD"
+                    if result.outcome == "FILLED_HOLD" or (strategy and strategy.filled)
+                    else ("UNKNOWN" if strategy and strategy.claimed else "FAILED")
+                )
             )
             result = MakerCanaryResult(outcome, "node_cleanup_failed", output, _order_id(strategy))
         if lock is not None:
@@ -514,6 +764,274 @@ def run_maker_canary(
     )
     transcript.close()
     return result
+
+
+async def _run_roundtrip_lifecycle(
+    node: TradingNode,
+    strategy: MakerRoundtripStrategy,
+    rest: BitfinexV1RestClient,
+    profile: LiveMakerCanaryProfile,
+    output: Path,
+    transcript: TextIO,
+    timeout: float,
+) -> MakerCanaryResult:
+    task = asyncio.create_task(node.run_async())
+    connection_timeout = float(profile.connection_timeout_seconds)
+    try:
+        await _wait_ready(node, strategy, task, connection_timeout * 4)
+        before = await asyncio.wait_for(read_snapshot(rest), connection_timeout)
+        _write(transcript, {"kind": "preflight", "phase": 2, **before.record()})
+        if (
+            before.user_id != profile.bitfinex_exec_config.user_id
+            or before.holds
+            or not _runtime_flat(node, strategy)
+        ):
+            return _roundtrip_failure(strategy, output, "pre_arm_runtime_not_flat", True)
+        await _wait_ready(node, strategy, task, connection_timeout * 4)
+        strategy.arm()
+        if not strategy.trigger_cached_once():
+            return _roundtrip_failure(strategy, output, "cached_quote_not_eligible", True)
+        reason = await _wait_roundtrip_phase(strategy, strategy.direction, task, timeout, False)
+        if reason:
+            return _roundtrip_failure(strategy, output, reason, True)
+        reconciled = await asyncio.wait_for(
+            node.kernel.exec_engine.reconcile_execution_state(timeout_secs=connection_timeout),
+            connection_timeout,
+        )
+        source = QUANTITY if strategy.direction is SourceDirection.LONG else -QUANTITY
+        paired = await asyncio.wait_for(read_snapshot(rest), connection_timeout)
+        _write(transcript, {"kind": "paired", **paired.record()})
+        if (
+            not reconciled
+            or not strategy.phase_exact(strategy.direction, closing=False)
+            or not _snapshot_exact(paired, profile, source)
+            or not _runtime_pair_exact(node, strategy, source)
+        ):
+            return _roundtrip_failure(strategy, output, "opening_pair_not_exact", True)
+        await _wait_ready(node, strategy, task, connection_timeout * 4)
+        if not _runtime_pair_exact(node, strategy, source) or not strategy.submit_flatten_once():
+            return _roundtrip_failure(strategy, output, "flatten_not_submitted", True)
+        reason = await _wait_roundtrip_phase(
+            strategy, strategy.close_direction, task, timeout, True
+        )
+        if reason:
+            return _roundtrip_failure(strategy, output, reason, True)
+        reconciled = await asyncio.wait_for(
+            node.kernel.exec_engine.reconcile_execution_state(timeout_secs=connection_timeout),
+            connection_timeout,
+        )
+        final = await asyncio.wait_for(read_snapshot(rest), connection_timeout)
+        _write(transcript, {"kind": "final", **final.record()})
+        await _wait_ready(node, strategy, task, connection_timeout * 4)
+        exact = (
+            reconciled
+            and not task.done()
+            and node.is_running()
+            and _snapshot_exact(final, profile, D())
+            and _runtime_flat(node, strategy)
+            and strategy.phase_exact(strategy.direction, closing=False)
+            and strategy.phase_exact(strategy.close_direction, closing=True)
+            and _roundtrip_orders_exact(node, strategy)
+            and all(store.cycle_evidence_complete() for store in strategy._stores.values())
+            and all(store.can_submit_source() for store in strategy._stores.values())
+            and not strategy._global_obligation_block()
+        )
+        return MakerCanaryResult(
+            "PASSED_FLAT" if exact else "HOLD",
+            "maker_roundtrip_exact_flat" if exact else "final_flat_evidence_not_exact",
+            output,
+            strategy.source_order_id,
+        )
+    finally:
+        strategy.armed = False
+        try:
+            await _cleanup_roundtrip_sources(strategy, task, min(connection_timeout * 2, 12.0))
+        finally:
+            await _shutdown(node, task, connection_timeout)
+
+
+async def _wait_roundtrip_phase(
+    strategy: MakerRoundtripStrategy,
+    direction: SourceDirection,
+    task: asyncio.Task[None],
+    timeout: float,
+    closing: bool,
+) -> str | None:
+    deadline = asyncio.get_running_loop().time() + timeout
+    failed = {ObligationStatus.BLOCKED, ObligationStatus.REJECTED, ObligationStatus.UNKNOWN}
+    while asyncio.get_running_loop().time() < deadline:
+        if task.done():
+            _raise_node_task(task, "Maker node stopped during roundtrip")
+        if strategy.phase_exact(direction, closing=closing):
+            return None
+        records = strategy._stores[direction].source_orders()
+        intents = strategy._stores[direction].intents()
+        if records and (
+            records[0].status in {"UNKNOWN", "DENIED", "REJECTED", "EXPIRED"}
+            or any(intent.status in failed for intent in intents)
+        ):
+            return f"{'closing' if closing else 'opening'}_terminal_failure"
+        if (
+            records
+            and records[0].status == "CANCELED"
+            and strategy._stores[direction].active_source_order_id is None
+        ):
+            return f"{'closing' if closing else 'opening'}_not_fully_filled"
+        await asyncio.sleep(0.01)
+    if not closing:
+        strategy._cancel_working(
+            direction, expected_order_id=strategy.source_order_id, reason="roundtrip timeout"
+        )
+    return f"{'closing' if closing else 'opening'}_timeout"
+
+
+async def _cleanup_roundtrip_sources(
+    strategy: MakerRoundtripStrategy,
+    task: asyncio.Task[None],
+    timeout: float,
+) -> None:
+    directions = (strategy.direction, strategy.close_direction)
+    for direction in directions:
+        strategy._cancel_working(direction, reason="roundtrip shutdown")
+    deadline = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < deadline and not task.done():
+        if all(
+            store.active_source_order_id is None and not store.has_unresolved_hedges()
+            for store in (strategy._stores[direction] for direction in directions)
+        ):
+            return
+        await asyncio.sleep(0.01)
+    for direction in directions:
+        store = strategy._stores[direction]
+        if (order_id := store.active_source_order_id) is not None:
+            record = store.source_order(order_id)
+            if record is None or record.status != "UNKNOWN":
+                store.mark_source_unknown(order_id, "roundtrip shutdown did not prove terminal")
+        for intent in store.intents():
+            if intent.status is ObligationStatus.COMPLETED:
+                continue
+            if intent.hedge_client_order_id is None:
+                if intent.status is ObligationStatus.PENDING:
+                    store.block_hedge_intent(intent.intent_id, "roundtrip shutdown timed out")
+            else:
+                store.update_hedge_status(
+                    intent.hedge_client_order_id, ObligationStatus.UNKNOWN
+                )
+
+
+def _snapshot_exact(
+    snapshot: PaperSnapshot, profile: LiveMakerCanaryProfile, expected: Decimal
+) -> bool:
+    return bool(
+        snapshot.user_id == profile.bitfinex_exec_config.user_id
+        and snapshot.position_quantity == expected
+        and not replace(snapshot, position_quantity=D()).holds
+    )
+
+
+def _runtime_pair_exact(node: TradingNode, strategy: MakerStrategy, source: Decimal) -> bool:
+    config = strategy._config
+    for instrument_id, account_id, expected in (
+        (config.source_instrument_id, config.source_accounts[0].account_id, source),
+        (config.hedge_instrument_id, config.hedge_accounts[0].account_id, -source),
+    ):
+        positions = node.cache.positions_open(instrument_id=instrument_id, account_id=account_id)
+        signed = [position.signed_decimal_qty() for position in positions]
+        if (
+            node.cache.orders_open(instrument_id=instrument_id, account_id=account_id)
+            or sum(signed, D()) != expected
+            or sum((abs(value) for value in signed), D()) != abs(expected)
+            or node.portfolio.net_position(instrument_id, account_id) != expected
+        ):
+            return False
+    return True
+
+
+def _roundtrip_orders_exact(node: TradingNode, strategy: MakerRoundtripStrategy) -> bool:
+    records = [
+        strategy._stores[direction].source_orders()
+        for direction in (strategy.direction, strategy.close_direction)
+    ]
+    if any(len(items) != 1 for items in records):
+        return False
+    opening = node.cache.order(ClientOrderId(records[0][0].client_order_id))
+    closing = node.cache.order(ClientOrderId(records[1][0].client_order_id))
+    opening_side = OrderSide.BUY if strategy.direction is SourceDirection.LONG else OrderSide.SELL
+    source_orders_exact = bool(
+        opening
+        and opening.side is opening_side
+        and opening.order_type is OrderType.LIMIT
+        and opening.time_in_force is TimeInForce.GTC
+        and cast(bool, opening.is_post_only)
+        and not cast(bool, opening.is_reduce_only)
+        and opening.quantity.as_decimal() == opening.filled_qty.as_decimal() == QUANTITY
+        and opening.is_closed
+        and closing
+        and closing.side is (OrderSide.SELL if opening_side is OrderSide.BUY else OrderSide.BUY)
+        and closing.order_type is OrderType.LIMIT
+        and closing.time_in_force is TimeInForce.IOC
+        and not cast(bool, closing.is_post_only)
+        and cast(bool, closing.is_reduce_only)
+        and closing.quantity.as_decimal() == closing.filled_qty.as_decimal() == QUANTITY
+        and closing.is_closed
+    )
+    return source_orders_exact and _hedge_orders_exact(
+        node, strategy, strategy.direction, closing=False
+    ) and _hedge_orders_exact(node, strategy, strategy.close_direction, closing=True)
+
+
+def _hedge_orders_exact(
+    node: TradingNode,
+    strategy: MakerRoundtripStrategy,
+    direction: SourceDirection,
+    *,
+    closing: bool,
+) -> bool:
+    quantity = D()
+    opened_or_closed: set[str] = set()
+    order_count = 0
+    for intent in strategy._stores[direction].intents():
+        if len(intent.hedge_plan) != len(intent.hedge_order_ids):
+            return False
+        for leg, order_id in zip(intent.hedge_plan, intent.hedge_order_ids, strict=True):
+            order = node.cache.order(ClientOrderId(order_id))
+            position_id = node.cache.position_id(ClientOrderId(order_id))
+            if (
+                order is None
+                or order.instrument_id != strategy._config.hedge_instrument_id
+                or order.account_id != strategy._config.hedge_accounts[0].account_id
+                or order.order_type is not OrderType.MARKET
+                or order.time_in_force is not TimeInForce.FOK
+                or order.side
+                is not (OrderSide.BUY if leg.side is BusinessOrderSide.BUY else OrderSide.SELL)
+                or cast(bool, order.is_reduce_only) is not closing
+                or leg.is_close is not closing
+                or order.quantity.as_decimal() != order.filled_qty.as_decimal()
+                or order.quantity.as_decimal() != leg.quantity_ounces
+                or not order.is_closed
+                or position_id is None
+                or (closing and position_id.value != leg.position_id)
+            ):
+                return False
+            quantity += leg.quantity_ounces
+            opened_or_closed.add(position_id.value)
+            order_count += 1
+    counterpart = strategy.close_direction if not closing else strategy.direction
+    if closing:
+        opening_ids = _hedge_position_ids(node, strategy, counterpart)
+        return quantity == QUANTITY and opened_or_closed == opening_ids
+    return quantity == QUANTITY and len(opened_or_closed) == order_count
+
+
+def _hedge_position_ids(
+    node: TradingNode, strategy: MakerRoundtripStrategy, direction: SourceDirection
+) -> set[str]:
+    return {
+        position_id.value
+        for intent in strategy._stores[direction].intents()
+        for order_id in intent.hedge_order_ids
+        if (position_id := node.cache.position_id(ClientOrderId(order_id))) is not None
+    }
 
 
 async def _run_lifecycle(
@@ -565,7 +1083,7 @@ async def _run_lifecycle(
 
 
 async def _wait_ready(
-    node: TradingNode, strategy: MakerCanaryStrategy, task: asyncio.Task[None], timeout: float
+    node: TradingNode, strategy: MakerStrategy, task: asyncio.Task[None], timeout: float
 ) -> None:
     deadline = asyncio.get_running_loop().time() + timeout
     while asyncio.get_running_loop().time() < deadline:
@@ -598,7 +1116,7 @@ def _raise_node_task(task: asyncio.Task[None], reason: str) -> None:
     raise RuntimeError(reason)
 
 
-def _runtime_flat(node: TradingNode, strategy: MakerCanaryStrategy) -> bool:
+def _runtime_flat(node: TradingNode, strategy: MakerStrategy) -> bool:
     config = strategy._config
     routes = (
         (config.source_instrument_id, config.source_accounts[0].account_id),
@@ -736,7 +1254,7 @@ def _exception_result(
     loop: asyncio.AbstractEventLoop,
     rest: BitfinexV1RestClient | None,
     profile: LiveMakerCanaryProfile,
-    strategy: MakerCanaryStrategy | None,
+    strategy: MakerCanaryStrategy | MakerRoundtripStrategy | None,
     output: Path,
     started_ms: int,
     reason: str,
@@ -745,6 +1263,8 @@ def _exception_result(
     *,
     unclaimed: Literal["HOLD", "FAILED"],
 ) -> MakerCanaryResult:
+    if isinstance(strategy, MakerRoundtripStrategy):
+        return _roundtrip_failure(strategy, output, reason, True)
     if strategy is None or not strategy.claimed:
         return MakerCanaryResult(unclaimed, reason, output, _order_id(strategy))
     fallback: Outcome = "FILLED_HOLD" if strategy.filled else "UNKNOWN"
@@ -773,17 +1293,28 @@ def _exception_result(
     return MakerCanaryResult("UNKNOWN", reason, output, strategy.source_order_id)
 
 
-def _order_id(strategy: MakerCanaryStrategy | None) -> str | None:
+def _order_id(strategy: MakerCanaryStrategy | MakerRoundtripStrategy | None) -> str | None:
     return strategy.source_order_id if strategy else None
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Validate or run one 2oz Maker cancel canary")
+def _roundtrip_failure(
+    strategy: MakerCanaryStrategy | MakerRoundtripStrategy | None,
+    output: Path,
+    reason: str,
+    execute: bool,
+) -> MakerCanaryResult:
+    return MakerCanaryResult("HOLD" if execute else "FAILED", reason, output, _order_id(strategy))
+
+
+def main(argv: Sequence[str] | None = None, *, roundtrip: bool = False) -> int:
+    parser = argparse.ArgumentParser(description="Validate or run one 2oz Maker canary")
     parser.add_argument("--profile", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--env-file", type=Path, default=Path(".env"))
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--signal-timeout", type=float, default=60.0)
+    if roundtrip:
+        parser.add_argument("--direction", required=True, choices=("long", "short"))
     args = parser.parse_args(argv)
     try:
         result = run_maker_canary(
@@ -792,6 +1323,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             execute=args.execute,
             signal_timeout_seconds=args.signal_timeout,
             env_file=args.env_file,
+            roundtrip_direction=(
+                SourceDirection.LONG if args.direction == "long" else SourceDirection.SHORT
+            )
+            if roundtrip
+            else None,
         )
     except Exception as exc:
         print(json.dumps({"outcome": "FAILED", "reason": type(exc).__name__}), file=sys.stderr)
@@ -806,8 +1342,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             sort_keys=True,
         )
     )
-    codes = {"VALIDATED": 0, "PASSED": 0, "HOLD": 2, "FAILED": 1, "UNKNOWN": 3, "FILLED_HOLD": 4}
-    return codes[result.outcome]
+    if result.outcome in {"VALIDATED", "PASSED", "PASSED_FLAT"}:
+        return 0
+    return {"HOLD": 2, "FAILED": 1, "UNKNOWN": 3, "FILLED_HOLD": 4}[result.outcome]
+
+
+def roundtrip_main(argv: Sequence[str] | None = None) -> int:
+    return main(argv, roundtrip=True)
 
 
 if __name__ == "__main__":

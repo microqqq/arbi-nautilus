@@ -10,12 +10,13 @@ from typing import Any, cast
 import pytest
 from msgspec.structs import replace as struct_replace
 from nautilus_trader.config import RoutingConfig
-from nautilus_trader.model.enums import OrderSide, TimeInForce
+from nautilus_trader.model.enums import OrderSide, OrderType, TimeInForce
 from nautilus_trader.model.identifiers import (
     AccountId,
     ClientId,
     ClientOrderId,
     InstrumentId,
+    PositionId,
     VenueOrderId,
 )
 from nautilus_trader.model.objects import Money
@@ -45,7 +46,17 @@ from py000_nautilus.config import (
     RiskConfig,
     SourceAccountRoute,
 )
-from py000_nautilus.models import BusinessOrderSide, HedgeIntent, MakerQuote, SourceDirection
+from py000_nautilus.live_maker import build_live_maker_node
+from py000_nautilus.models import (
+    BusinessOrderSide,
+    HedgeIntent,
+    HedgeLeg,
+    MakerAccount,
+    MakerQuote,
+    ObligationStatus,
+    SourceAccount,
+    SourceDirection,
+)
 from py000_nautilus.mt5_v1_data import Mt5V1DataClientConfig
 from py000_nautilus.mt5_v1_execution import Mt5V1ExecClientConfig
 from py000_nautilus.mt5_v1_transport import Mt5V1Transport
@@ -159,6 +170,19 @@ def _strategy(tmp_path: Path, query: Any) -> canary.MakerCanaryStrategy:
         hedge_quantity_ready=lambda _quantity: True,
         live_costs_from_adapters=False,
         source_terminal_query=query,
+    )
+
+
+def _roundtrip_strategy(
+    tmp_path: Path, direction: SourceDirection = SourceDirection.LONG
+) -> canary.MakerRoundtripStrategy:
+    return canary.MakerRoundtripStrategy(
+        _profile(tmp_path).strategy_config,
+        direction=direction,
+        live_submission_ready=lambda: True,
+        hedge_quantity_ready=lambda _quantity: True,
+        live_costs_from_adapters=False,
+        source_terminal_query=lambda *_args: None,
     )
 
 
@@ -1000,3 +1024,431 @@ def test_post_rest_freshness_timeout_holds_before_mutation(
     assert result.reason == "Maker readiness timed out"
     assert result.source_order_id is None
     assert not strategy.armed and not strategy.claimed
+
+
+@pytest.mark.parametrize("direction", [SourceDirection.LONG, SourceDirection.SHORT])
+def test_roundtrip_dry_run_builds_only_selected_direction(
+    tmp_path: Path,
+    direction: SourceDirection,
+) -> None:
+    profile = _profile(tmp_path)
+    built: list[canary.MakerRoundtripStrategy] = []
+
+    def builder(**kwargs: Any) -> tuple[Any, canary.MakerRoundtripStrategy]:
+        node, strategy = build_live_maker_node(**kwargs)
+        assert isinstance(strategy, canary.MakerRoundtripStrategy)
+        built.append(strategy)
+        return node, strategy
+
+    result = canary.run_maker_canary(
+        profile,
+        tmp_path / f"roundtrip-{direction.value}.jsonl",
+        node_builder=cast(Any, builder),
+        roundtrip_direction=direction,
+    )
+
+    assert result.outcome == "VALIDATED"
+    assert len(built) == 1 and built[0].direction is direction
+    bid = built[0]._config.economics.bid.open_quantity_ounces
+    ask = built[0]._config.economics.ask.open_quantity_ounces
+    assert (bid, ask) == ((D(2), D()) if direction is SourceDirection.LONG else (D(), D(2)))
+    assert profile.strategy_config.economics.bid.open_quantity_ounces == D(2)
+    assert profile.strategy_config.economics.ask.open_quantity_ounces == 0
+
+
+@pytest.mark.parametrize("direction", [SourceDirection.LONG, SourceDirection.SHORT])
+def test_roundtrip_flatten_is_ioc_reduce_only_and_submit_unknown_is_not_retried(
+    tmp_path: Path,
+    direction: SourceDirection,
+) -> None:
+    expected = D(2) if direction is SourceDirection.LONG else D(-2)
+    ticks = {
+        "value": _quote(_source_instrument(), "2000", "2001", "1", 1_000_000_000)
+    }
+    factory_calls: list[dict[str, Any]] = []
+    submit_calls: list[object] = []
+
+    class Factory:
+        def limit(self, **kwargs: Any) -> object:
+            factory_calls.append(kwargs)
+            return SimpleNamespace(
+                client_order_id=ClientOrderId("O-ROUNDTRIP-CLOSE"),
+                quantity=kwargs["quantity"],
+            )
+
+    class Probe(canary.MakerRoundtripStrategy):
+        def __init__(self) -> None:
+            super().__init__(
+                _profile(tmp_path).strategy_config,
+                direction=direction,
+                live_submission_ready=lambda: True,
+                hedge_quantity_ready=lambda _quantity: True,
+                live_costs_from_adapters=False,
+                source_terminal_query=lambda *_args: None,
+            )
+            self._source_instrument = _source_instrument()
+            self._test_cache = SimpleNamespace(
+                quote_tick=lambda _instrument_id: ticks["value"]
+            )
+            self._test_clock = SimpleNamespace(timestamp_ns=lambda: 1_000_000_000)
+            self._test_factory = Factory()
+
+        @property
+        def cache(self) -> Any:
+            return self._test_cache
+
+        @property
+        def clock(self) -> Any:
+            return self._test_clock
+
+        @property
+        def order_factory(self) -> Any:
+            return self._test_factory
+
+        def _source_account(self, account_id: AccountId) -> SourceAccount:
+            route = self._config.source_accounts[0]
+            return SourceAccount(account_id, route.client_id, expected, D(2), D(2), D(100))
+
+        def _hedge_account(self, account_id: AccountId) -> MakerAccount:
+            route = self._config.hedge_accounts[0]
+            return MakerAccount(account_id, route.client_id, -expected, D(2), D(2))
+
+        def _source_hedge_is_executable(
+            self, _quote: MakerQuote, _source_quantity_ounces: Decimal
+        ) -> bool:
+            return True
+
+        def _hedge_positions(self, _account_id: AccountId) -> list[Any]:
+            hedge_is_long = -expected > 0
+            return [
+                SimpleNamespace(
+                    id=PositionId("P-ROUNDTRIP"),
+                    quantity=D(2),
+                    is_long=hedge_is_long,
+                    is_short=not hedge_is_long,
+                )
+            ]
+
+        def submit_order(self, order: object, **_kwargs: Any) -> None:
+            submit_calls.append(order)
+            raise RuntimeError("injected uncertain submit")
+
+    assert not Probe().submit_flatten_once()
+    assert factory_calls == [] and submit_calls == []
+    ticks["value"] = _quote(_source_instrument(), "2000", "2001", "2", 1_000_000_000)
+    strategy = Probe()
+    with pytest.raises(RuntimeError, match="uncertain submit"):
+        strategy.submit_flatten_once()
+
+    call = factory_calls[0]
+    expected_side = OrderSide.SELL if direction is SourceDirection.LONG else OrderSide.BUY
+    assert call["order_side"] is expected_side
+    assert call["time_in_force"] is TimeInForce.IOC
+    assert call["post_only"] is False and call["reduce_only"] is True
+    assert Decimal(str(call["quantity"])) == D(2)
+    record = strategy._stores[strategy.close_direction].source_orders()[0]
+    assert record.status == "UNKNOWN" and len(submit_calls) == 1
+    assert not strategy.submit_flatten_once() and len(factory_calls) == 1
+
+
+def test_roundtrip_phase_exact_accepts_multi_ticket_mt5_close(tmp_path: Path) -> None:
+    strategy = _roundtrip_strategy(tmp_path)
+    store = strategy._stores[SourceDirection.SHORT]
+    store.begin_source("O-CLOSE", BusinessOrderSide.SELL, D(2))
+    intent = store.reserve_source_fill(
+        fill_key="O-CLOSE|V|T",
+        client_order_id="O-CLOSE",
+        trade_id="T",
+        source_side=BusinessOrderSide.SELL,
+        fill_ounces=D(2),
+    )
+    assert intent is not None
+    store.bind_hedge_plan(
+        intent.intent_id,
+        tuple(
+            HedgeLeg(
+                side=BusinessOrderSide.BUY,
+                quantity_ounces=D(1),
+                position_id=f"P-{ticket}",
+                expected_position_side=BusinessOrderSide.SELL,
+                expected_position_quantity_ounces=D(1),
+            )
+            for ticket in (1, 2)
+        ),
+    )
+    for ticket in (1, 2):
+        store.bind_hedge_order(intent.intent_id, f"H-{ticket}")
+        assert store.apply_hedge_fill(
+            client_order_id=f"H-{ticket}", trade_id=f"HT-{ticket}", fill_ounces=D(1)
+        )
+
+    assert strategy.phase_exact(SourceDirection.SHORT, closing=True)
+    assert len(store.intent(intent.intent_id).hedge_order_ids) == 2
+
+
+def test_roundtrip_close_never_submits_an_open_mt5_residual(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    strategy = _roundtrip_strategy(tmp_path)
+    store = strategy._stores[strategy.close_direction]
+    store.begin_source("O-DRIFT", BusinessOrderSide.SELL, D(2))
+    intent = store.reserve_source_fill(
+        fill_key="O-DRIFT|V|T",
+        client_order_id="O-DRIFT",
+        trade_id="T",
+        source_side=BusinessOrderSide.SELL,
+        fill_ounces=D(2),
+    )
+    assert intent is not None
+    monkeypatch.setattr(strategy, "_hedge_positions", lambda _account_id: [])
+    submissions: list[object] = []
+    monkeypatch.setattr(
+        "py000_nautilus.strategies.maker.MakerStrategy._submit_hedge",
+        lambda *_args, **_kwargs: submissions.append(object()),
+    )
+
+    route = strategy._config.hedge_accounts[0]
+    strategy._submit_hedge(strategy.close_direction, route.account_id, route.client_id, intent)
+
+    held = store.intent(intent.intent_id)
+    assert submissions == []
+    assert held.status is ObligationStatus.BLOCKED
+    assert held.hedge_plan and all(not leg.is_close for leg in held.hedge_plan)
+
+
+def test_roundtrip_final_hedge_orders_bind_exact_shapes_and_ticket_ids(tmp_path: Path) -> None:
+    strategy = _roundtrip_strategy(tmp_path)
+    open_leg = HedgeLeg(BusinessOrderSide.SELL, D(2))
+    close_legs = [
+        HedgeLeg(
+            BusinessOrderSide.BUY,
+            D(1),
+            position_id="P-1",
+            expected_position_side=BusinessOrderSide.SELL,
+            expected_position_quantity_ounces=D(expected),
+        )
+        for expected in (2, 1)
+    ]
+    strategy._stores[strategy.direction] = cast(
+        Any,
+        SimpleNamespace(
+            intents=lambda: (
+                SimpleNamespace(
+                    hedge_plan=(open_leg,),
+                    hedge_order_ids=("H-OPEN",),
+                ),
+            )
+        ),
+    )
+    strategy._stores[strategy.close_direction] = cast(
+        Any,
+        SimpleNamespace(
+            intents=lambda: (
+                SimpleNamespace(
+                    hedge_plan=(close_legs[0],),
+                    hedge_order_ids=("H-CLOSE-1",),
+                ),
+                SimpleNamespace(
+                    hedge_plan=(close_legs[1],),
+                    hedge_order_ids=("H-CLOSE-2",),
+                ),
+            )
+        ),
+    )
+    def quantity(value: int) -> object:
+        return SimpleNamespace(as_decimal=lambda: D(value))
+
+    account_id = strategy._config.hedge_accounts[0].account_id
+    orders = {
+        ClientOrderId(order_id): SimpleNamespace(
+            instrument_id=HEDGE_ID,
+            account_id=account_id,
+            order_type=OrderType.MARKET,
+            time_in_force=TimeInForce.FOK,
+            side=OrderSide.SELL if "OPEN" in order_id else OrderSide.BUY,
+            is_reduce_only="CLOSE" in order_id,
+            quantity=quantity(2 if order_id == "H-OPEN" else 1),
+            filled_qty=quantity(2 if order_id == "H-OPEN" else 1),
+            is_closed=True,
+        )
+        for order_id in ("H-OPEN", "H-CLOSE-1", "H-CLOSE-2")
+    }
+    positions = {
+        ClientOrderId(order_id): PositionId("P-1")
+        for order_id in ("H-OPEN", "H-CLOSE-1", "H-CLOSE-2")
+    }
+    node = SimpleNamespace(
+        cache=SimpleNamespace(order=orders.get, position_id=positions.get)
+    )
+
+    assert canary._hedge_orders_exact(
+        cast(Any, node), strategy, strategy.direction, closing=False
+    )
+    assert canary._hedge_orders_exact(
+        cast(Any, node), strategy, strategy.close_direction, closing=True
+    )
+    orders[ClientOrderId("H-CLOSE-2")].is_reduce_only = False
+    assert not canary._hedge_orders_exact(
+        cast(Any, node), strategy, strategy.close_direction, closing=True
+    )
+
+
+@pytest.mark.parametrize(
+    ("final_position", "task_stops", "expected_outcome", "expected_reason"),
+    [
+        (D(), False, "PASSED_FLAT", "maker_roundtrip_exact_flat"),
+        (D("0.1"), False, "HOLD", "final_flat_evidence_not_exact"),
+        (D(), True, "HOLD", "final_flat_evidence_not_exact"),
+    ],
+)
+def test_roundtrip_final_gate_requires_external_exact_flat(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    final_position: Decimal,
+    task_stops: bool,
+    expected_outcome: str,
+    expected_reason: str,
+) -> None:
+    profile = _profile(tmp_path)
+    snapshots = iter(
+        PaperSnapshot(
+            user_id=USER_ID,
+            balance=D(10_000),
+            available=D(10_000),
+            active_orders=0,
+            position_quantity=position,
+            permissions_ok=True,
+            withdrawal_disabled=True,
+            paper_enabled=True,
+        )
+        for position in (D(), D(2), final_position)
+    )
+    strategy = _roundtrip_strategy(tmp_path)
+    flatten_calls: list[None] = []
+
+    class ExecEngine:
+        async def reconcile_execution_state(self, **_kwargs: object) -> bool:
+            return True
+
+    class Node:
+        kernel = SimpleNamespace(exec_engine=ExecEngine())
+
+        async def run_async(self) -> None:
+            if not task_stops:
+                await asyncio.Event().wait()
+
+        def is_running(self) -> bool:
+            return True
+
+    async def wait_ready(*_args: object) -> None:
+        await asyncio.sleep(0)
+
+    async def read_next(_rest: object) -> PaperSnapshot:
+        return next(snapshots)
+
+    async def phase(*_args: object) -> None:
+        return None
+
+    async def cleanup(*_args: object) -> None:
+        return None
+
+    async def shutdown(
+        _node: object, task: asyncio.Task[None], _timeout: float
+    ) -> None:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    def flatten_once() -> bool:
+        flatten_calls.append(None)
+        return True
+
+    monkeypatch.setattr(canary, "_wait_ready", wait_ready)
+    monkeypatch.setattr(canary, "read_snapshot", read_next)
+    monkeypatch.setattr(canary, "_wait_roundtrip_phase", phase)
+    monkeypatch.setattr(canary, "_runtime_flat", lambda *_args: True)
+    monkeypatch.setattr(canary, "_runtime_pair_exact", lambda *_args: True)
+    monkeypatch.setattr(canary, "_roundtrip_orders_exact", lambda *_args: True)
+    monkeypatch.setattr(canary, "_cleanup_roundtrip_sources", cleanup)
+    monkeypatch.setattr(canary, "_shutdown", shutdown)
+    monkeypatch.setattr(strategy, "trigger_cached_once", lambda: True)
+    monkeypatch.setattr(strategy, "phase_exact", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(strategy, "submit_flatten_once", flatten_once)
+
+    result = asyncio.run(
+        canary._run_roundtrip_lifecycle(
+            cast(Any, Node()),
+            strategy,
+            cast(Any, object()),
+            profile,
+            tmp_path / "roundtrip.jsonl",
+            StringIO(),
+            1,
+        )
+    )
+
+    assert result.outcome == expected_outcome
+    assert result.reason == expected_reason
+    assert flatten_calls == [None]
+
+
+def test_roundtrip_timeout_cleanup_marks_unproved_gtc_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    strategy = _roundtrip_strategy(tmp_path)
+    store = strategy._stores[strategy.direction]
+    store.begin_source("O-OPEN", BusinessOrderSide.BUY, D(2))
+    cancellations: list[SourceDirection] = []
+    monkeypatch.setattr(
+        strategy,
+        "_cancel_working",
+        lambda direction, **_kwargs: cancellations.append(direction),
+    )
+
+    async def exercise() -> None:
+        async def wait_forever() -> None:
+            await asyncio.Event().wait()
+
+        task = asyncio.create_task(wait_forever())
+        try:
+            await canary._cleanup_roundtrip_sources(strategy, task, 0.02)
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(exercise())
+
+    record = store.source_order("O-OPEN")
+    assert record is not None and record.status == "UNKNOWN"
+    assert store.halt_reason == "roundtrip shutdown did not prove terminal"
+    assert cancellations == [strategy.direction, strategy.close_direction]
+
+
+def test_roundtrip_cleanup_waits_for_hedge_after_source_is_terminal(tmp_path: Path) -> None:
+    strategy = _roundtrip_strategy(tmp_path)
+    store = strategy._stores[strategy.direction]
+    store.begin_source("O-FILLED", BusinessOrderSide.BUY, D(2))
+    intent = store.reserve_source_fill(
+        fill_key="O-FILLED|V|T",
+        client_order_id="O-FILLED",
+        trade_id="T",
+        source_side=BusinessOrderSide.BUY,
+        fill_ounces=D(2),
+    )
+    assert intent is not None and store.active_source_order_id is None
+
+    async def exercise() -> None:
+        async def wait_forever() -> None:
+            await asyncio.Event().wait()
+
+        task = asyncio.create_task(wait_forever())
+        try:
+            await canary._cleanup_roundtrip_sources(strategy, task, 0.02)
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(exercise())
+
+    held = store.intent(intent.intent_id)
+    assert held.status is ObligationStatus.BLOCKED
+    assert store.halt_reason == f"hedge {intent.intent_id} blocked: roundtrip shutdown timed out"

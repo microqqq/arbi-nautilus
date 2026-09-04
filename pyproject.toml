@@ -30,6 +30,7 @@ py000-taker-live = "py000_nautilus.live_taker_entry:main"
 py000-taker-canary = "py000_nautilus.live_taker_canary:main"
 py000-taker-smoke = "py000_nautilus.live_taker_smoke:main"
 py000-maker-canary = "py000_nautilus.live_maker_canary:main"
+py000-maker-roundtrip-canary = "py000_nautilus.live_maker_canary:roundtrip_main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/py000_nautilus"]
