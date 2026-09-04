@@ -700,6 +700,9 @@ def _final_mismatch(
     expected_side = (
         BusinessOrderSide.BUY if direction is SourceDirection.LONG else BusinessOrderSide.SELL
     )
+    data_plane_mismatch = _final_data_plane_mismatch(node)
+    if data_plane_mismatch is not None:
+        return data_plane_mismatch
     if bitfinex.execution_hold_reason or mt5.execution_hold_reason or mt5.pending_client_order_ids:
         return "execution_adapter_not_clean_after_reconciliation"
     if (
@@ -744,6 +747,18 @@ def _final_mismatch(
             or node.portfolio.net_position(instrument_id, account_id) != expected
         ):
             return "paired_positions_are_not_exact_and_opposite"
+    return None
+
+
+def _final_data_plane_mismatch(node: TradingNode) -> str | None:
+    bitfinex_data, mt5_data = _data_clients(node)
+    if (
+        not node.kernel.data_engine.check_connected()
+        or not bitfinex_data.is_connected
+        or not mt5_data.is_connected
+        or not mt5_data.snapshot_refresh_healthy
+    ):
+        return "data_plane_not_clean_after_reconciliation"
     return None
 
 
