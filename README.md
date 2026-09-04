@@ -445,8 +445,8 @@ production composition wiring, recovery, and hard-error fail-closed boundaries. 
 does not rewrite the earlier evidence record or by itself qualify continuous live operation; that
 still requires one fresh, explicitly authorized canary.
 
-Dynamic venue margin capacity, authoritative cancel reconciliation, and Maker query closure
-remain live gates. The private Bitfinex candidate applies the strategy's validated integer
+Dynamic venue margin capacity and live qualification of Maker cancel reconciliation remain
+live gates. The private Bitfinex candidate applies the strategy's validated integer
 per-order leverage; the simulated venue still uses configured account leverage. The
 shared leverage helper preserves legacy floor division when its result is at
 least one and intentionally clamps smaller results to one as a migration safety
@@ -463,9 +463,13 @@ source fill also reserves its fill/hedge obligation first, then persists a
 two-sided fill freeze and cancels both working quotes. A cycle releases without
 timeouts only after every known source order has authoritative terminal
 evidence, every hedge obligation is completed by real fills, and outstanding
-and rounding exposure are zero on both stores. Cancel/expiry still needs an
-external authoritative reconciliation call; a terminal event alone does not
-release its gate.
+and rounding exposure are zero on both stores. A Bitfinex cancel event now starts one
+single-flight reconciliation task for the exact client and venue order IDs. Matching terminal
+identity, state, quantity, fills, price, and average across the REST report, Nautilus cache, and
+durable Maker record confirms the exposure; the paper venue's omitted post-only flag does not
+claim venue enforcement. Missing, active, or conflicting reports leave the persisted gate closed.
+This path is offline-tested, not yet live qualified; expiry and unknown outcomes remain stopped
+for explicit recovery.
 
 The selected source→hedge account/client route is stored with each source order,
 so same-process, canceled, and replayed late fills retain their original hedge

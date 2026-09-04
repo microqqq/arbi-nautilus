@@ -243,11 +243,16 @@ class JsonStateStore:
         record = self._state.source_orders.get(client_order_id)
         if record is None or record.status not in {"CANCELED", "EXPIRED"}:
             raise ValueError("source order is not awaiting terminal reconciliation")
+        previous_state = deepcopy(self._state)
         if self._state.active_source_order_id == client_order_id:
             self._state.active_source_order_id = None
         if self._state.halt_reason == _source_reconcile_reason(client_order_id):
             self._state.halt_reason = None
-        self._persist()
+        try:
+            self._persist()
+        except Exception:
+            self._state = previous_state
+            raise
 
     def mark_source_unknown(self, client_order_id: str, reason: str) -> None:
         record = self._state.source_orders.get(client_order_id)

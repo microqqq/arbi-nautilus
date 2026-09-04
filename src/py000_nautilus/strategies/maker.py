@@ -3,11 +3,13 @@
 from collections.abc import Callable
 from dataclasses import replace
 from decimal import Decimal
+from math import isclose
 from typing import cast
 
 from nautilus_trader.common.events import TimeEvent
+from nautilus_trader.execution.reports import OrderStatusReport
 from nautilus_trader.model.data import FundingRateUpdate, InstrumentStatus, QuoteTick
-from nautilus_trader.model.enums import OrderSide, TimeInForce
+from nautilus_trader.model.enums import OrderSide, OrderStatus, OrderType, TimeInForce
 from nautilus_trader.model.events import (
     OrderAccepted,
     OrderCanceled,
@@ -25,6 +27,7 @@ from nautilus_trader.model.identifiers import (
     ClientOrderId,
     InstrumentId,
     PositionId,
+    VenueOrderId,
 )
 from nautilus_trader.model.instruments import Instrument
 from nautilus_trader.model.orders import Order
@@ -53,6 +56,12 @@ from py000_nautilus.store import JsonStateStore
 
 _DIRECTIONS = (SourceDirection.LONG, SourceDirection.SHORT)
 
+type SourceTerminalResult = Callable[[OrderStatusReport | None], None]
+type SourceTerminalQuery = Callable[
+    [ClientOrderId, VenueOrderId, SourceTerminalResult],
+    None,
+]
+
 
 class MakerStrategy(Strategy):
     """Maintain one bid and one ask GTC source order, hedging actual fills only."""
@@ -64,12 +73,15 @@ class MakerStrategy(Strategy):
         live_submission_ready: Callable[[], bool] | None = None,
         hedge_quantity_ready: Callable[[Decimal], bool] | None = None,
         live_costs_from_adapters: bool = False,
+        source_terminal_query: SourceTerminalQuery | None = None,
     ) -> None:
         super().__init__(config)
         self._config = config
         self._live_submission_ready = live_submission_ready
         self._hedge_quantity_ready = hedge_quantity_ready
         self._live_costs_from_adapters = live_costs_from_adapters
+        self._source_terminal_query = source_terminal_query
+        self._source_terminal_inflight: set[str] = set()
         self._stores = {
             direction: JsonStateStore(f"{config.store_path_prefix}.{direction.value}.json")
             for direction in _DIRECTIONS
@@ -260,7 +272,11 @@ class MakerStrategy(Strategy):
         self._finish_or_reject(event.client_order_id.value, "REJECTED")
 
     def on_order_canceled(self, event: OrderCanceled) -> None:
-        self._finish_or_reject(event.client_order_id.value, "CANCELED")
+        client_order_id = event.client_order_id.value
+        direction = self._direction_for_source_order(client_order_id)
+        self._finish_or_reject(client_order_id, "CANCELED")
+        if direction is not None:
+            self._request_source_terminal_query(direction, event)
 
     def on_order_expired(self, event: OrderExpired) -> None:
         self._finish_or_reject(event.client_order_id.value, "EXPIRED")
@@ -839,14 +855,140 @@ class MakerStrategy(Strategy):
             for store in self._stores.values()
         )
 
-    def confirm_source_reconciled(
+    def _request_source_terminal_query(
         self,
         direction: SourceDirection,
-        client_order_id: str,
+        event: OrderCanceled,
+    ) -> None:
+        query = self._source_terminal_query
+        client_order_id = event.client_order_id.value
+        venue_order_id = event.venue_order_id
+        if query is None:
+            return
+        if venue_order_id is None:
+            self.log.error("Maker source cancel terminal has no venue order ID")
+            return
+        if client_order_id in self._source_terminal_inflight:
+            return
+        self._source_terminal_inflight.add(client_order_id)
+        try:
+            query(
+                event.client_order_id,
+                venue_order_id,
+                lambda report: self._complete_source_terminal_query(
+                    direction,
+                    event,
+                    report,
+                ),
+            )
+        except Exception as exc:
+            self._source_terminal_inflight.discard(client_order_id)
+            self.log.error(
+                "Maker source terminal query submission failed with "
+                f"{type(exc).__name__}"
+            )
+
+    def _complete_source_terminal_query(
+        self,
+        direction: SourceDirection,
+        event: OrderCanceled,
+        report: OrderStatusReport | None,
+    ) -> None:
+        client_order_id = event.client_order_id.value
+        if client_order_id not in self._source_terminal_inflight:
+            return
+        try:
+            if report is None or not self._source_cancel_report_is_exact(
+                direction,
+                event,
+                report,
+            ):
+                self.log.error("Maker source cancel terminal query was not exact")
+                return
+            self._stores[direction].confirm_source_reconciled(client_order_id)
+            self._try_release_cycle()
+        except Exception as exc:
+            self.log.error(
+                "Maker source terminal query failed with "
+                f"{type(exc).__name__}"
+            )
+        finally:
+            self._source_terminal_inflight.discard(client_order_id)
+
+    def _source_cancel_report_is_exact(
+        self,
+        direction: SourceDirection,
+        event: OrderCanceled,
+        report: OrderStatusReport,
     ) -> bool:
-        """Accept external authoritative cancel/expiry reconciliation evidence."""
-        self._stores[direction].confirm_source_reconciled(client_order_id)
-        return self._try_release_cycle()
+        client_order_id = event.client_order_id
+        venue_order_id = event.venue_order_id
+        record = self._stores[direction].source_order(client_order_id.value)
+        order = self.cache.order(client_order_id)
+        if record is None or order is None or venue_order_id is None:
+            return False
+        source_route = next(
+            (
+                route
+                for route in self._config.source_accounts
+                if route.account_id.value == record.source_account_id
+            ),
+            None,
+        )
+        if source_route is None:
+            return False
+        expected_client_id = (
+            source_route.client_id.value if source_route.client_id is not None else None
+        )
+        expected_side = (
+            OrderSide.BUY if record.side is BusinessOrderSide.BUY else OrderSide.SELL
+        )
+        order_avg = None if order.avg_px is None else Decimal(str(order.avg_px))
+        report_avg = None if report.avg_px is None else Decimal(str(report.avg_px))
+        order_price = None if order.price is None else Decimal(str(order.price))
+        report_price = None if report.price is None else report.price.as_decimal()
+        if record.filled_ounces == 0:
+            average_is_exact = report_avg is None
+        else:
+            average_is_exact = (
+                order_avg is not None
+                and report_avg is not None
+                and isclose(float(order_avg), float(report_avg))
+            )
+        return (
+            record.status == "CANCELED"
+            and record.source_client_id == expected_client_id
+            and event.instrument_id == self._config.source_instrument_id
+            and event.account_id == source_route.account_id
+            and report.instrument_id == self._config.source_instrument_id
+            and report.account_id == source_route.account_id
+            and order.instrument_id == self._config.source_instrument_id
+            and order.account_id == source_route.account_id
+            and report.client_order_id == client_order_id
+            and order.client_order_id == client_order_id
+            and report.venue_order_id == venue_order_id
+            and order.venue_order_id == venue_order_id
+            and report.order_status == OrderStatus.CANCELED
+            and order.status == OrderStatus.CANCELED
+            and order.is_closed
+            and report.order_side == expected_side
+            and order.side == expected_side
+            and report.order_type == OrderType.LIMIT
+            and order.order_type == OrderType.LIMIT
+            and report.time_in_force == TimeInForce.GTC
+            and order.time_in_force == TimeInForce.GTC
+            # This closes exposure; it does not prove venue-enforced post-only.
+            # Bitfinex paper omits that flag from otherwise exact terminal rows.
+            and cast(bool, order.is_post_only)
+            and not report.reduce_only
+            and not cast(bool, order.is_reduce_only)
+            and report.quantity.as_decimal() == record.quantity_ounces
+            and order.quantity.as_decimal() == record.quantity_ounces
+            and report.filled_qty.as_decimal() == record.filled_ounces
+            and order.filled_qty.as_decimal() == record.filled_ounces
+            and report_price == order_price
+            and average_is_exact
+        )
 
     def _try_release_cycle(self) -> bool:
         frozen = {

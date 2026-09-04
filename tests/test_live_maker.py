@@ -11,7 +11,14 @@ import pytest
 from msgspec.structs import replace as struct_replace
 from nautilus_trader.config import RoutingConfig
 from nautilus_trader.live.node import TradingNode
-from nautilus_trader.model.identifiers import AccountId, ClientId, InstrumentId, Venue
+from nautilus_trader.model.identifiers import (
+    AccountId,
+    ClientId,
+    ClientOrderId,
+    InstrumentId,
+    Venue,
+    VenueOrderId,
+)
 
 from py000_nautilus.bitfinex_v1_data import (
     RAW_SYMBOL,
@@ -255,6 +262,35 @@ def test_builds_exact_offline_maker_composition_without_creating_state(
         assert hedge_quantity_ready.__self__ is mt5_exec
         assert hedge_quantity_ready.__func__ is Mt5V1ExecutionClient.can_execute_quantity
         assert cast(Any, strategy)._live_costs_from_adapters is True
+        terminal_queries: list[Any] = []
+
+        async def record_terminal_query(
+            _client: BitfinexV1ExecutionClient,
+            command: Any,
+        ) -> None:
+            terminal_queries.append(command)
+            return None
+
+        monkeypatch.setattr(
+            BitfinexV1ExecutionClient,
+            "generate_order_status_report",
+            record_terminal_query,
+        )
+        terminal_query = cast(Any, strategy)._source_terminal_query
+        assert terminal_query is not None
+        completions: list[Any] = []
+        assert terminal_query(
+            ClientOrderId("O-MAKER-QUERY"),
+            VenueOrderId("V-MAKER-QUERY"),
+            completions.append,
+        ) is None
+        loop.run_until_complete(asyncio.sleep(0))
+        assert completions == [None]
+        assert len(terminal_queries) == 1
+        command = terminal_queries[0]
+        assert command.instrument_id == configs.strategy.source_instrument_id
+        assert command.client_order_id == ClientOrderId("O-MAKER-QUERY")
+        assert command.venue_order_id == VenueOrderId("V-MAKER-QUERY")
         assert not Path(configs.bitfinex_exec.cid_store_path).exists()
         assert not Path(f"{configs.strategy.store_path_prefix}.bid.json").exists()
         assert not Path(f"{configs.strategy.store_path_prefix}.ask.json").exists()

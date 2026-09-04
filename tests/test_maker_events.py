@@ -9,8 +9,9 @@ from typing import Any, cast
 import pytest
 from msgspec.structs import replace as struct_replace
 from nautilus_trader.core.uuid import UUID4
+from nautilus_trader.execution.reports import OrderStatusReport
 from nautilus_trader.model.data import FundingRateUpdate
-from nautilus_trader.model.enums import OrderSide
+from nautilus_trader.model.enums import OrderSide, OrderStatus, TimeInForce
 from nautilus_trader.model.events import OrderRejected
 from nautilus_trader.model.identifiers import (
     AccountId,
@@ -45,6 +46,8 @@ from py000_nautilus.models import (
 from py000_nautilus.store import JsonStateStore
 from py000_nautilus.strategies.maker import (
     MakerStrategy,
+    SourceTerminalQuery,
+    SourceTerminalResult,
     _maker_timer_name,
     _maker_timer_target,
 )
@@ -84,12 +87,16 @@ class RecordingMakerStrategy(MakerStrategy):
         state_prefix: Path,
         *,
         hedge_client_id: ClientId | None = None,
+        source_terminal_query: SourceTerminalQuery | None = None,
     ) -> None:
         config = _maker_strategy_config(state_prefix)
         if hedge_client_id is not None:
             route = struct_replace(config.hedge_accounts[0], client_id=hedge_client_id)
             config = struct_replace(config, hedge_accounts=(route,))
-        super().__init__(config)
+        super().__init__(
+            config,
+            source_terminal_query=source_terminal_query,
+        )
         self.recorded: list[
             tuple[SourceDirection, AccountId, ClientId | None, HedgeIntent]
         ] = []
@@ -202,6 +209,28 @@ class CyclePlacementMakerStrategy(RecordingMakerStrategy):
         self.placed_source_ids.append(client_order_id)
 
 
+class TerminalQueryMakerStrategy(RecordingMakerStrategy):
+    def __init__(
+        self,
+        state_prefix: Path,
+        *,
+        source_terminal_query: SourceTerminalQuery,
+    ) -> None:
+        super().__init__(
+            state_prefix,
+            source_terminal_query=source_terminal_query,
+        )
+        self.report_is_exact = True
+
+    def _source_cancel_report_is_exact(
+        self,
+        direction: SourceDirection,
+        event: Any,
+        report: OrderStatusReport,
+    ) -> bool:
+        return self.report_is_exact
+
+
 def _filled_events(quantity: int = 2) -> tuple[Any, Any]:
     instrument = _source_instrument()
     order = TestExecStubs.limit_order(
@@ -228,6 +257,284 @@ def _filled_events(quantity: int = 2) -> tuple[Any, Any]:
         commission=Money(0, instrument.quote_currency),
     )
     return partial, final
+
+
+def _canceled_source_order(
+    *,
+    quantity: int = 1,
+    fill_prices: tuple[str, ...] = (),
+) -> tuple[Any, Any]:
+    instrument = _source_instrument()
+    account_id = AccountId("BITFINEX-001")
+    venue_order_id = VenueOrderId("V-CANCEL-QUERY")
+    order = TestExecStubs.limit_order(
+        instrument=instrument,
+        order_side=OrderSide.BUY,
+        quantity=instrument.make_qty(quantity),
+        price=instrument.make_price(2400),
+        time_in_force=TimeInForce.GTC,
+        post_only=True,
+        client_order_id=ClientOrderId("O-CANCEL-QUERY"),
+    )
+    order.apply(TestEventStubs.order_submitted(order, account_id=account_id, ts_event=1))
+    order.apply(
+        TestEventStubs.order_accepted(
+            order,
+            account_id=account_id,
+            venue_order_id=venue_order_id,
+            ts_event=2,
+        )
+    )
+    for index, fill_price in enumerate(fill_prices, start=1):
+        order.apply(
+            TestEventStubs.order_filled(
+                order=order,
+                instrument=instrument,
+                account_id=account_id,
+                venue_order_id=venue_order_id,
+                trade_id=TradeId(f"T-CANCEL-QUERY-{index}"),
+                last_qty=instrument.make_qty(1),
+                last_px=instrument.make_price(fill_price),
+                commission=Money(0, instrument.quote_currency),
+                ts_event=2 + index,
+            )
+        )
+    event = TestEventStubs.order_canceled(
+        order,
+        account_id=account_id,
+        ts_event=3 + len(fill_prices),
+    )
+    order.apply(event)
+    return order, event
+
+
+def _cancel_report(order: Any, **overrides: Any) -> OrderStatusReport:
+    values: dict[str, Any] = {
+        "account_id": order.account_id,
+        "instrument_id": order.instrument_id,
+        "client_order_id": order.client_order_id,
+        "venue_order_id": order.venue_order_id,
+        "order_side": order.side,
+        "order_type": order.order_type,
+        "time_in_force": order.time_in_force,
+        "order_status": OrderStatus.CANCELED,
+        "quantity": order.quantity,
+        "filled_qty": order.filled_qty,
+        "price": order.price,
+        "avg_px": None if order.filled_qty.as_decimal() == 0 else Decimal(str(order.avg_px)),
+        "post_only": True,
+        "reduce_only": False,
+        "report_id": UUID4(),
+        "ts_accepted": 2,
+        "ts_last": 4,
+        "ts_init": 5,
+    }
+    values.update(overrides)
+    return OrderStatusReport(**values)
+
+
+def _seed_cancel_store(
+    strategy: RecordingMakerStrategy,
+    *,
+    quantity: int,
+    filled: int = 0,
+) -> JsonStateStore:
+    store = strategy._stores[SourceDirection.LONG]
+    store.begin_source(
+        "O-CANCEL-QUERY",
+        BusinessOrderSide.BUY,
+        D(quantity),
+        source_account_id="BITFINEX-001",
+        hedge_account_id="MT5-001",
+    )
+    if filled:
+        store.reserve_source_fill(
+            fill_key="O-CANCEL-QUERY|V-CANCEL-QUERY|T-CANCEL-QUERY",
+            client_order_id="O-CANCEL-QUERY",
+            trade_id="T-CANCEL-QUERY",
+            source_side=BusinessOrderSide.BUY,
+            fill_ounces=D(filled),
+        )
+    store.update_source_status("O-CANCEL-QUERY", "CANCELED")
+    return store
+
+
+def test_source_cancel_report_requires_exact_cache_and_store_facts(tmp_path: Path) -> None:
+    strategy = RecordingMakerStrategy(tmp_path / "cancel-report-exact.state")
+    store = _seed_cancel_store(strategy, quantity=1)
+    order, event = _canceled_source_order()
+    harness = cast(
+        Any,
+        SimpleNamespace(
+            _stores=strategy._stores,
+            _config=strategy._config,
+            cache=SimpleNamespace(order=lambda _client_order_id: order),
+        ),
+    )
+
+    assert MakerStrategy._source_cancel_report_is_exact(
+        harness,
+        SourceDirection.LONG,
+        event,
+        _cancel_report(order),
+    )
+    # Bitfinex paper terminal rows omit the submitted post-only flag. The cache
+    # still proves the intent; this gate reconciles terminal exposure only.
+    assert MakerStrategy._source_cancel_report_is_exact(
+        harness,
+        SourceDirection.LONG,
+        event,
+        _cancel_report(order, post_only=False),
+    )
+    assert store.halt_reason is not None
+
+    instrument = _source_instrument()
+    mismatches = (
+        {"account_id": AccountId("BITFINEX-OTHER")},
+        {"instrument_id": _hedge_instrument().id},
+        {"client_order_id": ClientOrderId("O-OTHER")},
+        {"venue_order_id": VenueOrderId("V-OTHER")},
+        {"order_side": OrderSide.SELL},
+        {"time_in_force": TimeInForce.IOC},
+        {"order_status": OrderStatus.ACCEPTED},
+        {"quantity": instrument.make_qty(2)},
+        {"filled_qty": instrument.make_qty(1)},
+        {"price": instrument.make_price(2399)},
+        {"avg_px": D(2400)},
+        {"reduce_only": True},
+    )
+    for overrides in mismatches:
+        assert not MakerStrategy._source_cancel_report_is_exact(
+            harness,
+            SourceDirection.LONG,
+            event,
+            _cancel_report(order, **overrides),
+        )
+
+
+def test_source_cancel_report_accepts_an_already_recorded_partial_fill(
+    tmp_path: Path,
+) -> None:
+    strategy = RecordingMakerStrategy(tmp_path / "cancel-report-partial.state")
+    _seed_cancel_store(strategy, quantity=3, filled=2)
+    order, event = _canceled_source_order(
+        quantity=3,
+        fill_prices=("2400.1", "2400.2"),
+    )
+    harness = cast(
+        Any,
+        SimpleNamespace(
+            _stores=strategy._stores,
+            _config=strategy._config,
+            cache=SimpleNamespace(order=lambda _client_order_id: order),
+        ),
+    )
+
+    assert MakerStrategy._source_cancel_report_is_exact(
+        harness,
+        SourceDirection.LONG,
+        event,
+        _cancel_report(order, avg_px=D("2400.15")),
+    )
+    assert not MakerStrategy._source_cancel_report_is_exact(
+        harness,
+        SourceDirection.LONG,
+        event,
+        _cancel_report(order, filled_qty=_source_instrument().make_qty(0), avg_px=None),
+    )
+
+
+def test_canceled_source_queries_once_and_confirms_only_after_exact_report(
+    tmp_path: Path,
+) -> None:
+    requested: list[tuple[ClientOrderId, VenueOrderId, SourceTerminalResult]] = []
+    order, event = _canceled_source_order()
+    report = _cancel_report(order)
+
+    def query(
+        client_order_id: ClientOrderId,
+        venue_order_id: VenueOrderId,
+        complete: SourceTerminalResult,
+    ) -> None:
+        requested.append((client_order_id, venue_order_id, complete))
+
+    strategy = TerminalQueryMakerStrategy(
+        tmp_path / "cancel-query-success.state",
+        source_terminal_query=query,
+    )
+    store = strategy._stores[SourceDirection.LONG]
+    store.begin_source(
+        order.client_order_id.value,
+        BusinessOrderSide.BUY,
+        D(1),
+        source_account_id="BITFINEX-001",
+        hedge_account_id="MT5-001",
+    )
+
+    strategy.on_order_canceled(event)
+    strategy.on_order_canceled(event)
+
+    assert len(requested) == 1
+    active_before_completion = store.active_source_order_id
+    halt_before_completion = store.halt_reason
+    assert active_before_completion == order.client_order_id.value
+    assert halt_before_completion is not None
+    assert strategy._source_terminal_inflight == {order.client_order_id.value}
+    requested[0][2](report)
+
+    assert [(item[0], item[1]) for item in requested] == [
+        (order.client_order_id, order.venue_order_id)
+    ]
+    assert store.active_source_order_id is None
+    assert store.halt_reason is None
+    assert not strategy._global_obligation_block()
+    assert strategy._source_terminal_inflight == set()
+
+
+@pytest.mark.parametrize("failure", ["none", "exception", "inexact"])
+def test_source_terminal_query_failure_keeps_durable_hold(
+    tmp_path: Path,
+    failure: str,
+) -> None:
+    completions: list[SourceTerminalResult] = []
+    order, event = _canceled_source_order()
+    report = _cancel_report(order)
+
+    def query(
+        _client_order_id: ClientOrderId,
+        _venue_order_id: VenueOrderId,
+        complete: SourceTerminalResult,
+    ) -> None:
+        if failure == "exception":
+            raise OSError("injected query failure")
+        completions.append(complete)
+
+    strategy = TerminalQueryMakerStrategy(
+        tmp_path / f"cancel-query-{failure}.state",
+        source_terminal_query=query,
+    )
+    strategy.report_is_exact = failure != "inexact"
+    store = strategy._stores[SourceDirection.LONG]
+    store.begin_source(
+        order.client_order_id.value,
+        BusinessOrderSide.BUY,
+        D(1),
+        source_account_id="BITFINEX-001",
+        hedge_account_id="MT5-001",
+    )
+
+    strategy.on_order_canceled(event)
+    if failure == "exception":
+        assert completions == []
+    else:
+        assert len(completions) == 1
+        completions.pop()(None if failure == "none" else report)
+
+    record = store.source_order(order.client_order_id.value)
+    assert record is not None and record.status == "CANCELED"
+    assert store.active_source_order_id == order.client_order_id.value
+    assert store.halt_reason is not None
+    assert strategy._source_terminal_inflight == set()
 
 
 def _rejected(order: Any, reason: str) -> OrderRejected:
@@ -318,7 +625,19 @@ def test_partial_final_duplicate_and_late_fills_keep_pair_and_freeze_both_sides(
 def test_unknown_engine_rejection_freezes_source_without_declaring_failure(
     tmp_path: Path,
 ) -> None:
-    strategy = RecordingMakerStrategy(tmp_path / "unknown.state")
+    requested: list[tuple[ClientOrderId, VenueOrderId]] = []
+
+    def query(
+        client_order_id: ClientOrderId,
+        venue_order_id: VenueOrderId,
+        _complete: SourceTerminalResult,
+    ) -> None:
+        requested.append((client_order_id, venue_order_id))
+
+    strategy = TerminalQueryMakerStrategy(
+        tmp_path / "unknown.state",
+        source_terminal_query=query,
+    )
     instrument = _source_instrument()
     order = TestExecStubs.limit_order(
         instrument=instrument,
@@ -344,6 +663,7 @@ def test_unknown_engine_rejection_freezes_source_without_declaring_failure(
     assert store.active_source_order_id == order.client_order_id.value
     assert not store.can_submit_source()
     assert strategy.canceled == [SourceDirection.LONG, SourceDirection.SHORT]
+    assert requested == []
 
 
 def test_restart_late_fill_uses_durable_pair_and_keeps_reconciliation_hold(
@@ -784,7 +1104,8 @@ def test_complete_source_terminals_and_hedge_evidence_release_next_cycle(
     strategy._finish_or_reject("O-SIBLING", "CANCELED")
 
     assert not strategy._try_release_cycle()
-    assert strategy.confirm_source_reconciled(SourceDirection.SHORT, "O-SIBLING")
+    ask_store.confirm_source_reconciled("O-SIBLING")
+    assert strategy._try_release_cycle()
 
     assert bid_store.source_freeze_reason is None
     assert ask_store.source_freeze_reason is None
@@ -850,7 +1171,9 @@ def test_partial_or_rejected_hedge_does_not_release_cycle(
     else:
         bid_store.update_hedge_status(hedge_order_id, ObligationStatus.REJECTED)
     strategy._finish_or_reject("O-SIBLING", "CANCELED")
-    assert not strategy.confirm_source_reconciled(SourceDirection.SHORT, "O-SIBLING")
+    ask_store = strategy._stores[SourceDirection.SHORT]
+    ask_store.confirm_source_reconciled("O-SIBLING")
+    assert not strategy._try_release_cycle()
 
     assert strategy._global_obligation_block()
     assert bid_store.source_freeze_reason is not None

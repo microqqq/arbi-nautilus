@@ -8,10 +8,18 @@ from pathlib import Path
 from typing import cast
 
 from nautilus_trader.config import TradingNodeConfig
+from nautilus_trader.core.uuid import UUID4
+from nautilus_trader.execution.messages import GenerateOrderStatusReport
 from nautilus_trader.live.config import LiveExecEngineConfig
 from nautilus_trader.live.execution_client import LiveExecutionClient
 from nautilus_trader.live.node import TradingNode
-from nautilus_trader.model.identifiers import ClientId, TraderId, Venue
+from nautilus_trader.model.identifiers import (
+    ClientId,
+    ClientOrderId,
+    TraderId,
+    Venue,
+    VenueOrderId,
+)
 
 from py000_nautilus.bitfinex_v1_data import (
     BitfinexV1DataClient,
@@ -35,7 +43,7 @@ from py000_nautilus.mt5_v1_execution import (
     Mt5V1LiveExecClientFactory,
     mt5_v1_execution_account_id,
 )
-from py000_nautilus.strategies.maker import MakerStrategy
+from py000_nautilus.strategies.maker import MakerStrategy, SourceTerminalResult
 
 BITFINEX_CLIENT_NAME = "BITFINEX"
 MT5_CLIENT_NAME = "MT5"
@@ -106,6 +114,36 @@ def build_live_maker_node(
         mt5_data = _data_client(node, MT5_VENUE, Mt5V1DataClient)
         bitfinex_exec = _exec_client(node, BITFINEX_CLIENT_ID, BitfinexV1ExecutionClient)
         mt5_exec = _exec_client(node, MT5_CLIENT_ID, Mt5V1ExecutionClient)
+
+        def query_source_terminal(
+            client_order_id: ClientOrderId,
+            venue_order_id: VenueOrderId,
+            complete: SourceTerminalResult,
+        ) -> None:
+            async def run_query() -> None:
+                try:
+                    report = await bitfinex_exec.generate_order_status_report(
+                        GenerateOrderStatusReport(
+                            instrument_id=strategy_config.source_instrument_id,
+                            client_order_id=client_order_id,
+                            venue_order_id=venue_order_id,
+                            command_id=UUID4(),
+                            ts_init=cast(int, node.kernel.clock.timestamp_ns()),
+                        )
+                    )
+                except asyncio.CancelledError:
+                    complete(None)
+                    raise
+                except Exception:
+                    complete(None)
+                    raise
+                complete(report)
+
+            bitfinex_exec.create_task(
+                run_query(),
+                log_msg="maker-source-terminal-query",
+            )
+
         strategy = MakerStrategy(
             strategy_config,
             live_submission_ready=lambda: (
@@ -120,6 +158,7 @@ def build_live_maker_node(
             ),
             hedge_quantity_ready=mt5_exec.can_execute_quantity,
             live_costs_from_adapters=True,
+            source_terminal_query=query_source_terminal,
         )
         node.trader.add_strategy(strategy)
         _verify_built_composition(

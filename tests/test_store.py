@@ -387,6 +387,37 @@ def test_nonzero_rounding_residual_blocks_new_source_after_cancel_reconciliation
     assert not store.can_submit_source()
 
 
+def test_source_reconciliation_persist_failure_rolls_back_memory_and_disk(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = _state_path(tmp_path)
+    store = JsonStateStore(path)
+    store.begin_source("O-RECONCILE", BusinessOrderSide.BUY, D(1))
+    store.update_source_status("O-RECONCILE", "CANCELED")
+    expected_record = store.source_order("O-RECONCILE")
+    expected_halt = store.halt_reason
+
+    def fail_persist() -> None:
+        raise OSError("injected reconciliation persistence failure")
+
+    monkeypatch.setattr(store, "_persist", fail_persist)
+
+    with pytest.raises(OSError, match="reconciliation persistence"):
+        store.confirm_source_reconciled("O-RECONCILE")
+
+    assert store.active_source_order_id == "O-RECONCILE"
+    assert store.halt_reason == expected_halt
+    assert store.source_order("O-RECONCILE") == expected_record
+    assert not store.can_submit_source()
+
+    reloaded = JsonStateStore(path)
+    assert reloaded.active_source_order_id == "O-RECONCILE"
+    assert reloaded.halt_reason == expected_halt
+    assert reloaded.source_order("O-RECONCILE") == expected_record
+    assert not reloaded.can_submit_source()
+
+
 def test_restart_marks_inflight_source_unknown_and_blocks_second_source(tmp_path: Path) -> None:
     path = _state_path(tmp_path)
     JsonStateStore(path).begin_source("O-UNKNOWN", BusinessOrderSide.BUY, D(2))
