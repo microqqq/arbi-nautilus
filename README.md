@@ -160,6 +160,27 @@ Offline preparation only:
 uv run py000-taker-canary --profile runtime/taker-paper-canary.json --direction long
 ```
 
+`py000-taker-smoke` composes those same one-shot canaries into a repeatable paper/demo
+open-close check. It accepts a positive-threshold base profile and leaves that profile unchanged.
+Only the derived test legs use the forced economic threshold `-0.005` and the bounded 5s quote /
+2s cross-leg windows needed by the two asynchronous feeds. Default mode builds every leg offline
+without credentials, network access, or filesystem writes:
+
+```bash
+uv run py000-taker-smoke \
+  --profile runtime/taker-paper-rehearsal.json \
+  --direction both
+```
+
+With `--execute`, it writes fresh credential-free leg profiles under `runtime/`, verifies both
+test accounts from new read-only connections, then runs SHORT open/close followed by LONG
+open/close. Every leg remains exactly 2oz/0.02 lot. A non-pass, authority mismatch, or unreadable
+result stops the sequence without a retry; overall `PASSED` requires an independently observed
+flat final state. The base profile must use positive strategy thresholds and freshness no wider
+than 5s for quotes, 2s cross-leg skew, and 15s for the MT5 tick, so the earlier 240s diagnostic
+profiles cannot be reused here. Derived legs retain the 15s MT5 tick ceiling and use at least a
+5s MT5 REP read deadline, matching the bounded mitigation already proven by the mirror canary.
+
 ## Bitfinex public read-side v1 candidate
 
 The repository now contains one deliberately small, offline-testable Nautilus live-data
