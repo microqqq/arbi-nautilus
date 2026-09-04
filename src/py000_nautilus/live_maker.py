@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from decimal import Decimal
 from pathlib import Path
-from typing import cast
+from typing import Protocol, cast
 
 from nautilus_trader.config import TradingNodeConfig
 from nautilus_trader.core.uuid import UUID4
@@ -43,7 +44,11 @@ from py000_nautilus.mt5_v1_execution import (
     Mt5V1LiveExecClientFactory,
     mt5_v1_execution_account_id,
 )
-from py000_nautilus.strategies.maker import MakerStrategy, SourceTerminalResult
+from py000_nautilus.strategies.maker import (
+    MakerStrategy,
+    SourceTerminalQuery,
+    SourceTerminalResult,
+)
 
 BITFINEX_CLIENT_NAME = "BITFINEX"
 MT5_CLIENT_NAME = "MT5"
@@ -52,6 +57,18 @@ MT5_CLIENT_ID = ClientId(MT5_CLIENT_NAME)
 BITFINEX_VENUE = Venue(BITFINEX_CLIENT_NAME)
 MT5_VENUE = Venue(MT5_CLIENT_NAME)
 LIVE_MAKER_TRADER_ID = TraderId("PY000-MAKER-LIVE-001")
+
+
+class MakerStrategyFactory(Protocol):
+    def __call__(
+        self,
+        config: MakerStrategyConfig,
+        *,
+        live_submission_ready: Callable[[], bool],
+        hedge_quantity_ready: Callable[[Decimal], bool],
+        live_costs_from_adapters: bool,
+        source_terminal_query: SourceTerminalQuery,
+    ) -> MakerStrategy: ...
 
 
 def build_live_maker_node(
@@ -63,6 +80,7 @@ def build_live_maker_node(
     strategy_config: MakerStrategyConfig,
     loop: asyncio.AbstractEventLoop | None = None,
     connection_timeout_seconds: float = 10.0,
+    strategy_factory: MakerStrategyFactory = MakerStrategy,
 ) -> tuple[TradingNode, MakerStrategy]:
     """Build, but never connect or run, the exact two-leg live Maker node."""
     _validate_composition(
@@ -144,7 +162,7 @@ def build_live_maker_node(
                 log_msg="maker-source-terminal-query",
             )
 
-        strategy = MakerStrategy(
+        strategy = strategy_factory(
             strategy_config,
             live_submission_ready=lambda: (
                 bitfinex_data.is_connected
