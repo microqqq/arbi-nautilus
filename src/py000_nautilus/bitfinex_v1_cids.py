@@ -7,6 +7,8 @@ from dataclasses import asdict, dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
 
+from py000_nautilus.durability import ParentDirectorySyncError, replace_and_sync_parent
+
 MAX_CID = 2**45 - 1
 
 
@@ -53,11 +55,18 @@ class BitfinexV1CidStore:
             allocated_utc_date=datetime.fromtimestamp(now_ms // 1000, UTC).date().isoformat(),
         )
         bindings = (*self._by_client.values(), binding)
-        self._persist(cid, bindings)
-        self._by_client[client_id] = binding
-        self._by_cid[cid] = binding
-        self._last_cid = cid
+        try:
+            self._persist(cid, bindings)
+        except ParentDirectorySyncError:
+            self._remember(binding)
+            raise
+        self._remember(binding)
         return binding
+
+    def _remember(self, binding: BitfinexCidBinding) -> None:
+        self._by_client[binding.client_order_id] = binding
+        self._by_cid[binding.cid] = binding
+        self._last_cid = binding.cid
 
     def _persist(self, last_cid: int, bindings: tuple[BitfinexCidBinding, ...]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -80,7 +89,7 @@ class BitfinexV1CidStore:
                 json.dump(payload, handle, sort_keys=True, separators=(",", ":"))
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.replace(temporary_path, self.path)
+            replace_and_sync_parent(temporary_path, self.path)
         finally:
             if temporary_path is not None:
                 temporary_path.unlink(missing_ok=True)

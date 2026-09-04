@@ -94,6 +94,8 @@ class Mt5V1ExecClientConfig(LiveExecClientConfig, kw_only=True, frozen=True):
     event_poll_interval_ms: int = 250
     snapshot_refresh_interval_ms: int = 1_000
     event_page_limit: int = 100
+    event_pagination_max_pages: int = 1_000
+    event_pagination_timeout_ms: int = 30_000
 
 
 def mt5_v1_execution_account_id(client_id: ClientId, expected_account_id: str) -> AccountId:
@@ -600,35 +602,72 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
         expected_sequence = (
             int(cast(str, expected_outcome["event_seq"])) if expected_outcome is not None else None
         )
-        while True:
-            page = await self._transport.execution_events(
-                identity.binding(),
-                after_cursor=self._cursor,
-                limit=self._mt5_config.event_page_limit,
-            )
-            self._validate_page_identity(page, identity)
-            for event in cast(list[JsonObject], page["events"]):
-                sequence = cast(str, event["event_seq"])
-                if int(sequence) != int(self._cursor) + 1:
-                    raise Mt5V1ExecutionError("execution journal cursor is not contiguous")
-                if (
-                    expected_sequence is not None
-                    and int(sequence) == expected_sequence
-                    and event != expected_outcome
-                ):
-                    raise Mt5V1ExecutionError(
-                        "submit outcome differs from its durable execution event"
+        target_sequence: int | None = None
+        try:
+            async with asyncio.timeout(self._mt5_config.event_pagination_timeout_ms / 1_000):
+                for _ in range(self._mt5_config.event_pagination_max_pages):
+                    current_sequence = int(self._cursor)
+                    if target_sequence is not None and current_sequence >= target_sequence:
+                        if expected_sequence is not None:
+                            raise Mt5V1ExecutionError(
+                                "submit outcome is missing from the durable execution stream"
+                            )
+                        return
+                    limit = self._mt5_config.event_page_limit
+                    if target_sequence is not None:
+                        limit = min(limit, target_sequence - current_sequence)
+                    page = await self._transport.execution_events(
+                        identity.binding(),
+                        after_cursor=self._cursor,
+                        limit=limit,
                     )
-                self._apply_event(event)
-                self._cursor = sequence
-                if expected_sequence is not None and int(sequence) == expected_sequence:
-                    return
-            if not cast(bool, page["has_more"]):
-                if expected_sequence is not None:
-                    raise Mt5V1ExecutionError(
-                        "submit outcome is missing from the durable execution stream"
-                    )
-                return
+                    self._validate_page_identity(page, identity)
+                    page_last_sequence = int(cast(str, page["last_cursor"]))
+                    if target_sequence is None:
+                        target_sequence = page_last_sequence
+                        if expected_sequence is not None and expected_sequence > target_sequence:
+                            raise Mt5V1ExecutionError(
+                                "submit outcome exceeds the durable execution stream tail"
+                            )
+                    elif page_last_sequence < target_sequence:
+                        raise Mt5V1ExecutionError(
+                            "execution journal tail moved behind the pagination target"
+                        )
+                    for event in cast(list[JsonObject], page["events"]):
+                        sequence = cast(str, event["event_seq"])
+                        if int(sequence) != int(self._cursor) + 1:
+                            raise Mt5V1ExecutionError(
+                                "execution journal cursor is not contiguous"
+                            )
+                        if (
+                            expected_sequence is not None
+                            and int(sequence) == expected_sequence
+                            and event != expected_outcome
+                        ):
+                            raise Mt5V1ExecutionError(
+                                "submit outcome differs from its durable execution event"
+                            )
+                        self._apply_event(event)
+                        self._cursor = sequence
+                        if expected_sequence is not None and int(sequence) == expected_sequence:
+                            return
+                    if int(self._cursor) >= target_sequence:
+                        if expected_sequence is not None:
+                            raise Mt5V1ExecutionError(
+                                "submit outcome is missing from the durable execution stream"
+                            )
+                        return
+                    if not cast(bool, page["has_more"]):
+                        raise Mt5V1ExecutionError(
+                            "execution journal ended before its pagination target"
+                        )
+                raise Mt5V1ExecutionError(
+                    "execution journal pagination exceeded its page budget"
+                )
+        except TimeoutError as exc:
+            raise Mt5V1ExecutionError(
+                "execution journal pagination exceeded its time budget"
+            ) from exc
 
     def _apply_event(self, event: JsonObject) -> None:
         event_type = cast(str, event["event_type"])
@@ -709,33 +748,52 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
         cursor = "0"
         events: list[JsonObject] = []
         last_cursor: str | None = None
-        while True:
-            page = await self._transport.execution_events(
-                identity.binding(),
-                after_cursor=cursor,
-                limit=self._mt5_config.event_page_limit,
-            )
-            self._validate_page_identity(page, identity)
-            if page["first_retained_cursor"] != "0":
-                raise Mt5V1ExecutionError("execution journal history is not fully retained")
-            page_last_cursor = cast(str, page["last_cursor"])
-            if last_cursor is None:
-                last_cursor = page_last_cursor
-            elif page_last_cursor != last_cursor:
-                raise Mt5V1ExecutionError("execution journal tail changed during pagination")
-            page_events = cast(list[JsonObject], page["events"])
-            for event in page_events:
-                sequence = cast(str, event["event_seq"])
-                if int(sequence) != int(cursor) + 1:
-                    raise Mt5V1ExecutionError("execution journal cursor is not contiguous")
-                cursor = sequence
-                events.append(event)
-            if page["next_cursor"] != cursor:
-                raise Mt5V1ExecutionError("execution journal page cursor is inconsistent")
-            if not cast(bool, page["has_more"]):
-                if cursor != last_cursor:
-                    raise Mt5V1ExecutionError("execution journal ended before its declared tail")
-                return events, cursor
+        try:
+            async with asyncio.timeout(self._mt5_config.event_pagination_timeout_ms / 1_000):
+                for _ in range(self._mt5_config.event_pagination_max_pages):
+                    page = await self._transport.execution_events(
+                        identity.binding(),
+                        after_cursor=cursor,
+                        limit=self._mt5_config.event_page_limit,
+                    )
+                    self._validate_page_identity(page, identity)
+                    if page["first_retained_cursor"] != "0":
+                        raise Mt5V1ExecutionError(
+                            "execution journal history is not fully retained"
+                        )
+                    page_last_cursor = cast(str, page["last_cursor"])
+                    if last_cursor is None:
+                        last_cursor = page_last_cursor
+                    elif page_last_cursor != last_cursor:
+                        raise Mt5V1ExecutionError(
+                            "execution journal tail changed during pagination"
+                        )
+                    page_events = cast(list[JsonObject], page["events"])
+                    for event in page_events:
+                        sequence = cast(str, event["event_seq"])
+                        if int(sequence) != int(cursor) + 1:
+                            raise Mt5V1ExecutionError(
+                                "execution journal cursor is not contiguous"
+                            )
+                        cursor = sequence
+                        events.append(event)
+                    if page["next_cursor"] != cursor:
+                        raise Mt5V1ExecutionError(
+                            "execution journal page cursor is inconsistent"
+                        )
+                    if not cast(bool, page["has_more"]):
+                        if cursor != last_cursor:
+                            raise Mt5V1ExecutionError(
+                                "execution journal ended before its declared tail"
+                            )
+                        return events, cursor
+                raise Mt5V1ExecutionError(
+                    "execution journal pagination exceeded its page budget"
+                )
+        except TimeoutError as exc:
+            raise Mt5V1ExecutionError(
+                "execution journal pagination exceeded its time budget"
+            ) from exc
 
     async def _verify_unchanged_journal_tail(self, identity: Identity, cursor: str) -> None:
         page = await self._transport.execution_events(
@@ -1452,3 +1510,13 @@ def _validate_config(config: Mt5V1ExecClientConfig) -> None:
         raise ValueError("snapshot refresh cannot be faster than the event poll interval")
     if not 1 <= config.event_page_limit <= 500:
         raise ValueError("event_page_limit is outside the v1 wire range")
+    if (
+        type(config.event_pagination_max_pages) is not int
+        or not 1 <= config.event_pagination_max_pages <= 10_000
+    ):
+        raise ValueError("event_pagination_max_pages is outside the supported range")
+    if (
+        type(config.event_pagination_timeout_ms) is not int
+        or not 50 <= config.event_pagination_timeout_ms <= 60_000
+    ):
+        raise ValueError("event_pagination_timeout_ms is outside the supported range")

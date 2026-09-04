@@ -1,11 +1,14 @@
 """Durable exactly-once and restart-stop behavior."""
 
 import json
+import os
 from decimal import Decimal
 from pathlib import Path
 
 import pytest
 
+import py000_nautilus.store as store_module
+from py000_nautilus.durability import ParentDirectorySyncError
 from py000_nautilus.models import BusinessOrderSide, HedgeLeg, ObligationStatus
 from py000_nautilus.store import JsonStateStore
 
@@ -416,6 +419,40 @@ def test_source_reconciliation_persist_failure_rolls_back_memory_and_disk(
     assert reloaded.halt_reason == expected_halt
     assert reloaded.source_order("O-RECONCILE") == expected_record
     assert not reloaded.can_submit_source()
+
+
+def test_post_replace_sync_failure_keeps_the_source_fill_reservation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = Path(_state_path(tmp_path))
+    store = JsonStateStore(path)
+    store.begin_source("O-UNCERTAIN", BusinessOrderSide.BUY, D(1))
+    original_replace = os.replace
+
+    def replace_then_fail(
+        source: str | os.PathLike[str],
+        destination: str | os.PathLike[str],
+    ) -> None:
+        original_replace(source, destination)
+        raise ParentDirectorySyncError("replacement completed but parent sync failed")
+
+    monkeypatch.setattr(store_module, "replace_and_sync_parent", replace_then_fail)
+
+    with pytest.raises(ParentDirectorySyncError, match="replacement completed"):
+        store.reserve_source_fill(
+            fill_key="O-UNCERTAIN|V-1|T-1",
+            client_order_id="O-UNCERTAIN",
+            trade_id="T-1",
+            source_side=BusinessOrderSide.BUY,
+            fill_ounces=D(1),
+        )
+
+    assert store.has_seen_source_fill("O-UNCERTAIN|V-1|T-1")
+    assert len(store.intents()) == 1
+    reloaded = JsonStateStore(path)
+    assert reloaded.has_seen_source_fill("O-UNCERTAIN|V-1|T-1")
+    assert len(reloaded.intents()) == 1
 
 
 def test_restart_marks_inflight_source_unknown_and_blocks_second_source(tmp_path: Path) -> None:

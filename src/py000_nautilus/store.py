@@ -10,6 +10,7 @@ from hashlib import sha256
 from pathlib import Path
 from typing import cast
 
+from py000_nautilus.durability import ParentDirectorySyncError, replace_and_sync_parent
 from py000_nautilus.economics import round_hedge_ounces
 from py000_nautilus.models import BusinessOrderSide, HedgeIntent, HedgeLeg, ObligationStatus
 
@@ -250,6 +251,8 @@ class JsonStateStore:
             self._state.halt_reason = None
         try:
             self._persist()
+        except ParentDirectorySyncError:
+            raise
         except Exception:
             self._state = previous_state
             raise
@@ -535,11 +538,13 @@ class JsonStateStore:
             handle.flush()
             os.fsync(handle.fileno())
             temporary_path = Path(handle.name)
-        os.replace(temporary_path, self.path)
+        replace_and_sync_parent(temporary_path, self.path)
 
     def _persist_source_reservation(self, previous_state: StoreState) -> None:
         try:
             self._persist()
+        except ParentDirectorySyncError:
+            raise
         except Exception:
             self._state = previous_state
             raise
