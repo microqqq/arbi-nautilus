@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, cast
 
 import pytest
+from nautilus_trader.common.component import TestClock
 from nautilus_trader.common.providers import InstrumentProvider
 from nautilus_trader.config import RoutingConfig, TradingNodeConfig
 from nautilus_trader.core.uuid import UUID4
@@ -124,8 +125,9 @@ def _client(
     fake: _FakeTransport,
     *,
     raw_symbol: str = RAW_SYMBOL,
+    clock: Any | None = None,
 ) -> BitfinexV1DataClient:
-    clock = TestComponentStubs.clock()
+    clock = TestComponentStubs.clock() if clock is None else clock
     profile = (
         {
             "min_quantity": Decimal("2"),
@@ -945,6 +947,98 @@ def test_unknown_book_heartbeat_is_ignored_while_subscription_ack_is_pending() -
     asyncio.run(scenario())
 
 
+def test_actionable_book_heartbeat_republishes_same_quote_with_fresh_local_time() -> None:
+    async def scenario() -> None:
+        clock = TestClock()
+        client = _client(_FakeTransport(), clock=clock)
+        client._subscription_requested = True
+        client._publish_quotes = True
+        client._consume_frame(_subscription())
+
+        clock.set_time(101)
+        snapshot = client._consume_frame(CAPTURE[0])
+        clock.set_time(202)
+        heartbeat = client._consume_frame([CHANNEL_ID, "hb"])
+
+        assert len(snapshot) == len(heartbeat) == 1
+        snapshot_quote = snapshot[0]
+        heartbeat_quote = heartbeat[0]
+        assert isinstance(snapshot_quote, QuoteTick)
+        assert isinstance(heartbeat_quote, QuoteTick)
+        assert heartbeat_quote.bid_price == snapshot_quote.bid_price
+        assert heartbeat_quote.ask_price == snapshot_quote.ask_price
+        assert heartbeat_quote.bid_size == snapshot_quote.bid_size
+        assert heartbeat_quote.ask_size == snapshot_quote.ask_size
+        assert snapshot_quote.ts_event == snapshot_quote.ts_init == 101
+        assert heartbeat_quote.ts_event == heartbeat_quote.ts_init == 202
+
+    asyncio.run(scenario())
+
+
+def test_book_heartbeat_waits_for_checksum_after_delta_invalidates_book() -> None:
+    async def scenario() -> None:
+        client = _client(_FakeTransport())
+        client._subscription_requested = True
+        client._publish_quotes = True
+        client._consume_frame(_subscription())
+        client._consume_frame(CAPTURE[0])
+
+        assert client._consume_frame(CAPTURE[1]) == ()
+        actionable_after_delta = client.book_is_actionable
+        assert not actionable_after_delta
+        assert client._consume_frame([CHANNEL_ID, "hb"]) == ()
+
+        for frame in CAPTURE[2:-1]:
+            assert client._consume_frame(frame) == ()
+        checksum = client._consume_frame(CAPTURE[-1])
+        heartbeat = client._consume_frame([CHANNEL_ID, "hb"])
+
+        actionable_after_checksum = client.book_is_actionable
+        assert actionable_after_checksum
+        assert len(checksum) == len(heartbeat) == 1
+        assert isinstance(checksum[0], QuoteTick)
+        assert isinstance(heartbeat[0], QuoteTick)
+
+    asyncio.run(scenario())
+
+
+def test_book_heartbeat_does_not_synthesize_delta_for_deltas_only_subscription() -> None:
+    async def scenario() -> None:
+        client = _client(_FakeTransport())
+        client._subscription_requested = True
+        client._publish_deltas = True
+        client._consume_frame(_subscription())
+
+        snapshot = client._consume_frame(CAPTURE[0])
+
+        assert len(snapshot) == 1
+        assert isinstance(snapshot[0], OrderBookDeltas)
+        assert client._consume_frame([CHANNEL_ID, "hb"]) == ()
+
+    asyncio.run(scenario())
+
+
+def test_non_book_and_pending_unsubscribe_heartbeats_do_not_publish_quotes() -> None:
+    async def scenario() -> None:
+        fake = _FakeTransport()
+        client = _client(fake)
+        client._subscription_requested = True
+        client._publish_quotes = True
+        client._consume_frame(_subscription())
+        assert isinstance(client._consume_frame(CAPTURE[0])[0], QuoteTick)
+
+        client._funding_subscription_requested = True
+        assert client._consume_frame([FUNDING_CHANNEL_ID, "hb"]) == ()
+        client._consume_frame(_funding_subscription())
+        assert client._consume_frame([FUNDING_CHANNEL_ID, "hb"]) == ()
+
+        await client._unsubscribe_quote_ticks(_quote_unsubscribe_command())
+        assert client._pending_unsubscribe_channel_id == CHANNEL_ID
+        assert client._consume_frame([CHANNEL_ID, "hb"]) == ()
+
+    asyncio.run(scenario())
+
+
 def test_single_pending_subscription_rejects_heartbeat_candidate_ack_mismatch() -> None:
     async def scenario() -> None:
         client = _client(_FakeTransport())
@@ -1159,6 +1253,21 @@ def test_client_publishes_atomic_snapshot_then_revalidates_deltas_with_crc() -> 
             await fake.queue.put(CAPTURE[0])
             await _wait_until(lambda: cache.quote_tick(INSTRUMENT_ID) is not None)
             assert client.book_is_actionable
+            quote = cache.quote_tick(INSTRUMENT_ID)
+            assert isinstance(quote, QuoteTick)
+            assert str(quote.bid_price) == "4455.2"
+            assert str(quote.bid_size) == "0.11766725"
+            assert str(quote.ask_price) == "4456.0"
+            assert str(quote.ask_size) == "0.17296923"
+            initial_quote_ts = quote.ts_event
+            await asyncio.sleep(0.001)
+            await fake.queue.put([CHANNEL_ID, "hb"])
+            await _wait_until(
+                lambda: (
+                    cache.quote_tick(INSTRUMENT_ID) is not None
+                    and cache.quote_tick(INSTRUMENT_ID).ts_event > initial_quote_ts
+                )
+            )
             quote = cache.quote_tick(INSTRUMENT_ID)
             assert isinstance(quote, QuoteTick)
             assert str(quote.bid_price) == "4455.2"
