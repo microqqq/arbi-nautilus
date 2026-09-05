@@ -1,18 +1,30 @@
 """Authenticated callee vectors and explicit normalized migration boundaries.
 
-These tests do not authenticate accounts, infer flat state, check freshness,
-or grant order admission. The old modules/ZIP are not loaded by this suite.
+Normalized vectors do not authenticate accounts; separate native-event tests
+cover the bounded metadata mapping, not live admission or working-order reserves.
+The old modules/ZIP are not loaded by this suite.
 """
 
+import inspect
 import json
 from collections.abc import Callable
+from copy import deepcopy
 from decimal import Decimal
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import pytest
+from nautilus_trader.core.uuid import UUID4
+from nautilus_trader.model.currencies import EUR, USD, USDT
+from nautilus_trader.model.enums import AccountType
+from nautilus_trader.model.events import AccountState
+from nautilus_trader.model.identifiers import AccountId, ClientId, InstrumentId
+from nautilus_trader.model.objects import Currency
 
+from py000_nautilus import margin as margin_module
+from py000_nautilus.config import HedgeAccountRoute, SourceAccountRoute
 from py000_nautilus.margin import bitfinex_margin_capacity, mt5_margin_capacity
+from py000_nautilus.models import HedgeAccount, MakerAccount, SourceAccount
 
 D = Decimal
 _FIXTURE = Path(__file__).parent / "fixtures" / "legacy_margin_vectors.json"
@@ -264,3 +276,401 @@ def test_all_normalized_values_are_required_arguments(
     for field in values:
         with pytest.raises(TypeError, match=field):
             calculate(**{name: value for name, value in values.items() if name != field})
+
+
+_SOURCE_ROUTE = SourceAccountRoute(
+    account_id=AccountId("BITFINEX-001"), client_id=ClientId("BITFINEX"),
+    max_long_ounces=D(100), max_short_ounces=D(100), base_margin_level=D(100),
+)
+_HEDGE_ROUTE = HedgeAccountRoute(
+    account_id=AccountId("MT5-001"), client_id=ClientId("MT5"),
+    max_long_ounces=D(100), max_short_ounces=D(100),
+)
+_SOURCE_ID = InstrumentId.from_str("XAUTUSDT.BITFINEX")
+_VIEW_INPUT = {
+    "margin_target": D(400), "max_abs_ounces": D(100), "now_ns": 100,
+    "max_account_age_ns": 20, "client_ready": True, "ask": D(4000),
+    "ask_ts_ns": 90, "max_quote_age_ns": 10, "ask_actionable": True,
+}
+
+
+def _account_event(*, bfx: bool, info: dict[str, Any] | None = None) -> AccountState:
+    if info is None:
+        info = ({
+            "bitfinex_wallet_currency": "USTF0",
+            "bitfinex_margin": {
+                "instrument_id": _SOURCE_ID.value,
+                "wallet": {
+                    "balance": "1000", "available_balance": "1000",
+                    "observed_ns": 85, "current": True,
+                },
+                "positions": {
+                    "complete": True, "current": True, "observed_ns": 90, "position": None,
+                },
+            },
+        } if bfx else {
+            "mt5_equity": "1000", "mt5_leverage": 999,
+            "mt5_positions_complete": True, "mt5_net_position_ounces": "0",
+            "mt5_position_count": 0, "mt5_symbol": "XAUUSD", "mt5_stream_id": "stream-1",
+            "mt5_account_observed_ns": 80, "mt5_account_sample_valid": True,
+        })
+    return AccountState(
+        account_id=(_SOURCE_ROUTE if bfx else _HEDGE_ROUTE).account_id,
+        account_type=AccountType.MARGIN, base_currency=USDT if bfx else USD,
+        balances=[], margins=[], reported=True, info=info,
+        event_id=UUID4(), ts_event=100, ts_init=100,
+    )
+
+
+def _position(quantity: str = "3") -> dict[str, Any]:
+    return {
+        "position_id": 44, "status": "ACTIVE", "quantity": quantity,
+        "base_price": "4000", "profit_loss": "0", "leverage": "10",
+        "collateral": "1000", "collateral_min": "200", "type": 1,
+        "venue_update_ms": 1,
+    }
+
+
+def _source_view(event: AccountState | None, **changes: Any) -> SourceAccount | None:
+    return margin_module.bitfinex_source_account(event, **{
+        **_VIEW_INPUT, "route": _SOURCE_ROUTE, "instrument_id": _SOURCE_ID,
+        "wallet_currency": "USTF0", **changes,
+    })
+
+
+def _mt5_view(
+    event: AccountState | None, *, maker: bool = False, **changes: Any,
+) -> HedgeAccount | MakerAccount | None:
+    mapper = margin_module.mt5_maker_account if maker else margin_module.mt5_hedge_account
+    return mapper(event, **{
+        **_VIEW_INPUT, "route": _HEDGE_ROUTE, "symbol": "XAUUSD", "stream_id": "stream-1",
+        **changes,
+    })
+
+
+def test_native_flat_account_mapping_and_mt5_shared_view_do_not_mutate_info() -> None:
+    source, hedge = _account_event(bfx=True), _account_event(bfx=False)
+    original = deepcopy((source.info, hedge.info))
+    assert _source_view(source) == SourceAccount(
+        _SOURCE_ROUTE.account_id, _SOURCE_ROUTE.client_id, D(0), D(5), D(5), D(100),
+    )
+    assert _mt5_view(hedge) == HedgeAccount(D(0), D(5), D(5))
+    assert _mt5_view(hedge, maker=True) == MakerAccount(
+        _HEDGE_ROUTE.account_id, _HEDGE_ROUTE.client_id, D(0), D(5), D(5),
+    )
+    assert (source.info, hedge.info) == original
+
+
+def test_native_held_source_uses_dynamic_base_and_entry_price_not_flat_defaults() -> None:
+    event = _account_event(bfx=True)
+    event.info["bitfinex_margin"]["positions"]["position"] = _position()
+    # B=10000*200/(1000*10)=200, floor leverage=16, H=min(8,4+3)=7.
+    view = _source_view(event, ask=D("NaN"), ask_ts_ns=101, ask_actionable=False)
+    assert view == SourceAccount(
+        _SOURCE_ROUTE.account_id, _SOURCE_ROUTE.client_id, D(3), D(4), D(10), D(200),
+    )
+
+
+@pytest.mark.parametrize("quantity", ["0.4", "-0.4"])
+def test_native_mapping_preserves_fractional_net_and_physical_sides(quantity: str) -> None:
+    q = D(quantity)
+    source, hedge = _account_event(bfx=True), _account_event(bfx=False)
+    position = _position(quantity)
+    position.update(collateral="200", collateral_min="20")
+    source.info["bitfinex_margin"]["positions"]["position"] = position
+    hedge.info.update(mt5_net_position_ounces=quantity, mt5_position_count=1)
+    assert _source_view(source) == SourceAccount(
+        _SOURCE_ROUTE.account_id, _SOURCE_ROUTE.client_id, q,
+        D("5.4") - q, D("5.4") + q, D(100),
+    )
+    assert _mt5_view(hedge) == HedgeAccount(q, D(5) - q, D(5) + q)
+
+
+@pytest.mark.parametrize("quantity", ["12", "-12"])
+@pytest.mark.parametrize("bfx", [False, True])
+def test_view_directional_risk_space_allows_reduction_but_not_opposite_over_limit(
+    quantity: str, bfx: bool,
+) -> None:
+    event, q = _account_event(bfx=bfx), D(quantity)
+    view: SourceAccount | HedgeAccount | MakerAccount | None
+    if bfx:
+        event.info["bitfinex_margin"]["positions"]["position"] = _position(quantity)
+        event.info["bitfinex_margin"]["wallet"]["available_balance"] = "100000"
+        view = _source_view(event, max_abs_ounces=D(10))
+    else:
+        event.info.update(mt5_net_position_ounces=quantity, mt5_position_count=1)
+        event.info["mt5_equity"] = "100000"
+        view = _mt5_view(event, max_abs_ounces=D(10))
+    assert view is not None
+    assert (view.max_long_ounces, view.max_short_ounces) == (
+        (D(0), D(22)) if q > 0 else (D(22), D(0))
+    )
+    reducing_capacity = view.max_short_ounces if q > 0 else view.max_long_ounces
+    assert D(1) <= reducing_capacity  # 12 -> 11 remains permitted.
+    assert D(22) <= reducing_capacity < D(23)  # Cross to -10, never -11.
+
+
+@pytest.mark.parametrize("bfx", [False, True])
+def test_route_capacity_is_trade_amount_not_another_position_limit(bfx: bool) -> None:
+    event = _account_event(bfx=bfx)
+    view: SourceAccount | HedgeAccount | MakerAccount | None
+    if bfx:
+        event.info["bitfinex_margin"]["positions"]["position"] = _position()
+        route = SourceAccountRoute(
+            account_id=_SOURCE_ROUTE.account_id, client_id=_SOURCE_ROUTE.client_id,
+            max_long_ounces=D(2), max_short_ounces=D("1.5"), base_margin_level=D(100),
+        )
+        view = _source_view(event, route=route)
+    else:
+        event.info.update(mt5_net_position_ounces="3", mt5_position_count=1)
+        hedge_route = HedgeAccountRoute(
+            account_id=_HEDGE_ROUTE.account_id, client_id=_HEDGE_ROUTE.client_id,
+            max_long_ounces=D(2), max_short_ounces=D("1.5"),
+        )
+        view = _mt5_view(event, route=hedge_route)
+    assert view is not None
+    assert (view.max_long_ounces, view.max_short_ounces) == (D(2), D("1.5"))
+
+
+def test_mapping_retains_zero_bfx_leverage_and_zero_base_from_real_held_fields() -> None:
+    event = _account_event(bfx=True)
+    position = _position("2.25")
+    event.info["bitfinex_margin"]["positions"]["position"] = position
+    view = _source_view(event, margin_target=D(10000))
+    assert view is not None
+    assert (view.max_long_ounces, view.max_short_ounces) == (D(0), D("2.25"))
+    position["collateral_min"] = "0"
+    view = _source_view(event)
+    assert view is not None and view.base_margin_level == 0
+
+
+@pytest.mark.parametrize("maker", [False, True])
+def test_mt5_zero_net_with_multiple_tickets_is_valid_and_leverage_is_not_base(maker: bool) -> None:
+    event = _account_event(bfx=False)
+    event.info.update(mt5_position_count=2, mt5_equity="184", mt5_leverage=1)
+    view = _mt5_view(event, maker=maker)
+    assert view is not None and view.position_ounces == 0
+    assert (view.max_long_ounces, view.max_short_ounces) == (D(1), D(1))
+
+
+@pytest.mark.parametrize("maker", [False, True])
+def test_mt5_single_positive_volume_ticket_cannot_have_zero_net(maker: bool) -> None:
+    event = _account_event(bfx=False)
+    event.info["mt5_position_count"] = 1
+    assert _mt5_view(event, maker=maker) is None
+
+
+@pytest.mark.parametrize("component", ["wallet", "positions"])
+@pytest.mark.parametrize("observed", [None, True, "90", -1, 79, 101])
+def test_bfx_component_age_is_independent_of_publish_time(component: str, observed: object) -> None:
+    event = _account_event(bfx=True)
+    event.info["bitfinex_margin"][component]["observed_ns"] = observed
+    assert _source_view(event) is None
+
+
+@pytest.mark.parametrize("field", ["balance", "available_balance"])
+@pytest.mark.parametrize("invalid", [None, True, "bad", "NaN", "Infinity"])
+def test_missing_or_invalid_wallet_value_is_not_zero(field: str, invalid: object) -> None:
+    event = _account_event(bfx=True)
+    event.info["bitfinex_margin"]["wallet"][field] = invalid
+    assert _source_view(event) is None
+
+
+@pytest.mark.parametrize("field", [
+    "quantity", "base_price", "profit_loss", "leverage", "collateral", "collateral_min",
+])
+@pytest.mark.parametrize("invalid", [None, "bad", "NaN", "Infinity"])
+def test_incomplete_held_fields_never_fall_back_to_flat(field: str, invalid: object) -> None:
+    event = _account_event(bfx=True)
+    event.info["bitfinex_margin"]["positions"]["position"] = _position()
+    event.info["bitfinex_margin"]["positions"]["position"][field] = invalid
+    assert _source_view(event) is None
+
+
+@pytest.mark.parametrize(("field", "invalid"), [
+    ("quantity", "0"), ("base_price", "0"), ("collateral", "0"),
+    ("leverage", "0"), ("collateral_min", "-1"), ("status", "CLOSED"),
+    ("type", 0), ("type", True), ("position_id", 0), ("position_id", True),
+])
+def test_held_position_requires_valid_derivative_position(field: str, invalid: object) -> None:
+    event = _account_event(bfx=True)
+    event.info["bitfinex_margin"]["positions"]["position"] = _position()
+    event.info["bitfinex_margin"]["positions"]["position"][field] = invalid
+    assert _source_view(event) is None
+
+
+@pytest.mark.parametrize("case", [
+    "missing_position", "missing_wallet", "incomplete", "old_positions", "old_wallet",
+    "instrument", "currency", "account", "no_flat_base",
+])
+def test_bfx_identity_and_completeness_cannot_invent_flat(case: str) -> None:
+    event, changes = _account_event(bfx=True), {}
+    facts = event.info["bitfinex_margin"]
+    if case == "missing_position":
+        del facts["positions"]["position"]
+    elif case == "missing_wallet":
+        del facts["wallet"]
+    elif case == "incomplete":
+        facts["positions"]["complete"] = False
+    elif case.startswith("old_"):
+        facts[case.removeprefix("old_")]["current"] = False
+    elif case == "instrument":
+        facts["instrument_id"] = "OTHER.BITFINEX"
+    elif case == "currency":
+        event.info["bitfinex_wallet_currency"] = "USD"
+    else:
+        changes["route"] = SourceAccountRoute(
+            account_id=(
+                AccountId("BITFINEX-OTHER") if case == "account" else _SOURCE_ROUTE.account_id
+            ),
+            max_long_ounces=D(100), max_short_ounces=D(100),
+        )
+    assert _source_view(event, **changes) is None
+
+
+@pytest.mark.parametrize("maker", [False, True])
+@pytest.mark.parametrize(("field", "invalid"), [
+    ("mt5_positions_complete", False), ("mt5_account_sample_valid", False),
+    ("mt5_account_observed_ns", 79), ("mt5_account_observed_ns", 101),
+    ("mt5_account_observed_ns", True), ("mt5_symbol", "OTHER"), ("mt5_stream_id", "old"),
+    ("mt5_net_position_ounces", None), ("mt5_net_position_ounces", "NaN"),
+    ("mt5_equity", None), ("mt5_equity", "Infinity"),
+    ("mt5_position_count", None), ("mt5_position_count", -1), ("mt5_position_count", True),
+    ("mt5_net_position_ounces", "1"),  # Contradicts the complete zero-ticket count.
+])
+def test_mt5_invalid_facts_never_fall_back_to_native_net_zero(
+    maker: bool, field: str, invalid: object,
+) -> None:
+    event = _account_event(bfx=False)
+    event.info[field] = invalid
+    assert _mt5_view(event, maker=maker) is None
+
+
+@pytest.mark.parametrize("bfx", [False, True])
+@pytest.mark.parametrize(("field", "invalid"), [
+    ("client_ready", False), ("client_ready", 1), ("ask_actionable", False),
+    ("ask_ts_ns", 89), ("ask_ts_ns", 101), ("ask", D(0)), ("ask", D("NaN")),
+    ("now_ns", True), ("max_account_age_ns", -1), ("max_quote_age_ns", -1),
+    ("max_abs_ounces", D(-1)), ("max_abs_ounces", D("NaN")),
+    ("margin_target", D("NaN")),
+])
+def test_flat_mapping_requires_current_qualification_and_actionable_fresh_ask(
+    bfx: bool, field: str, invalid: object,
+) -> None:
+    event = _account_event(bfx=bfx)
+    mapper = _source_view if bfx else _mt5_view
+    changes: dict[str, Any] = {field: invalid}
+    assert mapper(event, **changes) is None
+
+
+@pytest.mark.parametrize("bfx", [False, True])
+def test_mapping_converts_numeric_overflow_to_unavailable_without_mutating_event(bfx: bool) -> None:
+    event = _account_event(bfx=bfx)
+    if bfx:
+        event.info["bitfinex_margin"]["wallet"]["available_balance"] = "1e1000000"
+    else:
+        event.info["mt5_equity"] = "1e1000000"
+    before = deepcopy(event.info)
+    assert (_source_view(event) if bfx else _mt5_view(event)) is None
+    assert event.info == before
+
+
+def test_mapping_missing_event_and_wrong_mt5_account_are_unavailable() -> None:
+    assert _source_view(None) is None
+    assert _mt5_view(None) is None
+    assert _mt5_view(None, maker=True) is None
+    assert _mt5_view(_account_event(bfx=True)) is None
+    assert _source_view(_account_event(bfx=True), route=None) is None
+    assert _mt5_view(_account_event(bfx=False), route=None) is None
+
+
+def test_current_client_qualification_has_no_implicit_true_default() -> None:
+    for mapper in (
+        margin_module.bitfinex_source_account,
+        margin_module.mt5_hedge_account,
+        margin_module.mt5_maker_account,
+    ):
+        parameter = inspect.signature(mapper).parameters["client_ready"]
+        assert parameter.default is inspect.Parameter.empty
+
+
+@pytest.mark.parametrize("venue", ["bfx", "mt5", "maker"])
+@pytest.mark.parametrize("currency", [EUR, None])
+def test_native_base_currency_must_match_fixed_price_units(
+    venue: str, currency: Currency | None,
+) -> None:
+    correct = _account_event(bfx=venue == "bfx")
+    event = AccountState(
+        account_id=correct.account_id, account_type=AccountType.MARGIN,
+        base_currency=currency, balances=[], margins=[], reported=True, info=correct.info,
+        event_id=UUID4(), ts_event=100, ts_init=100,
+    )
+    if venue == "bfx":
+        assert _source_view(event) is None
+    else:
+        assert _mt5_view(event, maker=venue == "maker") is None
+
+
+def test_held_base_does_not_require_a_flat_route_default() -> None:
+    event = _account_event(bfx=True)
+    event.info["bitfinex_margin"]["positions"]["position"] = _position()
+    route = SourceAccountRoute(
+        account_id=_SOURCE_ROUTE.account_id, max_long_ounces=D(100), max_short_ounces=D(100),
+    )
+    view = _source_view(event, route=route)
+    assert view is not None and view.base_margin_level == D(200)
+
+
+@pytest.mark.parametrize("bfx", [False, True])
+def test_mapper_preserves_finite_negative_balance_formula(bfx: bool) -> None:
+    event = _account_event(bfx=bfx)
+    view: SourceAccount | HedgeAccount | MakerAccount | None
+    if bfx:
+        event.info["bitfinex_margin"]["positions"]["position"] = _position()
+        event.info["bitfinex_margin"]["wallet"]["available_balance"] = "-1"
+        view = _source_view(event)
+        expected = D(5)
+    else:
+        event.info.update(mt5_equity="-1", mt5_net_position_ounces="3", mt5_position_count=1)
+        view = _mt5_view(event)
+        expected = D(2)
+    assert view is not None
+    assert (view.max_long_ounces, view.max_short_ounces) == (D(0), expected)
+
+
+@pytest.mark.parametrize("invalid", [None, [], "bad"])
+def test_mapper_rejects_wrong_metadata_shapes(invalid: object) -> None:
+    event = _account_event(bfx=True)
+    event.info["bitfinex_margin"] = invalid
+    assert _source_view(event) is None
+
+
+def test_mapper_rejects_missing_mt5_equity_key() -> None:
+    event = _account_event(bfx=False)
+    del event.info["mt5_equity"]
+    assert _mt5_view(event) is None
+
+
+@pytest.mark.parametrize("component", ["wallet", "positions"])
+def test_bfx_current_is_exact_boolean(component: str) -> None:
+    event = _account_event(bfx=True)
+    event.info["bitfinex_margin"][component]["current"] = 1
+    assert _source_view(event) is None
+
+
+@pytest.mark.parametrize("bfx", [False, True])
+@pytest.mark.parametrize("invalid", [D(-1), D("NaN"), D("Infinity")])
+def test_route_trade_capacity_must_be_finite_and_nonnegative(bfx: bool, invalid: Decimal) -> None:
+    event = _account_event(bfx=bfx)
+    if bfx:
+        route = SourceAccountRoute(
+            account_id=_SOURCE_ROUTE.account_id, max_long_ounces=invalid,
+            max_short_ounces=D(100), base_margin_level=D(100),
+        )
+        assert _source_view(event, route=route) is None
+    else:
+        hedge_route = HedgeAccountRoute(
+            account_id=_HEDGE_ROUTE.account_id, max_long_ounces=invalid,
+            max_short_ounces=D(100),
+        )
+        assert _mt5_view(event, route=hedge_route) is None

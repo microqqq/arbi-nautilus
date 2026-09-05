@@ -46,13 +46,24 @@ from test_bitfinex_v1_execution import _FakeRest, _FakeTransport, _Harness, _pos
 from test_live_maker import _build as _build_maker
 from test_live_maker import _configs as _maker_configs
 from test_live_taker import _build, _configs
-from test_mt5_v1_execution import _identity, _snapshot
+from test_mt5_v1_execution import _capacity_harness, _identity, _outcome, _snapshot
 
 import py000_nautilus.live_runtime as runtime_module
+import py000_nautilus.margin as margin_module
 from py000_nautilus.app import _book_snapshot, _quote
 from py000_nautilus.bitfinex_v1_data import PAPER_RAW_SYMBOL, instrument_from_config
+from py000_nautilus.config import HedgeAccountRoute
+from py000_nautilus.economics import evaluate_taker
 from py000_nautilus.live_runtime import get_source_terminal_reconciler
-from py000_nautilus.models import ObligationStatus, SourceDirection
+from py000_nautilus.maker_economics import maker_quote
+from py000_nautilus.models import (
+    BookTop,
+    HedgeAccount,
+    MakerAccount,
+    ObligationStatus,
+    SourceAccount,
+    SourceDirection,
+)
 from py000_nautilus.mt5_v1_data import instrument_from_snapshot
 from py000_nautilus.store import JsonStateStore
 
@@ -1141,6 +1152,219 @@ def test_ordinary_maker_increasing_rest_fill_must_cover_already_applied_trade(
                 await asyncio.sleep(0.3)
                 assert source_attempts == 2 and order.filled_qty.as_decimal() == 1
                 assert len(harness.hedge_orders) == 1
+    asyncio.run(run())
+
+
+async def _publish_capacity_samples(
+    harness: _OrdinaryStrategy, *, source_quantity: Decimal, hedge_quantity: Decimal,
+    available: Decimal, equity: Decimal,
+) -> None:
+    now_ms = harness.node.kernel.clock.timestamp_ns() // 1_000_000
+    positions: list[list[object]] = []
+    if source_quantity:
+        row = [*_position_row(
+            source_quantity, avg_px=D(4000), raw_symbol=harness.wire.raw_symbol,
+        ), None, D(1000), D(200), None]
+        row[13] = now_ms
+        positions.append(row)
+    harness.source._consume_private_frame([0, "ps", positions])
+    harness.source._consume_private_frame(
+        [0, "wu", ["margin", harness.wallet_currency, D(10000), D(0), available]],
+    )
+    sample = _snapshot(_identity())
+    cast(dict[str, Any], sample["time"])["observed_utc_ms"] = str(now_ms)
+    account = cast(dict[str, Any], sample["account"])
+    account["equity"] = str(equity)
+    account["margin_free"] = str(equity - D(account["margin"]))
+    tickets = cast(list[dict[str, Any]], sample["positions"])
+    if hedge_quantity:
+        tickets[0]["side"] = "buy" if hedge_quantity > 0 else "sell"
+        tickets[0]["volume_lots"] = str(abs(hedge_quantity) / D(100))
+    else:
+        sample["positions"] = []
+    # Exercise the actual adapter publication and native Account/Portfolio path;
+    # raw MT5 snapshot wire validation has its own existing integration tests.
+    harness.hedge._install_snapshot(sample)
+    await _pump()
+
+
+def _mapped_capacity_accounts(
+    harness: _OrdinaryStrategy,
+) -> tuple[SourceAccount | None, HedgeAccount | MakerAccount | None]:
+    config = harness.strategy._config
+    source_account, hedge_account = harness.source.get_account(), harness.hedge.get_account()
+    assert source_account is not None and hedge_account is not None
+    now = harness.node.kernel.clock.timestamp_ns()
+    source_route = replace_config(
+        config.source_accounts[0], max_long_ounces=D(100), max_short_ounces=D(100),
+    )
+    source = margin_module.bitfinex_source_account(
+        source_account.last_event, route=source_route,
+        instrument_id=config.source_instrument_id, wallet_currency=harness.wallet_currency,
+        margin_target=D(400), max_abs_ounces=D(10), now_ns=now,
+        max_account_age_ns=5_000_000_000,
+        client_ready=harness.source.is_connected and harness.source.execution_hold_reason is None,
+        ask=D(4000), ask_ts_ns=now, max_quote_age_ns=5_000_000_000,
+        ask_actionable=harness.source_data.book_is_actionable,
+    )
+    hedge_route = HedgeAccountRoute(
+        account_id=harness.hedge.account_id, client_id=harness.hedge.id,
+        max_long_ounces=D(100), max_short_ounces=D(100),
+    )
+    mapper = margin_module.mt5_maker_account if harness.maker else margin_module.mt5_hedge_account
+    hedge = mapper(
+        hedge_account.last_event, route=hedge_route,
+        symbol=_identity().symbol, stream_id=_identity().stream_id,
+        margin_target=D(400), max_abs_ounces=D(10), now_ns=now,
+        max_account_age_ns=5_000_000_000,
+        client_ready=harness.hedge.account_capacity_ready(5_000_000_000),
+        ask=D(4000), ask_ts_ns=now, max_quote_age_ns=5_000_000_000,
+        ask_actionable=harness.hedge_data.snapshot_refresh_healthy,
+    )
+    return source, hedge
+
+
+@pytest.mark.parametrize("held", [False, True], ids=["complete-flat", "held-dynamic-base"])
+@pytest.mark.parametrize("maker", [False, True], ids=["taker", "maker"])
+def test_ordinary_account_capacity_mapping_drives_existing_economics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, maker: bool, held: bool,
+) -> None:
+    async def run() -> None:
+        async with _ordinary_strategy(tmp_path, monkeypatch, maker=maker, paper=True) as harness:
+            # Auth + wallet and a native account alone are not complete margin inputs.
+            assert _mapped_capacity_accounts(harness) == (None, None)
+            await _publish_capacity_samples(
+                harness, source_quantity=D("-0.4") if held else D(0), hedge_quantity=D(0),
+                available=D(400) if held else D(1000), equity=D(10000) if held else D(184),
+            )
+            source_event = harness.source.get_account().last_event
+            hedge_event = harness.hedge.get_account().last_event
+            before = deepcopy((source_event.info, hedge_event.info))
+            source, hedge = _mapped_capacity_accounts(harness)
+            assert source is not None and hedge is not None
+            assert source.position_ounces == (D("-0.4") if held else D(0))
+            assert source.base_margin_level == (D(200) if held else D(100))
+            assert (source.max_long_ounces, source.max_short_ounces) == (
+                (D("1.8"), D(1)) if held else (D(5), D(5))
+            )
+            assert hedge.position_ounces == 0
+            assert (hedge.max_long_ounces, hedge.max_short_ounces) == (
+                (D(10), D(10)) if held else (D(1), D(1))
+            )
+            book = BookTop(D(3999), D(4000), D(100), D(100))
+            config = replace_config(harness.strategy._config.economics, margin_level=D(400))
+            if maker:
+                assert isinstance(hedge, MakerAccount)
+                assert maker_quote(SourceDirection.LONG, book, (source,), (hedge,), config) is None
+                one = replace_config(
+                    config, bid=replace_config(config.bid, open_quantity_ounces=D(1)),
+                )
+                quote = maker_quote(SourceDirection.LONG, book, (source,), (hedge,), one)
+                assert quote is not None and quote.quantity_ounces == 1
+                leverage = quote.leverage
+            else:
+                assert isinstance(hedge, HedgeAccount)
+                config = replace_config(config, threshold_long=D(-1))
+                opportunity = evaluate_taker(
+                    book, book, (source,), hedge, config, allowed_direction=SourceDirection.LONG,
+                )
+                assert opportunity is not None
+                assert opportunity.source_quantity_ounces == (D("1.8") if held else D(1))
+                leverage = opportunity.leverage
+            assert leverage == (16 if held else 20)
+            assert (source_event.info, hedge_event.info) == before
+            assert not harness.sent_operations("on") and not harness.hedge_orders
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("sign", [-1, 1])
+@pytest.mark.parametrize("maker", [False, True], ids=["taker", "maker"])
+def test_ordinary_account_capacity_mapping_preserves_reduction_and_bounds_crossing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, maker: bool, sign: int,
+) -> None:
+    async def run() -> None:
+        async with _ordinary_strategy(tmp_path, monkeypatch, maker=maker, paper=True) as harness:
+            await _publish_capacity_samples(
+                harness, source_quantity=D(12 * sign), hedge_quantity=D(-12 * sign),
+                available=D(100000), equity=D(100000),
+            )
+            source, hedge = _mapped_capacity_accounts(harness)
+            assert source is not None and hedge is not None
+            assert (source.max_long_ounces, source.max_short_ounces) == (
+                (D(0), D(22)) if sign > 0 else (D(22), D(0))
+            )
+            assert (hedge.max_long_ounces, hedge.max_short_ounces) == (
+                (source.max_short_ounces, source.max_long_ounces)
+            )
+            direction = SourceDirection.SHORT if sign > 0 else SourceDirection.LONG
+            book = BookTop(D(3999), D(4000), D(100), D(100))
+            base_config = replace_config(harness.strategy._config.economics, margin_level=D(400))
+            for requested in (D(1), D(22), D(23), D(24)):
+                if maker:
+                    assert isinstance(hedge, MakerAccount)
+                    config = replace_config(
+                        base_config,
+                        bid=replace_config(base_config.bid, open_quantity_ounces=requested),
+                        ask=replace_config(base_config.ask, open_quantity_ounces=requested),
+                    )
+                    quote = maker_quote(direction, book, (source,), (hedge,), config)
+                    if requested > 22:
+                        assert quote is None
+                        continue
+                    assert quote is not None and quote.quantity_ounces == requested
+                    quantity = quote.quantity_ounces
+                else:
+                    assert isinstance(hedge, HedgeAccount)
+                    config = replace_config(
+                        base_config, open_quantity_long=requested, open_quantity_short=requested,
+                        threshold_long=D(-1), threshold_short=D(-1),
+                    )
+                    opportunity = evaluate_taker(
+                        book, book, (source,), hedge, config, allowed_direction=direction,
+                    )
+                    assert opportunity is not None
+                    quantity = opportunity.source_quantity_ounces
+                    assert quantity == min(requested, D(22))
+                after = source.position_ounces - D(sign) * quantity
+                assert after == (D(sign * 11) if requested == 1 else D(-sign * 10))
+            assert not harness.sent_operations("on") and not harness.hedge_orders
+    asyncio.run(run())
+
+
+def test_mt5_actual_fill_revokes_mapping_even_when_historical_account_event_stays_valid() -> None:
+    async def run() -> None:
+        harness, clock = await _capacity_harness(asyncio.get_running_loop())
+        try:
+            event = harness.account_states[-1]
+            old_info = deepcopy(event.info)
+            route = HedgeAccountRoute(
+                account_id=harness.client.account_id, max_long_ounces=D(100),
+                max_short_ounces=D(100), client_id=harness.client.id,
+            )
+
+            def view() -> HedgeAccount | None:
+                return margin_module.mt5_hedge_account(
+                    event, route=route, symbol=harness.identity.symbol,
+                    stream_id=harness.identity.stream_id, margin_target=D(400),
+                    max_abs_ounces=D(10), now_ns=clock.timestamp_ns(),
+                    max_account_age_ns=5_000_000_000,
+                    client_ready=harness.client.account_capacity_ready(5_000_000_000),
+                    ask=D(4000), ask_ts_ns=clock.timestamp_ns(),
+                    max_quote_age_ns=5_000_000_000, ask_actionable=True,
+                )
+
+            assert view() is not None
+            order = harness.market(quantity="1")
+            harness.fake.outcome = _outcome(
+                harness.identity, order, "order_filled", quantity_lots="0.01",
+            )
+            await harness.submit(order)
+            assert len([event for event in harness.events if isinstance(event, OrderFilled)]) == 1
+            assert event.info == old_info and event.info["mt5_account_sample_valid"] is True
+            assert view() is None
+            assert harness.client.execution_admitted
+        finally:
+            await harness.client._disconnect()
     asyncio.run(run())
 
 
