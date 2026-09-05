@@ -362,6 +362,24 @@ carry 是同 route 的唯一 signed residual；下一 fill 先与它合并再分
 - 缺失/变化票据、同ID数量/方向变化、residual前新反向票、前一腿未决或拒绝均不得多发。fresh snapshot超时/不可用不能使用旧snapshot继续。普通两策略到真实adapter的参数路由必须独立验证，不以单独直接调用adapter或原append-only MT5替身冒充串联验收。
 - 有界写集：现有hedge.py（仅必要的短命令前提映射）、两策略hedge提交、mt5_v1_execution.py；复用现有相关测试夹具，允许一个连续仓位矩阵测试文件。root维护本文与原生连续撮合测试，编码agent负责执行边界与对应测试，独立reviewer审核。全量离线通过后独立本地提交；不改profile/EA、不开真实账户、不推送/部署/发单。未覆盖的完整live连续矩阵继续明确列为未完，不以分层测试声称DEMO已验收。
 
+**W5b6 双adapter连续成交闭环（2026-09-06，实施前固定）：** 从`dfa90fb`出发，先作为test-only包补齐E01–E03的普通live composition离线证据。沿原builder、两策略、两个实际execution adapter、原生Engine与原source-terminal reconciler运行；仅venue执行IO与行情事件为确定性离线输入，行情经原生DataEngine交付，不认证实际PUB网络或data adapter解码。不得覆盖adapter提交/成交/报告方法、直接写业务store或native仓位来完成周期，不放宽2秒账户query节流、准入、时效或原UNKNOWN处置。
+
+- 现MT5 fake的pages是一次性响应队列，历史重读只返回stream_started，positions也不随mutation变化；这不够证明连续对账。仅在tests新增短的连续wire夹具，复用现有协议向量构造器：唯一request/order/deal/position ID、同一可重读有界journal、每次open/部分close/exact-close后的完整positions与新snapshot。snapshot、event分页和原generate_mass_status必须来自这些相同事实，不能分别拼出互不一致的绿色。它不是新EA或通用交易模拟平台，不启动ZMQ服务、不连外部账户。
+- Bitfinex复用已有fake WS/REST和行构造器，按真实发出的on/ou/oc维护活跃单/终态/成交；trade与order ID唯一、SELL数量保留负号，单symbol净仓累计并正确经过零。账户查询与报告只读同一venue事实；原阈值/方向通过新行情驱动，不调用策略私有下单入口或重写market去重时间。Maker使用启动即确定的双边配置，选择实际已确认工作单模拟成交，保留原保护撤单与终态核对。部分成交可以小于已发单量，但不能超过真实leaves。
+- 同一实例从flat连续经历2→4→2→1→反向1，以及1→3→反向1（反向delta4必须close1、close2、open1）；Maker/Taker及正反方向对称。每阶段检查实际source成交而非委托量、两端native净仓、MT5精确票据/剩余量、原adapter报告、store义务与下一源单准入；不同cycle不能用清仓、重启或手动解锁连接。MT5原0.02lot单腿上限保持，source4oz可由多个合格腿完成，不把整体delta误判为一张4oz MT5单。
+- 增加腿间有界故障：前腿等待响应时不发后腿，后续票据变化/结果未知时停止余腿与新source。实测原MT5 mass在UNKNOWN时返回None、保留pending，原生对账不能宣布成功；不承诺必然立即断线，也不将None当空仓。不把旧synthetic mass的宽松行为当成真实adapter承诺。完成路径要对齐source部分成交、保护cancel及原生对账，不能只验证最后净仓相等。
+- 写集：tests内一个短MT5 wire helper及其有限自检，一个双adapter连续矩阵测试文件；原test_strategy_continuity夹具只补必要的启动配置/IO注入选择，旧用例默认语义保持。root维护本文、BFX序列和集成矩阵；编码agent负责独立MT5 helper及其自检，不同时写同文件；另一个reviewer独立验收。若实际链路发现生产问题，先记录精确反例及最小修复方案再扩该处写集，不顺势重构平台。全量/静态/独立审核通过后本地提交，不推送、改EA/profile、部署或真实发单；原子残差、W6–W9仍是后续，离线闭环不等于DEMO验收。
+
+**W5b6 窄修复补充（反例确认后、生产修改前）：** 首轮8案普通双adapter矩阵5过3失败。Maker源单真实事件依次为Accepted→PendingUpdate→Filled→ModifyRejected（原生Engine拒绝已排队的改价，原因为order already closed）；新行情和真实WS fill交错即可触发，未覆盖adapter方法。native源单已FILLED、MT5多腿已COMPLETED、原terminal owner无失败，但Maker无条件将该源记录降为UNKNOWN并持久halt，后续周期不能开始。不能靠在测试里提前排空成交队列隐去此竞态。
+
+- 最小生产扩展仅`strategies/maker.py`：复用现有obsolete-cancel的精确终态证明，把它用于迟到的modify rejection；保持原身份、路由、native/store终态、逐笔成交已记账等全部判据。不按错误文案放行，不清旧HOLD，不接受工作中/未知/不一致订单，也不重新下单或补造终态。必要时只改私有helper名称/事件类型，不新增状态或框架。
+- 编码agent独占上述生产文件及既有`test_maker_events.py`：先保留RED，再覆盖真实native处理的迟到拒绝及身份/数量/未决/旧HOLD负例；root保留普通双adapter连续反例及后续周期验证，reviewer不参与实现。MT5 helper两个文件保持冻结；其余生产范围不扩展。
+
+**同根部分成交补充（第二反例确认后、再修改前）：** 真实MT5 poller启动后的24案为23过1失败，剩余为Maker第四周期partial1oz：PendingUpdate→Filled(partial)→PendingCancel→ModifyRejected（原生客户端因pending cancel拒绝旧改价）→Canceled；对冲已完成，源cancel也经原owner核对，但旧modify halt永久遗留。它与已关闭分支有区别，不能把pending cancel当终态。
+
+- 仍只扩同一Maker私有proof：对modify rejection，若精确身份/路由/数量/全部已记账成交仍吻合、原业务记录为PARTIALLY_FILLED且仍是active源单、Maker已有fill冻结，且原生事件证明保护cancel仍未决，可保留原取消过程而不新增UNKNOWN。部分fill改变native status但不代表cancel应答，沿用现有原生cancel事件序列判据；已有拒绝/终态不得假作pending。这个分支不适用于cancel rejection、UNKNOWN或缺失/不一致事实，不放开工作源单或新准入。所有既有HOLD、inflight query和未完成对冲不变，必须继续等原cancel终态＋精确报告＋对冲完成才由旧逻辑释放。补实际native顺序的正/负例和原普通第四周期回归；不新增恢复状态、延迟队列或按reason字符串判断。
+- 独立review追加真实反例：固定NT允许Canceled→PartiallyFilled的迟到成交转换；Accepted→Filled1→PendingCancel→Canceled→late Filled1无需篡改store，当前状态再次partial，但旧PendingCancel早已结束。短共享扫描必须被真实Canceled/Expired等已完成事实终止，不能仅看当前status或跳过历史终态来“复活”取消。原生真序列须使pending/protective proof为False，仍未决的两种partial排序保持True；同一有界写集修复，全量候选遇此REWORK即停止，不将其已跑部分记作全量通过。
+
 ### W6：重启与停止形成真实闭环
 
 范围：`store.py`、两个 execution 的报告/重连路径、live lifecycle、必要的原生 cache 配置和恢复测试。先执行 Q3。
@@ -564,7 +582,8 @@ EA 改动额外执行现有 `tools/mt5_source_manifest.sh --lines`、MetaEditor 
   - [x] W5b3：两端完整账户事实到既有动态容量视图的纯映射；普通账户事件、经济产出及独立复核通过。
   - [x] W5b4：普通两策略自动消费动态容量/杠杆，按需刷新、操作后预算、Maker旧单与双侧维护、账户时效和原未决义务门接线；普通组合及独立复核通过。
   - [x] W5b5：两策略原生连续加仓/反向/穿零矩阵，以及真实MT5 adapter提交前计划一致性、在途/拒绝/未知阻挡；独立复核与全量通过，仅接受该离线分层范围。
-  - [ ] W5后续：完整双adapter连续多票仓位矩阵、Maker原子残差与strict/bounded-carry、剩余原策略parity；不因分层离线验证完成而关闭。
+  - [x] W5b6：两真实execution adapter的普通连续多票矩阵、原终态/账户刷新闭环与腿间故障；Maker迟到改价拒绝及历史取消判据修复，独立复核与全量通过，仅接受规定的离线范围。
+  - [ ] W5后续：Maker原子残差与strict/bounded-carry、剩余原策略parity；不因连续离线验证完成而关闭。
 - [ ] W6 重启/停止。
 - [ ] W7 同节点共账户。
 - [ ] W8 入口/安装/文档/原生运行边界。
@@ -755,3 +774,13 @@ EA 改动额外执行现有 `tools/mt5_source_manifest.sh --lines`、MetaEditor 
 - 新增30项adapter边界（25新例及5个既有invalid-target的marked扩参），另20项普通builder→两真实adapter→原生Engine的exact/drift/pending/rejected/unknown序列。后者仅替换venue transport响应，初始反向仓通过真实native订单建立，source由原机会入口产生；不使用旧append-only MT5提交替身。新快照不一致时零mutation；在途、拒绝和未知时真实行情也不触发余腿或新源。UNKNOWN的业务义务保留SUBMITTED未完成且adapter持有unknown，不伪造COMPLETED或把残量清零。无关mass reports及所有venue IO仍是synthetic，未执行EA。
 - 主agent冻结候选全量 **1874 passed / 124条框架弃用警告 / 65.61s**，Ruff全仓、Mypy 74文件和diff-check通过；相对基线新增66项，8份生产/测试SHA运行前后完全一致。实施者另跑相关五文件508项通过。未参与本包编码的reviewer独立四文件 **330 passed / 43 warnings / 38.13s**（此前71定向为其子集，不累加），另3个BUY镜像探针通过；只在内存中关闭新前提后，Maker/Taker×open/close的4个原ordinary漂移案例均在预期DENIED断言重新RED，恢复冻结实现均GREEN。reviewer核验8份最终SHA后给出RECOMMEND-ACCEPT，主agent据独立语义复核及最终全量仅接受本小步；不把focused或独立复核冒称第二次全量。
 - 按约定形成本地提交。完整双adapter连续多票矩阵、Maker原子残差/strict/bounded-carry、W6–W9及W5父项仍未完成；snapshot读取与EA mutation之间的外部竞态不据本包消除，多写者串行归W7。不推送、部署、改profile/EA、访问真实账户或发单。
+
+2026-09-06 / W5b6双adapter连续成交闭环完成并接受（基线`dfa90fb`）：
+
+- 新增24项普通双execution adapter矩阵：8项Maker/Taker与LONG/SHORT对称的2→4→2→1→反向1、1→3→反向1连续路径，另16项腿间pending/drift/rejected/unknown。原builder、策略、native Engine和source-terminal owner保持；MT5以原public connect启动原poller，策略通过实际新行情与原账户刷新进入下一轮。启动配置固定、0.02lot单腿上限保持，不通过清仓、重启、改业务状态或降低节流/时效完成周期；最后非零库存上仍有下一原生源单实际ACCEPTED。
+- 两端执行IO只由有限测试事实响应：MT5新增162行wire及4项自检，positions随open/partial-close/exact-close更新，同一完整journal可重复读取；Bitfinex的on/ou/oc、真实有符号TU与REST读取相同订单/成交/净仓，均价同向加权、减仓保持、穿零重置。逐阶段对照实际source fill、native双端净仓、ticket/identifier、reduce_only、单腿量及两原adapter mass内容；每条venue mutation前只读验证前腿native已FILLED。不是网络、EA或PnL模拟平台。
+- 联测发现的两处夹具不足已纠正：初稿仅调用MT5 `_connect`未启动原poller，恰被手动mass读取刷新掩盖，现必须原poller先提供account_capacity_ready，fault setup连续1→3不调用mass也可进下一单；持久JSON按key排序后，重载义务必须按intent_id比较，不能把遍历顺序差异当生产丢失。未据这些测试承载问题修改生产。
+- 生产只改既有Maker文件，净增24行，无新状态、adapter/EA或协议改动。真实WS fill与已排队改价交错时，native的closed/pending-cancel拒绝曾无条件把已知源事实降为UNKNOWN并留下永久halt；现复用原身份、路由、数量、逐笔seen-fill证明，区分精确终态和已冻结partial的未决保护取消。新52项Maker参数回归：终态分支28项先11RED/17GREEN；partial分支20项先4RED/16GREEN；审核追加4项先4RED。真实取消拒绝、UNKNOWN、矛盾事实及旧HOLD仍保留，取消未决不等于终态，更不等于对冲完成。
+- 独立审核拦下初版历史扫描遗漏：真实Canceled→late PartialFill可使当前native再次partial，必须用历史Canceled等完成事实结束旧取消；不能跳过终态而复活旧PendingCancel。审核者原样原生Engine探针修前RED、修后pending/proof均False；真正新PendingCancel后两者又为True，modify拒绝不改store字节，两笔未完成义务和net_unhedged=2继续阻断新源。Expired仅验证终态结束取消，不外推其迟到partial转换。旧全量候选因此主动终止，未计为通过。
+- 最终冻结上主agent重新全量 **1954 passed / 124既有Pandas框架弃用警告 / 232.05s**，Ruff全仓、Mypy76文件、diff-check通过；6份源码/测试SHA运行前后相同。相对基线新增80项（矩阵24、MT5自检4、Maker52）。未参与编码的reviewer独立五文件 **535 passed / 6 warnings / 206.95s**，含最终24矩阵，不累加此前子集；再次核验六份SHA及上述反例后给出RECOMMEND-ACCEPT，主agent接受本包。1954全量为主agent证据，不冒称reviewer重复全量。
+- 按约定形成本地提交，不推送、部署、改profile/EA、访问真实账户或发单。UNKNOWN实测仍是adapter pending保留、mass返回None、义务未完成，不是空仓或必然断线。仅关闭上述普通离线连续范围；实际PUB/data decoder、网络/EA/DEMO、snapshot→EA竞态未认证，W5父项、原子残差、剩余parity和W6–W9继续未完。下一包按既定4.5先做Maker原子残差与strict/bounded-carry，不以本包绿色宣布上线。

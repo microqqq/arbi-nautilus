@@ -415,15 +415,19 @@ class MakerStrategy(Strategy):
             self._request_source_terminal_query(direction, event)
 
     def on_order_modify_rejected(self, event: OrderModifyRejected) -> None:
+        if self._source_action_is_obsolete(event):
+            return
         self._mark_source_unknown(event.client_order_id.value, "maker modify rejected")
 
     def on_order_cancel_rejected(self, event: OrderCancelRejected) -> None:
-        if self._source_cancel_is_obsolete(event):
+        if self._source_action_is_obsolete(event):
             return  # Preserve terminal facts, pending reconciliation, and every existing HOLD.
         self._mark_source_unknown(event.client_order_id.value, "maker cancel rejected")
 
-    def _source_cancel_is_obsolete(self, event: OrderCancelRejected) -> bool:
-        """A queued protective cancel can fail after native fill/terminal application."""
+    def _source_action_is_obsolete(
+        self, event: OrderCancelRejected | OrderModifyRejected,
+    ) -> bool:
+        """Preserve exact terminal facts or a partial fill's pending protective cancel."""
         direction = self._direction_for_source_order(event.client_order_id.value)
         if direction is None or event.venue_order_id is None:
             return False
@@ -431,7 +435,20 @@ class MakerStrategy(Strategy):
         order = self.cache.order(event.client_order_id)
         terminal = {"CANCELED": OrderStatus.CANCELED, "EXPIRED": OrderStatus.EXPIRED,
                     "FILLED": OrderStatus.FILLED}
-        if record is None or order is None or terminal.get(record.status) != order.status:
+        if record is None or order is None:
+            return False
+        terminal_matches = order.is_closed and terminal.get(record.status) == order.status
+        protective_cancel = (
+            isinstance(event, OrderModifyRejected)
+            and record.status == "PARTIALLY_FILLED"
+            and 0 < record.filled_ounces < record.quantity_ounces
+            and self._stores[direction].active_source_order_id == event.client_order_id.value
+            and self._source_hold
+            and self._stores[direction].source_freeze_reason is not None
+            and order.status in {OrderStatus.PENDING_CANCEL, OrderStatus.PARTIALLY_FILLED}
+            and _cancel_is_pending(order)
+        )
+        if not (terminal_matches or protective_cancel):
             return False
         source_route = next((route for route in self._config.source_accounts
                              if route.account_id.value == record.source_account_id), None)
@@ -455,7 +472,7 @@ class MakerStrategy(Strategy):
             and record.hedge_client_id == (
                 hedge_route.client_id.value if hedge_route.client_id is not None else None
             )
-            and order.is_closed and order.side == side
+            and order.side == side
             and order.quantity.as_decimal() == record.quantity_ounces
             and order.filled_qty.as_decimal() == record.filled_ounces
             and sum((fill.last_qty.as_decimal() for fill in fills), Decimal(0))
@@ -958,12 +975,7 @@ class MakerStrategy(Strategy):
             return
         if order.is_closed or order.is_pending_cancel:
             return
-        # A partial fill changes native status, but does not acknowledge its cancel.
-        last_cancel = next((
-            event for event in reversed(order.events)
-            if isinstance(event, OrderPendingCancel | OrderCancelRejected)
-        ), None)
-        if isinstance(last_cancel, OrderPendingCancel):
+        if _cancel_is_pending(order):
             return
         try:
             self.cancel_order(order)
@@ -1398,6 +1410,18 @@ class MakerStrategy(Strategy):
         if self._hedge_instrument is None:
             raise RuntimeError("hedge instrument unavailable before Maker start")
         return self._hedge_instrument
+
+
+def _cancel_is_pending(order: Order) -> bool:
+    # A partial fill changes native status, but does not acknowledge its cancel.
+    # Conversely, a late fill cannot reopen a cancel already completed in history.
+    last_cancel = next((
+        event for event in reversed(order.events)
+        if isinstance(event, (
+            OrderPendingCancel | OrderCancelRejected | OrderCanceled | OrderExpired | OrderRejected
+        ))
+    ), None)
+    return isinstance(last_cancel, OrderPendingCancel)
 
 
 def _book_top(tick: QuoteTick) -> BookTop:

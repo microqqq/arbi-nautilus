@@ -522,6 +522,168 @@ class _Harness:
         )
 
 
+def _continuous_wire_harness(loop: asyncio.AbstractEventLoop) -> _Harness:
+    from continuous_mt5_wire import ContinuousMt5Wire
+
+    sample = _snapshot(_identity())
+    sample["positions"] = []
+    cast(JsonObject, sample["execution_limits"])["max_order_lots"] = "0.02"
+    harness = _Harness(loop, snapshot=sample)
+    harness.fake = ContinuousMt5Wire(
+        harness.identity, sample, now_ns=harness.clock.timestamp_ns,
+    )
+    harness.client._transport = harness.fake
+    return harness
+
+
+def test_continuous_wire_actual_adapter_reduces_exact_tickets_and_reports_same_facts() -> None:
+    async def scenario() -> None:
+        harness = _continuous_wire_harness(asyncio.get_running_loop())
+        await harness.connect()
+        opened: list[PositionId] = []
+        expected = [[Decimal(2)], [Decimal(2), Decimal(2)], [Decimal(1), Decimal(2)],
+                    [Decimal(2)], [], [Decimal(1)]]
+        observed_ids: set[str] = set()
+        for index, (quantity, close_index, expected_target) in enumerate([
+            ("2", None, None), ("2", None, None), ("1", 0, Decimal(2)),
+            ("1", 0, Decimal(1)), ("2", 1, Decimal(2)), ("1", None, None),
+        ]):
+            order = harness.market(
+                quantity, order_side=OrderSide.BUY if close_index is None else OrderSide.SELL,
+                reduce_only=close_index is not None, client_order_id=ClientOrderId(f"SEQ-{index}"),
+            )
+            params: dict[str, object] = {"py000_hedge_plan": True}
+            if close_index is not None:
+                params["py000_expected_position_ounces"] = expected_target
+            await harness.submit(
+                order, position_id=opened[close_index] if close_index is not None else None,
+                params=params,
+            )
+            fill = cast(OrderFilled, harness.events[-1])
+            assert isinstance(fill, OrderFilled)
+            assert fill.position_id is not None
+            if close_index is None:
+                assert fill.position_id.value not in observed_ids
+                observed_ids.add(fill.position_id.value)
+                opened.append(fill.position_id)
+            else:
+                assert fill.position_id == opened[close_index]
+            mass = await harness.client.generate_mass_status()
+            assert mass is not None
+            assert len(mass.order_reports) == index + 1
+            assert sum(len(values) for values in mass.fill_reports.values()) == index + 1
+            reports = [item for values in mass.position_reports.values() for item in values]
+            reported: dict[str, Decimal] = {}
+            for report in reports:
+                assert report.venue_position_id is not None
+                reported[report.venue_position_id.value] = report.quantity.as_decimal()
+            assert sorted(reported.values()) == expected[index]
+            snapshot_quantities = {
+                position["identifier"]: Decimal(cast(str, position["volume_lots"])) * 100
+                for position in cast(list[JsonObject], harness.fake.current_snapshot["positions"])
+            }
+            assert reported == snapshot_quantities
+        fills = [event for event in harness.events if isinstance(event, OrderFilled)]
+        assert len({fill.trade_id for fill in fills}) == 6
+        assert len({fill.venue_order_id for fill in fills}) == 6
+        history, cursor = await harness.client._read_complete_journal(harness.identity)
+        assert cursor == "13" and len(history) == 13
+        await harness.client._disconnect()
+    asyncio.run(scenario())
+
+
+def test_continuous_wire_replays_requests_and_pages_without_changing_facts() -> None:
+    async def scenario() -> None:
+        harness = _continuous_wire_harness(asyncio.get_running_loop())
+        await harness.connect()
+        for index in range(2):
+            await harness.submit(
+                harness.market("1", client_order_id=ClientOrderId(f"REPLAY-{index}")),
+            )
+        before = deepcopy(harness.fake.current_snapshot)
+        result = await harness.fake.submit_market_delta(
+            harness.identity.binding(), client_request_id="REPLAY-0", side="buy",
+            quantity_lots="0.01",
+        )
+        assert cast(JsonObject, result["outcome"])["event_seq"] == "3"
+        assert harness.fake.current_snapshot == before
+        with pytest.raises(Mt5V1RemoteError, match="IDEMPOTENCY_CONFLICT"):
+            await harness.fake.submit_market_delta(
+                harness.identity.binding(), client_request_id="REPLAY-0", side="sell",
+                quantity_lots="0.01",
+            )
+        observed: list[JsonObject] = []
+        cursor = "0"
+        for expected_size in (2, 2, 1):
+            page = await harness.fake.execution_events(
+                harness.identity.binding(), after_cursor=cursor, limit=2,
+            )
+            batch = cast(list[JsonObject], page["events"])
+            assert len(batch) == expected_size and page["last_cursor"] == "5"
+            observed.extend(batch)
+            cursor = cast(str, page["next_cursor"])
+        assert not page["has_more"]
+        observed[1]["event_type"] = "corrupted copy"
+        history, final_cursor = await harness.client._read_complete_journal(harness.identity)
+        assert history[1]["event_type"] == "submission_reserved" and final_cursor == "5"
+        sample = await harness.fake.snapshot(harness.identity.binding())
+        sample["positions"] = []
+        assert harness.fake.current_snapshot == before
+        await harness.client._disconnect()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("unknown", [False, True])
+def test_continuous_wire_pending_then_terminal_preserves_actual_report_policy(
+    unknown: bool,
+) -> None:
+    from continuous_mt5_wire import ContinuousMt5Wire
+
+    async def scenario() -> None:
+        harness = _continuous_wire_harness(asyncio.get_running_loop())
+        wire = cast(ContinuousMt5Wire, harness.fake)
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def pause(_payload: JsonObject) -> None:
+            entered.set()
+            await release.wait()
+
+        wire.before_mutation = pause
+        wire.next_outcome = "order_unknown" if unknown else "order_rejected"
+        await harness.connect()
+        order = harness.market("1")
+        pending = asyncio.create_task(harness.submit(order, params={"py000_hedge_plan": True}))
+        await asyncio.wait_for(entered.wait(), 1)
+        assert harness.client.pending_client_order_ids == (order.client_order_id.value,)
+        assert [type(event).__name__ for event in harness.events] == ["OrderSubmitted"]
+        assert [item["event_type"] for item in wire.journal] == [
+            "stream_started", "submission_reserved",
+        ]
+        assert wire.current_snapshot["positions"] == []
+        release.set()
+        await asyncio.wait_for(pending, 1)
+        if unknown:
+            assert harness.client.pending_client_order_ids == (order.client_order_id.value,)
+            with pytest.raises(Mt5V1ExecutionError, match="pending"):
+                await harness.client.generate_position_status_reports(
+                    _position_reports_command(harness),
+                )
+            # Native mass collection catches the report exception and returns
+            # unavailable, never a fabricated empty/flat report.
+            assert await harness.client.generate_mass_status() is None
+            assert harness.client.pending_client_order_ids == (order.client_order_id.value,)
+            assert harness.client._identity == harness.identity and not wire.closed
+        else:
+            mass = await harness.client.generate_mass_status()
+            assert mass is not None
+            assert len(mass.order_reports) == 1
+            assert next(iter(mass.order_reports.values())).order_status == OrderStatus.REJECTED
+            assert not mass.fill_reports and not mass.position_reports
+        assert wire.current_snapshot["positions"] == []
+        await harness.client._disconnect()
+    asyncio.run(scenario())
+
+
 def _order_reports_command(
     harness: _Harness,
     *,

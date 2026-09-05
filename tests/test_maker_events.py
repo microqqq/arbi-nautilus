@@ -18,7 +18,12 @@ from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.execution.reports import OrderStatusReport
 from nautilus_trader.model.data import FundingRateUpdate
 from nautilus_trader.model.enums import OrderSide, OrderStatus, TimeInForce
-from nautilus_trader.model.events import OrderCancelRejected, OrderExpired, OrderRejected
+from nautilus_trader.model.events import (
+    OrderCancelRejected,
+    OrderExpired,
+    OrderModifyRejected,
+    OrderRejected,
+)
 from nautilus_trader.model.identifiers import (
     AccountId,
     ClientId,
@@ -65,6 +70,7 @@ from py000_nautilus.strategies.maker import (
     MakerStrategy,
     SourceTerminalQuery,
     SourceTerminalResult,
+    _cancel_is_pending,
     _maker_timer_name,
     _maker_timer_target,
 )
@@ -1030,12 +1036,25 @@ def _cancel_rejected(order: Any, **overrides: Any) -> OrderCancelRejected:
     return OrderCancelRejected(**values)
 
 
-def _fill_maker_source(engine: Any, order: Any, quantity: int) -> None:
+def _modify_rejected(order: Any, **overrides: Any) -> OrderModifyRejected:
+    values = dict(
+        trader_id=order.trader_id, strategy_id=order.strategy_id,
+        instrument_id=order.instrument_id, client_order_id=order.client_order_id,
+        venue_order_id=order.venue_order_id, account_id=order.account_id,
+        reason="arbitrary modify failure", event_id=UUID4(), ts_event=11, ts_init=11,
+    )
+    values.update(overrides)
+    return OrderModifyRejected(**values)
+
+
+def _fill_maker_source(
+    engine: Any, order: Any, quantity: int, *, trade_id: str = "S-ACTUAL", ts_event: int = 5,
+) -> None:
     instrument = _source_instrument()
     engine.kernel.exec_engine.process(TestEventStubs.order_filled(
         order=order, instrument=instrument, last_qty=instrument.make_qty(quantity),
-        last_px=instrument.make_price(2400), trade_id=TradeId("S-ACTUAL"),
-        commission=Money(0, instrument.quote_currency), ts_event=5,
+        last_px=instrument.make_price(2400), trade_id=TradeId(trade_id),
+        commission=Money(0, instrument.quote_currency), ts_event=ts_event,
     ))
 
 
@@ -1094,12 +1113,198 @@ def test_native_partial_fill_preserves_pending_cancel_until_explicit_completion(
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("expired", [False, True])
+def test_native_terminal_event_ends_pending_cancel_history(
+    tmp_path: Path, expired: bool,
+) -> None:
+    strategy = RecordingMakerStrategy(tmp_path / "cancel-history-terminal")
+    with _event_engine(cast(Any, strategy)) as engine:
+        engine.trader.start()
+        order = _seed_terminal_source(engine, strategy, maker=True)
+        engine.kernel.exec_engine.process(TestEventStubs.order_pending_cancel(order, ts_event=6))
+        assert _cancel_is_pending(order)
+        _process_source_terminal(engine, order, expired=expired)
+        assert order.is_closed
+        assert not _cancel_is_pending(order)
+
+
+@pytest.mark.parametrize("new_cancel", [False, True])
+def test_native_late_partial_fill_does_not_revive_completed_cancel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, new_cancel: bool,
+) -> None:
+    completions: list[SourceTerminalResult] = []
+    strategy = RecordingMakerStrategy(
+        tmp_path / "cancel-history-late-fill",
+        source_terminal_query=lambda _cid, _vid, complete: completions.append(complete),
+    )
+    with _event_engine(cast(Any, strategy)) as engine:
+        engine.trader.start()
+        order = _seed_terminal_source(engine, strategy, maker=True)
+        store = strategy._stores[SourceDirection.LONG]
+        _fill_maker_source(engine, order, 1)
+        engine.kernel.exec_engine.process(TestEventStubs.order_pending_cancel(order, ts_event=6))
+        _process_source_terminal(engine, order)
+        assert order.is_closed
+        _fill_maker_source(engine, order, 1, trade_id="AFTER-CANCEL", ts_event=12)
+        assert order.status == OrderStatus.PARTIALLY_FILLED
+        record = store.source_order(order.client_order_id.value)
+        assert record is not None and record.status == "PARTIALLY_FILLED"
+        assert record.filled_ounces == D(2)
+        assert store.active_source_order_id == order.client_order_id.value
+        assert len(completions) == 1 and len(store.intents()) == 2
+        assert store.source_freeze_reason is not None and strategy._source_hold
+        assert not _cancel_is_pending(order)
+        assert not strategy._source_action_is_obsolete(_modify_rejected(order))
+
+        if new_cancel:
+            cancel_commands: list[str] = []
+
+            def cancel(current: Any, **_kwargs: Any) -> None:
+                cancel_commands.append(current.client_order_id.value)
+                engine.kernel.exec_engine.process(TestEventStubs.order_pending_cancel(
+                    current, ts_event=13,
+                ))
+
+            monkeypatch.setattr(strategy, "cancel_order", cancel)
+            MakerStrategy._cancel_working(
+                strategy, SourceDirection.LONG, reason="late fill needs protection",
+            )
+            assert cancel_commands == [order.client_order_id.value]
+            assert _cancel_is_pending(order)
+            assert strategy._source_action_is_obsolete(_modify_rejected(order))
+
+        engine.kernel.exec_engine.process(_modify_rejected(order, ts_event=14, ts_init=14))
+        updated = store.source_order(order.client_order_id.value)
+        assert updated is not None
+        assert updated.status == ("PARTIALLY_FILLED" if new_cancel else "UNKNOWN")
+        assert not store.can_submit_source() and strategy._source_hold
+        assert len(completions) == 1 and len(store.intents()) == 2
+        assert store.net_unhedged_ounces == D(2)
+
+
+@pytest.mark.parametrize("fill_after_cancel", [False, True])
+@pytest.mark.parametrize("independent_hold", [False, True])
+def test_native_modify_rejection_during_partial_fill_cancel_preserves_pending_work(
+    tmp_path: Path, fill_after_cancel: bool, independent_hold: bool,
+) -> None:
+    completions: list[SourceTerminalResult] = []
+    strategy = RecordingMakerStrategy(
+        tmp_path / "partial-cancel-modify",
+        source_terminal_query=lambda _cid, _vid, complete: completions.append(complete),
+    )
+    with _event_engine(cast(Any, strategy)) as engine:
+        engine.trader.start()
+        order = _seed_terminal_source(engine, strategy, maker=True)
+        store = strategy._stores[SourceDirection.LONG]
+        engine.kernel.exec_engine.process(TestEventStubs.order_pending_update(order, ts_event=4))
+        _fill_maker_source(engine, order, 1)
+        engine.kernel.exec_engine.process(TestEventStubs.order_pending_cancel(order, ts_event=6))
+        if fill_after_cancel:
+            _fill_maker_source(engine, order, 1, trade_id="S-ACTUAL-2", ts_event=7)
+        assert order.status == (OrderStatus.PARTIALLY_FILLED if fill_after_cancel
+                                else OrderStatus.PENDING_CANCEL)
+        if independent_hold:
+            store._state.halt_reason = "independent reconciliation conflict"
+            store._persist()
+        original = (
+            store.path.read_bytes(), order.status, strategy._source_hold,
+            set(strategy._source_terminal_inflight), tuple(store.intents()),
+        )
+        rejection = _modify_rejected(order)
+
+        engine.kernel.exec_engine.process(rejection)
+
+        assert order.last_event == rejection
+        assert original == (
+            store.path.read_bytes(), order.status, strategy._source_hold,
+            set(strategy._source_terminal_inflight), tuple(store.intents()),
+        )
+        record = store.source_order(order.client_order_id.value)
+        assert record is not None and record.status == "PARTIALLY_FILLED"
+        assert store.active_source_order_id == order.client_order_id.value
+        assert not store.can_submit_source() and completions == []
+        assert len(store.intents()) == 1 + int(fill_after_cancel)
+        assert store.net_unhedged_ounces == D(1 + int(fill_after_cancel))
+        _process_source_terminal(engine, order)
+        assert len(completions) == 1
+        assert store.active_source_order_id == order.client_order_id.value
+        assert completions[0](_terminal_report(order)) is True
+        assert strategy._stores[SourceDirection.LONG].active_source_order_id is None
+        assert store.halt_reason == (
+            "independent reconciliation conflict" if independent_hold else None
+        )
+        # An exact cancel report still cannot discharge the pending hedge(s).
+        assert not store.can_submit_source()
+        assert all(intent.status is not ObligationStatus.COMPLETED for intent in store.intents())
+
+
+@pytest.mark.parametrize("fault", [
+    "no_cancel", "cancel_rejected", "cancel_completed", "cancel_event", "not_active",
+    "no_hold", "no_freeze", "unknown", "status", "quantity", "filled", "unseen_fill",
+    "route", "account", "venue", "instrument",
+])
+def test_native_partial_modify_rejection_without_exact_protection_keeps_unknown(
+    tmp_path: Path, fault: str,
+) -> None:
+    strategy = RecordingMakerStrategy(tmp_path / "partial-modify-mismatch")
+    with _event_engine(cast(Any, strategy)) as engine:
+        engine.trader.start()
+        order = _seed_terminal_source(engine, strategy, maker=True)
+        store = strategy._stores[SourceDirection.LONG]
+        _fill_maker_source(engine, order, 1)
+        if fault != "no_cancel":
+            engine.kernel.exec_engine.process(
+                TestEventStubs.order_pending_cancel(order, ts_event=6),
+            )
+        record = store.source_order(order.client_order_id.value)
+        assert record is not None
+        if fault == "cancel_rejected":
+            engine.kernel.exec_engine.process(_cancel_rejected(order))
+            # Isolate the old rejected cancel event from the separate UNKNOWN gate.
+            store._state.source_orders[order.client_order_id.value] = record
+        elif fault == "cancel_completed":
+            _process_source_terminal(engine, order)
+            store._state.source_orders[order.client_order_id.value] = record
+        elif fault == "not_active":
+            store._state.active_source_order_id = None
+        elif fault == "no_hold":
+            strategy._source_hold = False
+        elif fault == "no_freeze":
+            store._state.source_freeze_reason = None
+        elif fault == "unknown":
+            store.mark_source_unknown(order.client_order_id.value, "existing UNKNOWN")
+        elif fault == "unseen_fill":
+            store._state.seen_source_fills.clear()
+        changes: dict[str, dict[str, Any]] = {
+            "status": {"status": "ACCEPTED"}, "quantity": {"quantity_ounces": D(5)},
+            "filled": {"filled_ounces": D(2)}, "route": {"hedge_client_id": "OTHER"},
+        }
+        if fault in changes:
+            store._state.source_orders[order.client_order_id.value] = replace(
+                record, **changes[fault],
+            )
+        overrides: dict[str, Any] = {
+            "account": {"account_id": AccountId("BITFINEX-OTHER")},
+            "venue": {"venue_order_id": VenueOrderId("OTHER")},
+            "instrument": {"instrument_id": _hedge_instrument().id},
+        }.get(fault, {})
+        engine.kernel.exec_engine.process(
+            (_cancel_rejected if fault == "cancel_event" else _modify_rejected)(order, **overrides),
+        )
+        updated = store.source_order(order.client_order_id.value)
+        assert updated is not None and updated.status == "UNKNOWN"
+        assert store.halt_reason is not None and strategy._source_hold
+        assert not store.can_submit_source()
+        assert len(store.intents()) == 1 and store.net_unhedged_ounces == D(1)
+
+
 @pytest.mark.parametrize("terminal,filled", [
     ("CANCELED", 0), ("CANCELED", 1), ("EXPIRED", 0), ("EXPIRED", 1), ("FILLED", 4),
 ])
 @pytest.mark.parametrize("after_query", [False, True])
+@pytest.mark.parametrize("action", ["cancel", "modify"])
 def test_native_late_cancel_rejection_preserves_exact_terminal_and_pending_work(
-    tmp_path: Path, terminal: str, filled: int, after_query: bool,
+    tmp_path: Path, terminal: str, filled: int, after_query: bool, action: str,
 ) -> None:
     completions: list[SourceTerminalResult] = []
     strategy = RecordingMakerStrategy(
@@ -1110,6 +1315,11 @@ def test_native_late_cancel_rejection_preserves_exact_terminal_and_pending_work(
         engine.trader.start()
         order = _seed_terminal_source(engine, strategy, maker=True)
         store = strategy._stores[SourceDirection.LONG]
+        if action == "modify":
+            engine.kernel.exec_engine.process(
+                TestEventStubs.order_pending_update(order, ts_event=4),
+            )
+            assert order.status == OrderStatus.PENDING_UPDATE
         if filled:
             _fill_maker_source(engine, order, filled)
         if terminal != "FILLED":
@@ -1125,7 +1335,7 @@ def test_native_late_cancel_rejection_preserves_exact_terminal_and_pending_work(
             set(strategy._source_terminal_inflight), tuple(store.intents()),
         )
 
-        rejection = _cancel_rejected(order)
+        rejection = (_modify_rejected if action == "modify" else _cancel_rejected)(order)
         engine.kernel.exec_engine.process(rejection)
 
         assert order.last_event == rejection  # Native Engine applied and dispatched the real event.
@@ -1143,7 +1353,7 @@ def test_native_late_cancel_rejection_preserves_exact_terminal_and_pending_work(
         if filled:
             assert len(store.intents()) == 1
             assert store.intents()[0].status is not ObligationStatus.COMPLETED
-            # Ignoring stale cancel did not discharge its hedge.
+            # Ignoring a stale action did not discharge its hedge.
             assert not store.can_submit_source()
         else:
             assert store.can_submit_source()
@@ -1154,8 +1364,9 @@ def test_native_late_cancel_rejection_preserves_exact_terminal_and_pending_work(
     "source_account", "source_client", "hedge_account", "hedge_client",
     "record_id", "quantity", "filled", "status", "side", "unknown", "unseen_fill",
 ])
+@pytest.mark.parametrize("action", ["cancel", "modify"])
 def test_native_cancel_rejection_without_exact_terminal_proof_keeps_unknown_hold(
-    tmp_path: Path, fault: str,
+    tmp_path: Path, fault: str, action: str,
 ) -> None:
     strategy = RecordingMakerStrategy(tmp_path / "cancel-mismatch")
     with _event_engine(cast(Any, strategy)) as engine:
@@ -1192,7 +1403,9 @@ def test_native_cancel_rejection_without_exact_terminal_proof_keeps_unknown_hold
             "trader": {"trader_id": type(order.trader_id)("OTHER-001")},
         }.get(fault, {})
 
-        engine.kernel.exec_engine.process(_cancel_rejected(order, **overrides))
+        engine.kernel.exec_engine.process(
+            (_modify_rejected if action == "modify" else _cancel_rejected)(order, **overrides),
+        )
 
         observed = store.source_order(order.client_order_id.value)
         assert observed is not None and observed.status == "UNKNOWN"
@@ -1201,7 +1414,10 @@ def test_native_cancel_rejection_without_exact_terminal_proof_keeps_unknown_hold
         assert len(store.intents()) == 1  # Known hedge is never discarded.
 
 
-def test_native_late_cancel_rejection_does_not_clear_independent_hold(tmp_path: Path) -> None:
+@pytest.mark.parametrize("action", ["cancel", "modify"])
+def test_native_late_cancel_rejection_does_not_clear_independent_hold(
+    tmp_path: Path, action: str,
+) -> None:
     strategy = RecordingMakerStrategy(tmp_path / "cancel-existing-hold")
     with _event_engine(cast(Any, strategy)) as engine:
         engine.trader.start()
@@ -1212,7 +1428,9 @@ def test_native_late_cancel_rejection_does_not_clear_independent_hold(tmp_path: 
         store.freeze_source_submissions("operator HOLD")
         original = store.path.read_bytes()
 
-        engine.kernel.exec_engine.process(_cancel_rejected(order))
+        engine.kernel.exec_engine.process(
+            (_modify_rejected if action == "modify" else _cancel_rejected)(order),
+        )
 
         assert store.path.read_bytes() == original
         assert store.halt_reason == "independent reconciliation conflict"

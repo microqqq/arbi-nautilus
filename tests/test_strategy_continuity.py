@@ -92,9 +92,13 @@ class _OrdinaryStrategy:
     def __init__(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, maker: bool, paper: bool = False,
         source_quantity: int = 2, two_sided: bool = False, native_mt5_transport: bool = False,
+        source_short_quantity: int | None = None, inject_mt5_io: bool = True,
     ) -> None:
         self.maker = maker
         self.source_quantity = D(source_quantity)
+        short_quantity = D(
+            source_quantity if source_short_quantity is None else source_short_quantity,
+        )
         if maker:
             configs: Any = _maker_configs(tmp_path)
             configs = replace(configs, strategy=replace_config(
@@ -107,7 +111,7 @@ class _OrdinaryStrategy:
                     # Lifecycle tests isolate one direction using normal configuration.
                     ask=replace_config(
                         configs.strategy.economics.ask,
-                        open_quantity_ounces=self.source_quantity if two_sided else D(0),
+                        open_quantity_ounces=short_quantity if two_sided else D(0),
                     ),
                 ),
             ))
@@ -117,7 +121,7 @@ class _OrdinaryStrategy:
                 configs.strategy, economics=replace_config(
                     configs.strategy.economics, base_book_quantity=self.source_quantity,
                     open_quantity_long=self.source_quantity,
-                    open_quantity_short=self.source_quantity,
+                    open_quantity_short=short_quantity,
                 ),
             ))
         if paper:
@@ -221,8 +225,9 @@ class _OrdinaryStrategy:
                 "_subscribe_instrument_status", "_subscribe_order_book_deltas",
             ):
                 monkeypatch.setattr(client, name, subscription)
-        monkeypatch.setattr(self.hedge, "_submit_order", self._submit_hedge)
-        monkeypatch.setattr(self.hedge, "generate_mass_status", self._hedge_mass)
+        if inject_mt5_io:
+            monkeypatch.setattr(self.hedge, "_submit_order", self._submit_hedge)
+            monkeypatch.setattr(self.hedge, "generate_mass_status", self._hedge_mass)
         self.source_cancel_commands: list[ClientOrderId] = []
         cancel_order = self.source.cancel_order
 
