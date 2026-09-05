@@ -6,6 +6,7 @@ from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from decimal import Decimal
+from decimal import Overflow as DecimalOverflow
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any, cast
@@ -23,6 +24,7 @@ from nautilus_trader.execution.messages import (
     GenerateOrderStatusReports,
     GeneratePositionStatusReports,
     ModifyOrder,
+    QueryAccount,
     QueryOrder,
     SubmitOrder,
 )
@@ -121,6 +123,9 @@ class _FakeRest:
         self.history: list[object] = []
         self.trades: list[object] = []
         self.position_rows: list[object] = []
+        self.wallet_rows: list[object] = []
+        self.wallet_calls = 0
+        self.position_calls = 0
 
     async def user_info(self) -> object:
         self.user_info_calls += 1
@@ -158,7 +163,12 @@ class _FakeRest:
         return self.trades
 
     async def positions(self) -> object:
+        self.position_calls += 1
         return self.position_rows
+
+    async def wallets(self) -> object:
+        self.wallet_calls += 1
+        return self.wallet_rows
 
 
 class _Harness:
@@ -174,6 +184,7 @@ class _Harness:
         instrument_raw_symbol: str | None = None,
         instrument_available: bool = True,
         allow_cold_position_reconciliation: bool = False,
+        rest_timeout_secs: int = 10,
     ) -> None:
         self._temporary = TemporaryDirectory() if cid_store_path is None else None
         if cid_store_path is None:
@@ -235,6 +246,7 @@ class _Harness:
                 cid_store_path=str(cid_store_path),
                 mutation_ack_timeout_ms=mutation_ack_timeout_ms,
                 allow_cold_position_reconciliation=allow_cold_position_reconciliation,
+                rest_timeout_secs=rest_timeout_secs,
             ),
             msgbus=self.msgbus,
             cache=self.cache,
@@ -469,6 +481,494 @@ def _position_command(harness: _Harness) -> GeneratePositionStatusReports:
         instrument_id=SOURCE_ID, start=None, end=None,
         command_id=UUID4(), ts_init=harness.clock.timestamp_ns(),
     )
+
+
+def _account_command(
+    harness: _Harness, *, account: AccountId | None = None, client: ClientId | None = None,
+) -> QueryAccount:
+    return QueryAccount(
+        trader_id=harness.msgbus.trader_id, account_id=account or harness.client.account_id,
+        client_id=client, command_id=UUID4(), ts_init=harness.clock.timestamp_ns(),
+    )
+
+
+def _query_account(harness: _Harness) -> asyncio.Task[None]:
+    harness.client.query_account(_account_command(harness))
+    task = harness.client._account_refresh_task
+    assert task is not None
+    return task
+
+
+@pytest.mark.parametrize("positioned", [False, True])
+@pytest.mark.parametrize("available", [None, Decimal(600)])
+def test_query_account_native_entry_publishes_one_joint_sample_without_pushes(
+    positioned: bool, available: Decimal | None, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        harness = _Harness()
+        harness.msgbus.deregister("ExecEngine.process", harness.events.append)
+        engine = ExecutionEngine(msgbus=harness.msgbus, cache=harness.cache, clock=harness.clock)
+        engine.register_client(harness.client)
+        harness.cache.add_instrument(harness.instrument)
+        await harness.connect()
+        harness.client._set_connected(True)
+        entered, release = asyncio.Event(), asyncio.Event()
+        try:
+            before = _margin_info(harness)
+            before_events = len(harness.events)
+            harness.rest.wallet_rows = [["margin", "USTF0", Decimal(900), Decimal(0), available]]
+            position_read_start = 0
+
+            async def positions() -> object:
+                nonlocal position_read_start
+                harness.rest.position_calls += 1
+                position_read_start = harness.clock.timestamp_ns()
+                entered.set()
+                await release.wait()
+                return [_margin_position()] if positioned else []
+
+            monkeypatch.setattr(harness.rest, "positions", positions)
+            for index in range(10):
+                engine.execute(_account_command(
+                    harness, client=harness.client.id if index % 2 else None,
+                ))
+            task = harness.client._account_refresh_task
+            assert task is not None
+            await entered.wait()
+            assert harness.rest.wallet_calls == harness.rest.position_calls == 1
+            assert len(harness.events) == before_events
+            assert _margin_info(harness) == before
+            assert not task.done()
+            position_read_end = harness.clock.timestamp_ns()
+            release.set()
+            await task
+            after = _margin_info(harness)
+            assert len(harness.events) == before_events + 1
+            assert after["wallet"]["balance"] == "900"
+            assert after["wallet"]["available_balance"] == (
+                None if available is None else str(available)
+            )
+            assert after["wallet"]["current"] is True
+            assert after["wallet"]["observed_ns"] <= position_read_start
+            assert after["positions"]["observed_ns"] >= position_read_end
+            assert after["positions"]["complete"] is True
+            assert after["positions"]["current"] is True
+            assert (after["positions"]["position"] is not None) is positioned
+            assert before["positions"]["complete"] is False
+            account_event = harness.events[-1]
+            assert account_event.balances[0].free.as_decimal() == (available or Decimal(0))
+            assert harness.client._account_refresh_task is None
+            assert harness.client.execution_hold_reason is None
+        finally:
+            await harness.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("bad", ["account", "client", "running", "connected", "authenticated"])
+def test_query_account_wrong_identity_or_lifecycle_does_not_start_io(bad: str) -> None:
+    async def scenario() -> None:
+        harness = _Harness()
+        await harness.connect()
+        harness.client._set_connected(True)
+        try:
+            command = _account_command(harness)
+            if bad == "account":
+                command = _account_command(harness, account=AccountId("BITFINEX-OTHER"))
+            elif bad == "client":
+                command = _account_command(harness, client=ClientId("OTHER"))
+            elif bad == "running":
+                harness.client._running = False
+            elif bad == "connected":
+                harness.client._set_connected(False)
+            else:
+                harness.client._account_ready = False
+            before = len(harness.events)
+            harness.client.query_account(command)
+            await asyncio.sleep(0)
+            assert harness.client._account_refresh_task is None
+            assert harness.rest.wallet_calls == harness.rest.position_calls == 0
+            assert len(harness.events) == before
+        finally:
+            await harness.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("change", ["same_wallet", "position", "roundtrip"])
+def test_query_account_joint_sample_drops_any_observed_revision_change(
+    monkeypatch: pytest.MonkeyPatch, change: str,
+) -> None:
+    async def scenario() -> None:
+        harness = _Harness()
+        await harness.connect()
+        harness.client._set_connected(True)
+        entered, release = asyncio.Event(), asyncio.Event()
+        try:
+            harness.client._consume_private_frame([0, "ps", []])
+            harness.rest.wallet_rows = [["margin", "USTF0", Decimal(900), Decimal(0), Decimal(500)]]
+
+            async def positions() -> object:
+                entered.set()
+                await release.wait()
+                return []
+
+            monkeypatch.setattr(harness.rest, "positions", positions)
+            task = _query_account(harness)
+            await entered.wait()
+            if change == "same_wallet":
+                harness.client._consume_private_frame(
+                    [0, "wu", ["margin", "USTF0", Decimal(1000), Decimal(0), Decimal(800)]],
+                )
+            elif change == "position":
+                harness.client._consume_private_frame([0, "ps", [_margin_position()]])
+            else:
+                harness.client._consume_private_frame([0, "pn", _margin_position()])
+                closed = _margin_position(quantity="0", updated=102)
+                closed[1] = "CLOSED"
+                harness.client._consume_private_frame([0, "pc", closed])
+            fresh = _margin_info(harness)
+            count = len(harness.events)
+            release.set()
+            await task
+            assert _margin_info(harness) == fresh and len(harness.events) == count
+            assert harness.client._account_refresh_task is None
+        finally:
+            await harness.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "failure", ["missing_wallet", "duplicate_wallet", "bad_wallet", "position"],
+)
+def test_query_account_bad_candidate_has_no_half_install_and_explicit_retry_recovers(
+    failure: str,
+) -> None:
+    async def scenario() -> None:
+        harness = _Harness()
+        await harness.connect()
+        harness.client._set_connected(True)
+        try:
+            harness.client._consume_private_frame([0, "ps", [_margin_position()]])
+            before = _margin_info(harness)
+            wallet: list[object] = ["margin", "USTF0", Decimal(900), Decimal(0), Decimal(500)]
+            harness.rest.wallet_rows = [wallet]
+            if failure == "missing_wallet":
+                harness.rest.wallet_rows = []
+            elif failure == "duplicate_wallet":
+                harness.rest.wallet_rows.append(wallet.copy())
+            elif failure == "bad_wallet":
+                wallet[4] = True
+            else:
+                harness.rest.position_rows = [_margin_position(), _margin_position(pid=99)]
+            with pytest.raises((ValueError, BitfinexV1ExecutionError)):
+                await _query_account(harness)
+            after = _margin_info(harness)
+            assert after["wallet"]["balance"] == before["wallet"]["balance"]
+            assert after["wallet"]["observed_ns"] == before["wallet"]["observed_ns"]
+            assert after["positions"]["position"] == before["positions"]["position"]
+            assert after["positions"]["observed_ns"] == before["positions"]["observed_ns"]
+            if failure == "position":
+                assert after["positions"]["complete"] is False
+            else:
+                assert after["wallet"]["current"] is False
+            assert harness.client.execution_hold_reason is None
+            harness.rest.wallet_rows = [["margin", "USTF0", Decimal(900), Decimal(0), None]]
+            harness.rest.position_rows = [_margin_position(updated=103)]
+            await _query_account(harness)
+            assert _margin_info(harness)["wallet"]["balance"] == "900"
+            assert _margin_info(harness)["positions"]["current"] is True
+        finally:
+            await harness.close()
+    asyncio.run(scenario())
+
+
+def test_query_account_decimal_wallet_arithmetic_overflow_revokes_only_wallet() -> None:
+    async def scenario() -> None:
+        harness = _Harness()
+        await harness.connect()
+        harness.client._set_connected(True)
+        try:
+            harness.client._consume_private_frame([0, "ps", [_margin_position()]])
+            before = _margin_info(harness)
+            # This value is finite but balance - available overflows Decimal's
+            # exponent range, before any native Money range conversion occurs.
+            available = Decimal("1e1000000")
+            assert available.is_finite()
+            harness.rest.wallet_rows = [["margin", "USTF0", Decimal(900), Decimal(0), available]]
+            with pytest.raises(DecimalOverflow):
+                await _query_account(harness)
+            after = _margin_info(harness)
+            assert after["wallet"]["current"] is False
+            assert after["wallet"]["balance"] == before["wallet"]["balance"]
+            assert after["wallet"]["available_balance"] == before["wallet"]["available_balance"]
+            assert after["wallet"]["observed_ns"] == before["wallet"]["observed_ns"]
+            assert after["positions"] == before["positions"]
+            assert before["wallet"]["current"] is True
+            assert harness.rest.position_calls == 0
+            assert harness.client.execution_hold_reason is None
+            assert harness.client._account_refresh_task is None
+        finally:
+            await harness.close()
+    asyncio.run(scenario())
+
+
+def test_query_account_decimal_position_arithmetic_overflow_revokes_only_positions() -> None:
+    async def scenario() -> None:
+        harness = _Harness()
+        await harness.connect()
+        harness.client._set_connected(True)
+        try:
+            harness.client._consume_private_frame([0, "ps", [_margin_position()]])
+            before = _margin_info(harness)
+            harness.rest.wallet_rows = [["margin", "USTF0", Decimal(900), Decimal(0), Decimal(500)]]
+            # The report mapper's Decimal abs(amount) overflows before native
+            # quantity conversion; this is not a native Quantity range failure.
+            harness.rest.position_rows = [_margin_position(quantity="1e1000000")]
+            with pytest.raises(DecimalOverflow):
+                await _query_account(harness)
+            after = _margin_info(harness)
+            assert after["positions"]["complete"] is False
+            assert after["positions"]["current"] is False
+            assert after["positions"]["position"] == before["positions"]["position"]
+            assert after["positions"]["observed_ns"] == before["positions"]["observed_ns"]
+            assert after["wallet"] == before["wallet"]
+            assert before["positions"]["current"] is True
+            assert harness.client.execution_hold_reason is None
+            assert harness.client._account_refresh_task is None
+        finally:
+            await harness.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("stage", ["queued", "wallet", "position", "fatal"])
+def test_query_account_disconnect_owns_pending_task_and_cannot_cross_reconnect(
+    monkeypatch: pytest.MonkeyPatch, stage: str,
+) -> None:
+    async def scenario() -> None:
+        harness = _Harness()
+        await harness.connect()
+        harness.client._set_connected(True)
+        entered, canceled = asyncio.Event(), asyncio.Event()
+        try:
+            harness.rest.wallet_rows = [["margin", "USTF0", Decimal(900), Decimal(0), None]]
+
+            async def blocked() -> object:
+                entered.set()
+                try:
+                    await asyncio.Event().wait()
+                    return []
+                finally:
+                    canceled.set()
+
+            if stage in {"wallet", "fatal"}:
+                monkeypatch.setattr(harness.rest, "wallets", blocked)
+            elif stage == "position":
+                monkeypatch.setattr(harness.rest, "positions", blocked)
+            task = _query_account(harness)
+            if stage != "queued":
+                await entered.wait()
+            if stage == "fatal":
+                await harness.fake.queue.put([0, "invalid", []])
+                reader = harness.client._reader_task
+                assert reader is not None
+                await asyncio.wait_for(asyncio.shield(reader), 1)
+            else:
+                await harness.client._disconnect()
+            assert task.done() and task.cancelled()
+            assert harness.client._account_refresh_task is None
+            if stage == "queued":
+                assert harness.rest.wallet_calls == harness.rest.position_calls == 0
+            else:
+                assert canceled.is_set()
+            monkeypatch.undo()
+            await harness.connect()
+            harness.client._set_connected(True)
+            await _query_account(harness)
+            assert _margin_info(harness)["wallet"]["balance"] == "900"
+            assert _margin_info(harness)["positions"]["current"] is True
+        finally:
+            await harness.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("changed", ["wallet", "position", "connection"])
+def test_query_account_watermarks_are_captured_before_task_start(changed: str) -> None:
+    async def scenario() -> None:
+        harness = _Harness()
+        await harness.connect()
+        harness.client._set_connected(True)
+        try:
+            task = _query_account(harness)
+            # No event-loop turn has run the queued query yet.
+            if changed == "wallet":
+                harness.client._consume_private_frame(
+                    [0, "wu", ["margin", "USTF0", Decimal(1000), Decimal(0), Decimal(800)]],
+                )
+            elif changed == "position":
+                harness.client._consume_private_frame([0, "ps", []])
+            else:
+                harness.client._invalidate_margin_facts(connection_changed=True)
+            fresh = _margin_info(harness)
+            await task
+            assert harness.rest.wallet_calls == harness.rest.position_calls == 0
+            assert _margin_info(harness) == fresh
+            assert harness.client._account_refresh_task is None
+        finally:
+            await harness.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("failure", ["timeout", "cancel"])
+def test_query_account_total_budget_and_cancel_do_not_install_partial_samples(
+    monkeypatch: pytest.MonkeyPatch, failure: str,
+) -> None:
+    async def scenario() -> None:
+        harness = _Harness(rest_timeout_secs=1)
+        await harness.connect()
+        harness.client._set_connected(True)
+        entered = asyncio.Event()
+        try:
+            harness.client._consume_private_frame([0, "ps", []])
+            before = _margin_info(harness)
+            count = len(harness.events)
+            wallet = ["margin", "USTF0", Decimal(900), Decimal(0), Decimal(500)]
+
+            async def wallets() -> object:
+                await asyncio.sleep(0.55 if failure == "timeout" else 0)
+                return [wallet]
+
+            async def positions() -> object:
+                entered.set()
+                await asyncio.sleep(0.55 if failure == "timeout" else 10)
+                return []
+
+            monkeypatch.setattr(harness.rest, "wallets", wallets)
+            monkeypatch.setattr(harness.rest, "positions", positions)
+            started = asyncio.get_running_loop().time()
+            task = _query_account(harness)
+            await entered.wait()
+            if failure == "timeout":
+                with pytest.raises(TimeoutError):
+                    await task
+                assert asyncio.get_running_loop().time() - started < 1.5
+            else:
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            assert _margin_info(harness) == before and len(harness.events) == count
+            assert harness.client._account_refresh_task is None
+            assert harness.client.execution_hold_reason is None
+            monkeypatch.undo()
+            harness.rest.wallet_rows = [wallet]
+            await _query_account(harness)
+            assert _margin_info(harness)["wallet"]["balance"] == "900"
+            assert _margin_info(harness)["positions"]["current"] is True
+        finally:
+            await harness.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("roundtrip", [False, True])
+def test_query_account_native_fills_invalidate_even_if_net_quantity_returns_to_zero(
+    monkeypatch: pytest.MonkeyPatch, roundtrip: bool,
+) -> None:
+    async def scenario() -> None:
+        harness = _Harness()
+        harness.msgbus.deregister("ExecEngine.process", harness.events.append)
+        engine = ExecutionEngine(msgbus=harness.msgbus, cache=harness.cache, clock=harness.clock)
+        engine.register_client(harness.client)
+        harness.cache.add_instrument(harness.instrument)
+        harness.cache.add_account(TestExecStubs.margin_account(account_id=harness.client.account_id))
+        await harness.connect()
+        harness.client._set_connected(True)
+        entered, release = asyncio.Event(), asyncio.Event()
+        try:
+            harness.client._consume_private_frame([0, "ps", []])
+            harness.rest.wallet_rows = [["margin", "USTF0", Decimal(900), Decimal(0), Decimal(500)]]
+
+            async def positions() -> object:
+                entered.set()
+                await release.wait()
+                return []
+
+            monkeypatch.setattr(harness.rest, "positions", positions)
+            task = _query_account(harness)
+            await entered.wait()
+            for index, side in enumerate(
+                [OrderSide.BUY, OrderSide.SELL] if roundtrip else [OrderSide.BUY],
+            ):
+                order = harness.order(side=side, tif=TimeInForce.IOC, post_only=False, quantity="1")
+                harness.cache.add_order(order)
+                venue_id = VenueOrderId(str(VENUE_ORDER_ID + index))
+                engine.process(TestEventStubs.order_submitted(
+                    order, account_id=harness.client.account_id,
+                ))
+                engine.process(TestEventStubs.order_accepted(
+                    order, account_id=harness.client.account_id, venue_order_id=venue_id,
+                ))
+                engine.process(TestEventStubs.order_filled(
+                    order=order, instrument=harness.instrument,
+                    account_id=harness.client.account_id, venue_order_id=venue_id,
+                    trade_id=TradeId(str(1234 + index)), commission=Money(0, USD),
+                    last_qty=harness.instrument.make_qty(Decimal(1)),
+                    last_px=harness.instrument.make_price(Decimal("3926.70")),
+                    ts_event=harness.clock.timestamp_ns(),
+                ))
+                assert order.filled_qty.as_decimal() == 1
+            net = sum(
+                (position.signed_decimal_qty() for position in harness.cache.positions_open()),
+                Decimal(0),
+            )
+            assert net == (0 if roundtrip else 1)
+            invalid = _margin_info(harness)
+            assert invalid["wallet"]["current"] is False
+            assert invalid["positions"]["current"] is False
+            count = len(harness.events)
+            release.set()
+            await task
+            assert _margin_info(harness) == invalid and len(harness.events) == count
+            assert harness.client.execution_hold_reason is None
+        finally:
+            await harness.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("stage", ["wallet", "position"])
+def test_query_account_late_bad_reply_cannot_revoke_a_newer_complete_sample(
+    monkeypatch: pytest.MonkeyPatch, stage: str,
+) -> None:
+    async def scenario() -> None:
+        harness = _Harness()
+        await harness.connect()
+        harness.client._set_connected(True)
+        entered, release = asyncio.Event(), asyncio.Event()
+        try:
+            harness.rest.wallet_rows = [["margin", "USTF0", Decimal(900), Decimal(0), None]]
+
+            async def delayed_bad_reply() -> object:
+                entered.set()
+                await release.wait()
+                return "not a snapshot"
+
+            monkeypatch.setattr(
+                harness.rest, "wallets" if stage == "wallet" else "positions", delayed_bad_reply,
+            )
+            task = _query_account(harness)
+            await entered.wait()
+            harness.client._consume_private_frame([0, "ps", [_margin_position(updated=103)]])
+            harness.client._consume_private_frame(
+                [0, "wu", ["margin", "USTF0", Decimal(1100), Decimal(0), Decimal(900)]],
+            )
+            fresh = _margin_info(harness)
+            count = len(harness.events)
+            release.set()
+            await task
+            assert _margin_info(harness) == fresh and len(harness.events) == count
+            assert fresh["wallet"]["current"] is True
+            assert fresh["positions"]["complete"] is True
+            assert fresh["positions"]["current"] is True
+        finally:
+            await harness.close()
+    asyncio.run(scenario())
 
 
 def test_margin_facts_distinguish_absence_flat_and_independent_observations() -> None:

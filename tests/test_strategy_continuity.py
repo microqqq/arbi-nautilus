@@ -21,7 +21,7 @@ import pytest
 from msgspec.structs import replace as replace_config
 from nautilus_trader.accounting.accounts.margin import MarginAccount
 from nautilus_trader.core.uuid import UUID4
-from nautilus_trader.execution.messages import SubmitOrder
+from nautilus_trader.execution.messages import QueryAccount, SubmitOrder
 from nautilus_trader.execution.reports import ExecutionMassStatus, PositionStatusReport
 from nautilus_trader.model.currencies import USDT
 from nautilus_trader.model.enums import (
@@ -198,6 +198,13 @@ class _OrdinaryStrategy:
         self.node.trader.start()
         await _pump()
         assert self.strategy.is_running
+
+    def query_source_account(self) -> None:
+        self.node.kernel.exec_engine.execute(QueryAccount(
+            trader_id=self.strategy.trader_id, account_id=self.source.account_id,
+            client_id=self.source.id, command_id=UUID4(),
+            ts_init=self.node.kernel.clock.timestamp_ns(),
+        ))
 
     async def close(self) -> None:
         if self.node.trader.is_running:
@@ -1134,6 +1141,219 @@ def test_ordinary_maker_increasing_rest_fill_must_cover_already_applied_trade(
                 await asyncio.sleep(0.3)
                 assert source_attempts == 2 and order.filled_qty.as_decimal() == 1
                 assert len(harness.hedge_orders) == 1
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("maker", [False, True], ids=["taker", "maker"])
+def test_ordinary_native_account_query_coalesces_and_publishes_one_complete_sample(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, maker: bool,
+) -> None:
+    async def run() -> None:
+        async with _ordinary_strategy(tmp_path, monkeypatch, maker=maker, paper=True) as harness:
+            account = harness.source.get_account()
+            assert account is not None
+            old_event, event_count = account.last_event, account.event_count
+            old_info = deepcopy(old_event.info)
+            calls: list[str] = []
+            wallet_returned: list[int] = []
+            position_entered, release = asyncio.Event(), asyncio.Event()
+
+            async def wallets() -> object:
+                calls.append("wallets")
+                wallet_returned.append(harness.node.kernel.clock.timestamp_ns())
+                return [["margin", harness.wallet_currency, D(12000), D(0), None]]
+
+            async def positions() -> object:
+                calls.append("positions")
+                position_entered.set()
+                await release.wait()
+                return []
+
+            monkeypatch.setattr(harness.rest, "wallets", wallets, raising=False)
+            monkeypatch.setattr(harness.rest, "positions", positions)
+            harness.query_source_account()
+            await _wait_until(position_entered.is_set)
+            for _ in range(9):
+                harness.query_source_account()
+            await _pump()
+            before_release = harness.node.kernel.clock.timestamp_ns()
+            assert calls == ["wallets", "positions"]
+            assert account.last_event is old_event and old_event.info == old_info
+
+            release.set()
+            await _wait_until(lambda: account.event_count == event_count + 1)
+            facts = account.last_event.info["bitfinex_margin"]
+            assert facts["wallet"]["balance"] == "12000"
+            assert facts["wallet"]["available_balance"] is None
+            assert facts["wallet"]["current"] is True
+            assert wallet_returned[0] <= facts["wallet"]["observed_ns"] <= before_release
+            assert facts["positions"]["observed_ns"] >= before_release
+            assert facts["positions"]["complete"] is True
+            assert facts["positions"]["current"] is True
+            assert facts["positions"]["position"] is None
+            assert account.balance_total(USDT).as_decimal() == 12000
+            assert old_event.info == old_info
+            assert calls == ["wallets", "positions"]
+            assert not harness.sent_operations("on") and not harness.hedge_orders
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("maker", [False, True], ids=["taker", "maker"])
+def test_ordinary_native_account_query_discards_old_wallet_then_allows_new_query(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, maker: bool,
+) -> None:
+    async def run() -> None:
+        async with _ordinary_strategy(tmp_path, monkeypatch, maker=maker, paper=True) as harness:
+            account = harness.source.get_account()
+            assert account is not None
+            entered, release, returned = asyncio.Event(), asyncio.Event(), asyncio.Event()
+            calls: list[str] = []
+
+            async def wallets() -> object:
+                calls.append("wallets")
+                return [["margin", harness.wallet_currency, D(12000), D(0), D(12000)]]
+
+            async def positions() -> object:
+                calls.append("positions")
+                entered.set()
+                await release.wait()
+                returned.set()
+                return []
+
+            monkeypatch.setattr(harness.rest, "wallets", wallets, raising=False)
+            monkeypatch.setattr(harness.rest, "positions", positions)
+            harness.query_source_account()
+            await _wait_until(entered.is_set)
+            harness.source._consume_private_frame(
+                [0, "wu", ["margin", harness.wallet_currency, D(11000), D(0), D(11000)]],
+            )
+            await _pump()
+            newer_event = account.last_event
+            newer_info = deepcopy(newer_event.info)
+            release.set()
+            await _wait_until(returned.is_set)
+            assert account.last_event is newer_event
+            assert account.last_event.info == newer_info
+            assert newer_info["bitfinex_margin"]["wallet"]["balance"] == "11000"
+            assert newer_info["bitfinex_margin"]["positions"]["complete"] is False
+
+            # Completion does not schedule another read; only the next command does.
+            assert calls == ["wallets", "positions"]
+            harness.query_source_account()
+            await _wait_until(
+                lambda: account.last_event.info["bitfinex_margin"]["positions"]["complete"],
+            )
+            assert calls == ["wallets", "positions", "wallets", "positions"]
+            assert account.last_event.info["bitfinex_margin"]["wallet"]["balance"] == "12000"
+            assert newer_event.info == newer_info
+            assert not harness.sent_operations("on") and not harness.hedge_orders
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("stage", ["wallet", "positions"])
+@pytest.mark.parametrize("maker", [False, True], ids=["taker", "maker"])
+def test_ordinary_native_account_query_decimal_overflow_revokes_candidate_qualification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, maker: bool, stage: str,
+) -> None:
+    async def run() -> None:
+        async with _ordinary_strategy(tmp_path, monkeypatch, maker=maker, paper=True) as harness:
+            harness.source._consume_private_frame([0, "ps", []])
+            await _pump()
+            account = harness.source.get_account()
+            assert account is not None
+            old_event, old_count = account.last_event, account.event_count
+            old_info = deepcopy(old_event.info)
+            before = old_info["bitfinex_margin"]
+            entered, release = asyncio.Event(), asyncio.Event()
+
+            async def wallets() -> object:
+                if stage == "wallet":
+                    entered.set()
+                    await release.wait()
+                available = D("1e1000000") if stage == "wallet" else D(500)
+                return [["margin", harness.wallet_currency, D(900), D(0), available]]
+
+            async def positions() -> object:
+                entered.set()
+                await release.wait()
+                row = _position_row(
+                    D("1e1000000"), avg_px=D(4000), raw_symbol=harness.wire.raw_symbol,
+                )
+                row[13] = harness.node.kernel.clock.timestamp_ns() // 1_000_000
+                return [row]
+
+            monkeypatch.setattr(harness.rest, "wallets", wallets, raising=False)
+            monkeypatch.setattr(harness.rest, "positions", positions)
+            harness.query_source_account()
+            await _wait_until(entered.is_set)
+            task = harness.source._account_refresh_task
+            assert task is not None
+            release.set()
+            with pytest.raises(ArithmeticError):
+                await task
+            await _pump()
+            facts = account.last_event.info["bitfinex_margin"]
+            expected = deepcopy(before)
+            expected[stage]["current"] = False
+            if stage == "positions":
+                expected[stage]["complete"] = False
+            assert facts == expected
+            assert account.event_count == old_count + 1
+            assert account.balance_total(USDT).as_decimal() == 10000
+            assert old_event.info == old_info
+            assert harness.source._account_refresh_task is None
+            assert harness.source.execution_hold_reason is None
+            assert not harness.sent_operations("on") and not harness.hedge_orders
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("maker", [False, True], ids=["taker", "maker"])
+def test_ordinary_native_account_query_does_not_block_fill_or_install_pre_fill_wallet(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, maker: bool,
+) -> None:
+    async def run() -> None:
+        async with _ordinary_strategy(tmp_path, monkeypatch, maker=maker, paper=True) as harness:
+            account = harness.source.get_account()
+            assert account is not None
+            entered, release, returned = asyncio.Event(), asyncio.Event(), asyncio.Event()
+            original_positions = harness.rest.positions
+            position_calls = 0
+
+            async def wallets() -> object:
+                return [["margin", harness.wallet_currency, D(12000), D(0), D(12000)]]
+
+            async def positions() -> object:
+                nonlocal position_calls
+                position_calls += 1
+                if position_calls == 1:
+                    entered.set()
+                    await release.wait()
+                    returned.set()
+                # Any normal reconciliation remains on its existing venue read.
+                return await original_positions()
+
+            monkeypatch.setattr(harness.rest, "wallets", wallets, raising=False)
+            monkeypatch.setattr(harness.rest, "positions", positions)
+            harness.query_source_account()
+            await _wait_until(entered.is_set)
+            order, cid = await harness.seed_source()
+            await harness.finish_source(order, cid, filled=1)
+            assert harness.late_trade is not None
+            harness.source._consume_private_frame(harness.late_trade)
+            await _wait_until(lambda: len(harness.hedge_orders) == 1)
+            assert order.filled_qty.as_decimal() == 1
+            assert harness.hedge_orders[0].quantity.as_decimal() == 1
+            release.set()
+            await _wait_until(returned.is_set)
+            wallet = account.last_event.info["bitfinex_margin"]["wallet"]
+            assert wallet["balance"] == "10000" and wallet["current"] is False
+            assert len([event for event in order.events if isinstance(event, OrderFilled)]) == 1
+            assert len(harness.hedge_orders) == len(harness.store.intents()) == 1
+            harness.release_hedge.set()
+            await _wait_until(
+                lambda: harness.store.intents()[0].status is ObligationStatus.COMPLETED,
+            )
+            assert harness.store.net_unhedged_ounces == 0
     asyncio.run(run())
 
 

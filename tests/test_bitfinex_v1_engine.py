@@ -51,6 +51,9 @@ class _FakeTransport:
 
 
 class _FakeRest:
+    async def wallets(self) -> object:
+        return []
+
     async def user_info(self) -> object:
         row: list[object] = [None] * 22
         row[0] = 269_312
