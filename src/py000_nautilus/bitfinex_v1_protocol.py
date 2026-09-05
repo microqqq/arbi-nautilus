@@ -127,6 +127,11 @@ class PositionState:
     liquidation_price: Decimal | None
     leverage: Decimal | None
     position_id: int | None
+    ts_created_ms: int | None = None
+    ts_updated_ms: int | None = None
+    position_type: int | None = None
+    collateral: Decimal | None = None
+    collateral_min: Decimal | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -420,7 +425,25 @@ def _parse_position(value: object) -> PositionState:
         liquidation_price=_optional_decimal(row[8], "position.liquidation_price"),
         leverage=_optional_decimal(row[9], "position.leverage"),
         position_id=_optional_int(row[11], "position.id"),
+        ts_created_ms=_margin_extension_int(row, 12),
+        ts_updated_ms=_margin_extension_int(row, 13),
+        position_type=_margin_extension_int(row, 15),
+        collateral=_margin_extension_decimal(row, 17),
+        collateral_min=_margin_extension_decimal(row, 18),
     )
+
+
+def _margin_extension_int(row: list[object], index: int) -> int | None:
+    value = row[index] if len(row) > index else None
+    return value if type(value) is int and value >= 0 else None
+
+
+def _margin_extension_decimal(row: list[object], index: int) -> Decimal | None:
+    # Auxiliary capacity metadata must not break delivery of known execution facts.
+    try:
+        return _optional_decimal(row[index], "position.margin") if len(row) > index else None
+    except BitfinexV1ProtocolError:
+        return None
 
 
 def _array(

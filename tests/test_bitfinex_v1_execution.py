@@ -74,6 +74,7 @@ from py000_nautilus.bitfinex_v1_execution import (
     BitfinexV1LiveExecClientFactory,
 )
 from py000_nautilus.bitfinex_v1_protocol import POST_ONLY_FLAG, REDUCE_ONLY_FLAG
+from py000_nautilus.bitfinex_v1_reports import BitfinexV1ReportError
 from py000_nautilus.hedge import HedgeCoordinator
 from py000_nautilus.models import BusinessOrderSide
 from py000_nautilus.store import JsonStateStore
@@ -449,6 +450,475 @@ def _position_row(
 
 def _order_events(harness: _Harness) -> list[OrderEvent]:
     return [event for event in harness.events if isinstance(event, OrderEvent)]
+
+
+def _margin_info(harness: _Harness) -> dict[str, Any]:
+    account = next(event for event in reversed(harness.events)
+                   if type(event).__name__ == "AccountState")
+    return cast(dict[str, Any], account.info["bitfinex_margin"])
+
+
+def _margin_position(*, quantity: str = "-0.75", updated: int = 100, pid: int = 44) -> list[object]:
+    row = _position_row(Decimal(quantity), avg_px=Decimal("4050.1"))
+    row[11:14] = [pid, 50, updated]
+    return [*row, None, Decimal("150.125"), Decimal("15.0125")]
+
+
+def _position_command(harness: _Harness) -> GeneratePositionStatusReports:
+    return GeneratePositionStatusReports(
+        instrument_id=SOURCE_ID, start=None, end=None,
+        command_id=UUID4(), ts_init=harness.clock.timestamp_ns(),
+    )
+
+
+def test_margin_facts_distinguish_absence_flat_and_independent_observations() -> None:
+    async def scenario() -> None:
+        harness = _Harness()
+        await harness.connect(available=None)
+        try:
+            first = _margin_info(harness)
+            assert first["wallet"]["available_balance"] is None
+            assert first["wallet"]["current"] is True
+            assert first["positions"] == {
+                "complete": False, "current": False, "observed_ns": None, "position": None,
+            }
+            before_snapshot = harness.clock.timestamp_ns()
+            harness.client._consume_private_frame([0, "ps", []])
+            flat = _margin_info(harness)
+            assert flat["wallet"] == first["wallet"]
+            assert flat["positions"]["complete"] is True
+            assert flat["positions"]["current"] is True
+            assert flat["positions"]["position"] is None
+            assert before_snapshot <= flat["positions"]["observed_ns"]
+            assert flat["positions"]["observed_ns"] <= harness.clock.timestamp_ns()
+            harness.client._consume_private_frame([0, "pn", _margin_position()])
+            positioned = _margin_info(harness)
+            assert positioned["positions"]["position"]["quantity"] == "-0.75"
+            assert positioned["positions"]["position"]["collateral"] == "150.125"
+            assert positioned["positions"]["position"]["venue_update_ms"] == 100
+            before_wallet = harness.clock.timestamp_ns()
+            harness.client._consume_private_frame(
+                [0, "wu", ["margin", "USTF0", Decimal(900), Decimal(0), Decimal(600)]],
+            )
+            assert _margin_info(harness)["positions"] == positioned["positions"]
+            assert before_wallet <= _margin_info(harness)["wallet"]["observed_ns"]
+            # AccountState.info is not copied by Nautilus: old nested values must survive.
+            assert first["positions"]["complete"] is False
+            assert flat["positions"]["position"] is None
+            assert positioned["wallet"] == first["wallet"]
+        finally:
+            await harness.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("message_type", ["pn", "pu"])
+def test_margin_increment_without_full_snapshot_never_certifies_positions(
+    message_type: str,
+) -> None:
+    async def scenario() -> None:
+        harness = _Harness()
+        await harness.connect()
+        try:
+            harness.client._consume_private_frame([0, message_type, _margin_position()])
+            info = _margin_info(harness)["positions"]
+            assert info["complete"] is False and info["current"] is False
+            harness.client._consume_private_frame([0, "ps", [_margin_position()]])
+            assert _margin_info(harness)["positions"]["current"] is True
+        finally:
+            await harness.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "bad", ["old_time", "same_time_conflict", "wrong_id", "wrong_close", "duplicate"],
+)
+def test_margin_ambiguous_position_preserves_last_good_without_claiming_current(bad: str) -> None:
+    async def scenario() -> None:
+        harness = _Harness()
+        await harness.connect()
+        try:
+            good = _margin_position()
+            harness.client._consume_private_frame([0, "ps", [good]])
+            before = _margin_info(harness)["positions"]
+            row = _margin_position(quantity="-1", updated=101)
+            message_type = "pu"
+            if bad == "old_time":
+                row[13] = 99
+            elif bad == "same_time_conflict":
+                row[13] = 100
+            elif bad == "wrong_id":
+                row[11] = 99
+            elif bad == "wrong_close":
+                message_type = "pc"
+            frame: list[object] = [0, message_type, row]
+            if bad == "duplicate":
+                frame = [0, "ps", [good, row]]
+            harness.client._consume_private_frame(frame)
+            after = _margin_info(harness)["positions"]
+            assert after["position"] == before["position"]
+            assert after["observed_ns"] == before["observed_ns"]
+            assert after["current"] is False
+            assert harness.client.execution_hold_reason is None
+            harness.client._consume_private_frame([0, "ps", [_margin_position(updated=102)]])
+            assert _margin_info(harness)["positions"]["current"] is True
+        finally:
+            await harness.close()
+    asyncio.run(scenario())
+
+
+def test_margin_exact_close_does_not_allow_late_old_position_to_reappear() -> None:
+    async def scenario() -> None:
+        harness = _Harness()
+        await harness.connect()
+        try:
+            harness.client._consume_private_frame([0, "ps", [_margin_position()]])
+            closed = _margin_position(quantity="0", updated=101)
+            closed[1] = "CLOSED"
+            harness.client._consume_private_frame([0, "pc", closed])
+            flat = _margin_info(harness)["positions"]
+            assert flat["position"] is None and flat["current"] is True
+            harness.client._consume_private_frame([0, "pn", _margin_position()])
+            assert _margin_info(harness)["positions"]["position"] is None
+            assert _margin_info(harness)["positions"]["current"] is False
+            harness.client._consume_private_frame([0, "ps", []])
+            assert _margin_info(harness)["positions"]["current"] is True
+        finally:
+            await harness.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("race", ["position", "wallet", "disconnect", "cancel", "timeout", "none"])
+def test_margin_rest_observation_cannot_overwrite_newer_stream_or_connection(
+    monkeypatch: pytest.MonkeyPatch, race: str,
+) -> None:
+    async def scenario() -> None:
+        harness = _Harness()
+        await harness.connect()
+        entered, release = asyncio.Event(), asyncio.Event()
+        try:
+            harness.client._consume_private_frame([0, "ps", [_margin_position()]])
+            before = _margin_info(harness)["positions"]
+
+            async def positions() -> object:
+                entered.set()
+                await release.wait()
+                if race == "timeout":
+                    raise TimeoutError("synthetic positions timeout")
+                return []
+
+            monkeypatch.setattr(harness.rest, "positions", positions)
+            task = asyncio.create_task(harness.client.generate_position_status_reports(
+                _position_command(harness),
+            ))
+            await entered.wait()
+            before_release = harness.clock.timestamp_ns()
+            if race == "position":
+                harness.client._consume_private_frame([0, "pu", _margin_position(updated=102)])
+            elif race == "wallet":
+                harness.client._consume_private_frame(
+                    [0, "wu", ["margin", "USTF0", Decimal(900), Decimal(0), Decimal(600)]],
+                )
+            elif race == "disconnect":
+                await harness.client._disconnect()
+            elif race == "cancel":
+                task.cancel()
+            latest = _margin_info(harness)
+            release.set()
+            if race == "cancel":
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            elif race == "timeout":
+                with pytest.raises(TimeoutError, match="synthetic positions timeout"):
+                    await task
+            else:
+                reports = await task
+                assert len(reports) == 1 and reports[0].signed_decimal_qty == 0
+            after = _margin_info(harness)
+            if race in {"none", "wallet"}:
+                assert after["positions"]["position"] is None
+                assert after["positions"]["current"] is True
+                assert before_release <= after["positions"]["observed_ns"]
+                assert after["wallet"] == latest["wallet"]
+            else:
+                assert after == latest
+                if race == "position":
+                    assert after["positions"]["position"]["venue_update_ms"] == 102
+                else:
+                    assert after["positions"]["position"] == before["position"]
+            if race == "disconnect":
+                assert after["wallet"]["current"] is False
+                assert after["positions"]["current"] is False
+        finally:
+            await harness.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("bound", [False, True], ids=["no-fee-binding", "owned"])
+def test_margin_applied_native_fill_invalidates_once_even_during_rest_without_fee_binding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, bound: bool,
+) -> None:
+    async def scenario() -> None:
+        harness = _Harness()
+        harness.msgbus.deregister("ExecEngine.process", harness.events.append)
+        engine = ExecutionEngine(msgbus=harness.msgbus, cache=harness.cache, clock=harness.clock)
+        engine.register_client(harness.client)
+        harness.cache.add_instrument(harness.instrument)
+        harness.cache.add_account(TestExecStubs.margin_account(account_id=harness.client.account_id))
+        store = JsonStateStore(tmp_path / "margin-hedges.json")
+        hedges = HedgeCoordinator(SOURCE_ID, store)
+        await harness.connect()
+        try:
+            order = harness.order(tif=TimeInForce.IOC, post_only=False, quantity="2")
+            harness.cache.add_order(order)
+            store.begin_source(order.client_order_id.value, BusinessOrderSide.BUY, Decimal(2))
+
+            def on_order(event: OrderEvent) -> None:
+                if isinstance(event, OrderFilled):
+                    hedges.on_source_filled(event)
+
+            harness.msgbus.subscribe(f"events.order.{order.strategy_id}", on_order)
+            if bound:
+                cid = await harness.submit(order)
+                harness.client._consume_private_frame(harness.order_frame("on", cid, order))
+            else:
+                engine.process(TestEventStubs.order_submitted(
+                    order, account_id=harness.client.account_id,
+                ))
+                engine.process(TestEventStubs.order_accepted(
+                    order, account_id=harness.client.account_id,
+                    venue_order_id=VenueOrderId(str(VENUE_ORDER_ID)),
+                ))
+            assert (harness.client._cid_store.binding_for_client(
+                order.client_order_id.value,
+            ) is not None) is bound
+
+            # Bad optional data is delivered by the real reader, not only a codec call.
+            row = _margin_position()
+            row[17:19] = ["bad collateral", Decimal("NaN")]
+            await harness.fake.queue.put([0, "ps", [row]])
+            await asyncio.sleep(0)
+            before = _margin_info(harness)
+            assert before["positions"]["position"]["collateral"] is None
+            assert before["positions"]["position"]["collateral_min"] is None
+            assert before["positions"]["current"] is True
+
+            entered, release = asyncio.Event(), asyncio.Event()
+
+            async def positions() -> object:
+                entered.set()
+                await release.wait()
+                return []
+
+            monkeypatch.setattr(harness.rest, "positions", positions)
+            task = asyncio.create_task(harness.client.generate_position_status_reports(
+                _position_command(harness),
+            ))
+            await entered.wait()
+            fill = TestEventStubs.order_filled(
+                order=order, instrument=harness.instrument,
+                account_id=harness.client.account_id,
+                venue_order_id=VenueOrderId(str(VENUE_ORDER_ID)), trade_id=TradeId("1234"),
+                last_qty=harness.instrument.make_qty(Decimal(2)),
+                last_px=harness.instrument.make_price(Decimal("3926.70")),
+                commission=Money(0, USD), ts_event=harness.clock.timestamp_ns(),
+            )
+            # Merely calling the observer without cache application is not a mutation.
+            if not bound:
+                harness.client._capture_native_fee_evidence(fill)
+                assert _margin_info(harness) == before
+            engine.process(fill)
+            after = _margin_info(harness)
+            assert after["wallet"]["current"] is False
+            assert after["positions"]["current"] is False
+            assert after["wallet"]["observed_ns"] == before["wallet"]["observed_ns"]
+            assert after["positions"]["observed_ns"] == before["positions"]["observed_ns"]
+            assert before["wallet"]["current"] is True
+            assert len(store.intents()) == 1 and order.filled_qty.as_decimal() == 2
+            release.set()
+            assert (await task)[0].signed_decimal_qty == 0
+            assert _margin_info(harness) == after
+
+            harness.client._consume_private_frame([0, "ps", [_margin_position(updated=102)]])
+            harness.client._consume_private_frame(
+                [0, "wu", ["margin", "USTF0", Decimal(900), Decimal(0), Decimal(600)]],
+            )
+            refreshed = _margin_info(harness)
+            # Fee reconciliation also scans pre-existing cache events; it is not
+            # a new Engine publication, even without an in-process seen marker.
+            harness.client._margin_seen_fills.clear()
+            harness.client._capture_native_fee_evidence(fill)
+            harness.client._capture_native_fee_evidence(fill)
+            assert _margin_info(harness) == refreshed
+            assert refreshed["wallet"]["current"] is True
+            assert refreshed["positions"]["current"] is True
+            assert len(store.intents()) == 1
+            assert harness.client._reader_task is not None
+            assert not harness.client._reader_task.done()
+            assert harness.client.execution_hold_reason is None
+        finally:
+            await harness.close()
+    asyncio.run(scenario())
+
+
+def test_margin_rest_after_disconnect_cannot_restore_current_connection() -> None:
+    async def scenario() -> None:
+        harness = _Harness()
+        await harness.connect()
+        try:
+            harness.client._consume_private_frame([0, "ps", [_margin_position()]])
+            await harness.client._disconnect()
+            before = _margin_info(harness)
+            reports = await harness.client.generate_position_status_reports(
+                _position_command(harness),
+            )
+            assert reports[0].signed_decimal_qty == 0
+            assert _margin_info(harness) == before
+            await harness.connect()
+            harness.client._consume_private_frame([0, "pu", _margin_position(updated=102)])
+            assert _margin_info(harness)["positions"]["complete"] is False
+            harness.client._consume_private_frame([0, "ps", []])
+            assert _margin_info(harness)["positions"]["current"] is True
+        finally:
+            await harness.close()
+    asyncio.run(scenario())
+
+
+def test_margin_rest_enrichment_failure_keeps_existing_report_result_and_last_good() -> None:
+    async def scenario() -> None:
+        harness = _Harness()
+        await harness.connect()
+        try:
+            harness.client._consume_private_frame([0, "ps", [_margin_position()]])
+            before = _margin_info(harness)
+            # The existing position report does not consume funding/PL metadata.
+            row = _margin_position(updated=102)
+            row[6] = "bad auxiliary PL"
+            harness.rest.position_rows = [row]
+            reports = await harness.client.generate_position_status_reports(
+                _position_command(harness),
+            )
+            assert reports[0].signed_decimal_qty == Decimal("-0.75")
+            after = _margin_info(harness)
+            assert after["wallet"] == before["wallet"]
+            assert after["positions"]["position"] == before["positions"]["position"]
+            assert after["positions"]["observed_ns"] == before["positions"]["observed_ns"]
+            assert after["positions"]["current"] is False
+            assert harness.client.execution_hold_reason is None
+        finally:
+            await harness.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "failure", [
+        "ps_ambiguous", "rest_parse", "rest_report", "wrong_id", "pn_wrong_id", "time_conflict",
+    ],
+)
+@pytest.mark.parametrize("delta", ["pc", "pu", "pn"])
+def test_margin_rejected_projection_needs_full_sample_before_any_delta_can_recover(
+    failure: str, delta: str,
+) -> None:
+    async def scenario() -> None:
+        harness = _Harness()
+        await harness.connect()
+        try:
+            good = _margin_position()
+            harness.client._consume_private_frame([0, "ps", [good]])
+            before = _margin_info(harness)
+            if failure == "ps_ambiguous":
+                harness.client._consume_private_frame([0, "ps", [
+                    _margin_position(updated=101), _margin_position(pid=99, updated=101),
+                ]])
+            elif failure == "rest_parse":
+                invalid = _margin_position(updated=101)
+                invalid[6] = "bad auxiliary PL"
+                harness.rest.position_rows = [invalid]
+                reports = await harness.client.generate_position_status_reports(
+                    _position_command(harness),
+                )
+                assert reports[0].signed_decimal_qty == Decimal("-0.75")
+            elif failure == "rest_report":
+                harness.rest.position_rows = [
+                    _margin_position(updated=101), _margin_position(pid=99, updated=101),
+                ]
+                with pytest.raises(BitfinexV1ReportError, match="one NETTING position"):
+                    await harness.client.generate_position_status_reports(
+                        _position_command(harness),
+                    )
+            elif failure in {"wrong_id", "pn_wrong_id"}:
+                message_type = "pn" if failure == "pn_wrong_id" else "pu"
+                harness.client._consume_private_frame([0, message_type, _margin_position(
+                    pid=99, updated=101,
+                )])
+            else:
+                harness.client._consume_private_frame([0, "pu", _margin_position(quantity="-1")])
+            assert _margin_info(harness)["positions"]["current"] is False
+
+            # Each delta would be valid against the old single position, but none
+            # can exclude the missing/conflicting facts from the rejected sample.
+            update = _margin_position(updated=102)
+            if delta == "pc":
+                update[1:3] = ["CLOSED", Decimal(0)]
+            elif delta == "pn":
+                update = good
+            harness.client._consume_private_frame([0, delta, update])
+            after = _margin_info(harness)
+            assert after["positions"]["complete"] is False
+            assert after["positions"]["current"] is False
+            assert after["positions"]["position"] == before["positions"]["position"]
+            assert after["positions"]["observed_ns"] == before["positions"]["observed_ns"]
+            assert after["wallet"] == before["wallet"]
+
+            recovered = _margin_position(updated=103)
+            if failure == "ps_ambiguous":
+                harness.rest.position_rows = [recovered]
+                await harness.client.generate_position_status_reports(_position_command(harness))
+            else:
+                harness.client._consume_private_frame([0, "ps", [recovered]])
+            assert _margin_info(harness)["positions"]["complete"] is True
+            assert _margin_info(harness)["positions"]["current"] is True
+            closed = _margin_position(quantity="0", updated=104)
+            closed[1] = "CLOSED"
+            harness.client._consume_private_frame([0, "pc", closed])
+            assert _margin_info(harness)["positions"]["current"] is True
+            assert _margin_info(harness)["positions"]["position"] is None
+            assert harness.client.execution_hold_reason is None
+        finally:
+            await harness.close()
+    asyncio.run(scenario())
+
+
+def test_margin_late_rejected_rest_report_cannot_revoke_new_full_stream_sample(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        harness = _Harness()
+        await harness.connect()
+        entered, release = asyncio.Event(), asyncio.Event()
+        try:
+            harness.client._consume_private_frame([0, "ps", [_margin_position()]])
+
+            async def positions() -> object:
+                entered.set()
+                await release.wait()
+                return [_margin_position(updated=101), _margin_position(pid=99, updated=101)]
+
+            monkeypatch.setattr(harness.rest, "positions", positions)
+            task = asyncio.create_task(harness.client.generate_position_status_reports(
+                _position_command(harness),
+            ))
+            await entered.wait()
+            harness.client._consume_private_frame([0, "ps", [_margin_position(updated=103)]])
+            fresh = _margin_info(harness)
+            assert fresh["positions"]["complete"] is True
+            assert fresh["positions"]["current"] is True
+            release.set()
+            with pytest.raises(BitfinexV1ReportError, match="one NETTING position"):
+                await task
+            assert _margin_info(harness) == fresh
+        finally:
+            await harness.close()
+    asyncio.run(scenario())
 
 
 def test_connect_authenticates_and_uses_zero_free_when_wallet_available_is_unknown() -> None:

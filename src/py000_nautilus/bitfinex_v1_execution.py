@@ -74,13 +74,16 @@ from py000_nautilus.bitfinex_v1_protocol import (
     MAX_AUTH_NONCE,
     POST_ONLY_FLAG,
     REDUCE_ONLY_FLAG,
+    BitfinexV1ProtocolError,
     Notification,
     OrderEvent,
     OrderSnapshot,
     OrderState,
     PositionEvent,
+    PositionState,
     TradeExecution,
     TradeUpdate,
+    WalletBalance,
     WalletEvent,
     auth_message,
     cancel_order_op,
@@ -91,6 +94,7 @@ from py000_nautilus.bitfinex_v1_protocol import (
 )
 from py000_nautilus.bitfinex_v1_reports import (
     BitfinexFeeSummary,
+    BitfinexV1ReportError,
     map_fill_reports,
     map_order_status_reports,
     map_position_status_reports,
@@ -276,9 +280,19 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
         self._unbound_paper_interim_fills: dict[int, TradeExecution] = {}
         self._ack_deadlines: dict[tuple[int, str], asyncio.TimerHandle] = {}
         self._accounting_failure: str | None = None
+        self._margin_wallet: WalletBalance | None = None
+        self._margin_wallet_observed_ns: int | None = None
+        self._margin_wallet_current = False
+        self._margin_position: PositionState | None = None
+        self._margin_position_last: PositionState | None = None
+        self._margin_positions_observed_ns: int | None = None
+        self._margin_positions_complete = False
+        self._margin_positions_current = False
+        self._margin_revision = 0
+        self._margin_seen_fills: set[tuple[ClientOrderId, TradeId]] = set()
         # The Engine publishes this topic after applying the order event. Keep
         # observing through disconnect/drain; the subscription shares node lifetime.
-        self._msgbus.subscribe("events.order.*", self._capture_native_fee_evidence)
+        self._msgbus.subscribe("events.order.*", self._capture_native_execution_facts)
 
     @property
     def accounting_incomplete(self) -> bool:
@@ -351,21 +365,31 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
             # This auxiliary I/O must not stop publication or the known-fill hedge.
             self._log.error(f"Bitfinex accounting conflict write failed: {type(exc).__name__}")
 
-    def _capture_native_fee_evidence(self, event: object) -> None:
+    def _capture_native_execution_facts(self, event: object) -> None:
+        self._capture_native_fee_evidence(event, native_publication=True)
+
+    def _capture_native_fee_evidence(
+        self, event: object, *, native_publication: bool = False,
+    ) -> None:
         if not isinstance(event, OrderFilled) or (
             event.account_id != self.account_id
             or event.instrument_id != self._bfx_config.instrument_id
         ):
-            return
-        binding = self._cid_store.binding_for_client(event.client_order_id.value)
-        if binding is None:
             return
         order = self._cache.order(event.client_order_id)
         cached = None if order is None else next(
             (fill for fill in order.events if isinstance(fill, OrderFilled)
              and fill.trade_id == event.trade_id), None,
         )
-        if cached is None or OrderFilled.to_dict(cached) != OrderFilled.to_dict(event):
+        applied = cached is not None and OrderFilled.to_dict(cached) == OrderFilled.to_dict(event)
+        fill_key = (event.client_order_id, event.trade_id)
+        if native_publication and applied and fill_key not in self._margin_seen_fills:
+            self._margin_seen_fills.add(fill_key)
+            self._invalidate_margin_facts()
+        binding = self._cid_store.binding_for_client(event.client_order_id.value)
+        if binding is None:
+            return
+        if not applied:
             self._record_accounting_conflict("native fill publication lacks applied cache evidence")
             return
         origin = event.info.get("bitfinex_fill_source", "unknown")
@@ -651,6 +675,7 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
             self._cid_by_venue.pop(live.venue_order_id, None)
 
     async def _connect(self) -> None:
+        self._invalidate_margin_facts(connection_changed=True)
         await self._await_instrument_profile()
         if any(
             live.rejection_key is None and not live.terminal_emitted
@@ -687,6 +712,7 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
                 timeout=self._bfx_config.auth_timeout_ms / 1_000,
             )
         except BaseException:
+            self._invalidate_margin_facts(connection_changed=True)
             await self._transport.close()
             raise
         self._running = True
@@ -741,6 +767,7 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
 
     async def _disconnect(self) -> None:
         self._running = False
+        self._invalidate_margin_facts(connection_changed=True)
         task = self._reader_task
         self._reader_task = None
         if task is not None and task is not asyncio.current_task():
@@ -764,6 +791,7 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
             raise
         except Exception as exc:
             self._running = False
+            self._invalidate_margin_facts(connection_changed=True)
             self._stop_ack_deadlines(mark_unknown=True)
             context = f"private reader frame_type={frame_type}"
             self._record_fatal(context, exc)
@@ -791,7 +819,7 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
         elif isinstance(message, OrderSnapshot):
             self._handle_order_snapshot(message)
         elif isinstance(message, PositionEvent):
-            return
+            self._handle_margin_positions(message)
 
     def _handle_wallet(self, event: WalletEvent) -> None:
         for wallet in event.wallets:
@@ -802,7 +830,10 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
                 continue
             total = wallet.balance
             free = wallet.available_balance if wallet.available_balance is not None else Decimal(0)
-            self.generate_account_state(
+            self._margin_wallet = wallet
+            self._margin_wallet_observed_ns = self._clock.timestamp_ns()
+            self._margin_wallet_current = True
+            self._publish_margin_state(
                 balances=[
                     AccountBalance(
                         Money(total, USDT),
@@ -810,14 +841,122 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
                         Money(free, USDT),
                     )
                 ],
-                margins=[],
-                reported=True,
-                ts_event=self._clock.timestamp_ns(),
-                info={"bitfinex_wallet_currency": wallet.currency},
             )
             if event.message_type == "ws":
                 self._account_ready = True
             return
+
+    def _publish_margin_state(self, *, balances: list[AccountBalance] | None = None) -> None:
+        wallet, position = self._margin_wallet, self._margin_position
+        if wallet is None and self._margin_positions_observed_ns is None:
+            return
+        # Nautilus retains info by reference: never reuse a published mutable object.
+        self.generate_account_state(
+            balances=balances or [], margins=[], reported=True,
+            ts_event=self._clock.timestamp_ns(),
+            info={
+                "bitfinex_wallet_currency": (
+                    wallet.currency if wallet is not None else self._bfx_config.wallet_currency
+                ),
+                "bitfinex_margin": {
+                    "instrument_id": self._bfx_config.instrument_id.value,
+                    "wallet": {
+                        "balance": None if wallet is None else str(wallet.balance),
+                        "available_balance": None if wallet is None or (
+                            wallet.available_balance is None
+                        ) else str(wallet.available_balance),
+                        "observed_ns": self._margin_wallet_observed_ns,
+                        "current": self._margin_wallet_current,
+                    },
+                    "positions": {
+                        "complete": self._margin_positions_complete,
+                        "current": self._margin_positions_current,
+                        "observed_ns": self._margin_positions_observed_ns,
+                        "position": None if position is None else {
+                            "position_id": position.position_id, "status": position.status,
+                            "quantity": str(position.quantity),
+                            **{key: None if value is None else str(value) for key, value in (
+                                ("base_price", position.base_price),
+                                ("profit_loss", position.profit_loss),
+                                ("leverage", position.leverage),
+                                ("collateral", position.collateral),
+                                ("collateral_min", position.collateral_min),
+                            )},
+                            "type": position.position_type,
+                            "venue_update_ms": position.ts_updated_ms,
+                        },
+                    },
+                },
+            },
+        )
+
+    def _invalidate_margin_facts(self, *, connection_changed: bool = False) -> None:
+        self._margin_revision += 1
+        self._margin_wallet_current = False
+        self._margin_positions_current = False
+        if connection_changed:
+            # A delta on the next stream cannot repair a missed snapshot.
+            self._margin_positions_complete = False
+        self._publish_margin_state()
+
+    def _handle_margin_positions(self, event: PositionEvent) -> None:
+        rows = [row for row in event.positions if row.symbol == self._bfx_config.raw_symbol]
+        if event.message_type != "ps" and not rows:
+            return
+        self._margin_revision += 1
+        was_complete = self._margin_positions_complete
+        # A rejected target sample breaks the complete projection. A later delta
+        # cannot exclude missing/conflicting positions; only a full sample can.
+        self._margin_positions_complete = False
+        self._margin_positions_current = False
+        full = event.message_type == "ps"
+        if (full or was_complete) and len(rows) <= 1:
+            row = rows[0] if rows else None
+            if (full and row is None) or (
+                row is not None and self._margin_position_transition_valid(row, event.message_type)
+            ):
+                self._margin_position = row if row is not None and row.status == "ACTIVE" else None
+                if row is not None:
+                    self._margin_position_last = row
+                self._margin_positions_complete = True
+                self._margin_positions_current = True
+                self._margin_positions_observed_ns = self._clock.timestamp_ns()
+        self._publish_margin_state()
+
+    def _reject_margin_positions(self) -> None:
+        self._margin_revision += 1
+        self._margin_positions_complete = False
+        self._margin_positions_current = False
+        self._publish_margin_state()
+
+    def _margin_position_transition_valid(self, row: PositionState, message_type: str) -> bool:
+        previous = self._margin_position_last
+        if row.position_id is None or row.position_id <= 0:
+            return False
+        if previous is not None and previous.ts_updated_ms is not None:
+            if row.ts_updated_ms is None or row.ts_updated_ms < previous.ts_updated_ms:
+                return False
+            if row.ts_updated_ms == previous.ts_updated_ms and row != previous:
+                return False
+        if message_type == "pc":
+            return (
+                row.status == "CLOSED" and row.quantity == 0 and previous is not None
+                and row.position_id == previous.position_id
+                and (self._margin_position is not None or row == previous)
+            )
+        if row.status != "ACTIVE" or row.quantity == 0:
+            return False
+        if message_type == "pu" and (
+            self._margin_position is None or row.position_id != self._margin_position.position_id
+        ):
+            return False
+        if message_type == "pn" and self._margin_position is not None:
+            return row == self._margin_position
+        # A known closed ID cannot be resurrected by an old delta or snapshot.
+        return not (
+            self._margin_position is None and previous is not None
+            and row.position_id == previous.position_id
+        )
 
     async def _submit_order(self, command: SubmitOrder) -> None:
         order = command.order
@@ -2551,12 +2690,33 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
     ) -> list[PositionStatusReport]:
         if command.instrument_id not in {None, self._bfx_config.instrument_id}:
             return []
-        return map_position_status_reports(
-            rows=_rows(await self._rest.positions(), "positions"),
-            instrument=self._report_instrument(),
-            account_id=self.account_id,
-            ts_init=self._clock.timestamp_ns(),
-        )
+        revision = self._margin_revision
+        rows = _rows(await self._rest.positions(), "positions")
+        try:
+            reports = map_position_status_reports(
+                rows=rows,
+                instrument=self._report_instrument(),
+                account_id=self.account_id,
+                ts_init=self._clock.timestamp_ns(),
+            )
+        except BitfinexV1ReportError:
+            if self._running and revision == self._margin_revision:
+                self._reject_margin_positions()
+            raise
+        if self._running and revision == self._margin_revision:
+            try:
+                # Keep the existing report mapper and its error contract authoritative.
+                # Enrichment-only fields must not turn a valid report into a failed query.
+                message = parse_private_message([0, "ps", [
+                    row for row in rows if isinstance(row, list) and row
+                    and row[0] == self._bfx_config.raw_symbol
+                ]])
+            except BitfinexV1ProtocolError:
+                self._reject_margin_positions()
+            else:
+                if isinstance(message, PositionEvent):
+                    self._handle_margin_positions(message)
+        return reports
 
     async def _order_reports(
         self,

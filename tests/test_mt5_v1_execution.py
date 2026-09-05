@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import cast
 
 import pytest
+from nautilus_trader.common.component import LiveClock, TestClock
 from nautilus_trader.common.providers import InstrumentProvider
 from nautilus_trader.config import LiveExecClientConfig
 from nautilus_trader.core.uuid import UUID4
@@ -413,10 +414,11 @@ class _Harness:
         event_pagination_max_pages: int = 1_000,
         event_pagination_timeout_ms: int = 30_000,
         capture_events: bool = True,
+        clock: LiveClock | None = None,
     ) -> None:
         self.identity = identity or _identity()
         self.snapshot = snapshot or _snapshot(self.identity, recovery_state=recovery_state)
-        self.clock = TestComponentStubs.clock()
+        self.clock = clock or TestComponentStubs.clock()
         self.msgbus = TestComponentStubs.msgbus()
         self.cache = TestComponentStubs.cache()
         self.events: list[OrderEvent] = []
@@ -431,6 +433,7 @@ class _Harness:
                 self.events.append(event)
 
             self.msgbus.register("ExecEngine.process", capture_event)
+            self.capture_event = capture_event
             self.msgbus.register("Portfolio.update_account", self.account_states.append)
         self.instrument = instrument_from_snapshot(self.snapshot, INSTRUMENT_ID, ts_init=0)
         provider = InstrumentProvider()
@@ -860,6 +863,300 @@ def test_runtime_pagination_time_budget_disconnects_fail_closed(
     asyncio.run(scenario())
 
 
+async def _capacity_harness(
+    loop: asyncio.AbstractEventLoop,
+    *,
+    snapshot: JsonObject | None = None,
+) -> tuple[_Harness, TestClock]:
+    snapshot = snapshot or _snapshot(_identity())
+    clock = TestClock()
+    clock.set_time(
+        int(cast(str, cast(JsonObject, snapshot["time"])["observed_utc_ms"])) * 1_000_000
+    )
+    harness = _Harness(loop, snapshot=snapshot, clock=cast(LiveClock, clock))
+    assert not harness.client.account_capacity_ready(5_000_000_000)
+    await harness.connect()
+    harness.client._set_connected(True)
+    return harness, clock
+
+
+@pytest.mark.parametrize(
+    ("sides", "expected_net"),
+    [
+        ([], "0"),
+        ([("buy", "0.015"), ("sell", "0.004")], "1.1"),
+        ([("buy", "0.004"), ("sell", "0.015")], "-1.1"),
+        ([("buy", "0.015"), ("sell", "0.015")], "0"),
+    ],
+)
+def test_capacity_metadata_uses_complete_exact_ticket_sample(
+    sides: list[tuple[str, str]],
+    expected_net: str,
+) -> None:
+    async def scenario() -> None:
+        snapshot = _snapshot(_identity())
+        spec = cast(JsonObject, snapshot["symbol_spec"])
+        spec.update({"volume_min": "0.001", "volume_step": "0.001"})
+        template = cast(list[JsonObject], snapshot["positions"])[0]
+        positions: list[JsonObject] = []
+        for index, (side, lots) in enumerate(sides):
+            position = deepcopy(template)
+            position.update(
+                {
+                    "ticket": str(800000010 + index),
+                    "identifier": str(800000010 + index),
+                    "side": side,
+                    "volume_lots": lots,
+                }
+            )
+            positions.append(position)
+        snapshot["positions"] = positions
+        harness, clock = await _capacity_harness(asyncio.get_running_loop(), snapshot=snapshot)
+        state = harness.account_states[-1]
+        assert state.info["mt5_positions_complete"] is True
+        assert Decimal(state.info["mt5_net_position_ounces"]) == Decimal(expected_net)
+        assert state.info["mt5_position_count"] == len(sides)
+        assert state.info["mt5_symbol"] == harness.identity.symbol
+        assert state.info["mt5_stream_id"] == harness.identity.stream_id
+        assert state.info["mt5_account_observed_ns"] == state.ts_event == clock.timestamp_ns()
+        assert state.info["mt5_account_sample_valid"] is True
+        assert harness.client.account_capacity_ready(5_000_000_000)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("elapsed_ns", "ready"), [(0, True), (5_000_000_000, True), (5_000_000_001, False), (-1, False)]
+)
+def test_capacity_age_is_checked_at_read_time(elapsed_ns: int, ready: bool) -> None:
+    async def scenario() -> None:
+        harness, clock = await _capacity_harness(asyncio.get_running_loop())
+        event = harness.account_states[-1]
+        clock.set_time(event.ts_event + elapsed_ns)
+        assert harness.client.account_capacity_ready(5_000_000_000) is ready
+        # Capacity expiry never changes the pre-existing execution gate or old event.
+        assert harness.client.execution_admitted
+        assert event.info["mt5_account_sample_valid"] is True
+        assert len(harness.account_states) == 1
+        assert not harness.fake.closed
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("invalid_age", [-1, True, 1.5])
+def test_capacity_age_parameter_cannot_create_an_implicit_allow(invalid_age: object) -> None:
+    async def scenario() -> None:
+        harness, _ = await _capacity_harness(asyncio.get_running_loop())
+        assert not harness.client.account_capacity_ready(cast(int, invalid_age))
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("bad_kind", ["future", "backward"])
+def test_capacity_bad_sample_time_does_not_poison_watermark_or_execution(bad_kind: str) -> None:
+    async def scenario() -> None:
+        harness, clock = await _capacity_harness(asyncio.get_running_loop())
+        original = harness.account_states[-1]
+        original_info = deepcopy(original.info)
+        clock.set_time(original.ts_event + 10_000_000)
+        invalid = deepcopy(harness.snapshot)
+        bad_ns = (
+            clock.timestamp_ns() + 1_000_000
+            if bad_kind == "future"
+            else original.ts_event - 1_000_000
+        )
+        cast(JsonObject, invalid["time"])["observed_utc_ms"] = str(bad_ns // 1_000_000)
+        harness.fake.current_snapshot = invalid
+        await harness.client._refresh_snapshot_if_due(force=True)
+        invalid_event = harness.account_states[-1]
+        assert invalid_event.info["mt5_account_sample_valid"] is False
+        assert not harness.client.account_capacity_ready(5_000_000_000)
+        assert harness.client.execution_admitted
+        assert harness.client.is_connected and not harness.fake.closed
+        assert original.info == original_info
+        assert original.info is not invalid_event.info
+
+        recovered = deepcopy(harness.snapshot)
+        cast(JsonObject, recovered["time"])["observed_utc_ms"] = str(
+            (clock.timestamp_ns() - 1_000_000) // 1_000_000
+        )
+        harness.fake.current_snapshot = recovered
+        await harness.client._refresh_snapshot_if_due(force=True)
+        assert harness.client.account_capacity_ready(5_000_000_000)
+        assert harness.account_states[-1].info["mt5_account_sample_valid"] is True
+        assert invalid_event.info["mt5_account_sample_valid"] is False
+        assert original.info == original_info
+
+    asyncio.run(scenario())
+
+
+def test_capacity_same_second_refresh_is_complete_and_does_not_alias_old_info() -> None:
+    async def scenario() -> None:
+        harness, _ = await _capacity_harness(asyncio.get_running_loop())
+        old = harness.account_states[-1]
+        old_info = deepcopy(old.info)
+        replacement = deepcopy(harness.snapshot)
+        cast(JsonObject, replacement["account"]).update(
+            {"equity": "10002.50", "margin_free": "9992.50"}
+        )
+        cast(list[JsonObject], replacement["positions"])[0]["volume_lots"] = "0.02"
+        harness.fake.current_snapshot = replacement
+        await harness.client._refresh_snapshot_if_due(force=True)
+        new = harness.account_states[-1]
+        assert new.ts_event == old.ts_event
+        assert new.info["mt5_equity"] == "10002.50"
+        assert Decimal(new.info["mt5_net_position_ounces"]) == Decimal("2")
+        assert new.info["mt5_account_sample_valid"] is True
+        assert harness.client.account_capacity_ready(5_000_000_000)
+        assert old.info == old_info and old.info is not new.info
+        assert new.info.keys() == old.info.keys()
+
+    asyncio.run(scenario())
+
+
+def test_capacity_unavailable_disconnect_and_foreign_magic_preserve_original_gates() -> None:
+    async def scenario() -> None:
+        harness, _ = await _capacity_harness(asyncio.get_running_loop())
+        harness.fake.snapshot_results.append(Mt5V1RemoteError("SNAPSHOT_UNAVAILABLE", "incomplete"))
+        await harness.client._poll_once()  # Not yet due: old complete sample remains current.
+        harness.client._next_snapshot_refresh_at = 0
+        await harness.client._poll_once()
+        assert not harness.client.account_capacity_ready(5_000_000_000)
+        assert harness.client.is_connected and not harness.fake.closed
+        harness.client._next_snapshot_refresh_at = 0
+        await harness.client._poll_once()
+        assert harness.client.account_capacity_ready(5_000_000_000)
+
+        foreign = deepcopy(harness.snapshot)
+        cast(list[JsonObject], foreign["positions"])[0]["magic"] = "0"
+        harness.fake.current_snapshot = foreign
+        await harness.client._refresh_snapshot_if_due(force=True)
+        assert not harness.client.execution_admitted
+        assert "foreign-magic" in cast(str, harness.client.execution_hold_reason)
+        assert harness.account_states[-1].info["mt5_position_count"] == 1
+        assert Decimal(harness.account_states[-1].info["mt5_net_position_ounces"]) == Decimal("1")
+        await harness.client._disconnect()
+        assert not harness.client.account_capacity_ready(5_000_000_000)
+        harness.fake.current_snapshot = harness.snapshot
+        await harness.connect()
+        harness.client._set_connected(True)
+        assert harness.client.account_capacity_ready(5_000_000_000)
+        assert harness.client.execution_admitted
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("expired", [False, True])
+def test_capacity_new_fill_invalidates_sample_without_blocking_existing_execution(
+    expired: bool,
+) -> None:
+    async def scenario() -> None:
+        harness, clock = await _capacity_harness(asyncio.get_running_loop())
+        old = harness.account_states[-1]
+        old_info = deepcopy(old.info)
+        if expired:
+            clock.set_time(old.ts_event + 6_000_000_000)
+        ready_during_fill: list[bool] = []
+
+        def capture_fill(event: OrderEvent) -> None:
+            harness.capture_event(event)
+            if isinstance(event, OrderFilled):
+                ready_during_fill.append(harness.client.account_capacity_ready(5_000_000_000))
+
+        harness.msgbus.deregister("ExecEngine.process", harness.capture_event)
+        harness.msgbus.register("ExecEngine.process", capture_fill)
+        order = harness.market()
+        harness.fake.outcome = _outcome(harness.identity, order, "order_filled")
+        await harness.submit(order)
+        assert [type(event).__name__ for event in harness.events] == [
+            "OrderSubmitted",
+            "OrderAccepted",
+            "OrderFilled",
+        ]
+        assert not harness.client.account_capacity_ready(5_000_000_000)
+        assert ready_during_fill == [False]
+        assert harness.client.pending_client_order_ids == ()
+        assert harness.client.execution_admitted
+        assert len(harness.fake.submit_calls) == 1 and not harness.fake.closed
+        assert old.info == old_info
+        # No new journal fact on a repeated poll restores or reapplies the fill.
+        await harness.client._poll_once()
+        assert not harness.client.account_capacity_ready(5_000_000_000)
+        assert len(harness.events) == 3
+
+        refreshed = deepcopy(harness.snapshot)
+        positions = cast(list[JsonObject], refreshed["positions"])
+        newly_filled = deepcopy(positions[0])
+        newly_filled.update(
+            {
+                "identifier": "900000002",
+                "ticket": "700000002",
+                "volume_lots": "1",
+                "price_open": "2401.25",
+            }
+        )
+        positions.append(newly_filled)
+        cast(JsonObject, refreshed["time"])["observed_utc_ms"] = str(
+            clock.timestamp_ns() // 1_000_000
+        )
+        harness.fake.current_snapshot = refreshed
+        await harness.client._refresh_snapshot_if_due(force=True)
+        assert harness.client.account_capacity_ready(5_000_000_000)
+        assert Decimal(harness.account_states[-1].info["mt5_net_position_ounces"]) == Decimal("101")
+        assert old.info == old_info
+
+    asyncio.run(scenario())
+
+
+def test_capacity_account_callback_observes_recovered_sample_before_publication() -> None:
+    async def scenario() -> None:
+        harness, _ = await _capacity_harness(asyncio.get_running_loop())
+        seen: list[tuple[bool, str]] = []
+
+        def capture_account(event: AccountState) -> None:
+            harness.account_states.append(event)
+            seen.append(
+                (
+                    harness.client.account_capacity_ready(5_000_000_000),
+                    event.info["mt5_net_position_ounces"],
+                )
+            )
+
+        harness.msgbus.deregister("Portfolio.update_account", harness.account_states.append)
+        harness.msgbus.register("Portfolio.update_account", capture_account)
+        harness.fake.snapshot_results.append(Mt5V1RemoteError("SNAPSHOT_UNAVAILABLE", "incomplete"))
+        harness.client._next_snapshot_refresh_at = 0
+        await harness.client._poll_once()
+        assert not harness.client.account_capacity_ready(5_000_000_000)
+        assert seen == []
+        await harness.client._refresh_snapshot_if_due(force=True)
+        assert seen == [(True, "1.00")]
+
+    asyncio.run(scenario())
+
+
+def test_capacity_journal_verification_does_not_renew_old_observation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        harness, clock = await _capacity_harness(asyncio.get_running_loop())
+        observed_ns = harness.account_states[-1].ts_event
+        original_query = harness.fake.execution_events
+
+        async def delayed_query(binding: Binding, *, after_cursor: str, limit: int) -> JsonObject:
+            page = await original_query(binding, after_cursor=after_cursor, limit=limit)
+            clock.set_time(observed_ns + 5_000_000_001)
+            return page
+
+        monkeypatch.setattr(harness.fake, "execution_events", delayed_query)
+        await harness.client._refresh_snapshot_if_due(force=True)
+        assert harness.account_states[-1].info["mt5_account_observed_ns"] == observed_ns
+        assert not harness.client.account_capacity_ready(5_000_000_000)
+        assert harness.client.execution_admitted and not harness.fake.closed
+
+    asyncio.run(scenario())
+
+
 def test_connect_publishes_snapshot_backed_margin_account_state() -> None:
     async def scenario() -> None:
         harness = _Harness(asyncio.get_running_loop())
@@ -884,6 +1181,13 @@ def test_connect_publishes_snapshot_backed_margin_account_state() -> None:
             "mt5_margin_free": "9991.25",
             "mt5_margin_level": "100012.5",
             "mt5_leverage": 100,
+            "mt5_positions_complete": True,
+            "mt5_net_position_ounces": "1.00",
+            "mt5_position_count": 1,
+            "mt5_symbol": harness.identity.symbol,
+            "mt5_stream_id": harness.identity.stream_id,
+            "mt5_account_observed_ns": 1_788_271_200_000_000_000,
+            "mt5_account_sample_valid": True,
         }
 
     asyncio.run(scenario())

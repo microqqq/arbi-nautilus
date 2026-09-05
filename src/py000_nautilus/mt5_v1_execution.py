@@ -326,6 +326,9 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
         self._bound_stream_id: str | None = None
         self._snapshot: JsonObject | None = None
         self._snapshot_refresh_healthy = False
+        self._account_sample_observed_ns: int | None = None
+        self._account_sample_last_valid_ns: int | None = None
+        self._account_sample_valid = False
         self._cursor = "0"
         self._pending: dict[str, _Pending] = {}
         self._seen_request_ids: set[str] = set()
@@ -357,6 +360,21 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
     @property
     def execution_hold_reason(self) -> str | None:
         return self._execution_hold_reason
+
+    def account_capacity_ready(self, max_age_ns: int) -> bool:
+        """Qualify the latest account sample, not execution or a future order."""
+        if (
+            type(max_age_ns) is not int
+            or max_age_ns < 0
+            or not self.is_connected
+            or self._identity is None
+            or not self._snapshot_refresh_healthy
+            or not self._account_sample_valid
+            or self._account_sample_observed_ns is None
+        ):
+            return False
+        age_ns = self._clock.timestamp_ns() - self._account_sample_observed_ns
+        return bool(0 <= age_ns <= max_age_ns)
 
     def can_execute_quantity(self, quantity_ounces: Decimal) -> bool:
         """Return whether the installed MT5 snapshot can express this ounce quantity."""
@@ -733,6 +751,9 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
         )
         price = pending.instrument.make_price(Decimal(cast(str, payload["fill_price"])))
         commission = _mt5_usd_commission(cast(str, payload["commission"]))
+        # The old account's position sample predates this real fill. Do not mutate
+        # its published AccountState, or stop delivery of the hedge's execution.
+        self._account_sample_valid = False
         if not pending.accepted:
             self.generate_order_accepted(
                 pending.order.strategy_id,
@@ -890,20 +911,44 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
             raise Mt5V1ExecutionError(
                 "MT5 account equity, margin, and free margin are inconsistent"
             ) from exc
+        positions = cast(list[JsonObject], snapshot["positions"])
         foreign_position_ids = tuple(
             cast(str, position["identifier"])
-            for position in cast(list[JsonObject], snapshot["positions"])
+            for position in positions
             if position["magic"] != self._mt5_config.expected_magic
+        )
+        contract_size = Decimal(
+            cast(str, cast(JsonObject, snapshot["symbol_spec"])["contract_size"])
+        )
+        net_ounces = sum(
+            (
+                Decimal(cast(str, position["volume_lots"]))
+                * contract_size
+                * (1 if position["side"] == "buy" else -1)
+                for position in positions
+            ),
+            Decimal(0),
+        )
+        observed_ns = (
+            int(cast(str, cast(JsonObject, snapshot["time"])["observed_utc_ms"])) * 1_000_000
+        )
+        sample_valid = observed_ns <= self._clock.timestamp_ns() and (
+            self._account_sample_last_valid_ns is None
+            or observed_ns >= self._account_sample_last_valid_ns
         )
 
         self._snapshot = snapshot
         self._foreign_position_ids = foreign_position_ids
+        self._account_sample_observed_ns = observed_ns
+        self._account_sample_valid = sample_valid
+        if sample_valid:
+            self._account_sample_last_valid_ns = observed_ns
+        self._snapshot_refresh_healthy = True
         self.generate_account_state(
             balances=[balance],
             margins=[],
             reported=True,
-            ts_event=int(cast(str, cast(JsonObject, snapshot["time"])["observed_utc_ms"]))
-            * 1_000_000,
+            ts_event=observed_ns,
             info={
                 "mt5_balance": cast(str, account["balance"]),
                 "mt5_equity": cast(str, account["equity"]),
@@ -911,9 +956,15 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
                 "mt5_margin_free": cast(str, account["margin_free"]),
                 "mt5_margin_level": cast(str, account["margin_level"]),
                 "mt5_leverage": cast(int, account["leverage"]),
+                "mt5_positions_complete": True,
+                "mt5_net_position_ounces": format(net_ounces, "f"),
+                "mt5_position_count": len(positions),
+                "mt5_symbol": self._mt5_config.expected_symbol,
+                "mt5_stream_id": self._require_identity().stream_id,
+                "mt5_account_observed_ns": observed_ns,
+                "mt5_account_sample_valid": sample_valid,
             },
         )
-        self._snapshot_refresh_healthy = True
 
     @staticmethod
     def _snapshot_execution_spec(snapshot: JsonObject) -> tuple[object, ...]:

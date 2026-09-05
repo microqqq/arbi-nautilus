@@ -2,6 +2,7 @@
 
 Bitfinex uses its actual execution adapter with fake authenticated WS/REST.
 MT5 submission/report IO is injected here; its wire/EA contract is tested separately.
+Native reported-account construction is explicit to isolate prior in-process backtests.
 No canary strategy, direct state confirmation, or replacement strategy logic is used.
 """
 
@@ -10,6 +11,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
+from copy import deepcopy
 from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
@@ -17,11 +19,19 @@ from typing import Any, cast
 
 import pytest
 from msgspec.structs import replace as replace_config
+from nautilus_trader.accounting.accounts.margin import MarginAccount
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.execution.messages import SubmitOrder
 from nautilus_trader.execution.reports import ExecutionMassStatus, PositionStatusReport
-from nautilus_trader.model.enums import LiquiditySide, OrderSide, OrderStatus, PositionSide
-from nautilus_trader.model.events import OrderFilled
+from nautilus_trader.model.currencies import USDT
+from nautilus_trader.model.enums import (
+    AccountType,
+    LiquiditySide,
+    OrderSide,
+    OrderStatus,
+    PositionSide,
+)
+from nautilus_trader.model.events import AccountState, OrderFilled
 from nautilus_trader.model.identifiers import (
     ClientId,
     ClientOrderId,
@@ -31,7 +41,7 @@ from nautilus_trader.model.identifiers import (
     VenueOrderId,
 )
 from nautilus_trader.model.objects import Money
-from nautilus_trader.test_kit.stubs.execution import TestExecStubs
+from nautilus_trader.test_kit.stubs.events import TestEventStubs
 from test_bitfinex_v1_execution import _FakeRest, _FakeTransport, _Harness, _position_row
 from test_live_maker import _build as _build_maker
 from test_live_maker import _configs as _maker_configs
@@ -126,7 +136,20 @@ class _OrdinaryStrategy:
         ):
             self.node.cache.add_instrument(instrument)
             client._instrument_provider.add(instrument)
-        self.node.cache.add_account(TestExecStubs.margin_account(account_id=self.hedge.account_id))
+        # Nautilus backtests permanently register calculated accounts per issuer.
+        # A fresh live process instead consumes reported balances. Construct that
+        # native account mode explicitly, without resetting framework private state.
+        source_initial = AccountState(
+            account_id=self.source.account_id, account_type=AccountType.MARGIN,
+            base_currency=USDT, balances=[], margins=[], reported=False, info={},
+            event_id=UUID4(), ts_event=0, ts_init=0,
+        )
+        for initial in (
+            source_initial, TestEventStubs.margin_account_state(account_id=self.hedge.account_id),
+        ):
+            account = MarginAccount(initial, calculate_account_state=False)
+            self.node.cache.add_account(account)
+            assert not account.calculate_account_state
         self.hedge._identity = _identity()
         self.hedge._snapshot = snapshot
         self.hedge._execution_hold_reason = None
@@ -1111,4 +1134,205 @@ def test_ordinary_maker_increasing_rest_fill_must_cover_already_applied_trade(
                 await asyncio.sleep(0.3)
                 assert source_attempts == 2 and order.filled_qty.as_decimal() == 1
                 assert len(harness.hedge_orders) == 1
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("maker", [False, True], ids=["taker", "maker"])
+def test_ordinary_account_events_keep_independent_complete_margin_facts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, maker: bool,
+) -> None:
+    async def run() -> None:
+        async with _ordinary_strategy(tmp_path, monkeypatch, maker=maker, paper=True) as harness:
+            account = harness.source.get_account()
+            assert account is not None
+            initial = account.last_event
+            initial_info = deepcopy(initial.info)
+            margin = initial.info["bitfinex_margin"]
+            assert margin["instrument_id"] == harness.source_instrument.id.value
+            assert margin["wallet"]["available_balance"] == "10000"
+            assert margin["positions"]["complete"] is False
+            assert margin["positions"]["current"] is False
+            assert margin["positions"]["position"] is None
+
+            row = [*_position_row(
+                D("-0.75"), avg_px=D("3926.5"), raw_symbol=harness.wire.raw_symbol,
+            ), None, D("150.125"), D("15.0125"), None]
+            row[13] = harness.node.kernel.clock.timestamp_ns() // 1_000_000
+            harness.source._consume_private_frame([0, "ps", [row]])
+            await _pump()
+            positioned = account.last_event
+            positioned_info = deepcopy(positioned.info)
+            facts = positioned.info["bitfinex_margin"]
+            assert facts["wallet"] == margin["wallet"]
+            assert facts["positions"]["complete"] is True
+            assert facts["positions"]["current"] is True
+            assert facts["positions"]["position"]["quantity"] == "-0.75"
+            assert facts["positions"]["position"]["collateral"] == "150.125"
+            assert facts["positions"]["observed_ns"] >= facts["wallet"]["observed_ns"]
+
+            harness.source._consume_private_frame(
+                [0, "wu", ["margin", harness.wallet_currency, D(10000), D(0), None]],
+            )
+            await _pump()
+            updated = account.last_event.info["bitfinex_margin"]
+            assert updated["wallet"]["available_balance"] is None
+            assert updated["positions"] == facts["positions"]
+            assert updated["wallet"]["observed_ns"] >= facts["wallet"]["observed_ns"]
+            assert initial.info == initial_info and positioned.info == positioned_info
+            assert not harness.sent_operations("on") and not harness.hedge_orders
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("maker", [False, True], ids=["taker", "maker"])
+def test_ordinary_ambiguous_positions_cannot_become_flat_from_one_close(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, maker: bool,
+) -> None:
+    async def run() -> None:
+        async with _ordinary_strategy(tmp_path, monkeypatch, maker=maker, paper=True) as harness:
+            account = harness.source.get_account()
+            assert account is not None
+            row = [*_position_row(
+                D("-0.75"), avg_px=D("3926.5"), raw_symbol=harness.wire.raw_symbol,
+            ), None, D(150), D(15)]
+            row[13] = 100
+            harness.source._consume_private_frame([0, "ps", [row]])
+            await _pump()
+            last_good = deepcopy(account.last_event.info["bitfinex_margin"]["positions"])
+
+            other = row.copy()
+            other[11], other[13] = 99, 101
+            changed = row.copy()
+            changed[13] = 101
+            harness.source._consume_private_frame([0, "ps", [changed, other]])
+            closed = row.copy()
+            closed[1], closed[2], closed[13] = "CLOSED", D(0), 102
+            harness.source._consume_private_frame([0, "pc", closed])
+            await _pump()
+            after = account.last_event.info["bitfinex_margin"]["positions"]
+            assert after["complete"] is False and after["current"] is False
+            assert after["position"] == last_good["position"]
+            assert after["observed_ns"] == last_good["observed_ns"]
+
+            # A complete later observation can identify the remaining position.
+            other[13] = 103
+            harness.source._consume_private_frame([0, "ps", [other]])
+            await _pump()
+            recovered = account.last_event.info["bitfinex_margin"]["positions"]
+            assert recovered["complete"] is True and recovered["current"] is True
+            assert recovered["position"]["position_id"] == 99
+            assert recovered["position"]["quantity"] == "-0.75"
+            assert not harness.sent_operations("on") and not harness.hedge_orders
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("maker", [False, True], ids=["taker", "maker"])
+def test_ordinary_real_fill_invalidates_margin_facts_without_interrupting_hedge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, maker: bool,
+) -> None:
+    async def run() -> None:
+        async with _ordinary_strategy(tmp_path, monkeypatch, maker=maker, paper=True) as harness:
+            order, cid = await harness.seed_source()
+            account = harness.source.get_account()
+            assert account is not None
+            harness.source._consume_private_frame([0, "ps", []])
+            await _pump()
+            before = account.last_event
+            before_info = deepcopy(before.info)
+            assert before.info["bitfinex_margin"]["positions"]["complete"] is True
+            assert before.info["bitfinex_margin"]["positions"]["current"] is True
+
+            release_positions = asyncio.Event()
+            original_positions = harness.rest.positions
+
+            async def delayed_positions() -> object:
+                # Hold the venue read so we can inspect the actual fill's
+                # invalidation before a legitimate complete REST refresh wins.
+                await release_positions.wait()
+                return await original_positions()
+
+            monkeypatch.setattr(harness.rest, "positions", delayed_positions)
+            await harness.finish_source(order, cid, filled=1)
+            assert harness.late_trade is not None
+            harness.source._consume_private_frame(harness.late_trade)
+            await _wait_until(lambda: len(harness.hedge_orders) == 1)
+            after = account.last_event.info["bitfinex_margin"]
+            assert after["wallet"]["current"] is False
+            assert after["positions"]["current"] is False
+            assert before.info == before_info
+            assert order.filled_qty.as_decimal() == 1
+            assert harness.hedge_orders[0].quantity.as_decimal() == 1
+
+            position = [*_position_row(
+                D(1), avg_px=order.price.as_decimal(), raw_symbol=harness.wire.raw_symbol,
+            ), None, D(200), D(20), None]
+            position[13] = harness.node.kernel.clock.timestamp_ns() // 1_000_000
+            harness.source._consume_private_frame([0, "ps", [position]])
+            harness.source._consume_private_frame(
+                [0, "wu", ["margin", harness.wallet_currency, D(10000), D(0), D(9800)]],
+            )
+            await _pump()
+            refreshed = deepcopy(account.last_event.info)
+            assert refreshed["bitfinex_margin"]["positions"]["current"] is True
+            assert refreshed["bitfinex_margin"]["positions"]["position"]["quantity"] == "1"
+            harness.source._consume_private_frame(harness.late_trade)
+            harness.source._consume_private_frame(harness.late_trade)
+            await _pump()
+            assert account.last_event.info == refreshed
+            fills = [event for event in order.events if isinstance(event, OrderFilled)]
+            assert len(fills) == len(harness.hedge_orders) == len(harness.store.intents()) == 1
+            release_positions.set()
+            harness.release_hedge.set()
+            await _wait_until(
+                lambda: harness.store.intents()[0].status is ObligationStatus.COMPLETED,
+            )
+            assert harness.store.net_unhedged_ounces == 0
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("maker", [False, True], ids=["taker", "maker"])
+@pytest.mark.parametrize("stale", [False, True], ids=["fresh", "stale-account"])
+def test_ordinary_mt5_account_capacity_uses_its_own_complete_sample(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, maker: bool, stale: bool,
+) -> None:
+    async def run() -> None:
+        async with _ordinary_strategy(tmp_path, monkeypatch, maker=maker, paper=True) as harness:
+            sample = _snapshot(_identity())
+            observed_ms = harness.node.kernel.clock.timestamp_ns() // 1_000_000
+            if stale:
+                observed_ms -= 5_001
+            cast(dict[str, Any], sample["time"])["observed_utc_ms"] = str(observed_ms)
+            positions = cast(list[dict[str, Any]], sample["positions"])
+            short = positions[0].copy()
+            short.update(ticket="700000002", identifier="800000002", side="sell")
+            positions.append(short)
+            # The actual adapter publishes through the ordinary node's Account
+            # and Portfolio. Snapshot wire validation is exercised separately.
+            harness.hedge._install_snapshot(sample)
+            await _pump()
+            account = harness.hedge.get_account()
+            assert account is not None
+            event = account.last_event
+            original_info = deepcopy(event.info)
+            assert event.info["mt5_positions_complete"] is True
+            assert event.info["mt5_position_count"] == 2
+            assert D(event.info["mt5_net_position_ounces"]) == 0  # Hedged, not an empty list.
+            assert event.info["mt5_symbol"] == "XAUUSD"
+            assert event.info["mt5_stream_id"] == _identity().stream_id
+            assert event.info["mt5_account_observed_ns"] == event.ts_event
+            assert event.ts_event == observed_ms * 1_000_000
+            assert harness.hedge_data._snapshot_refresh_healthy
+            assert harness.hedge.account_capacity_ready(5_000_000_000) == (not stale)
+
+            empty_sample = deepcopy(sample)
+            empty_sample["positions"] = []
+            cast(dict[str, Any], empty_sample["time"])["observed_utc_ms"] = str(
+                harness.node.kernel.clock.timestamp_ns() // 1_000_000,
+            )
+            harness.hedge._install_snapshot(empty_sample)
+            await _pump()
+            assert account.last_event.info["mt5_position_count"] == 0
+            assert D(account.last_event.info["mt5_net_position_ounces"]) == 0
+            assert harness.hedge.account_capacity_ready(5_000_000_000)
+            assert event.info == original_info
+            assert not harness.sent_operations("on") and not harness.hedge_orders
     asyncio.run(run())

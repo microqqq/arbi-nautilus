@@ -303,7 +303,7 @@ carry 是同 route 的唯一 signed residual；下一 fill 先与它合并再分
 - 固定向量记录 ZIP、成员、选定方法及原向量哈希；2,000 normalized 向量与两端原输出按 `1e-9` 绝对容差对照，另测试 Decimal 取整边界、整数/非整数杠杆、零杠杆、精确小数净仓与物理方向。normalized flat 的 `(5,5)` 明确属于上述迁移入口；原 Bitfinex flat producer 的除零缺陷仍单独记录，不能声称原账户生产链全等。
 - 独立数值复核补充：MT5 的 `H` 用等价的 `floor(equity*10000/((target+base)*ask))` 直接求值，不先把重复小数的 leverage 舍入后再乘。`target=400, base=60, equity=184, ask=4000, q=0` 的原 callee 与精确代数均为 `(1,1)`；初稿中间舍入误成 `(0,0)`，属于必须修正的迁移错误。增加该现实量级整界及两侧，不以随机向量绿色替代边界验证。
 
-**W5b 下一实施切口（2026-09-05，只读勘查后固定，尚未实施）：** 分为“既有账户事实入口”与“策略视图/占用接线”两个可验证小步。沿执行客户端 → 原生 `AccountState.info` → `margin.py` → 现有账户视图，不引入风险服务、另一份义务账本或独立周期轮询器。
+**W5b 实施切口（2026-09-05，只读勘查后固定）：** 分为“既有账户事实入口”与“策略视图/占用接线”两个可验证小步；W5b1的实际结果单独记录，后续接线尚未完成。沿执行客户端 → 原生 `AccountState.info` → `margin.py` → 现有账户视图，不引入风险服务、另一份义务账本或独立周期轮询器。
 
 - 第一步主要写集为 `bitfinex_v1_protocol.py`、两个现有execution及其测试。BFX补齐现有PositionState的collateral/collateral_min等容量字段，处理现在被忽略的`ps/pn/pu/pc`，复用完整REST positions读取；严格限定配置的账户/品种。保留钱包available的原始缺失状态及钱包、持仓各自观察时刻/完整样本事实；`auth+wallet`、`get_account()!=None`、native净仓0均不单独证明flat。完整元数据随AccountState发布，不能由新钱包事件覆盖或刷新旧持仓样本。
 - 主agent重新核验原ZIP及BFX成员SHA并只读原callee：真实producer的`freeMargin`和容量式的available都来自同一个`wallet.available_balance`；有仓`B=10000*collateral_min/(collateral*leverage)`，容量价格分母另为`position.base_price`。normalized fixture中F/A独立采样不代表真实接口独立。迁移保留精确Decimal净量，但不复制原`available=None→0`或flat除零；有仓B还须送入现有SourceAccount，避免容量用动态B、下单杠杆却用静态B。
@@ -312,6 +312,16 @@ carry 是同 route 的唯一 signed residual；下一 fill 先与它合并再分
 - 第二步才改两策略账户视图与必要的短共享纯映射：动态容量、route配置硬上限、方向净仓空间、实际可执行量取交集；沿原降风险例外，已仓12/上限10仍可减到11。MT5物理BUY/SELL不按旧duration换错；缺账户容量不假造无限额度。纯公式完成不等于这一步完成。
 - 占用从现有SourceOrderRecord、native leaves与store.intents读取。BUY/SELL各算最坏剩余，相反挂单不提前抵消；重新评估旧报价排除它自身，pending cancel未确认前不释放，partial的已成交量由仓位/义务承接。不得猜测venue的available是否已扣挂单资金，继而把同一单从现金和转换后容量重复扣除；先区分资金占用与方向性最坏敞口，按当前接口证据在本节补齐精确规则，再实施占用接线。W5c原子残差与W7共策略lane不混进本小步。
 - 最小验收包括：wallet先到但无完整positions、合法flat/有仓缺字段、钱包与持仓时间互不刷新、采样间fill与净量往返、MT5旧/未来/倒序账户、物理方向、降风险与穿零、Maker双边/自身刷新/pending cancel/partial占用，以及margin不可用时原hedge仍推进。全部先离线，真实账户/profile/订单不在该小步内修改。
+
+**W5b1 账户事实入口（实施前固定）：** 先交付元数据生产和时间资格，不修改策略、原execution admission、钱包Money表示、未知订单处置或既有hedge流程。QueryAccount按需刷新、实际动态容量/杠杆及挂单占用接线属于W5b后续，不据本小步宣称长期连续准入已完成。
+
+- BFX保留`bitfinex_wallet_currency`，在`AccountState.info`新增单个`bitfinex_margin`字典：`instrument_id`；`wallet={balance,available_balance,observed_ns,current}`；`positions={complete,current,observed_ns,position}`。position为null或单个对象，含`position_id/status/quantity/base_price/profit_loss/leverage/type/collateral/collateral_min/venue_update_ms`。Decimal值用字符串，缺失保留null；无完整样本时position=null不表示flat。`current`只表示本客户端未观察到失效事实，不等于年龄合格、字段齐备或允许下单。
+- 复用现有protocol/REST报告映射，字段依据[Bitfinex WS positions](https://docs.bitfinex.com/reference/ws-auth-positions)及[REST positions](https://docs.bitfinex.com/reference/rest-auth-positions)：17/18为collateral及最小collateral，13为venue最后变更时间，不能拿它替代本次读取时间。完整PS/REST可建立单一配置symbol的完整投影；局部PN/PU不能在此之前创造完整性。PC须匹配已知position身份及明确关闭事实；迟到旧ID/时间、重复冲突或含混目标行不能覆盖last-good或伪造flat。独立反例补充：含混PS、REST报告映射拒绝/enrichment解析失败或被拒的目标持仓局部事件均撤销complete/current，保留last-good对象和时间；后续PN/PU/PC不能恢复完整性，只能由合法完整PS/REST恢复，不能用“关掉已知票”排除另一张未解释的票。
+- 钱包/持仓各自更新观察时间。新增margin字段坏值或null只令容量元数据不可用，不使reader fatal；原核心身份/单位校验不放宽。新的已应用native fill使此前两部分current失效，重复/费用补充不伪造新变化；不要求先有fee CID binding。连接更换/断开使旧样本失效。REST await遇新持仓、真实fill或断线，不发布旧结果为当前元数据；超时/取消不刷新样本，取消保持传播。原报告执行结果仍按原接口处理。
+- MT5保留现有六个raw账户字段，追加`mt5_positions_complete`、`mt5_net_position_ounces`、`mt5_position_count`、`mt5_symbol`、`mt5_stream_id`、`mt5_account_observed_ns`、`mt5_account_sample_valid`。净量为同次完整票据的`sum(±Decimal(volume_lots)*Decimal(contract_size))`，保留票数以区分净0与无票；foreign magic的原HOLD不清除。时间来自该execution snapshot，与data行情和发布日期分开。
+- MT5只新增窄的`account_capacity_ready(max_age_ns)`读取资格，调用方后续传入已有`max_cost_age_ns`；以本客户端当前clock实时判`0<=now-observed<=max_age`并结合现有连接/完整样本条件，不新增配置、timer或全局execution gate。future/严格倒序令本次容量样本无资格，不扩大原执行路径的断线/异常分类；仅合法样本推进时间水位。EA时间为秒精度，所以相同时间的合法账户内容变化可以发布。新的真实fill令旧容量样本失效，原完整刷新后恢复；不妨碍fill事件传播及原对冲流程。
+- 独立安装版探针已证明AccountState.info不自动合并、可别名共享且原生允许倒序。两端每次发布均构造新的完整字典及嵌套对象，不能原地改历史事件；元数据资格读取必须针对同一份完整事件，不用新钱包或data事件更新其它组件的时间。
+- 写集限BFX protocol/execution与其两测试、MT5 execution与其测试；主agent维护本文及必要的普通composition集成测试，未参与本包编码的reviewer独立复核。最小RED矩阵固定auth+wallet未有PS、合法flat/有仓nullable、局部/迟到/错ID、时间互不刷新、REST await竞争/取消、native fill与重复、MT5精确净量/票数/age边界/未来/倒序/同秒更新及历史info不被修改。验证后作为独立本地提交。
 
 ### W6：重启与停止形成真实闭环
 
@@ -510,6 +520,8 @@ EA 改动额外执行现有 `tools/mt5_source_manifest.sh --lines`、MetaEditor 
   - [ ] W4 剩余矩阵：D04b跨重启费用/原生事件恢复及完整node启停/信号drain归W6；当前组合的组件级stop与同run恢复不替代这些验收。
 - [ ] W5 经济/仓位行为与残差。
   - [x] W5a：原容量 normalized Decimal 纯函数及脱敏固定向量，整数容量边界修正；独立复核通过，尚未接 live 动态准入。
+  - [x] W5b1：账户原始事实、完整性和独立观察时间已实现；串联伪flat修复、普通组合与独立复核通过，仅交付事实入口。
+  - [ ] W5b后续：按需账户刷新、动态容量/杠杆、配置及挂单/义务占用接线；原子残差与完整连续仓位矩阵仍未完成。
 - [ ] W6 重启/停止。
 - [ ] W7 同节点共账户。
 - [ ] W8 入口/安装/文档/原生运行边界。
@@ -653,3 +665,15 @@ EA 改动额外执行现有 `tools/mt5_source_manifest.sh --lines`、MetaEditor 
 - 非超时目标的业务确认测试仍真实落盘；其30ms期限受fsync调度影响，故只把该夹具设为300ms，生产与专用超时测试不变。40ms真实fsync后延迟可复现旧断言失败，且成功回调并未重复；没有原始历史超时日志，不宣称已证明历史偶发的唯一根因。
 - 未参与这些代码编写的reviewer复跑原探针、458项相关回归及root新增普通2例，结合前轮单root/预算/停止/健康观察的只读核验，给出范围内RECOMMEND-ACCEPT；主agent接受W4d。最终冻结代码上主agent全量 **1468 passed / 80既有Pandas框架弃用警告 / 58.91s**，Ruff全仓、Mypy 73文件与diff-check通过。execution SHA256 `82eb40e29c2ad9d49b4991c632c7ad1dcb4d508291fb3d4bf06505a090ab8d6d`、runtime `c60c93442824c8d394f8f455c39340397abff9c95a4d8cd2d30c4b96c69d7c4d`、普通组合测试 `a9c87f9e3819d773d408075d504c5fd0c4d4f7344c3a5d01f541c00c46dc9662`。
 - 分支/HEAD仍为 `codex/audit-remediation @ 7d0d4766c62b98c3e4b950da1d61e789d140e2c5` 的本地未提交候选，没有推送、部署或发单。当前复查发现 `arbi-nautilus` 已变为PAUSED（`updated_at=1788611405664`），本轮未修改或重新启用它；旧canary也保持PAUSED。本次用户“继续”的当前轮实施正常收尾，不承诺暂停期间自动续跑。W4父项、W5动态接线以及W6–W9仍未关闭。
+
+2026-09-05 / 按步提交的检查点：用户要求后续按小步提交并继续。主agent核对全部49条变更路径、已有独立验收及冻结源码，重新全量1468 passed（80既有warnings，62.41s）、Ruff、Mypy 73文件与diff-check通过后，提交此前累积的相互依赖修复为`f1d7cdcb7d15f34719eda3054158778f143de5a0`，提交后工作区干净。该提交是已记录范围的基础检查点，不代表W1–W9全部关闭；没有推送或部署。下一提交从上面的W5b1账户事实入口开始。
+
+2026-09-05 / W5b1账户事实入口完成并接受：
+
+- BFX复用现有PositionState、私有消息与REST报告入口，把钱包/持仓的原始值、完整性和各自观察时间作为完整AccountState.info发布；保留available=null，不改变原Money表示。MT5沿已有完整snapshot发布精确净盎司、票数及独立账户时间，并增加读取时的窄年龄资格。两端原成交、对冲、UNKNOWN、foreign-magic和执行准入保持；没有新服务或状态文件。
+- 已应用native fill使旧样本失效，不以fee CID绑定作前置；重复成交或费用历史扫描不再次失效。REST读取跨越新PS、fill或连接变更时不能把旧结果装成当前样本。MT5未来/倒序不污染合法时间水位，同秒账户变化可发布；旧AccountState及嵌套info不被后续发布原地修改。
+- 独立审核拦下串联伪flat：PS44后出现含混PS44/99或未知新ID，随后PC44把未解释的99错误排除；REST enrichment失败有同根遗漏。主agent在普通Maker/Taker各新增一条实际Account/Portfolio路径反例，两条先RED。最小修复撤销失败投影的complete/current，保留last-good；后续delta不能自证完整，必须合法PS/REST。实施者补18条失败入口×后续delta及1条迟到REST错误竞争；现均通过。原报告mapper自身明确拒绝也按同一规则处理，但原错误照常抛出，不扩大timeout/cancel分类。
+- 首轮全量1518过/2失败，另与上述生产缺陷无关的根因是同进程回测永久注册Nautilus calculated-account模式，框架随后用空info覆盖报告账户。主agent和独立审核分别以普通回测、Paper canary作为最小前置复现，两例单跑均绿。仅在普通测试harness启动前显式构造原生非推算MarginAccount，隔离回测注册；保留真实WS/PS/fill到最新account.last_event的断言，不篡改原生全局注册或运行中cache/store。两种前置修后通过，Paper前置加原70项普通组合共71过。
+- 相对检查点新增73个案例（BFX44、MT5 19、普通组合10），普通组合共72项；生产净增234行，没有新生产模块。最终冻结版主agent全量 **1541 passed / 80既有Pandas框架弃用警告 / 63.06s**，Ruff全仓、Mypy 73文件与diff-check通过。BFX execution SHA256 `647943e59a20036e39dcec9931f14477f066328cbca0197ad56f704946fb945d`，MT5 execution `e8ffc2646a627fc46285a03c420e01630b3887be40dc880bb47b52aed0a75f66`，普通组合测试 `c530b1324032bcf862228607575ce46d42df3259d2e7a85478d67d6201e961d8`。
+- 未参与本包编码的reviewer重新核对全部7文件冻结哈希，复跑原PS/PN/PU/REST伪flat探针及4入口×2完整恢复路径共8组，确认拒绝后last-good不变、旧PC不能造flat、合法PS/REST恢复后PU/PC/新PN仍正常。另独立BFX389项、普通账户10项及MT5先前135+4项通过，Ruff/Mypy/diff-check通过，关闭原R1并给出RECOMMEND-ACCEPT；主agent接受W5b1。全量1541为主agent执行，不冒称reviewer重复执行了全量。
+- 本步只完成事实入口，不把current/sample_valid当最终下单许可。下一小步先接已有native QueryAccount的按需、有界刷新，证明钱包/持仓联合采样无fill/连接竞争，再把margin.py与动态杠杆接入既有两策略账户视图；挂单/义务占用、降风险/穿零和连续仓位仍分别验证。未修改profile、EA、真实账户或交易额度，未推送、部署、发单；W5父项及W6–W9仍未关闭。

@@ -484,6 +484,32 @@ def test_position_snapshot_distinguishes_not_received_from_confirmed_empty() -> 
     assert event == PositionEvent("ps", ())
 
 
+def test_position_margin_extension_preserves_raw_numbers_and_venue_time() -> None:
+    row = [*position_row(), 100, 200, None, 1, None, Decimal("150.125"), Decimal("15.0125")]
+    event = parse_private_message([0, "ps", [row]])
+    assert isinstance(event, PositionEvent)
+    position = event.positions[0]
+    assert position.ts_created_ms == 100
+    assert position.ts_updated_ms == 200
+    assert position.position_type == 1
+    assert position.collateral == Decimal("150.125")
+    assert position.collateral_min == Decimal("15.0125")
+
+
+@pytest.mark.parametrize("bad", [None, "bad", True, 1.25, Decimal("NaN")])
+def test_bad_optional_position_margin_extension_does_not_break_private_codec(bad: object) -> None:
+    row = [*position_row(), bad, bad, None, bad, None, bad, bad]
+    event = parse_private_message([0, "pu", row])
+    assert isinstance(event, PositionEvent)
+    position = event.positions[0]
+    assert position.ts_created_ms is None and position.ts_updated_ms is None
+    assert position.position_type is None
+    assert position.collateral is None and position.collateral_min is None
+    row[2] = True
+    with pytest.raises(BitfinexV1ProtocolError, match="position.amount"):
+        parse_private_message([0, "pu", row])
+
+
 @pytest.mark.parametrize(
     "message",
     [
