@@ -7,6 +7,7 @@ reserves working orders or grants admission. Finite negative balances retain the
 original formula, and net ounces remain exact Decimal values.
 """
 
+from collections.abc import Callable
 from decimal import ROUND_FLOOR, Decimal
 from typing import cast
 
@@ -17,7 +18,15 @@ from nautilus_trader.model.identifiers import AccountId, InstrumentId
 from nautilus_trader.model.objects import Currency
 
 from py000_nautilus.config import HedgeAccountRoute, SourceAccountRoute
-from py000_nautilus.models import HedgeAccount, MakerAccount, SourceAccount
+from py000_nautilus.models import BookTop, HedgeAccount, MakerAccount, SourceAccount
+
+# Source/hedge books keep their own timestamps; the last argument requests new
+# source budget. Live composition supplies the IO, not this pure module.
+# Results are source, hedge, earliest account expiry, and new-budget qualification.
+type LiveAccountReader = Callable[
+    [BookTop, int, BookTop, int, bool],
+    tuple[SourceAccount, HedgeAccount, int, bool] | None,
+]
 
 
 def bitfinex_margin_capacity(

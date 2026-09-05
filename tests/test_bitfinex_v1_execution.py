@@ -4,6 +4,7 @@ import asyncio
 import json
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
+from copy import deepcopy
 from datetime import UTC, datetime
 from decimal import Decimal
 from decimal import Overflow as DecimalOverflow
@@ -497,6 +498,316 @@ def _query_account(harness: _Harness) -> asyncio.Task[None]:
     task = harness.client._account_refresh_task
     assert task is not None
     return task
+
+
+async def _budget_harness() -> _Harness:
+    harness = _Harness()
+    harness.msgbus.deregister("ExecEngine.process", harness.events.append)
+    engine = ExecutionEngine(msgbus=harness.msgbus, cache=harness.cache, clock=harness.clock)
+    engine.register_client(harness.client)
+    harness.cache.add_instrument(harness.instrument)
+    harness.cache.add_account(TestExecStubs.margin_account(account_id=harness.client.account_id))
+    await harness.connect()
+    harness.client._set_connected(True)
+    harness.client._consume_private_frame([0, "ps", []])
+    harness.rest.wallet_rows = [["margin", "USTF0", Decimal(900), Decimal(0), Decimal(800)]]
+    return harness
+
+
+async def _budget_order(harness: _Harness, *, accepted: bool = True) -> tuple[Order, int]:
+    order = harness.order()
+    harness.cache.add_order(order, client_id=harness.client.id)
+    cid = await harness.submit(order)
+    if accepted:
+        harness.client._consume_private_frame(harness.order_frame("on", cid, order))
+        assert order.status == OrderStatus.ACCEPTED
+    return order, cid
+
+
+@pytest.mark.parametrize("action", ["submit", "modify", "cancel"])
+@pytest.mark.parametrize("blocked_read", ["queued", "wallet", "positions"])
+def test_account_budget_query_crossing_order_action_discards_late_sample(
+    action: str, blocked_read: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        harness = await _budget_harness()
+        entered, release = asyncio.Event(), asyncio.Event()
+        order: Order | None = None
+        cid = 0
+        try:
+            if action != "submit":
+                order, cid = await _budget_order(harness)
+            await _query_account(harness)
+            before = deepcopy(_margin_info(harness))
+
+            async def wallets() -> object:
+                if blocked_read == "wallet":
+                    entered.set()
+                    await release.wait()
+                return [["margin", "USTF0", Decimal(777), Decimal(0), Decimal(700)]]
+
+            async def positions() -> object:
+                if blocked_read == "positions":
+                    entered.set()
+                    await release.wait()
+                return []
+
+            monkeypatch.setattr(harness.rest, "wallets", wallets)
+            monkeypatch.setattr(harness.rest, "positions", positions)
+            task = _query_account(harness)
+            if blocked_read != "queued":
+                await asyncio.wait_for(entered.wait(), timeout=1)
+            if action == "submit":
+                order, cid = await _budget_order(harness)
+            elif action == "modify":
+                assert order is not None
+                await harness.modify(order, price="3930.00")
+                harness.client._consume_private_frame(
+                    harness.order_frame("ou", cid, order, price="3930.00"),
+                )
+                assert order.price.as_decimal() == Decimal("3930.00")
+            else:
+                assert order is not None
+                await harness.cancel(order)
+                harness.client._consume_private_frame(
+                    harness.order_frame("oc", cid, order, status="CANCELED"),
+                )
+                assert order.status == OrderStatus.CANCELED
+            release.set()
+            await task
+            # The old REST read really completes AFTER the native acknowledgment.
+            assert _margin_info(harness) == before
+            assert not bool(harness.client.account_budget_ready)
+            assert bool(harness.client.account_budget_refresh_ready)
+            assert harness.client.execution_hold_reason is None
+            await _query_account(harness)
+            assert bool(harness.client.account_budget_ready)
+            assert _margin_info(harness)["wallet"]["balance"] == "777"
+        finally:
+            release.set()
+            await harness.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("action", ["submit", "modify", "cancel"])
+def test_account_budget_pending_query_is_readable_but_cannot_authorize_new_orders(
+    action: str,
+) -> None:
+    async def scenario() -> None:
+        harness = await _budget_harness()
+        try:
+            assert bool(harness.client.account_budget_ready)
+            order, cid = await _budget_order(harness, accepted=action != "submit")
+            if action == "modify":
+                await harness.modify(order, price="3930.00")
+            elif action == "cancel":
+                await harness.cancel(order)
+            before = deepcopy(_margin_info(harness))
+            assert not bool(harness.client.account_budget_ready)
+            assert not bool(harness.client.account_budget_refresh_ready)
+            await _query_account(harness)  # Manual native QueryAccount retains its read-only role.
+            assert _margin_info(harness)["positions"]["complete"] is True
+            assert not bool(harness.client.account_budget_ready)
+            assert before["wallet"]["current"] is True
+            if action == "cancel":
+                frame = harness.order_frame("oc", cid, order, status="CANCELED")
+            else:
+                frame = harness.order_frame(
+                    "on" if action == "submit" else "ou", cid, order,
+                    price="3930.00" if action == "modify" else None,
+                )
+            harness.client._consume_private_frame(frame)
+            harness.client._consume_private_frame([0, "ws", harness.rest.wallet_rows])
+            harness.client._consume_private_frame([0, "ps", []])
+            assert bool(harness.client.account_budget_refresh_ready)
+            # WS freshness is not a joint query.
+            assert not bool(harness.client.account_budget_ready)
+            await _query_account(harness)
+            assert bool(harness.client.account_budget_ready)
+        finally:
+            await harness.close()
+    asyncio.run(scenario())
+
+
+def test_account_budget_initial_native_order_blocks_until_processed_and_refreshed() -> None:
+    async def scenario() -> None:
+        harness = await _budget_harness()
+        try:
+            assert bool(harness.client.account_budget_ready)
+            order = harness.order()
+            harness.cache.add_order(order, client_id=harness.client.id)
+            assert not bool(harness.client.account_budget_refresh_ready)
+            assert not bool(harness.client.account_budget_ready)
+            await _query_account(harness)
+            assert not bool(harness.client.account_budget_ready)
+            cid = await harness.submit(order)
+            harness.client._consume_private_frame(harness.order_frame("on", cid, order))
+            assert not bool(harness.client.account_budget_ready)
+            await _query_account(harness)
+            assert bool(harness.client.account_budget_ready)
+        finally:
+            await harness.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("action", ["submit", "modify", "cancel"])
+def test_account_budget_query_started_pending_does_not_become_post_ack_sample(
+    action: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        harness = await _budget_harness()
+        entered, release = asyncio.Event(), asyncio.Event()
+        try:
+            order, cid = await _budget_order(harness, accepted=action != "submit")
+            if action == "modify":
+                await harness.modify(order, price="3930.00")
+            elif action == "cancel":
+                await harness.cancel(order)
+            before = deepcopy(_margin_info(harness))
+
+            async def wallets() -> object:
+                entered.set()
+                await release.wait()
+                return harness.rest.wallet_rows
+
+            monkeypatch.setattr(harness.rest, "wallets", wallets)
+            task = _query_account(harness)
+            await asyncio.wait_for(entered.wait(), timeout=1)
+            frame = harness.order_frame(
+                {"submit": "on", "modify": "ou", "cancel": "oc"}[action], cid, order,
+                status="CANCELED" if action == "cancel" else "ACTIVE",
+                price="3930.00" if action == "modify" else None,
+            )
+            harness.client._consume_private_frame(frame)
+            release.set()
+            await task
+            assert _margin_info(harness) == before
+            assert bool(harness.client.account_budget_refresh_ready)
+            assert not bool(harness.client.account_budget_ready)
+            await _query_account(harness)
+            assert bool(harness.client.account_budget_ready)
+        finally:
+            release.set()
+            await harness.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("ending", ["cancel", "disconnect", "timeout"])
+def test_account_budget_failed_post_action_refresh_cannot_restore_old_qualification(
+    ending: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        harness = await _budget_harness()
+        entered = asyncio.Event()
+        try:
+            await _budget_order(harness)
+            before = deepcopy(_margin_info(harness))
+            original = harness.rest.wallets
+
+            async def wallets() -> object:
+                entered.set()
+                if ending == "timeout":
+                    raise TimeoutError("offline REST timeout")
+                await asyncio.Future[None]()
+                return []
+
+            monkeypatch.setattr(harness.rest, "wallets", wallets)
+            task = _query_account(harness)
+            await asyncio.wait_for(entered.wait(), timeout=1)
+            if ending == "disconnect":
+                await harness.client._disconnect()
+            elif ending == "cancel":
+                task.cancel()
+            with pytest.raises(TimeoutError if ending == "timeout" else asyncio.CancelledError):
+                await task
+            assert not bool(harness.client.account_budget_ready)
+            assert harness.client._account_refresh_task is None
+            assert before["wallet"]["current"] is True
+            if ending != "disconnect":
+                assert _margin_info(harness) == before
+                assert harness.client.execution_hold_reason is None
+                monkeypatch.setattr(harness.rest, "wallets", original)
+                await _query_account(harness)
+                assert bool(harness.client.account_budget_ready)
+        finally:
+            await harness.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("action", ["submit", "modify", "cancel"])
+def test_account_budget_explicit_rejection_needs_new_query_without_changing_facts(
+    action: str,
+) -> None:
+    async def scenario() -> None:
+        harness = await _budget_harness()
+        try:
+            order, cid = await _budget_order(harness, accepted=action != "submit")
+            if action == "modify":
+                await harness.modify(order, price="3930.00")
+            elif action == "cancel":
+                await harness.cancel(order)
+            before = deepcopy(_margin_info(harness))
+            operation = {"submit": "on-req", "modify": "ou-req", "cancel": "oc-req"}[action]
+            harness.client._consume_private_frame(_notification(
+                operation, cid=cid, venue_order_id=None if action == "submit" else VENUE_ORDER_ID,
+            ))
+            assert _margin_info(harness) == before
+            assert not bool(harness.client.account_budget_ready)
+            assert bool(harness.client.account_budget_refresh_ready)
+            await _query_account(harness)
+            assert bool(harness.client.account_budget_ready)
+        finally:
+            await harness.close()
+    asyncio.run(scenario())
+
+
+def test_account_budget_repeated_unchanged_order_observations_do_not_dirty_query() -> None:
+    async def scenario() -> None:
+        harness = await _budget_harness()
+        try:
+            order, cid = await _budget_order(harness)
+            await _query_account(harness)
+            assert bool(harness.client.account_budget_ready)
+            frame = harness.order_frame("on", cid, order)
+            for _ in range(3):
+                harness.client._consume_private_frame(frame)
+                harness.client._consume_private_frame([0, "os", [frame[2]]])
+                assert bool(harness.client.account_budget_ready)
+            await harness.cancel(order)
+            terminal = harness.order_frame("oc", cid, order, status="CANCELED")
+            harness.client._consume_private_frame(terminal)
+            await _query_account(harness)
+            harness.client._consume_private_frame(terminal)
+            assert bool(harness.client.account_budget_ready)
+        finally:
+            await harness.close()
+    asyncio.run(scenario())
+
+
+def test_account_budget_reconnect_does_not_reuse_previous_run_action_query() -> None:
+    async def scenario() -> None:
+        harness = await _budget_harness()
+        try:
+            order, cid = await _budget_order(harness)
+            await harness.cancel(order)
+            harness.client._consume_private_frame(
+                harness.order_frame("oc", cid, order, status="CANCELED"),
+            )
+            await _query_account(harness)
+            assert bool(harness.client.account_budget_ready)
+            await harness.client._disconnect()
+            assert not bool(harness.client.account_budget_ready)
+            assert not bool(harness.client.account_budget_refresh_ready)
+            await harness.connect()
+            harness.client._set_connected(True)
+            harness.client._consume_private_frame([0, "ps", []])
+            assert bool(harness.client.account_budget_refresh_ready)
+            assert not bool(harness.client.account_budget_ready)
+            await _query_account(harness)
+            assert bool(harness.client.account_budget_ready)
+        finally:
+            await harness.close()
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize("positioned", [False, True])

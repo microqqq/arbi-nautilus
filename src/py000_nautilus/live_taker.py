@@ -25,7 +25,7 @@ from py000_nautilus.bitfinex_v1_execution import (
     BitfinexV1LiveExecClientFactory,
 )
 from py000_nautilus.config import TakerStrategyConfig
-from py000_nautilus.live_runtime import SourceTerminalReconciler
+from py000_nautilus.live_runtime import SourceTerminalReconciler, bind_live_account_reader
 from py000_nautilus.models import SourceDirection
 from py000_nautilus.mt5_v1_data import (
     Mt5V1DataClient,
@@ -174,6 +174,14 @@ def build_live_taker_node(
             hedge_must_reduce_only=one_shot_close_existing,
         )
         node.trader.add_strategy(strategy)
+        bind_live_account_reader(
+            strategy, config=runtime_strategy_config,
+            source_data=bitfinex_data, source_client=bitfinex_exec,
+            hedge_data=mt5_data, hedge_client=mt5_exec,
+            wallet_currency=runtime_bitfinex_exec_config.wallet_currency,
+            hedge_symbol=mt5_exec_config.expected_symbol,
+            hedge_stream_id=mt5_exec_config.expected_stream_id,
+        )
         _verify_built_composition(
             node,
             strategy,

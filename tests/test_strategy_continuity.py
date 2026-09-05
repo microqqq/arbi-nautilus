@@ -21,7 +21,7 @@ import pytest
 from msgspec.structs import replace as replace_config
 from nautilus_trader.accounting.accounts.margin import MarginAccount
 from nautilus_trader.core.uuid import UUID4
-from nautilus_trader.execution.messages import QueryAccount, SubmitOrder
+from nautilus_trader.execution.messages import CancelOrder, QueryAccount, SubmitOrder
 from nautilus_trader.execution.reports import ExecutionMassStatus, PositionStatusReport
 from nautilus_trader.model.currencies import USDT
 from nautilus_trader.model.enums import (
@@ -85,7 +85,7 @@ async def _wait_until(ready: Callable[[], bool]) -> None:
 class _OrdinaryStrategy:
     def __init__(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, maker: bool, paper: bool = False,
-        source_quantity: int = 2,
+        source_quantity: int = 2, two_sided: bool = False,
     ) -> None:
         self.maker = maker
         self.source_quantity = D(source_quantity)
@@ -98,8 +98,11 @@ class _OrdinaryStrategy:
                         configs.strategy.economics.bid,
                         open_quantity_ounces=self.source_quantity,
                     ),
-                    # Isolate one direction using normal configuration, not strategy overrides.
-                    ask=replace_config(configs.strategy.economics.ask, open_quantity_ounces=D(0)),
+                    # Lifecycle tests isolate one direction using normal configuration.
+                    ask=replace_config(
+                        configs.strategy.economics.ask,
+                        open_quantity_ounces=self.source_quantity if two_sided else D(0),
+                    ),
                 ),
             ))
         else:
@@ -120,6 +123,11 @@ class _OrdinaryStrategy:
                     wallet_currency="TESTUSDTF0", mutation_ack_timeout_ms=100,
                 ),
             )
+        # The synthetic MT5 producer below uses this stream; the live reader
+        # must check the configured stream, not inherit a mismatching fixture.
+        configs = replace(configs, mt5_exec=replace_config(
+            configs.mt5_exec, expected_stream_id=_identity().stream_id,
+        ))
         build = _build_maker if maker else _build
         self.node, self.strategy = build(configs, loop=asyncio.get_running_loop())
         self.store = (
@@ -132,6 +140,9 @@ class _OrdinaryStrategy:
         self.hedge_data = self.node.kernel.data_engine.routing_map[Venue("MT5")]
         self.transport = _FakeTransport()
         self.rest = _FakeRest(configs.bitfinex_exec.raw_symbol)
+        self.rest.wallet_rows = [
+            ["margin", self.wallet_currency, D(10000), D(0), D(10000)],
+        ]
         self.source._transport = self.transport
         self.source._rest = self.rest
         self.source_instrument = instrument_from_config(configs.bitfinex_data, ts_init=0)
@@ -188,6 +199,14 @@ class _OrdinaryStrategy:
                 monkeypatch.setattr(client, name, subscription)
         monkeypatch.setattr(self.hedge, "_submit_order", self._submit_hedge)
         monkeypatch.setattr(self.hedge, "generate_mass_status", self._hedge_mass)
+        self.source_cancel_commands: list[ClientOrderId] = []
+        cancel_order = self.source.cancel_order
+
+        def observe_cancel(command: CancelOrder) -> None:
+            self.source_cancel_commands.append(command.client_order_id)
+            cancel_order(command)
+
+        monkeypatch.setattr(self.source, "cancel_order", observe_cancel)
         # Use the existing authentic wire vector builders, with this node's instrument/order.
         self.wire = object.__new__(_Harness)
         self.wire.raw_symbol = configs.bitfinex_exec.raw_symbol
@@ -270,8 +289,32 @@ class _OrdinaryStrategy:
             self.hedge_instrument.quote_currency, Money(0, self.hedge_instrument.quote_currency),
             LiquiditySide.NO_LIQUIDITY_SIDE, now,
         )
+        # The synthetic MT5 venue reports its updated complete account after
+        # the fill, just as a subsequent real snapshot would. No capacity/cache
+        # field is backfilled directly by the test.
+        sample = _snapshot(_identity())
+        template = cast(list[dict[str, Any]], sample["positions"])[0]
+        sample["positions"] = [
+            {
+                **template, "identifier": str(position.venue_position_id),
+                "side": "buy" if position.position_side == PositionSide.LONG else "sell",
+                "volume_lots": str(position.quantity.as_decimal() / D(100)),
+            }
+            for position in self.hedge_positions
+        ]
+        cast(dict[str, Any], sample["time"])["observed_utc_ms"] = str(now // 1_000_000)
+        self.hedge._install_snapshot(sample)
 
-    async def seed_source(self, *, acknowledge: bool = True) -> tuple[Any, int]:
+    async def seed_source(
+        self, *, acknowledge: bool = True, publish_accounts: bool = True,
+    ) -> tuple[Any, int]:
+        if publish_accounts:
+            # An actual live order now requires complete venue facts. Keep start()
+            # incomplete for account-query tests; seed only these lifecycle cases.
+            await _publish_capacity_samples(
+                self, source_quantity=D(0), hedge_quantity=D(0),
+                available=D(10000), equity=D(10000),
+            )
         await self.opportunity()
         orders = self.node.cache.orders(instrument_id=self.source_instrument.id)
         assert len(orders) == 1
@@ -308,7 +351,8 @@ class _OrdinaryStrategy:
             cast(list[Any], trade[2])[2] = now_ms
             self.rest.trades = [trade[2]]
             self.rest.position_rows = [
-                _position_row(D(filled), avg_px=price, raw_symbol=self.wire.raw_symbol),
+                [*_position_row(D(filled), avg_px=price, raw_symbol=self.wire.raw_symbol),
+                 None, D(1000), D(200), None],
             ]
             self.late_trade = trade
         if deliver_terminal:
@@ -329,7 +373,7 @@ class _OrdinaryStrategy:
         now = self.node.kernel.clock.timestamp_ns()
         strategy = self.strategy
         assert strategy.update_cost_snapshot(
-            strategy._config.economics.carry, strategy._config.economics.fx, now,
+            strategy._carry, strategy._fx, now,
         )
         strategy.update_hedge_session(True, now)
         self.node.kernel.data_engine.process(_quote(
@@ -366,10 +410,11 @@ class _OrdinaryStrategy:
 @asynccontextmanager
 async def _ordinary_strategy(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, maker: bool, paper: bool = False,
-    source_quantity: int = 2,
+    source_quantity: int = 2, two_sided: bool = False,
 ) -> AsyncIterator[_OrdinaryStrategy]:
     harness = _OrdinaryStrategy(
         tmp_path, monkeypatch, maker=maker, paper=paper, source_quantity=source_quantity,
+        two_sided=two_sided,
     )
     try:
         await harness.start()
@@ -425,10 +470,20 @@ def test_ordinary_partial_cancel_waits_for_real_hedge_then_continues(
             positions = harness.node.cache.positions_open(instrument_id=harness.hedge_instrument.id)
             assert len(positions) == 1 and positions[0].account_id == harness.hedge.account_id
             assert D(str(positions[0].avg_px_open)) == D("3936.7")
-            assert state.can_submit_source(), (
-                state.halt_reason, state.source_freeze_reason, state.active_source_order_id,
-                get_source_terminal_reconciler(harness.node).last_failure,
-            )
+            if public_data_lost:
+                assert state.active_source_order_id is None and state.halt_reason is None
+                if maker:
+                    # Account wakeup also reruns the existing public-data gate.
+                    assert state.source_freeze_reason == "stale, closed, or unresolved"
+            elif state.active_source_order_id is None:
+                assert state.can_submit_source(), (
+                    state.halt_reason, state.source_freeze_reason,
+                    get_source_terminal_reconciler(harness.node).last_failure,
+                )
+            else:
+                # The unclaimed market event above can now be consumed when
+                # account recovery wakes the strategy after the hedge completes.
+                harness.assert_second_source_sent(order.client_order_id.value)
             assert harness.late_trade is not None
             harness.source._consume_private_frame(harness.late_trade)
             harness.source._consume_private_frame(harness.late_trade)
@@ -703,7 +758,9 @@ def test_ordinary_maker_discovers_unrequested_silent_terminal_and_continues(
                 assert harness.hedge_orders[0].quantity.as_decimal() == filled
                 assert not harness.store.can_submit_source()
                 harness.release_hedge.set()
-                await _wait_until(harness.store.can_submit_source)
+                await _wait_until(lambda: (
+                    harness.store.can_submit_source() or len(harness.sent_operations("on")) == 2
+                ))
                 assert harness.store.intents()[0].status is ObligationStatus.COMPLETED
                 assert harness.store.net_unhedged_ounces == 0
                 assert harness.late_trade is not None
@@ -755,11 +812,14 @@ def test_ordinary_maker_discovers_still_active_fill_before_normal_protective_can
             harness.source._consume_private_frame(harness.late_trade)
             harness.source._consume_private_frame(harness.late_trade)
             harness.release_hedge.set()
-            await _wait_until(harness.store.can_submit_source)
+            await _wait_until(lambda: (
+                harness.store.can_submit_source() or len(harness.sent_operations("on")) == 2
+            ))
             assert harness.store.net_unhedged_ounces == 0
             assert len(harness.store.intents()) == 1
             await harness.opportunity()
             harness.assert_second_source_sent(order.client_order_id.value)
+            assert harness.source_cancel_commands.count(order.client_order_id) == 1
     asyncio.run(run())
 
 
@@ -797,15 +857,11 @@ def test_ordinary_maker_discovery_never_infers_missing_or_conflicting_execution(
             owner = get_source_terminal_reconciler(harness.node)
             await _wait_until(lambda: owner.last_failure is not None and not owner.busy)
             assert attempts == 2 and not owner.source_submission_ready
-            assert order.status == OrderStatus.ACCEPTED and order.filled_qty.as_decimal() == 0
-            assert not harness.hedge_orders and not harness.sent_operations("oc")
-            # Timer alone must not reopen this failed discovery.
-            await asyncio.sleep(0.3)
-            assert attempts == 2 and len(harness.sent_operations("on")) == 1
-            assert not harness.hedge_orders and not harness.sent_operations("oc")
-            # A real market callback now sees a failed execution channel, so the
-            # original Maker makes one protective cancel with its own bounded query.
-            await harness.opportunity()
+            assert order.status == OrderStatus.PENDING_CANCEL and order.filled_qty.as_decimal() == 0
+            assert not harness.hedge_orders
+            # The account notification now runs the same protection before
+            # another market tick. It must still send only one protective cancel
+            # and allow only that cancel's existing bounded recovery episode.
             assert len(harness.sent_operations("oc")) == 1
             await _wait_until(lambda: attempts == 4 and not owner.busy)
             await harness.opportunity()
@@ -902,7 +958,9 @@ def test_ordinary_maker_discovery_await_cannot_overwrite_new_ws_or_outlive_owner
                 await _pump()
                 assert order.status == OrderStatus.CANCELED and order.filled_qty.as_decimal() == 1
                 release.set()
-                await _wait_until(lambda: not owner.busy and harness.store.can_submit_source())
+                await _wait_until(lambda: not owner.busy and (
+                    harness.store.can_submit_source() or len(harness.sent_operations("on")) == 2
+                ))
                 assert owner.last_failure is None
                 assert len(harness.hedge_orders) == len(harness.store.intents()) == 1
                 assert len([event for event in order.events if isinstance(event, OrderFilled)]) == 1
@@ -937,9 +995,9 @@ def test_ordinary_maker_rest_fill_then_distinct_ws_fill_preserves_cumulative_qua
             trade[0] = first_trade[0] + 1
             trade[2] = harness.node.kernel.clock.timestamp_ns() // 1_000_000
             harness.rest.trades = [first_trade, trade]
-            harness.rest.position_rows = [_position_row(
+            harness.rest.position_rows = [[*_position_row(
                 D(2), avg_px=order.price.as_decimal(), raw_symbol=harness.wire.raw_symbol,
-            )]
+            ), None, D(1000), D(200), None]]
             terminal = harness.wire.order_frame(
                 "oc", cid, order, remaining="0", status=f"EXECUTED @ {order.price}(2)",
             )
@@ -950,7 +1008,9 @@ def test_ordinary_maker_rest_fill_then_distinct_ws_fill_preserves_cumulative_qua
             harness.source._consume_private_frame(second)
             harness.source._consume_private_frame(terminal)
             harness.release_hedge.set()
-            await _wait_until(lambda: harness.store.can_submit_source() and not owner.busy)
+            await _wait_until(lambda: not owner.busy and (
+                harness.store.can_submit_source() or len(harness.sent_operations("on")) == 2
+            ))
             assert order.status == OrderStatus.FILLED and order.filled_qty.as_decimal() == 2
             fills = [event for event in order.events if isinstance(event, OrderFilled)]
             assert {event.trade_id.value for event in fills} == {
@@ -965,6 +1025,7 @@ def test_ordinary_maker_rest_fill_then_distinct_ws_fill_preserves_cumulative_qua
             assert harness.source.execution_hold_reason is None and owner.last_failure is None
             await harness.opportunity()
             harness.assert_second_source_sent(order.client_order_id.value)
+            assert harness.source_cancel_commands.count(order.client_order_id) == 1
     asyncio.run(run())
 
 
@@ -1065,6 +1126,7 @@ def test_ordinary_maker_working_fill_then_ws_close_rechecks_second_venue_round(
             await _wait_until(lambda: source_attempts == 2 and not owner.busy)
             assert attempts == 2
             assert order.status == OrderStatus.CANCELED and order.filled_qty.as_decimal() == 1
+            assert harness.source_cancel_commands.count(order.client_order_id) == 1
             assert len(harness.hedge_orders) == len(harness.store.intents()) == 1
             assert harness.store.intents()[0].status is ObligationStatus.COMPLETED
             assert harness.store.net_unhedged_ounces == 0
@@ -1128,9 +1190,9 @@ def test_ordinary_maker_increasing_rest_fill_must_cover_already_applied_trade(
                     harness.rest.trades = (
                         [second_trade] if missing_previous_trade else [first_trade, second_trade]
                     )
-                    harness.rest.position_rows = [_position_row(
+                    harness.rest.position_rows = [[*_position_row(
                         D(2), avg_px=order.price.as_decimal(), raw_symbol=harness.wire.raw_symbol,
-                    )]
+                    ), None, D(1000), D(200), None]]
                 return await original_source_mass(lookback)
 
             monkeypatch.setattr(harness.hedge, "generate_mass_status", missing_first_hedge_report)
@@ -1157,7 +1219,7 @@ def test_ordinary_maker_increasing_rest_fill_must_cover_already_applied_trade(
 
 async def _publish_capacity_samples(
     harness: _OrdinaryStrategy, *, source_quantity: Decimal, hedge_quantity: Decimal,
-    available: Decimal, equity: Decimal,
+    available: Decimal, equity: Decimal, hedge_observed_ns: int | None = None,
 ) -> None:
     now_ms = harness.node.kernel.clock.timestamp_ns() // 1_000_000
     positions: list[list[object]] = []
@@ -1167,12 +1229,18 @@ async def _publish_capacity_samples(
         ), None, D(1000), D(200), None]
         row[13] = now_ms
         positions.append(row)
+    harness.rest.position_rows = [*positions]
+    harness.rest.wallet_rows = [
+        ["margin", harness.wallet_currency, D(10000), D(0), available],
+    ]
     harness.source._consume_private_frame([0, "ps", positions])
     harness.source._consume_private_frame(
         [0, "wu", ["margin", harness.wallet_currency, D(10000), D(0), available]],
     )
     sample = _snapshot(_identity())
-    cast(dict[str, Any], sample["time"])["observed_utc_ms"] = str(now_ms)
+    cast(dict[str, Any], sample["time"])["observed_utc_ms"] = str(
+        now_ms if hedge_observed_ns is None else hedge_observed_ns // 1_000_000,
+    )
     account = cast(dict[str, Any], sample["account"])
     account["equity"] = str(equity)
     account["margin_free"] = str(equity - D(account["margin"]))
@@ -1186,6 +1254,213 @@ async def _publish_capacity_samples(
     # raw MT5 snapshot wire validation has its own existing integration tests.
     harness.hedge._install_snapshot(sample)
     await _pump()
+
+
+@pytest.mark.parametrize("maker", [False, True], ids=["taker", "maker"])
+def test_ordinary_capacity_query_completion_admits_without_a_new_market_event(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, maker: bool,
+) -> None:
+    async def run() -> None:
+        async with _ordinary_strategy(tmp_path, monkeypatch, maker=maker) as harness:
+            entered, release = asyncio.Event(), asyncio.Event()
+            calls = 0
+
+            async def wallets() -> object:
+                nonlocal calls
+                calls += 1
+                entered.set()
+                await release.wait()
+                return [["margin", harness.wallet_currency, D(10000), D(0), D(10000)]]
+
+            monkeypatch.setattr(harness.rest, "wallets", wallets)
+            sample = _snapshot(_identity())
+            sample["positions"] = []
+            cast(dict[str, Any], sample["time"])["observed_utc_ms"] = str(
+                harness.node.kernel.clock.timestamp_ns() // 1_000_000,
+            )
+            harness.hedge._install_snapshot(sample)
+            await harness.opportunity()
+            await asyncio.wait_for(entered.wait(), 1)
+            assert not harness.sent_operations("on")
+            assert calls == 1
+            source_timestamp = (
+                harness.node.cache.quote_tick(harness.source_instrument.id).ts_event if maker
+                else harness.node.cache.order_book(harness.source_instrument.id).ts_last
+            )
+            # Only the real QueryAccount result wakes the ordinary strategy now.
+            release.set()
+            await _wait_until(lambda: len(harness.sent_operations("on")) == 1)
+            order = harness.node.cache.orders(instrument_id=harness.source_instrument.id)[0]
+            assert order.status == OrderStatus.SUBMITTED
+            assert order.quantity.as_decimal() == D(2)
+            assert calls == 1
+            latest_timestamp = (
+                harness.node.cache.quote_tick(harness.source_instrument.id).ts_event if maker
+                else harness.node.cache.order_book(harness.source_instrument.id).ts_last
+            )
+            assert latest_timestamp == source_timestamp
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("maker", [False, True], ids=["taker", "maker"])
+def test_ordinary_strategy_automatically_uses_capacity_for_actual_source_quantity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, maker: bool,
+) -> None:
+    async def run() -> None:
+        async with _ordinary_strategy(tmp_path, monkeypatch, maker=maker) as harness:
+            await _publish_capacity_samples(
+                harness, source_quantity=D(0), hedge_quantity=D(0),
+                available=D(375), equity=D(10000),
+            )
+            await harness.opportunity()
+            orders = harness.node.cache.orders(instrument_id=harness.source_instrument.id)
+            if not maker:
+                assert len(orders) == 1
+                assert orders[0].status == OrderStatus.SUBMITTED
+                assert orders[0].quantity.as_decimal() == D(1)
+                assert D(str(harness.sent_operations("on")[0]["amount"])) == D(1)
+                return
+            # Maker keeps the configured quantity; a one-ounce budget cannot
+            # silently resize its two-ounce quote. Funding recovery alone wakes it.
+            assert not orders and not harness.sent_operations("on")
+            harness.source._consume_private_frame(
+                [0, "wu", ["margin", harness.wallet_currency, D(10000), D(0), D(1000)]],
+            )
+            await _wait_until(lambda: len(harness.sent_operations("on")) == 1)
+            orders = harness.node.cache.orders(instrument_id=harness.source_instrument.id)
+            assert len(orders) == 1 and orders[0].quantity.as_decimal() == D(2)
+    asyncio.run(run())
+
+
+def test_ordinary_maker_retains_its_reserved_source_budget_but_obeys_hedge_capacity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run() -> None:
+        async with _ordinary_strategy(tmp_path, monkeypatch, maker=True) as harness:
+            await _publish_capacity_samples(
+                harness, source_quantity=D(0), hedge_quantity=D(0),
+                available=D(1000), equity=D(10000),
+            )
+            order, cid = await harness.seed_source(publish_accounts=False)
+            original_price = order.price
+            harness.source._consume_private_frame(
+                [0, "wu", ["margin", harness.wallet_currency, D(10000), D(0), D(0)]],
+            )
+            await _pump()
+            assert order.status == OrderStatus.ACCEPTED and order.price == original_price
+            assert len(harness.sent_operations("on")) == 1
+            assert not harness.sent_operations("oc") and not harness.sent_operations("ou")
+            # A current real hedge-capacity reduction is different from source
+            # collateral already reserved for this exact CID.
+            await _publish_capacity_samples(
+                harness, source_quantity=D(0), hedge_quantity=D(0),
+                available=D(0), equity=D(10),
+            )
+            await _wait_until(lambda: len(harness.sent_operations("oc")) == 1)
+            assert order.status == OrderStatus.PENDING_CANCEL
+            assert len(harness.sent_operations("on")) == 1
+            binding = harness.source._cid_store.binding_for_client(order.client_order_id.value)
+            assert binding is not None and binding.cid == cid
+    asyncio.run(run())
+
+
+def test_ordinary_maker_two_sides_wait_for_post_action_budget_without_requote_starvation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run() -> None:
+        async with _ordinary_strategy(
+            tmp_path, monkeypatch, maker=True, two_sided=True,
+        ) as harness:
+            await _publish_capacity_samples(
+                harness, source_quantity=D(0), hedge_quantity=D(0),
+                available=D(1000), equity=D(10000),
+            )
+            await harness.opportunity()
+            # Both sides saw the same market callback; the native INITIALIZED
+            # first order must prevent reuse of that pre-submit account budget.
+            orders = harness.node.cache.orders(instrument_id=harness.source_instrument.id)
+            assert len(orders) == len(harness.sent_operations("on")) == 1
+            first = orders[0]
+            assert first.side == OrderSide.BUY and first.status == OrderStatus.SUBMITTED
+            cid = harness.sent_operations("on")[0]["cid"]
+            entered, release = asyncio.Event(), asyncio.Event()
+            calls = 0
+
+            async def wallets() -> object:
+                nonlocal calls
+                calls += 1
+                entered.set()
+                await release.wait()
+                # The venue now reports remaining funds after accepting BUY.
+                return [["margin", harness.wallet_currency, D(10000), D(0), D(600)]]
+
+            monkeypatch.setattr(harness.rest, "wallets", wallets)
+            harness.source._consume_private_frame(harness.wire.order_frame("on", cid, first))
+            await _pump()
+            assert first.status == OrderStatus.ACCEPTED
+            await harness.opportunity()
+            await asyncio.wait_for(entered.wait(), 1)
+            for change in range(1, 9):
+                now = harness.node.kernel.clock.timestamp_ns()
+                harness.node.kernel.data_engine.process(_quote(
+                    harness.hedge_instrument, str(D(3936) + change),
+                    str(D("3936.1") + change), "10", now,
+                ))
+                harness.node.kernel.data_engine.process(_quote(
+                    harness.source_instrument, str(D(3926) + change),
+                    str(D("3926.1") + change), "10", now,
+                ))
+                await _pump()
+                assert len(harness.sent_operations("on")) == calls == 1
+                assert not harness.sent_operations("ou") and not harness.sent_operations("oc")
+            release.set()
+            await _wait_until(lambda: len(harness.sent_operations("on")) == 2)
+            sent = harness.sent_operations("on")
+            assert [D(str(item["amount"])) for item in sent] == [D(2), D(-2)]
+            assert sent[0]["cid"] != sent[1]["cid"]
+            assert calls == 1 and first.status == OrderStatus.PENDING_UPDATE
+            assert len(harness.sent_operations("ou")) == 1
+            assert not harness.sent_operations("oc")
+            # Once the second side has secured its new budget, normal
+            # price-only maintenance of the first side can resume.
+            assert [
+                row[1] for row in cast(list[Any], harness.transport.sent) if isinstance(row, list)
+            ] == ["on", "on", "ou"]
+            assert harness.sent_operations("ou")[0]["id"] == int(first.venue_order_id.value)
+    asyncio.run(run())
+
+
+def test_ordinary_maker_account_expiry_cancels_while_market_and_costs_remain_fresh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run() -> None:
+        async with _ordinary_strategy(tmp_path, monkeypatch, maker=True) as harness:
+            config = harness.strategy._config
+            observed = (
+                harness.node.kernel.clock.timestamp_ns() - config.max_cost_age_ns + 400_000_000
+            )
+            await _publish_capacity_samples(
+                harness, source_quantity=D(0), hedge_quantity=D(0),
+                available=D(1000), equity=D(10000), hedge_observed_ns=observed,
+            )
+            order, _cid = await harness.seed_source(publish_accounts=False)
+            account = harness.hedge.get_account()
+            assert account is not None
+            event = account.last_event
+            expected_expiry = event.info["mt5_account_observed_ns"] + config.max_cost_age_ns + 1
+            assert order.status == OrderStatus.ACCEPTED and not harness.sent_operations("oc")
+            assert harness.strategy._account_deadline_ns == expected_expiry
+            await _wait_until(lambda: len(harness.sent_operations("oc")) == 1)
+            now = harness.node.kernel.clock.timestamp_ns()
+            for instrument in (harness.source_instrument, harness.hedge_instrument):
+                tick = harness.node.cache.quote_tick(instrument.id)
+                assert tick is not None and now - tick.ts_event < config.max_quote_age_ns
+            assert now - harness.strategy._cost_ts_ns < config.max_cost_age_ns
+            assert now - harness.strategy._session_ts_ns < config.max_session_age_ns
+            assert now >= expected_expiry and account.last_event is event
+            assert order.status == OrderStatus.PENDING_CANCEL
+            assert len(harness.sent_operations("on")) == 1
+    asyncio.run(run())
 
 
 def _mapped_capacity_accounts(
@@ -1537,6 +1812,10 @@ def test_ordinary_native_account_query_does_not_block_fill_or_install_pre_fill_w
 ) -> None:
     async def run() -> None:
         async with _ordinary_strategy(tmp_path, monkeypatch, maker=maker, paper=True) as harness:
+            await _publish_capacity_samples(
+                harness, source_quantity=D(0), hedge_quantity=D(0),
+                available=D(10000), equity=D(10000),
+            )
             account = harness.source.get_account()
             assert account is not None
             entered, release, returned = asyncio.Event(), asyncio.Event(), asyncio.Event()
@@ -1560,7 +1839,7 @@ def test_ordinary_native_account_query_does_not_block_fill_or_install_pre_fill_w
             monkeypatch.setattr(harness.rest, "positions", positions)
             harness.query_source_account()
             await _wait_until(entered.is_set)
-            order, cid = await harness.seed_source()
+            order, cid = await harness.seed_source(publish_accounts=False)
             await harness.finish_source(order, cid, filled=1)
             assert harness.late_trade is not None
             harness.source._consume_private_frame(harness.late_trade)

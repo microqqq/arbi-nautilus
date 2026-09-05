@@ -1,5 +1,6 @@
 """Minimal Taker strategy using Nautilus books, orders, and fill events."""
 
+import asyncio
 from collections.abc import Callable
 from decimal import ROUND_FLOOR, Decimal
 from typing import cast
@@ -35,6 +36,7 @@ from py000_nautilus.economics import (
     round_hedge_ounces,
 )
 from py000_nautilus.hedge import HedgeCoordinator, HedgePlanningError, plan_hedge_delta
+from py000_nautilus.margin import LiveAccountReader
 from py000_nautilus.models import (
     BookTop,
     BusinessOrderSide,
@@ -98,6 +100,10 @@ class TakerStrategy(Strategy):
         self._source_terminal_inflight: set[str] = set()
         self._source_terminal_stopped = False
         self._source_terminal_generation = 0
+        self._live_account_reader: LiveAccountReader | None = None
+        self._account_loop: asyncio.AbstractEventLoop | None = None
+        self._account_handle: asyncio.Handle | None = None
+        self._account_topics: tuple[str, ...] = ()
         self._one_shot_hedge_position_id: PositionId | None = None
         self._one_shot_hedge_position_quantity_ounces: Decimal | None = None
         self._one_shot_armed = False
@@ -119,6 +125,29 @@ class TakerStrategy(Strategy):
         self._cost_recovery_after_ns = 0
         self._hedge_session_open = config.initial_hedge_session_open
         self._session_ts_ns = config.initial_session_ts_ns
+
+    def bind_live_account_reader(self, reader: LiveAccountReader) -> None:
+        """Bind the composition's current-account view before strategy start."""
+        self._live_account_reader = reader
+
+    def _on_account_update(self, _event: object) -> None:
+        # Account publication can be nested inside a fill: never re-enter trading here.
+        loop = self._account_loop
+        if self._source_terminal_stopped or loop is None or loop.is_closed():
+            return
+        if self._account_handle is None:
+            self._account_handle = loop.call_soon(
+                self._evaluate_account_update, self._source_terminal_generation,
+            )
+
+    def _evaluate_account_update(self, generation: int) -> None:
+        if self._source_terminal_stopped or generation != self._source_terminal_generation:
+            return
+        self._account_handle = None
+        try:
+            self._evaluate_and_submit()
+        except Exception as exc:
+            self.log.error(f"Taker account evaluation failed with {type(exc).__name__}")
 
     @property
     def one_shot_armed(self) -> bool:
@@ -232,6 +261,14 @@ class TakerStrategy(Strategy):
 
     def on_start(self) -> None:
         self._source_terminal_stopped = False
+        if self._live_account_reader is not None:
+            self._account_loop = asyncio.get_running_loop()
+            self._account_topics = tuple({
+                f"events.account.{self._config.source_accounts[0].account_id}",
+                f"events.account.{self._config.hedge_account_id}",
+            })
+            for topic in self._account_topics:
+                self.msgbus.subscribe(topic, self._on_account_update)
         self._source_instrument = self.cache.instrument(self._config.source_instrument_id)
         self._hedge_instrument = self.cache.instrument(self._config.hedge_instrument_id)
         if self._source_instrument is None or self._hedge_instrument is None:
@@ -267,6 +304,13 @@ class TakerStrategy(Strategy):
         self._source_terminal_stopped = True
         self._source_terminal_generation += 1
         self._source_terminal_inflight.clear()
+        if self._account_handle is not None:
+            self._account_handle.cancel()
+            self._account_handle = None
+        for topic in self._account_topics:
+            self.msgbus.unsubscribe(topic, self._on_account_update)
+        self._account_topics = ()
+        self._account_loop = None
         client_order_id = self.state_store.active_source_order_id
         if client_order_id is None:
             return
@@ -313,6 +357,18 @@ class TakerStrategy(Strategy):
         if not self._inputs_are_fresh(source_book.ts_last, hedge_tick, now_ns):
             self._last_decision_gate = "inputs_not_fresh"
             return
+        accounts: tuple[SourceAccount, ...]
+        if self._live_account_reader is not None:
+            view = self._live_account_reader(
+                reference_book, source_book.ts_last, _book_top(hedge_tick),
+                hedge_tick.ts_event, True,
+            )
+            if view is None or not view[3]:
+                self._last_decision_gate = "account_budget_unavailable"
+                return
+            accounts, hedge = (view[0],), view[1]
+        else:
+            accounts, hedge = self._source_accounts(), self._hedge_account()
         # Coalesce one market timestamp without changing either freshness clock.
         market_ts_ns = max(source_book.ts_last, hedge_tick.ts_event)
         if market_ts_ns == self._last_source_attempt_market_ts_ns:
@@ -325,8 +381,8 @@ class TakerStrategy(Strategy):
         opportunity = evaluate_taker(
             source_book=reference_book,
             hedge_book=_book_top(hedge_tick),
-            accounts=self._source_accounts(),
-            hedge=self._hedge_account(),
+            accounts=accounts,
+            hedge=hedge,
             config=self._config.economics,
             allowed_direction=self._allowed_source_direction,
             carry=carry,

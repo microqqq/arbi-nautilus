@@ -7,7 +7,10 @@ import threading
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
+from copy import deepcopy
+from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
@@ -18,12 +21,14 @@ from nautilus_trader.common.component import TestClock as NativeTestClock
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.execution.reports import OrderStatusReport
 from nautilus_trader.model.enums import OrderSide, OrderStatus, OrderType, TimeInForce
+from nautilus_trader.model.events import AccountState
 from nautilus_trader.model.identifiers import ClientOrderId, VenueOrderId
 from nautilus_trader.model.objects import Price, Quantity
 from nautilus_trader.test_kit.stubs.component import TestComponentStubs
 from test_bitfinex_v1_execution import _Harness
 from test_live_taker import _build as _build_live_taker
 from test_live_taker import _configs as _live_taker_configs
+from test_margin import _account_event
 from test_taker_events import (
     RecordingTakerStrategy,
     _event_engine,
@@ -36,9 +41,109 @@ from py000_nautilus import live_runtime
 from py000_nautilus.app import _maker_strategy_config
 from py000_nautilus.bitfinex_v1_data import INSTRUMENT_ID as SOURCE_ID
 from py000_nautilus.live_runtime import SourceTerminalReconciler, get_source_terminal_reconciler
-from py000_nautilus.models import SourceDirection
+from py000_nautilus.margin import LiveAccountReader
+from py000_nautilus.models import BookTop, SourceDirection
 from py000_nautilus.strategies._source_terminal import SourceTerminalResult
 from py000_nautilus.strategies.maker import MakerStrategy
+
+
+def _account_reader_probe(tmp_path: Path, *, query_failure: bool = False) -> Any:
+    """Real AccountState/mappers; only current eligibility, clock and IO are synthetic."""
+    config = _live_taker_configs(tmp_path).strategy
+    now = 10_000_000_000
+    source, hedge = _account_event(bfx=True), _account_event(bfx=False)
+    source.info["bitfinex_margin"]["instrument_id"] = config.source_instrument_id.value
+    source.info["bitfinex_margin"]["wallet"]["observed_ns"] = now - 1_000_000_000
+    source.info["bitfinex_margin"]["positions"]["observed_ns"] = now - 500_000_000
+    hedge.info["mt5_account_observed_ns"] = now - 2_000_000_000
+
+    def bind_identity(event: AccountState, account_id: Any) -> AccountState:
+        return AccountState(
+            account_id=account_id, account_type=event.account_type,
+            base_currency=event.base_currency, balances=[], margins=[], reported=True,
+            info=event.info, event_id=UUID4(), ts_event=now, ts_init=now,
+        )
+
+    source = bind_identity(source, config.source_accounts[0].account_id)
+    hedge = bind_identity(hedge, config.hedge_account_id)
+    clock = NativeTestClock()
+    calls: list[tuple[int, Any, Any]] = []
+    errors: list[str] = []
+    captured: list[LiveAccountReader] = []
+    clock.set_time(now)
+    book = BookTop(Decimal(3999), Decimal(4000), Decimal(10), Decimal(10))
+    source_client = SimpleNamespace(
+        get_account=lambda: SimpleNamespace(last_event=source), is_connected=True,
+        execution_hold_reason=None, account_budget_ready=False, account_budget_refresh_ready=True,
+    )
+    hedge_client = SimpleNamespace(
+        get_account=lambda: SimpleNamespace(last_event=hedge), execution_admitted=True,
+        sample_current=True,
+    )
+    hedge_client.account_capacity_ready = lambda _age: hedge_client.sample_current
+
+    def query(account_id: Any, client_id: Any) -> None:
+        calls.append((clock.timestamp_ns(), account_id, client_id))
+        if query_failure:
+            # Reentry and a synchronous failure must neither bypass the interval
+            # nor escape an account notification into an enclosing fill callback.
+            current = clock.timestamp_ns()
+            captured[0](book, current, book, current, True)
+            raise OSError("synthetic request failure")
+
+    strategy = SimpleNamespace(
+        clock=clock, log=SimpleNamespace(error=errors.append), query_account=query,
+        bind_live_account_reader=captured.append,
+    )
+    live_runtime.bind_live_account_reader(
+        cast(Any, strategy), config=config,
+        source_data=cast(Any, SimpleNamespace(is_connected=True, book_is_actionable=True)),
+        source_client=cast(Any, source_client),
+        hedge_data=cast(Any, SimpleNamespace(is_connected=True, snapshot_refresh_healthy=True)),
+        hedge_client=cast(Any, hedge_client), wallet_currency="USTF0",
+        hedge_symbol="XAUUSD", hedge_stream_id="stream-1",
+    )
+    return SimpleNamespace(
+        read=captured[0], clock=clock, calls=calls, errors=errors, book=book,
+        source=source, hedge=hedge, source_client=source_client, hedge_client=hedge_client,
+        config=config, now=now,
+    )
+
+
+@pytest.mark.parametrize("query_failure", [False, True])
+def test_live_account_reader_production_query_interval_and_failure_are_bounded(
+    tmp_path: Path, query_failure: bool,
+) -> None:
+    probe = _account_reader_probe(tmp_path, query_failure=query_failure)
+    old = deepcopy((probe.source.info, probe.hedge.info))
+    assert live_runtime._ACCOUNT_QUERY_INTERVAL_NS == 2_000_000_000
+    for offset in (0, 1, 1_999_999_999):
+        probe.clock.set_time(probe.now + offset)
+        for _ in range(20):
+            view = probe.read(probe.book, probe.now + offset, probe.book, probe.now + offset, True)
+            assert view is not None and view[3] is False
+            assert view[2] == probe.now + 3_000_000_001
+    assert len(probe.calls) == 1
+    probe.clock.set_time(probe.now + 2_000_000_000)
+    probe.read(probe.book, probe.clock.timestamp_ns(), probe.book, probe.clock.timestamp_ns(), True)
+    assert [entry[0] for entry in probe.calls] == [probe.now, probe.now + 2_000_000_000]
+    route = probe.config.source_accounts[0]
+    assert all(entry[1:] == (route.account_id, route.client_id) for entry in probe.calls)
+    assert len(probe.errors) == (2 if query_failure else 0)
+    assert (probe.source.info, probe.hedge.info) == old
+
+
+def test_live_account_reader_keeps_maintenance_separate_from_new_budget_and_current_hedge(
+    tmp_path: Path,
+) -> None:
+    probe = _account_reader_probe(tmp_path)
+    probe.source_client.account_budget_refresh_ready = False
+    view = probe.read(probe.book, probe.now, probe.book, probe.now, False)
+    assert view is not None and view[3] is False and not probe.calls
+    probe.hedge_client.sample_current = False
+    assert probe.hedge.info["mt5_account_sample_valid"] is True
+    assert probe.read(probe.book, probe.now, probe.book, probe.now, False) is None
+    assert not probe.calls
 
 
 class _Engine:

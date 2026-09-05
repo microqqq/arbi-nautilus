@@ -292,6 +292,8 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
         self._margin_positions_current = False
         self._margin_revision = 0
         self._margin_wallet_revision = 0
+        self._account_action_revision = 0
+        self._account_budget_revision: int | None = None
         self._account_refresh_task: asyncio.Task[None] | None = None
         self._margin_seen_fills: set[tuple[ClientOrderId, TradeId]] = set()
         # The Engine publishes this topic after applying the order event. Keep
@@ -309,6 +311,47 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
     @property
     def accounting_ready(self) -> bool:
         return not self.accounting_incomplete
+
+    @property
+    def account_budget_ready(self) -> bool:
+        """Current joint facts qualify for NEW budget; age/amount checks remain external."""
+        return (
+            self.account_budget_refresh_ready
+            and self._margin_wallet_current and self._margin_positions_current
+            and self._margin_positions_complete
+            and (
+                self._account_action_revision == 0
+                or self._account_budget_revision == self._account_action_revision
+            )
+        )
+
+    @property
+    def account_budget_refresh_ready(self) -> bool:
+        """Authenticated and action-stable, not a restriction on manual account reads."""
+        if not self.is_connected or self.execution_hold_reason is not None:
+            return False
+        if any(
+            live.pending_cancel or live.pending_modify_price is not None
+            or (not live.accepted and live.rejection_key is None and not live.terminal_emitted)
+            for live in self._by_cid.values()
+        ):
+            return False
+        # Strategy.submit_order adds INITIALIZED to cache before the async client runs.
+        pending = {
+            OrderStatus.INITIALIZED, OrderStatus.SUBMITTED,
+            OrderStatus.PENDING_UPDATE, OrderStatus.PENDING_CANCEL,
+        }
+        return not any(
+            order.status in pending
+            and self._cache.client_id(order.client_order_id) in {None, self.id}
+            and order.account_id in {None, self.account_id}
+            for order in self._cache.orders(instrument_id=self._bfx_config.instrument_id)
+        )
+
+    def _advance_account_action(self) -> None:
+        # This is causal eligibility, not a collateral ledger or an AccountState mutation.
+        self._account_action_revision += 1
+        self._account_budget_revision = None
 
     def fee_summary(self, client_order_id: ClientOrderId | None = None) -> BitfinexFeeSummary:
         bindings = self._cid_store.bindings if client_order_id is None else tuple(
@@ -389,6 +432,7 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
         fill_key = (event.client_order_id, event.trade_id)
         if native_publication and applied and fill_key not in self._margin_seen_fills:
             self._margin_seen_fills.add(fill_key)
+            self._advance_account_action()
             self._invalidate_margin_facts()
         binding = self._cid_store.binding_for_client(event.client_order_id.value)
         if binding is None:
@@ -669,6 +713,7 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
         )
 
     def _retire_reconciled_terminal(self, live: _LiveOrder, filled_qty: Decimal) -> None:
+        self._advance_account_action()
         live.filled_qty = filled_qty
         live.terminal_emitted = True
         live.terminal_reconciliation_pending = False
@@ -859,23 +904,30 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
         if command.account_id != self.account_id or command.client_id not in {None, self.id}:
             self._log.warning("Bitfinex account query identity does not match this client")
             return
-        revision = (self._margin_revision, self._margin_wallet_revision)
+        revision = (
+            self._margin_revision, self._margin_wallet_revision, self._account_action_revision,
+        )
         if not self._account_query_current(revision):
             self._log.warning("Bitfinex account query requires an authenticated connection")
             return
         if self._account_refresh_task is not None and not self._account_refresh_task.done():
             return
         self._account_refresh_task = self.create_task(
-            self._query_account(revision), log_msg="bitfinex-account-refresh",
+            self._query_account(revision, budget_eligible=self.account_budget_refresh_ready),
+            log_msg="bitfinex-account-refresh",
         )
 
-    def _account_query_current(self, revision: tuple[int, int]) -> bool:
+    def _account_query_current(self, revision: tuple[int, int, int]) -> bool:
         return (
             self._running and self.is_connected and self._account_ready
-            and revision == (self._margin_revision, self._margin_wallet_revision)
+            and revision == (
+                self._margin_revision, self._margin_wallet_revision, self._account_action_revision,
+            )
         )
 
-    async def _query_account(self, revision: tuple[int, int]) -> None:
+    async def _query_account(
+        self, revision: tuple[int, int, int], *, budget_eligible: bool,
+    ) -> None:
         try:
             if not self._account_query_current(revision):
                 return
@@ -924,6 +976,8 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
                 self._install_margin_wallet(wallet, wallet_ns)
                 self._margin_revision += 1
                 self._install_margin_position(position, positions_ns)
+                if budget_eligible and self.account_budget_refresh_ready:
+                    self._account_budget_revision = revision[2]
                 self._publish_margin_state(balances=balances)
         finally:
             if self._account_refresh_task is asyncio.current_task():
@@ -983,6 +1037,7 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
 
     def _invalidate_margin_facts(self, *, connection_changed: bool = False) -> None:
         self._margin_revision += 1
+        self._account_budget_revision = None
         self._margin_wallet_current = False
         self._margin_positions_current = False
         if connection_changed:
@@ -1190,6 +1245,7 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
             raise BitfinexV1ExecutionError(
                 f"Bitfinex {operation} already has a pending acknowledgment"
             )
+        self._advance_account_action()
         self._arm_terminal_reconciliation(live, operation)
         try:
             await self._transport.send_json(payload)
@@ -1363,6 +1419,7 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
                 return
             raise BitfinexV1ExecutionError("Bitfinex success followed a definitive rejection")
         if rejection is not None:
+            self._advance_account_action()
             self.generate_order_rejected(
                 live.order.strategy_id,
                 live.order.instrument_id,
@@ -1379,6 +1436,7 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
         self._accept(live, state.venue_order_id, state.ts_updated_ms * 1_000_000)
         self._ack_pending_price(live, state.price, state.ts_updated_ms * 1_000_000)
         if event.operation == "oc":
+            self._advance_account_action()
             live.pending_cancel = False
             live.terminal = state
             self._resolve_all_mutations(live)
@@ -1814,6 +1872,7 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
         if note.operation == "on":
             if live.accepted:
                 raise BitfinexV1ExecutionError("Bitfinex submit failure followed acceptance")
+            self._advance_account_action()
             self.generate_order_rejected(
                 live.order.strategy_id,
                 live.order.instrument_id,
@@ -1827,6 +1886,7 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
         elif note.operation == "ou":
             if live.pending_modify_price is None and "modify" not in live.unknown_operations:
                 raise BitfinexV1ExecutionError("unexpected Bitfinex modify rejection")
+            self._advance_account_action()
             self.generate_order_modify_rejected(
                 live.order.strategy_id,
                 live.order.instrument_id,
@@ -1840,6 +1900,7 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
         elif note.operation == "oc":
             if not live.pending_cancel and "cancel" not in live.unknown_operations:
                 raise BitfinexV1ExecutionError("unexpected Bitfinex cancel rejection")
+            self._advance_account_action()
             self.generate_order_cancel_rejected(
                 live.order.strategy_id,
                 live.order.instrument_id,
@@ -1866,6 +1927,7 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
         self._resolve_mutation(live, "submit")
         if live.accepted:
             return
+        self._advance_account_action()
         live.accepted = True
         self.generate_order_accepted(
             live.order.strategy_id,
@@ -1888,6 +1950,7 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
             return
         if terminal_filled > live.filled_qty:
             return
+        self._advance_account_action()
         disposition = _terminal_disposition(state)
         if disposition == "canceled" and terminal_filled < abs(state.original_qty):
             self.generate_order_canceled(
@@ -1905,6 +1968,7 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
             return
         if live.venue_order_id is None:
             raise BitfinexV1ExecutionError("Bitfinex modify has no venue order ID")
+        self._advance_account_action()
         self.generate_order_updated(
             live.order.strategy_id,
             live.order.instrument_id,
@@ -2150,6 +2214,7 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
         return VenueOrderId(str(live.venue_order_id)) if live.venue_order_id is not None else None
 
     def _deny(self, order: Order, reason: str) -> None:
+        self._advance_account_action()
         self.generate_order_denied(
             order.strategy_id,
             order.instrument_id,
@@ -2159,6 +2224,7 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
         )
 
     def _reject_modify(self, command: ModifyOrder, reason: str) -> None:
+        self._advance_account_action()
         self.generate_order_modify_rejected(
             command.strategy_id,
             command.instrument_id,
@@ -2169,6 +2235,7 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
         )
 
     def _reject_cancel(self, command: CancelOrder, reason: str) -> None:
+        self._advance_account_action()
         self.generate_order_cancel_rejected(
             command.strategy_id,
             command.instrument_id,
@@ -2631,6 +2698,8 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
                     raise BitfinexV1ExecutionError(
                         "Bitfinex REST terminal changed its reconciliation facts"
                     )
+                if previous is None:
+                    self._advance_account_action()
                 live.venue_order_id = venue_order_id
                 self._cid_by_venue[venue_order_id] = live.cid
                 live.reconciled_terminal = report
@@ -2638,10 +2707,14 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
             return True
 
         if working_maker and report.filled_qty.as_decimal() > 0:
+            if report.filled_qty.as_decimal() > live.filled_qty and live.reconciled_working is None:
+                self._advance_account_action()
             live.reconciled_working = report
         private_stream_won = live.accepted and live.submitted_in_process
         live.venue_order_id = venue_order_id
         self._cid_by_venue[venue_order_id] = live.cid
+        if not live.accepted:
+            self._advance_account_action()
         live.accepted = True
         self._resolve_mutation(live, "submit")
         return not private_stream_won

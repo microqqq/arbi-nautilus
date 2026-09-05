@@ -1,5 +1,6 @@
 """Use real Nautilus order/fill event types for source-to-hedge behavior."""
 
+import asyncio
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from decimal import Decimal
@@ -44,8 +45,10 @@ from py000_nautilus.app import (
 from py000_nautilus.models import (
     BookTop,
     BusinessOrderSide,
+    HedgeAccount,
     HedgeIntent,
     ObligationStatus,
+    SourceAccount,
     SourceDirection,
 )
 from py000_nautilus.strategies.maker import MakerStrategy, SourceTerminalQuery, SourceTerminalResult
@@ -256,6 +259,9 @@ class _StopCache:
 
 
 class _StopHarness:
+    _account_handle = None
+    _account_topics: tuple[str, ...] = ()
+
     def __init__(self, active: str, *, fail_cancel: bool = False) -> None:
         self.state_store = _StopStore(active)
         self.cache = _StopCache(active)
@@ -755,6 +761,59 @@ def _swap_instrument(timestamp: int, **changes: Any) -> Cfd:
         else:
             values[key] = value
     return Cfd.from_dict(values)
+
+
+@pytest.mark.parametrize("available", [False, True])
+def test_live_account_taker_defers_merges_and_uses_dynamic_quantity(
+    tmp_path: Path, available: bool,
+) -> None:
+    async def run() -> None:
+        strategy = TakerStrategy(_strategy_config(tmp_path / "dynamic"))
+        reads: list[tuple[int, int, bool]] = []
+        ready = False
+
+        def reader(_source: BookTop, source_ts: int, _hedge: BookTop, hedge_ts: int,
+                   new_source: bool) -> tuple[SourceAccount, HedgeAccount, int, bool] | None:
+            reads.append((source_ts, hedge_ts, new_source))
+            if not ready:
+                return None
+            return (
+                SourceAccount(AccountId("BITFINEX-001"), None, Decimal(0), Decimal(1),
+                              Decimal(1), Decimal(200)),
+                HedgeAccount(Decimal(0), Decimal(1), Decimal(1)),
+                2_000_000_000, available,
+            )
+
+        strategy.bind_live_account_reader(reader)
+        with _event_engine(strategy) as engine:
+            engine.trader.start()
+            engine.kernel.exec_engine.start()
+            strategy.clock.set_time(1_100_000_000)
+            engine.kernel.data_engine.process(_book_snapshot(
+                _source_instrument(), "2399", "2401", "5", 1_100_000_000,
+            ))
+            engine.kernel.data_engine.process(_quote(
+                _hedge_instrument(), "2405", "2406", "10", 1_100_000_000,
+            ))
+            assert reads and not engine.cache.orders()
+            reads.clear()
+            ready = True
+            for account in ("BITFINEX-001", "MT5-001", "BITFINEX-001"):
+                engine.kernel.msgbus.publish(f"events.account.{account}", object())
+            assert reads == [] and not engine.cache.orders()
+            await asyncio.sleep(0)
+            assert reads == [(1_100_000_000, 1_100_000_000, True)]
+            orders = engine.cache.orders(instrument_id=_source_instrument().id)
+            assert len(orders) == int(available)
+            if orders:
+                assert orders[0].quantity.as_decimal() == Decimal(1)
+                assert strategy._last_source_attempt_market_ts_ns == 1_100_000_000
+            reads.clear()
+            engine.kernel.msgbus.publish("events.account.OTHER-001", object())
+            await asyncio.sleep(0)
+            assert reads == []
+            engine.trader.stop()
+    asyncio.run(run())
 
 
 @contextmanager

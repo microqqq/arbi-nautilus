@@ -7,6 +7,7 @@ from decimal import Decimal
 from functools import partial
 from typing import cast
 
+from msgspec.structs import replace as replace_config
 from nautilus_trader.common.component import LiveClock
 from nautilus_trader.common.events import TimeEvent
 from nautilus_trader.execution.reports import OrderStatusReport
@@ -20,6 +21,7 @@ from nautilus_trader.model.events import (
     OrderExpired,
     OrderFilled,
     OrderModifyRejected,
+    OrderPendingCancel,
     OrderRejected,
     OrderSubmitted,
 )
@@ -43,6 +45,7 @@ from py000_nautilus.economics import (
 )
 from py000_nautilus.hedge import HedgeCoordinator, HedgePlanningError, plan_hedge_delta
 from py000_nautilus.maker_economics import maker_quote, passive_maker_price
+from py000_nautilus.margin import LiveAccountReader
 from py000_nautilus.models import (
     BookTop,
     BusinessOrderSide,
@@ -96,6 +99,12 @@ class MakerStrategy(Strategy):
         self._source_terminal_inflight: set[str] = set()
         self._source_terminal_stopped = False
         self._source_terminal_generation = 0
+        self._live_account_reader: LiveAccountReader | None = None
+        self._account_loop: asyncio.AbstractEventLoop | None = None
+        self._account_handle: asyncio.Handle | None = None
+        self._account_topics: tuple[str, ...] = ()
+        self._account_deadline_ns: int | None = None
+        self._account_budget_waiting = False
         self._stores = {
             direction: JsonStateStore(f"{config.store_path_prefix}.{direction.value}.json")
             for direction in _DIRECTIONS
@@ -172,11 +181,46 @@ class MakerStrategy(Strategy):
             else:
                 self._reschedule_active_timers()
 
+    def bind_live_account_reader(self, reader: LiveAccountReader) -> None:
+        """Bind the composition's current-account view before strategy start."""
+        self._live_account_reader = reader
+
+    def _on_account_update(self, _event: object) -> None:
+        # A source fill may publish AccountState before its hedge obligation exists.
+        loop = self._account_loop
+        if self._source_terminal_stopped or loop is None or loop.is_closed():
+            return
+        if self._account_handle is None:
+            self._account_handle = loop.call_soon(
+                self._evaluate_account_update, self._source_terminal_generation,
+            )
+
+    def _evaluate_account_update(self, generation: int) -> None:
+        if self._source_terminal_stopped or generation != self._source_terminal_generation:
+            return
+        self._account_handle = None
+        try:
+            tick = self.cache.quote_tick(self._config.source_instrument_id)
+            if tick is not None:
+                # Preserve existing subclass admission (including canary arming).
+                # Reuse the cached event as-is; do not publish or advance its timestamp.
+                self.on_quote_tick(tick)
+        except Exception as exc:
+            self.log.error(f"Maker account evaluation failed with {type(exc).__name__}")
+
     def on_start(self) -> None:
         self._stale_timer_loop = (
             asyncio.get_running_loop() if isinstance(self.clock, LiveClock) else None
         )
         self._source_terminal_stopped = False
+        if self._live_account_reader is not None:
+            self._account_loop = asyncio.get_running_loop()
+            self._account_topics = tuple({
+                f"events.account.{self._config.source_accounts[0].account_id}",
+                f"events.account.{self._config.hedge_accounts[0].account_id}",
+            })
+            for topic in self._account_topics:
+                self.msgbus.subscribe(topic, self._on_account_update)
         self._source_instrument = self.cache.instrument(self._config.source_instrument_id)
         self._hedge_instrument = self.cache.instrument(self._config.hedge_instrument_id)
         if self._source_instrument is None or self._hedge_instrument is None:
@@ -212,6 +256,13 @@ class MakerStrategy(Strategy):
         self._source_terminal_stopped = True
         self._source_terminal_generation += 1
         self._source_terminal_inflight.clear()
+        if self._account_handle is not None:
+            self._account_handle.cancel()
+            self._account_handle = None
+        for topic in self._account_topics:
+            self.msgbus.unsubscribe(topic, self._on_account_update)
+        self._account_topics = ()
+        self._account_loop = None
         for direction in _DIRECTIONS:
             self._cancel_working(direction, reason="strategy stop")
 
@@ -223,6 +274,9 @@ class MakerStrategy(Strategy):
             return
         if tick.instrument_id == self._config.hedge_instrument_id:
             self._submit_next_pending_hedge()
+        self._evaluate_quotes()
+
+    def _evaluate_quotes(self) -> None:
         source_tick = self.cache.quote_tick(self._config.source_instrument_id)
         hedge_tick = self.cache.quote_tick(self._config.hedge_instrument_id)
         if source_tick is None or hedge_tick is None:
@@ -242,11 +296,22 @@ class MakerStrategy(Strategy):
             return
         # A healthy active-list read pauses quoting, not protection of working
         # orders. Real health failures and obligations have already run above.
-        if self._source_quote_refresh_paused is not None and self._source_quote_refresh_paused():
+        if (
+            self._live_account_reader is None
+            and self._source_quote_refresh_paused is not None
+            and self._source_quote_refresh_paused()
+        ):
             return
         source_book = _book_top(source_tick)
         hedge_book = _book_top(hedge_tick)
-        for direction in _DIRECTIONS:
+        directions: tuple[SourceDirection, ...] = _DIRECTIONS
+        if self._live_account_reader is not None:
+            self._account_budget_waiting = False
+            directions = tuple(sorted(
+                _DIRECTIONS,
+                key=lambda direction: self._stores[direction].active_source_order_id is not None,
+            ))
+        for direction in directions:
             self._refresh_direction(direction, source_book, hedge_book)
 
     def on_instrument_status(self, status: InstrumentStatus) -> None:
@@ -462,13 +527,94 @@ class MakerStrategy(Strategy):
             store.mark_source_unknown(active_id, "Maker account pair missing for active order")
             self._cancel_working(direction, expected_order_id=active_id, reason="route missing")
             return
+        if self._live_account_reader is not None and not self._live_working_order_is_exact(
+            direction, order, bound,
+        ):
+            store.mark_source_unknown(active_id, "Maker live order/route evidence differs")
+            self._cancel_working(direction, expected_order_id=active_id, reason="route differs")
+            return
         desired = self._bound_quote(bound, source_book, hedge_book)
         if desired is None:
             self._cancel_working(direction, expected_order_id=active_id, reason="risk changed")
             return
-        self._requote(order, desired)
-        self._working_quotes[active_id] = desired
+        if not (
+            self._live_account_reader is not None
+            and (
+                self._account_budget_waiting or self._quote_refresh_paused()
+                or order.status is not OrderStatus.ACCEPTED
+            )
+        ):
+            self._requote(order, desired)
+            self._working_quotes[active_id] = desired
         self._schedule_stale_timer(direction, active_id)
+
+    def _quote_refresh_paused(self) -> bool:
+        return self._source_quote_refresh_paused is not None and self._source_quote_refresh_paused()
+
+    def _live_working_order_is_exact(
+        self, direction: SourceDirection, order: Order, bound: MakerQuote,
+    ) -> bool:
+        record = self._stores[direction].source_order(order.client_order_id.value)
+        source_route = self._config.source_accounts[0]
+        hedge_route = self._config.hedge_accounts[0]
+        return bool(
+            record is not None
+            and order.strategy_id == self.id
+            and self.cache.client_id(order.client_order_id) == source_route.client_id
+            and bound.direction is direction
+            and bound.source_account.account_id == source_route.account_id
+            and bound.source_account.client_id == source_route.client_id
+            and bound.hedge_account.account_id == hedge_route.account_id
+            and bound.hedge_account.client_id == hedge_route.client_id
+            and record.source_account_id == bound.source_account.account_id.value
+            and record.hedge_account_id == bound.hedge_account.account_id.value
+            and record.source_client_id == (
+                source_route.client_id.value if source_route.client_id is not None else None
+            )
+            and record.hedge_client_id == (
+                hedge_route.client_id.value if hedge_route.client_id is not None else None
+            )
+            and (
+                order.account_id == bound.source_account.account_id
+                or (order.status is OrderStatus.INITIALIZED and order.account_id is None)
+            )
+            and order.instrument_id == self._config.source_instrument_id
+            and order.side == (
+                OrderSide.BUY if direction is SourceDirection.LONG else OrderSide.SELL
+            )
+            and record.side == (
+                BusinessOrderSide.BUY
+                if direction is SourceDirection.LONG else BusinessOrderSide.SELL
+            )
+            and record.quantity_ounces == order.quantity.as_decimal()
+            and record.filled_ounces == order.filled_qty.as_decimal() == 0
+            and order.leaves_qty.as_decimal() == bound.quantity_ounces
+        )
+
+    def _live_quote_accounts(
+        self, source_book: BookTop, hedge_book: BookTop, *, new_source: bool,
+    ) -> tuple[SourceAccount, MakerAccount] | None:
+        assert self._live_account_reader is not None
+        source_tick = self.cache.quote_tick(self._config.source_instrument_id)
+        hedge_tick = self.cache.quote_tick(self._config.hedge_instrument_id)
+        if source_tick is None or hedge_tick is None:
+            return None
+        view = self._live_account_reader(
+            source_book, source_tick.ts_event, hedge_book, hedge_tick.ts_event, new_source,
+        )
+        if view is None:
+            self._account_deadline_ns = None
+            self._account_budget_waiting |= new_source
+            return None
+        source, hedge, self._account_deadline_ns, budget_ready = view
+        if new_source and not budget_ready:
+            self._account_budget_waiting = True
+            return None
+        route = self._config.hedge_accounts[0]
+        return source, MakerAccount(
+            route.account_id, route.client_id, hedge.position_ounces,
+            hedge.max_long_ounces, hedge.max_short_ounces,
+        )
 
     def _new_quote(
         self,
@@ -476,11 +622,32 @@ class MakerStrategy(Strategy):
         source_book: BookTop,
         hedge_book: BookTop,
     ) -> MakerQuote | None:
+        side = self._config.economics.bid if direction is SourceDirection.LONG else (
+            self._config.economics.ask
+        )
+        if side.open_quantity_ounces <= 0:
+            return None
+        sources: tuple[SourceAccount, ...]
+        hedges: tuple[MakerAccount, ...]
+        if self._live_account_reader is not None:
+            view = self._live_quote_accounts(source_book, hedge_book, new_source=True)
+            if view is None or self._quote_refresh_paused() or self._global_obligation_block():
+                return None
+            for store in self._stores.values():
+                active = store.active_source_order_id
+                if active is not None:
+                    order = self.cache.order(ClientOrderId(active))
+                    if order is None or order.status not in {OrderStatus.ACCEPTED}:
+                        self._account_budget_waiting = True
+                        return None
+            sources, hedges = (view[0],), (view[1],)
+        else:
+            sources, hedges = self._source_accounts(), self._hedge_accounts()
         quote = maker_quote(
             direction,
             hedge_book,
-            self._source_accounts(),
-            self._hedge_accounts(),
+            sources,
+            hedges,
             self._config.economics,
             carry=self._quote_carry,
             fx=self._fx,
@@ -493,14 +660,42 @@ class MakerStrategy(Strategy):
         source_book: BookTop,
         hedge_book: BookTop,
     ) -> MakerQuote | None:
-        source = self._source_account(bound.source_account.account_id)
-        hedge = self._hedge_account(bound.hedge_account.account_id)
+        economics = self._config.economics
+        if self._live_account_reader is not None:
+            view = self._live_quote_accounts(source_book, hedge_book, new_source=False)
+            if view is None:
+                return None
+            source, hedge = view
+            if (source.account_id != bound.source_account.account_id
+                    or hedge.account_id != bound.hedge_account.account_id):
+                return None
+            # This order already owns its source funds. Recheck route/net risk,
+            # not the entire old quantity against the remaining new-order budget.
+            route = self._config.source_accounts[0]
+            maximum = self._config.economics.risk.source_max_abs
+            source = replace(
+                source,
+                max_long_ounces=min(
+                    route.max_long_ounces, max(maximum - source.position_ounces, Decimal(0)),
+                ),
+                max_short_ounces=min(
+                    route.max_short_ounces, max(maximum + source.position_ounces, Decimal(0)),
+                ),
+            )
+            side_name = "bid" if bound.direction is SourceDirection.LONG else "ask"
+            side = economics.bid if bound.direction is SourceDirection.LONG else economics.ask
+            economics = replace_config(economics, **{
+                side_name: replace_config(side, open_quantity_ounces=bound.quantity_ounces),
+            })
+        else:
+            source = self._source_account(bound.source_account.account_id)
+            hedge = self._hedge_account(bound.hedge_account.account_id)
         quote = maker_quote(
             bound.direction,
             hedge_book,
             (source,),
             (hedge,),
-            self._config.economics,
+            economics,
             carry=self._quote_carry,
             fx=self._fx,
         )
@@ -757,6 +952,13 @@ class MakerStrategy(Strategy):
             return
         if order.is_closed or order.is_pending_cancel:
             return
+        # A partial fill changes native status, but does not acknowledge its cancel.
+        last_cancel = next((
+            event for event in reversed(order.events)
+            if isinstance(event, OrderPendingCancel | OrderCancelRejected)
+        ), None)
+        if isinstance(last_cancel, OrderPendingCancel):
+            return
         try:
             self.cancel_order(order)
         except Exception as exc:
@@ -785,6 +987,13 @@ class MakerStrategy(Strategy):
                 deadline,
                 self._required_hedge_instrument().ts_event + self._config.max_cost_age_ns + 1,
             )
+        if self._live_account_reader is not None:
+            if self._account_deadline_ns is None:
+                return
+            deadline = min(deadline, self._account_deadline_ns)
+            if deadline <= self.clock.timestamp_ns():
+                self._freeze_and_cancel_all("account deadline")
+                return
         callback: Callable[[TimeEvent], None] = self._on_stale_timer
         if isinstance(self.clock, LiveClock):
             callback = partial(
@@ -831,6 +1040,12 @@ class MakerStrategy(Strategy):
             source_tick is not None
             and hedge_tick is not None
             and self._inputs_are_fresh(source_tick, hedge_tick, now_ns)
+            and (
+                self._live_account_reader is None
+                or self._live_quote_accounts(
+                    _book_top(source_tick), _book_top(hedge_tick), new_source=False,
+                ) is not None
+            )
         ):
             self._schedule_stale_timer(direction, order_id)
         else:

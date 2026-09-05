@@ -342,6 +342,18 @@ carry 是同 route 的唯一 signed residual；下一 fill 先与它合并再分
 
 **2026-09-06 / W5b3验证中的独立test-only前置（修正前记录）：** 首次全量1751过/1失败，失败为未修改的`test_maker_events.py`原生时钟线程测试要求handler恰好一次。对原测试做40次有界诊断，只记录原`_inputs_are_fresh`的实参/结果，第25次复现两次回调：相对deadline分别为-520001ns（仍fresh）和+843999ns（过期）。现有生产按设计先重排再冻结/撤单，不是线程错误。只新增这一测试文件为前置写路径：允许一次或多次同loop handler，仍严查非空、线程归属、恰好两次持久化、每张单各撤一次及最终冻结状态/0.5秒等待上限；不改生产时钟或策略。独立复核后先将此测试修正单独本地提交，再完成W5b3的全量和提交。
 
+**W5b4 普通策略自动容量接线（2026-09-06，实施前固定）：** 正式两builder必须绑定同一短账户reader，普通策略消费W5b3映射，不新增live开关、账户模型、轮询器或资金预留账。未绑定的原构造方式仅保留现有离线/Backtest输入；不能据其静态容量声称live准入。本包保留单节点、单source/hedge账户、Maker每方向最多一单、未决义务冻结新源的现有限制，不混入W5c残差或W7共策略额度。
+
+- 已重新核验原ZIP和`arbi_trader.py`既有SHA：`pick_candidate_trader`新route选择才调用`max_volume_for_margin_target`；已有Maker单经`get_limit_order_params`、`_update_maker_order`重算经济price/base margin→lev，不重新申请全部旧数量。[官方wallet说明](https://docs.bitfinex.com/reference/ws-auth-wallets)把available定义为未被活跃订单/持仓/资金占用的余额，[derivatives API](https://docs.bitfinex.com/docs/derivatives)复用该钱包接口。每单实际锁资和ACK/WU原子顺序未获保证，不能用`quantity*price/leverage`猜测加回，更不能把`_working_quotes`的desired字段当venue已确认杠杆。
+- 新source必须动态容量、route交易量、方向净仓空间及实际可执行量全部通过。已有Maker单只在数量不增加的price-only范围维护：仍要求当前完整新鲜账户、动态B、route/方向净风险及MT5动态对冲容量；source不重新扣整笔旧free额度，route/risk须独立重算，不以`max(已截断动态容量,旧量)`绕过硬限制。price+lev改变所需额外抵押由venue最终accept/reject裁决，本地不宣称已精算；既有modify rejection/UNKNOWN→冻结及核对路径保持。
+- 占用复用两store的active记录与native实际leaves。每方向只有一单，重估按精确CID排除自身，BUY/SELL最坏方向分别判，绝不靠双边净额相抵开放额度；不从已合并资金/route/risk的容量再次机械减全部订单。pending update/cancel、未核对终态不放新单；确认后历史CANCELED即使leaves非零也不占用。partial真实成交继续冻结两方向，已有intent/residual门保持，已成交量与native hedge leaves不重复计入未决义务。没有新理由在partial未完成期间开放报价。
+- BFX在既有client内增加窄订单action水位和最近完整query对应水位，不持久化第二套账。发/改/撤及其明确确认、拒绝或终态使旧新增预算资格失效；账户query须在已稳定的操作状态开始，并在读取和发布之间核对action、wallet、positions水位。ACK前开始、ACK后才返回的旧钱包即使observed_ns较新也不得放行。单纯WS时间戳不能证明操作后的联合采样。水位只管新增预算，不破坏既有账户事实或对冲执行；取消/重连沿原task生命周期。实际capture点以barrier反例确定，不凭返回时间替代因果。
+- 同一行情先提交的一侧同步进入native cache，后一新侧必须重新检查native未决状态和当前预算，不能复用回调开始时的空订单/资金快照。共同的时效/成本/义务保护先运行，再处理有需求但尚无单的方向和旧单维护；若新侧正等待有界账户刷新，暂缓健康旧单改价以免每个tick的modify持续废弃查询、饿死新侧，但当次回调不能跳过旧单自身风险撤单。数量为零的禁用方向不制造刷新需求。顺序复核明确：没有已在途操作时，合格的降风险SHORT与已不合格旧LONG的撤单可同一回调排队，不额外要求前者等待后者ACK；每向最多一单、物理方向容量各自通过，不能靠相抵证明容量。已有pending或真实fill/义务时的新源阻挡不变。
+- reader在当前loop同步取得同份最新AccountState及当前client资格，使用原行情各自时间戳、已有max_cost_age_ns和原配置路线；MT5从现有account_capacity_ready读真实fill后的资格。BFX缺事实、需post-action预算或接近账户TTL时，仅按需调用原生QueryAccount，复用client单task和超时；至少2秒的发起间隔先记后发，失败不在同一事件栈递归重试。后续市场/既有MT5完整账户事件继续消费需求，不新建周期器；不把无账户容量卡在触发query之前。
+- 原生Portfolio先更新cache再发布账户topic，而BFX失效账户通知可嵌套在策略处理真实fill之前。两策略显式订阅自身两个账户topic，handler只合并投递到已有event loop，不能同步发单或抛错打断fill→义务→hedge；停止取消待回调/退订，原generation隔离重启。延后一次读取最新事实，再复用原机会入口；Taker不伪造行情时间或重置market_ts去重。Maker账户最早过期时间并入原stale timer，不能因行情继续新鲜而保留过期账户报价。
+- 普通REST补成交回归补充（修正前固定）：账户回调可先发保护撤单，随后native部分成交会把当前status从PENDING_CANCEL变回PARTIALLY_FILLED，但这不是撤单已结束。Maker从同一native order.events读取最近撤单Pending/Rejected事实；部分成交不释放仍在途的撤单，明确拒绝或终态沿原处理。不新增撤单台账、不按错误字符串吞拒绝；必须证明每单只发一次保护cancel、真实fill/hedge不丢、明确拒绝仍HOLD及终态后恢复。
+- 写集：`margin.py`只加reader类型约定；BFX execution的窄预算水位；既有live_runtime的共享绑定、两builder及两策略。测试限既有BFX execution、Maker/Taker events、live builder/runtime和strategy_continuity，另`test_taker_cost_input`仅给绕过构造器的单时钟fixture补未绑定reader字段，主agent维护本文。先做真实RED：post-action查询barrier、冷启动无PS主动刷新、账户恢复不需新行情/不重复claim、旧单available下降不自撤、真实risk/MT5容量下降撤单、持续行情双边不饥饿、pending/partial/拒绝不释放、账户TTL与停止代际。实际普通双客户端路径必须覆盖，不以手动调用mapper或canary特制逻辑替代；独立复核、全量通过后再本地提交。不改profile/EA、不访问真实账户、不推送、部署或发单。
+
 ### W6：重启与停止形成真实闭环
 
 范围：`store.py`、两个 execution 的报告/重连路径、live lifecycle、必要的原生 cache 配置和恢复测试。先执行 Q3。
@@ -538,11 +550,12 @@ EA 改动额外执行现有 `tools/mt5_source_manifest.sh --lines`、MetaEditor 
   - [x] W4d：当前Paper同run工作中Maker漏消息主动发现、完整真实成交集合核验、健康观察暂缓报价；普通双客户端与独立复核通过。
   - [ ] W4 剩余矩阵：D04b跨重启费用/原生事件恢复及完整node启停/信号drain归W6；当前组合的组件级stop与同run恢复不替代这些验收。
 - [ ] W5 经济/仓位行为与残差。
-  - [x] W5a：原容量 normalized Decimal 纯函数及脱敏固定向量，整数容量边界修正；独立复核通过，尚未接 live 动态准入。
+  - [x] W5a：原容量 normalized Decimal 纯函数及脱敏固定向量，整数容量边界修正；独立复核通过，普通策略接线由W5b4交付。
   - [x] W5b1：账户原始事实、完整性和独立观察时间已实现；串联伪flat修复、普通组合与独立复核通过，仅交付事实入口。
   - [x] W5b2：Bitfinex原生QueryAccount按需联合刷新、有界去重与生命周期收束；普通组合及独立复核通过。MT5沿用既有完整刷新，不新增周期器。
-  - [x] W5b3：两端完整账户事实到既有动态容量视图的纯映射；普通账户事件、经济产出及独立复核通过，尚未激活策略动态准入。
-  - [ ] W5b后续：策略按需查询触发、动态容量/杠杆自动使用、配置及挂单/义务占用接线；原子残差与完整连续仓位矩阵仍未完成。
+  - [x] W5b3：两端完整账户事实到既有动态容量视图的纯映射；普通账户事件、经济产出及独立复核通过。
+  - [x] W5b4：普通两策略自动消费动态容量/杠杆，按需刷新、操作后预算、Maker旧单与双侧维护、账户时效和原未决义务门接线；普通组合及独立复核通过。
+  - [ ] W5后续：完整LONG→LONG→SHORT/穿零仓位矩阵、Maker原子残差与strict/bounded-carry、剩余原策略parity；不因动态接线完成而关闭。
 - [ ] W6 重启/停止。
 - [ ] W7 同节点共账户。
 - [ ] W8 入口/安装/文档/原生运行边界。
@@ -715,3 +728,13 @@ EA 改动额外执行现有 `tools/mt5_source_manifest.sh --lines`、MetaEditor 
 - 首轮全量1751过/1红来自既有LiveClock测试的恰好一次回调断言；按上文有界诊断实证早醒后正常重排。只修测试断言，仍严查正确loop、恰好两次持久化和两张单各撤一次，主agent及独立reviewer各跑8组合通过。该独立test-only前置已本地提交`bcfc509`，没有修改生产定时器、期限或冻结逻辑。
 - 最终冻结候选上主agent全量 **1752 passed / 80既有Pandas框架弃用警告 / 61.53s**，Ruff全仓、Mypy 73文件和diff-check通过。未参与本包编码的reviewer核验450组独立Fraction算式（BFX360、MT590）、容量及两套economics共263项、普通/组件新增9项及三份冻结SHA，给出本包RECOMMEND-ACCEPT；主agent结合测试前置独立复核和最终全量接受W5b3。全量1752为主agent执行，不冒称reviewer重复全量。生产SHA256 `8cd63d8b22e74dfdf31da07af828ac0d53738d4f103ea8508ec6122b3ec993a6`，映射测试`9d7fe92437e33d21f9a2ea02f8fab8607d1f608040affa40c1f813946196ac1a`，普通组合测试`b65f9fde11c0fc9803a9074f753a8c156497b29db31f8523c44baf2652608f3c`。
 - 下一包把策略自动视图、按需query触发/节流与Maker自身、双边、partial和pending-cancel占用一起接入；先核实venue可用资金与工作单占用的口径，避免自撤循环或同一风险重复扣除，不用新开关绕过动态检查。本包未改策略、builder、runtime、adapter、profile或EA，未推送、部署、访问真实账户或发单；W5父项、原子残差和W6–W9仍未完成。
+
+2026-09-06 / W5b4普通策略自动动态容量接线完成并接受（基线`6271676`）：
+
+- 两live builder强制绑定同一账户reader，经原生AccountState及当前client资格调用W5b3映射，再进入原Maker/Taker经济计算；不增加开关或live静态fallback。BFX缺事实、接近TTL或需操作后预算时按需调用native QueryAccount，保留2秒最小间隔、client单task/超时/取消；MT5沿既有刷新。生产净增476行，均在7个既有模块，没有新服务、配置或状态文件。
+- BFX增加窄action水位，操作前开始、ACK后才返回的query不能认证新预算；同回调首单的native INITIALIZED也立即阻止另一侧复用旧预算。先9项真实引擎查询竞争RED，再覆盖24项预算回归；独立review另以实际ExecutionEngine命令及barrier核对submit/modify/cancel、UNKNOWN和重复报告，不靠返回时间证明因果。
+- 新source用完整动态额度；已有Maker不以剩余free重新申请整笔旧量，但精确native leaves、route/net risk、MT5容量及账户时效仍有效。等待新侧预算时暂停健康旧单改价，账户恢复后可发另一侧；旧单price+lev所需额外抵押仍由venue裁决，不建立猜测性的锁资账。账户通知只合并延后到原loop，保持真实行情时间、Taker去重及canary覆写；stop退订/取消回调并隔离旧代际，Maker原timer覆盖账户最早到期。
+- 主agent普通入口首5项语义RED修后通过；最终新增7项真实普通组合证明冷启动主动查询、无新行情账户恢复、Taker实际缩量、Maker固定量不足拒发、旧单free下降保留/MT5容量下降撤单、双边8次价变期间不饿死及账户独立TTL撤单。旧测试补完整模拟venue事实、更新MT5快照和当前carry，不修改生产节流/时效、不手补业务完成状态；账户恢复可自动发第二单，核对仍以真实native/wire/CID/数量为准。
+- 普通组合发现并修复真实回归：账户回调先保护cancel，REST partial fill把native状态改回PARTIALLY_FILLED，旧代码重复本地cancel并形成reject/HOLD链。主agent、实施者与reviewer分别复现；仅复用native事件历史的7行判断修复，不放宽旧终态证明或按reason吞拒绝。新增3项先RED后GREEN，原3条普通失败流程现在首CID仅1条native cancel/1条wire OC、无重复拒绝，真实fill/hedge和下一源单完整；明确拒绝仍HOLD。
+- 相对基线新增56项（BFX24、策略事件22、runtime3、普通组合7）。最终主agent全量 **1808 passed / 84 warnings / 59.49s**，Ruff全仓、Mypy 73文件及diff-check通过，运行前后13份源码/测试SHA完全相同。未参与编码的reviewer独立345项及真实嵌套fill/查询竞争探针通过，关闭重复撤单REWORK并给出RECOMMEND-ACCEPT；主agent据此接受本包。全量1808为主agent证据，不冒称reviewer重复全量。
+- 按约定形成本地小包提交；不推送、部署、改profile/EA、访问真实账户或发单。下一包先完成正常策略的连续加仓/反向/穿零矩阵，再推进已定的原子残差；W5父项、W6–W9和真实DEMO连续验收仍未完成，不能将本包绿色称为可上线。

@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import math
 from dataclasses import dataclass, field
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 from nautilus_trader.common.actor import Actor
 from nautilus_trader.common.component import TimeEvent
@@ -15,12 +15,119 @@ from nautilus_trader.live.execution_engine import LiveExecutionEngine
 from nautilus_trader.live.node import TradingNode
 from nautilus_trader.model.identifiers import ClientOrderId, InstrumentId, VenueOrderId
 
+from py000_nautilus.bitfinex_v1_data import BitfinexV1DataClient
 from py000_nautilus.bitfinex_v1_execution import BitfinexV1ExecutionClient
+from py000_nautilus.config import HedgeAccountRoute, MakerStrategyConfig, TakerStrategyConfig
+from py000_nautilus.margin import bitfinex_source_account, mt5_hedge_account
+from py000_nautilus.models import BookTop, HedgeAccount, SourceAccount
+from py000_nautilus.mt5_v1_data import Mt5V1DataClient
+from py000_nautilus.mt5_v1_execution import Mt5V1ExecutionClient
 from py000_nautilus.strategies._source_terminal import SourceTerminalResult
+
+if TYPE_CHECKING:
+    from py000_nautilus.strategies.maker import MakerStrategy
+    from py000_nautilus.strategies.taker import TakerStrategy
 
 _TIMER = "source-terminal-observation"
 _POLL_NS = 250_000_000
 _WORKING_ORDER_CHECK_NS = 5_000_000_000
+_ACCOUNT_QUERY_INTERVAL_NS = 2_000_000_000
+
+
+def bind_live_account_reader(
+    strategy: MakerStrategy | TakerStrategy,
+    *,
+    config: MakerStrategyConfig | TakerStrategyConfig,
+    source_data: BitfinexV1DataClient,
+    source_client: BitfinexV1ExecutionClient,
+    hedge_data: Mt5V1DataClient,
+    hedge_client: Mt5V1ExecutionClient,
+    wallet_currency: str,
+    hedge_symbol: str,
+    hedge_stream_id: str,
+) -> None:
+    """Bind the one-account live composition to native facts and demand-only refresh.
+
+    The adapter owns query IO, deduplication, action causality and cancellation.
+    This closure only rate-limits demand and reads both current clients in one
+    synchronous turn; it never changes historical account events or orders.
+    """
+    source_route = config.source_accounts[0]
+    hedge_route = (
+        config.hedge_accounts[0] if isinstance(config, MakerStrategyConfig)
+        else HedgeAccountRoute(
+            account_id=config.hedge_account_id, client_id=config.hedge_client_id,
+            max_long_ounces=config.hedge_max_long_ounces,
+            max_short_ounces=config.hedge_max_short_ounces,
+        )
+    )
+    next_query_ns = 0
+
+    def read(
+        source_book: BookTop, source_ts_ns: int,
+        hedge_book: BookTop, hedge_ts_ns: int, new_source: bool,
+    ) -> tuple[SourceAccount, HedgeAccount, int, bool] | None:
+        nonlocal next_query_ns
+        now = cast(int, strategy.clock.timestamp_ns())
+        source_native, hedge_native = source_client.get_account(), hedge_client.get_account()
+        source_event = None if source_native is None else source_native.last_event
+        hedge_event = None if hedge_native is None else hedge_native.last_event
+        budget_ready = source_client.account_budget_ready
+        source = bitfinex_source_account(
+            source_event, route=source_route, instrument_id=config.source_instrument_id,
+            wallet_currency=wallet_currency, margin_target=config.economics.margin_level,
+            max_abs_ounces=config.economics.risk.source_max_abs, now_ns=now,
+            max_account_age_ns=config.max_cost_age_ns,
+            client_ready=(
+                source_client.is_connected and source_client.execution_hold_reason is None
+                and source_data.is_connected and source_data.book_is_actionable
+            ),
+            ask=source_book.ask, ask_ts_ns=source_ts_ns,
+            max_quote_age_ns=config.max_quote_age_ns,
+            ask_actionable=source_book.ask_size > 0,
+        )
+        hedge = mt5_hedge_account(
+            hedge_event, route=hedge_route, symbol=hedge_symbol, stream_id=hedge_stream_id,
+            margin_target=config.economics.margin_level,
+            max_abs_ounces=config.economics.risk.hedge_max_abs, now_ns=now,
+            max_account_age_ns=config.max_cost_age_ns,
+            client_ready=(
+                hedge_client.execution_admitted
+                and hedge_client.account_capacity_ready(config.max_cost_age_ns)
+                and hedge_data.is_connected and hedge_data.snapshot_refresh_healthy
+            ),
+            ask=hedge_book.ask, ask_ts_ns=hedge_ts_ns,
+            max_quote_age_ns=config.max_quote_age_ns,
+            ask_actionable=hedge_book.ask_size > 0,
+        )
+        source_observed = 0
+        if source is not None:
+            # The pure mapper has validated these exact event fields above.
+            assert source_event is not None
+            facts = source_event.info["bitfinex_margin"]
+            source_observed = min(
+                facts["wallet"]["observed_ns"], facts["positions"]["observed_ns"],
+            )
+        refresh_due = (
+            source is None or now - source_observed >= config.max_cost_age_ns // 2
+            or (new_source and not budget_ready)
+        )
+        if refresh_due and source_client.account_budget_refresh_ready and now >= next_query_ns:
+            # Reserve the interval before queuing; synchronous failure cannot recurse.
+            next_query_ns = now + _ACCOUNT_QUERY_INTERVAL_NS
+            try:
+                strategy.query_account(source_route.account_id, source_route.client_id)
+            except Exception as exc:
+                strategy.log.error(f"Bitfinex account refresh request failed: {type(exc).__name__}")
+        if source is None or hedge is None:
+            return None
+        assert hedge_event is not None
+        deadline = min(
+            source_observed, cast(int, hedge_event.info["mt5_account_observed_ns"]),
+        ) + config.max_cost_age_ns + 1
+        return source, hedge, deadline, budget_ready
+
+    strategy.bind_live_account_reader(read)
 
 
 @dataclass

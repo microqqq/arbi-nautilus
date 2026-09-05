@@ -263,6 +263,7 @@ def test_book_decision_captures_now_once_for_freshness_and_swap_day(
             economics=SimpleNamespace(base_book_quantity=Decimal(1)),
         ),
         _allowed_source_direction=None,
+        _live_account_reader=None,
         state_store=SimpleNamespace(can_submit_source=lambda: True),
         cache=SimpleNamespace(
             order_book=lambda instrument_id: source_book,

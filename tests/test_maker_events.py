@@ -45,12 +45,14 @@ from py000_nautilus.app import (
     _maker_strategy_config,
     _quote,
     _source_instrument,
+    _strategy_config,
 )
 from py000_nautilus.config import CarryConfig, FxConfig, MakerStrategyConfig
 from py000_nautilus.hedge import HedgeCoordinator
 from py000_nautilus.models import (
     BookTop,
     BusinessOrderSide,
+    HedgeAccount,
     HedgeIntent,
     MakerAccount,
     MakerQuote,
@@ -66,6 +68,7 @@ from py000_nautilus.strategies.maker import (
     _maker_timer_name,
     _maker_timer_target,
 )
+from py000_nautilus.strategies.taker import TakerStrategy
 
 D = Decimal
 
@@ -85,9 +88,13 @@ class _InstrumentLifecycleMaker(MakerStrategy):
         self.new_quote_attempts.append(quote.direction)
 
 
-def _seed_native_working_quotes(strategy: _InstrumentLifecycleMaker) -> list[Any]:
+def _seed_native_working_quotes(
+    strategy: _InstrumentLifecycleMaker, *, exact_route: bool = False,
+    directions: tuple[SourceDirection, ...] = (SourceDirection.LONG, SourceDirection.SHORT),
+    native_status: OrderStatus = OrderStatus.ACCEPTED,
+) -> list[Any]:
     orders: list[Any] = []
-    for direction in (SourceDirection.LONG, SourceDirection.SHORT):
+    for direction in directions:
         side = OrderSide.BUY if direction is SourceDirection.LONG else OrderSide.SELL
         order = strategy.order_factory.limit(
             instrument_id=_source_instrument().id, order_side=side,
@@ -95,25 +102,240 @@ def _seed_native_working_quotes(strategy: _InstrumentLifecycleMaker) -> list[Any
             time_in_force=TimeInForce.GTC, post_only=True,
         )
         account_id = AccountId("BITFINEX-001")
-        order.apply(TestEventStubs.order_submitted(order, account_id=account_id, ts_event=100))
-        order.apply(TestEventStubs.order_accepted(
-            order, account_id=account_id,
-            venue_order_id=VenueOrderId(direction.value), ts_event=100,
-        ))
+        if native_status is not OrderStatus.INITIALIZED:
+            order.apply(TestEventStubs.order_submitted(order, account_id=account_id, ts_event=100))
+        if native_status is OrderStatus.ACCEPTED:
+            order.apply(TestEventStubs.order_accepted(
+                order, account_id=account_id,
+                venue_order_id=VenueOrderId(direction.value), ts_event=100,
+            ))
         strategy.cache.add_order(order)
         strategy._stores[direction].begin_source(
             order.client_order_id.value,
             BusinessOrderSide.BUY if side is OrderSide.BUY else BusinessOrderSide.SELL,
             D(2),
+            source_account_id="BITFINEX-001" if exact_route else None,
+            hedge_account_id="MT5-001" if exact_route else None,
         )
-        strategy._stores[direction].update_source_status(order.client_order_id.value, "ACCEPTED")
-        strategy._working_quotes[order.client_order_id.value] = replace(
-            _bound_quote(), direction=direction,
-        )
+        if native_status is not OrderStatus.INITIALIZED:
+            strategy._stores[direction].update_source_status(
+                order.client_order_id.value, native_status.name,
+            )
+        bound = replace(_bound_quote(), direction=direction)
+        if exact_route:
+            bound = replace(
+                bound, source_account=replace(bound.source_account, client_id=None),
+                hedge_account=replace(bound.hedge_account, client_id=None),
+            )
+        strategy._working_quotes[order.client_order_id.value] = bound
         orders.append(order)
     for instrument in (_source_instrument(), _hedge_instrument()):
         strategy.cache.add_quote_tick(_quote(instrument, "2399", "2401", "5", 100))
     return orders
+
+
+@pytest.mark.parametrize(
+    "change", ["free", "source_risk", "hedge_capacity", "hedge_capacity_one", "missing"],
+)
+def test_live_account_maker_maintenance_excludes_own_funds_but_keeps_risk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, change: str,
+) -> None:
+    async def run() -> None:
+        config = struct_replace(
+            _maker_strategy_config(tmp_path / change), initial_cost_ts_ns=100,
+            initial_session_ts_ns=100, max_cost_age_ns=1_000, max_quote_age_ns=1_000,
+            max_session_age_ns=1_000,
+        )
+        strategy = _InstrumentLifecycleMaker(config)
+        maintained: list[MakerQuote] = []
+        # This case exercises native working orders and the strategy timer, not venue modify I/O.
+        monkeypatch.setattr(
+            strategy, "_requote", lambda _order, desired: maintained.append(desired),
+        )
+        source = SourceAccount(AccountId("BITFINEX-001"), None, D(0), D(0), D(0), D(200))
+        hedge = HedgeAccount(D(0), D(10), D(10))
+        if change == "source_risk":
+            source = replace(source, position_ounces=config.economics.risk.source_max_abs)
+        if change == "hedge_capacity":
+            hedge = HedgeAccount(D(0), D(0), D(0))
+        if change == "hedge_capacity_one":
+            hedge = HedgeAccount(D(0), D(1), D(1))
+        reads: list[bool] = []
+
+        def reader(_source: BookTop, _source_ts: int, _hedge: BookTop, _hedge_ts: int,
+                   new_source: bool) -> tuple[SourceAccount, HedgeAccount, int, bool] | None:
+            reads.append(new_source)
+            return None if change == "missing" else (source, hedge, 151, False)
+
+        strategy.bind_live_account_reader(reader)
+        with _event_engine(cast(Any, strategy)) as engine:
+            engine.kernel.clock.set_time(100)
+            strategy.clock.set_time(100)
+            engine.trader.start()
+            orders = _seed_native_working_quotes(strategy, exact_route=True)
+            engine.kernel.msgbus.publish("events.account.BITFINEX-001", object())
+            engine.kernel.msgbus.publish("events.account.MT5-001", object())
+            assert reads == [] and strategy.cancel_ids == []
+            await asyncio.sleep(0)
+            assert reads and not any(reads)
+            expected = [] if change == "free" else [orders[0].client_order_id.value]
+            if change in {"hedge_capacity", "hedge_capacity_one", "missing"}:
+                expected = [order.client_order_id.value for order in orders]
+            assert strategy.cancel_ids == expected
+            if change == "free":
+                assert len(maintained) == 2
+                assert all(quote.quantity_ounces == 2 for quote in maintained)
+                assert strategy._stale_timer_names
+                assert all(strategy.clock.next_time_ns(name) == 151
+                           for name in strategy._stale_timer_names.values())
+                # New quotes cannot disguise the earlier account expiry.
+                for instrument in (_source_instrument(), _hedge_instrument()):
+                    strategy.cache.add_quote_tick(_quote(instrument, "2399", "2401", "5", 150))
+                strategy.clock.set_time(151)
+                for callback in strategy.clock.advance_time(151):
+                    callback.handle()
+                assert strategy.cancel_ids == [order.client_order_id.value for order in orders]
+            engine.trader.stop()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("kind", ["maker", "taker"])
+@pytest.mark.parametrize("loop_factory", [asyncio.SelectorEventLoop, uvloop.new_event_loop])
+def test_live_account_notifications_stop_generation_and_exception_isolation(
+    tmp_path: Path, kind: str, loop_factory: Callable[[], asyncio.AbstractEventLoop],
+) -> None:
+    async def run() -> None:
+        strategy: Any = (
+            MakerStrategy(_maker_strategy_config(tmp_path / kind)) if kind == "maker" else
+            TakerStrategy(_strategy_config(tmp_path / kind))
+        )
+        strategy.bind_live_account_reader(lambda *_args: None)
+        calls: list[int] = []
+
+        def evaluate() -> None:
+            calls.append(strategy._source_terminal_generation)
+            raise ValueError("injected reader failure")
+
+        if kind == "maker":
+            strategy._evaluate_quotes = evaluate
+        else:
+            strategy._evaluate_and_submit = evaluate
+        with _event_engine(strategy) as engine:
+            engine.trader.start()
+            strategy.cache.add_quote_tick(_quote(_source_instrument(), "2399", "2401", "5", 1))
+            engine.kernel.msgbus.publish("events.account.BITFINEX-001", object())
+            engine.kernel.msgbus.publish("events.account.MT5-001", object())
+            assert not calls
+            await asyncio.sleep(0)
+            assert calls == [0]  # No exception escapes the account publication or the loop.
+            engine.kernel.msgbus.publish("events.account.BITFINEX-001", object())
+            old_generation = strategy._source_terminal_generation
+            strategy.stop()
+            await asyncio.sleep(0)
+            assert calls == [0]
+            strategy.reset()
+            strategy.start()
+            assert strategy.is_running
+            engine.kernel.msgbus.publish("events.account.MT5-001", object())
+            new_handle = strategy._account_handle
+            strategy._evaluate_account_update(old_generation)
+            assert strategy._account_handle is new_handle
+            await asyncio.sleep(0)
+            assert calls == [0, 1]
+            strategy.stop()
+            engine.kernel.msgbus.publish("events.account.MT5-001", object())
+            await asyncio.sleep(0)
+            assert calls == [0, 1]
+
+    with asyncio.Runner(loop_factory=loop_factory) as runner:
+        runner.run(run())
+
+
+@pytest.mark.parametrize(
+    "state", ["initialized", "submitted", "accepted", "update", "cancel", "budget", "disabled"],
+)
+def test_live_account_maker_empty_side_first_and_pending_budget_never_nets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, state: str,
+) -> None:
+    async def run() -> None:
+        base = _maker_strategy_config(tmp_path / state)
+        config = struct_replace(
+            base, initial_cost_ts_ns=100, initial_session_ts_ns=100,
+            economics=struct_replace(
+                base.economics, ask=struct_replace(
+                    base.economics.ask, open_quantity_ounces=D(0 if state == "disabled" else 2),
+                ),
+            ),
+        )
+        strategy = _InstrumentLifecycleMaker(config)
+        reads: list[bool] = []
+        maintained: list[MakerQuote] = []
+
+        def reader(_source: BookTop, _source_ts: int, _hedge: BookTop, _hedge_ts: int,
+                   new_source: bool) -> tuple[SourceAccount, HedgeAccount, int, bool]:
+            reads.append(new_source)
+            return (
+                SourceAccount(AccountId("BITFINEX-001"), None, D(0), D(10), D(10), D(100)),
+                HedgeAccount(D(0), D(10), D(10)), 1_000, state != "budget",
+            )
+
+        strategy.bind_live_account_reader(reader)
+        monkeypatch.setattr(
+            strategy, "_requote", lambda _order, desired: maintained.append(desired),
+        )
+        with _event_engine(cast(Any, strategy)) as engine:
+            engine.kernel.clock.set_time(100)
+            strategy.clock.set_time(100)
+            engine.trader.start()
+            order = _seed_native_working_quotes(
+                strategy, exact_route=True, directions=(SourceDirection.LONG,),
+                native_status={
+                    "initialized": OrderStatus.INITIALIZED, "submitted": OrderStatus.SUBMITTED,
+                }.get(state, OrderStatus.ACCEPTED),
+            )[0]
+            if state == "update":
+                order.apply(TestEventStubs.order_pending_update(order, ts_event=100))
+            elif state == "cancel":
+                order.apply(TestEventStubs.order_pending_cancel(order, ts_event=100))
+            strategy.cache.update_order(order)
+            engine.kernel.msgbus.publish("events.account.MT5-001", object())
+            await asyncio.sleep(0)
+            assert reads == ([False] if state == "disabled" else [True, False])
+            assert strategy.new_quote_attempts == (
+                [SourceDirection.SHORT] if state == "accepted" else []
+            )
+            assert len(maintained) == int(state in {"accepted", "disabled"})
+            assert not strategy.cancel_ids
+            assert strategy._stores[SourceDirection.LONG].active_source_order_id == (
+                order.client_order_id.value
+            )
+            engine.trader.stop()
+    asyncio.run(run())
+
+
+def test_live_account_maker_respects_quote_override_without_new_market_event(
+    tmp_path: Path,
+) -> None:
+    class GuardedMaker(MakerStrategy):
+        def on_quote_tick(self, tick: Any) -> None:
+            observed.append(tick)
+
+    observed: list[Any] = []
+
+    async def run() -> None:
+        strategy = GuardedMaker(_maker_strategy_config(tmp_path / "override"))
+        strategy.bind_live_account_reader(lambda *_args: None)
+        with _event_engine(cast(Any, strategy)) as engine:
+            engine.trader.start()
+            original = _quote(_source_instrument(), "2399", "2401", "5", 100)
+            engine.cache.add_quote_tick(original)
+            engine.kernel.msgbus.publish("events.account.BITFINEX-001", object())
+            assert observed == []
+            await asyncio.sleep(0)
+            assert len(observed) == 1 and observed[0] is original
+            assert engine.cache.quote_tick(_source_instrument().id).ts_event == 100
+            engine.trader.stop()
+    asyncio.run(run())
 
 
 @pytest.mark.parametrize(
@@ -817,6 +1039,61 @@ def _fill_maker_source(engine: Any, order: Any, quantity: int) -> None:
     ))
 
 
+@pytest.mark.parametrize("completion", ["partial", "rejected", "canceled"])
+def test_native_partial_fill_preserves_pending_cancel_until_explicit_completion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, completion: str,
+) -> None:
+    class PendingCancelMaker(RecordingMakerStrategy):
+        _cancel_working = MakerStrategy._cancel_working
+
+    async def run() -> None:
+        strategy = PendingCancelMaker(tmp_path / completion)
+        strategy.bind_live_account_reader(lambda *_args: None)
+        cancel_commands: list[str] = []
+        with _event_engine(cast(Any, strategy)) as engine:
+            engine.kernel.clock.set_time(1_000_000_000)
+            strategy.clock.set_time(1_000_000_000)
+            engine.trader.start()
+            order = _seed_terminal_source(engine, strategy, maker=True)
+            store = strategy._stores[SourceDirection.LONG]
+
+            def cancel(current: Any, **_kwargs: Any) -> None:
+                cancel_commands.append(current.client_order_id.value)
+                engine.kernel.exec_engine.process(TestEventStubs.order_pending_cancel(
+                    current, ts_event=strategy.clock.timestamp_ns(),
+                ))
+
+            monkeypatch.setattr(strategy, "cancel_order", cancel)
+            strategy._cancel_working(SourceDirection.LONG, reason="initial protection")
+            assert order.status is OrderStatus.PENDING_CANCEL
+            _fill_maker_source(engine, order, 1)
+            assert cancel_commands == [order.client_order_id.value]
+            assert order.status is OrderStatus.PARTIALLY_FILLED
+            assert len(store.intents()) == len(strategy.recorded) == 1
+            for instrument in (_source_instrument(), _hedge_instrument()):
+                engine.cache.add_quote_tick(_quote(
+                    instrument, "2399", "2401", "5", 1_000_000_000,
+                ))
+            engine.kernel.msgbus.publish("events.account.MT5-001", object())
+            engine.kernel.msgbus.publish("events.account.BITFINEX-001", object())
+            await asyncio.sleep(0)
+            assert len(cancel_commands) == 1
+            if completion == "rejected":
+                # An actual rejection is not hidden behind the older pending event.
+                engine.kernel.exec_engine.process(_cancel_rejected(order))
+                assert store.halt_reason == "maker cancel rejected"
+                assert len(cancel_commands) == 2
+                assert order.status is OrderStatus.PENDING_CANCEL
+            elif completion == "canceled":
+                _process_source_terminal(engine, order)
+                strategy._cancel_working(SourceDirection.LONG, reason="late account protection")
+                assert order.status is OrderStatus.CANCELED
+                assert len(cancel_commands) == 1
+            assert len(store.intents()) == 1 and not store.can_submit_source()
+            engine.trader.stop()
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize("terminal,filled", [
     ("CANCELED", 0), ("CANCELED", 1), ("EXPIRED", 0), ("EXPIRED", 1), ("FILLED", 4),
 ])
@@ -1438,6 +1715,7 @@ def test_maker_fresh_hedge_quote_retries_pending_leg_exactly_once(
     harness._submit_next_pending_hedge = lambda: MakerStrategy._submit_next_pending_hedge(
         cast(Any, harness)
     )
+    harness._evaluate_quotes = lambda: MakerStrategy._evaluate_quotes(cast(Any, harness))
 
     harness._submit_next_pending_hedge()
     assert submissions == [PositionId("1")]
@@ -1852,6 +2130,7 @@ def test_each_side_replaces_instead_of_accumulating_stale_timers(tmp_path: Path)
     harness = SimpleNamespace(
         _stale_timer_names={},
         _live_costs_from_adapters=False,
+        _live_account_reader=None,
         _config=_maker_strategy_config(tmp_path / "timer.state"),
         _cost_ts_ns=100,
         _session_ts_ns=100,
@@ -1886,6 +2165,7 @@ class _StopStore:
 
 
 class _WorkingOrder:
+    events: tuple[object, ...] = ()
     is_closed = False
     is_pending_cancel = False
 
@@ -1904,6 +2184,10 @@ class _StopCache:
 
 
 class _StopHarness:
+    _account_handle = None
+    _account_topics: tuple[str, ...] = ()
+    _live_account_reader = None
+
     def __init__(self) -> None:
         self._live_costs_from_adapters = False
         self._source_terminal_stopped = False
@@ -2319,6 +2603,10 @@ class _QuoteCache:
 
 class _LiveQuoteGateHarness:
     _source_quote_refresh_paused: Callable[[], bool] | None = None
+    _live_account_reader = None
+
+    def _evaluate_quotes(self) -> None:
+        MakerStrategy._evaluate_quotes(cast(Any, self))
 
     def __init__(self, state_prefix: Path, *, now_ns: int) -> None:
         self._config = _maker_strategy_config(state_prefix)
@@ -2441,6 +2729,11 @@ def test_live_mt5_swap_normalization_feeds_both_maker_quote_sides(tmp_path: Path
 
 
 class _QuoteGateHarness:
+    _live_account_reader = None
+
+    def _evaluate_quotes(self) -> None:
+        MakerStrategy._evaluate_quotes(cast(Any, self))
+
     def __init__(self, state_prefix: Path, *, blocked: bool, fresh: bool) -> None:
         self._config = _maker_strategy_config(state_prefix)
         self.cache = _QuoteCache()
