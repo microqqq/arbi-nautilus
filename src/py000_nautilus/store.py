@@ -525,20 +525,7 @@ class JsonStateStore:
         )
 
     def _persist(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        payload = self._to_payload()
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            dir=self.path.parent,
-            prefix=f".{self.path.name}.",
-            delete=False,
-        ) as handle:
-            json.dump(payload, handle, sort_keys=True, separators=(",", ":"))
-            handle.flush()
-            os.fsync(handle.fileno())
-            temporary_path = Path(handle.name)
-        replace_and_sync_parent(temporary_path, self.path)
+        _persist_payload(self.path, self._to_payload())
 
     def _persist_source_reservation(self, previous_state: StoreState) -> None:
         try:
@@ -570,6 +557,10 @@ class JsonStateStore:
 
     def _load(self) -> StoreState:
         raw = cast(dict[str, object], json.loads(self.path.read_text(encoding="utf-8")))
+        return self._from_payload(raw)
+
+    @staticmethod
+    def _from_payload(raw: dict[str, object]) -> StoreState:
         if raw.get("schema_version") != 1:
             raise ValueError("unsupported state schema")
         source_raw = cast(dict[str, dict[str, object]], raw["source_orders"])
@@ -637,6 +628,22 @@ class JsonStateStore:
             halt_reason=_optional_string(raw["halt_reason"]),
             source_freeze_reason=_optional_string(raw.get("source_freeze_reason")),
         )
+
+
+def _persist_payload(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        delete=False,
+    ) as handle:
+        json.dump(payload, handle, sort_keys=True, separators=(",", ":"))
+        handle.flush()
+        os.fsync(handle.fileno())
+        temporary_path = Path(handle.name)
+    replace_and_sync_parent(temporary_path, path)
 
 
 def _optional_string(value: object) -> str | None:

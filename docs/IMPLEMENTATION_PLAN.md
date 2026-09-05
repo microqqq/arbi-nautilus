@@ -209,7 +209,7 @@ Taker 将同一 `max(source_book.ts_last, hedge_tick.ts_event)` 的行情回调�
 - `positions[]` 按 venue/account/instrument 限定，列表元素是 position 不是 order。MT5 用票据集合，Bitfinex 每 symbol 的 venue 净仓是单一投影。
 - 目标是执行 signed delta，不是每次重设某个净仓目标：已有同向票据不吸收新增 delta；先关闭反向票，再开剩余；下一腿前重新读取当前票据。
 - 比如当前 MT5 BUY 1oz + BUY 2oz，执行 SELL 4oz，应 close 1、close 2、open SELL 1；中间任何未决结果都不继续后续腿。
-- Maker bid/ask 同 route 的已确认小额成交可以按净额抵消，但必须同一原子写单元记录抵消量和原始 fill 身份。当前两个 JSON 不能依次扣减后宣称原子；W5 使用一个 Maker 状态文件、两个方向 view，复用原协调器，不引入两阶段提交。
+- Maker bid/ask 同 route 的已确认小额成交可以按净额抵消，但必须同一原子写单元记录抵消量和原始 fill 身份。旧两个 JSON 不能依次扣减后宣称原子；W5 使用一个 Maker 状态文件、两个方向 view，复用原协调器，不引入两阶段提交。W5c1 已交付单文件边界，净额分配仍待后续验收。
 - 只有相同账户/品种/route 的未分配残差可抵消；已经提交 hedge 的义务不可被另一个方向擦掉；净额不为零的 dust 保留并应用明确额度/暂停规则。
 
 非零 dust 的交付规则也要闭环：实现 `strict` 与 `bounded-carry` 两种明确模式。strict 保持当前零残差才开启下一 cycle；bounded-carry 只允许相关源单终态已确认、无 UNKNOWN/在途义务时把小额残差带入下一轮，残差必须持久化并计入共享敞口预算。现有 1oz hedge 舍入步长下 carry 上限不得超过 0.5oz，也不得超过 profile 的残差限；±边界、累计越界和反向抵消均测试，不暗改舍入算法。
@@ -379,6 +379,16 @@ carry 是同 route 的唯一 signed residual；下一 fill 先与它合并再分
 
 - 仍只扩同一Maker私有proof：对modify rejection，若精确身份/路由/数量/全部已记账成交仍吻合、原业务记录为PARTIALLY_FILLED且仍是active源单、Maker已有fill冻结，且原生事件证明保护cancel仍未决，可保留原取消过程而不新增UNKNOWN。部分fill改变native status但不代表cancel应答，沿用现有原生cancel事件序列判据；已有拒绝/终态不得假作pending。这个分支不适用于cancel rejection、UNKNOWN或缺失/不一致事实，不放开工作源单或新准入。所有既有HOLD、inflight query和未完成对冲不变，必须继续等原cancel终态＋精确报告＋对冲完成才由旧逻辑释放。补实际native顺序的正/负例和原普通第四周期回归；不新增恢复状态、延迟队列或按reason字符串判断。
 - 独立review追加真实反例：固定NT允许Canceled→PartiallyFilled的迟到成交转换；Accepted→Filled1→PendingCancel→Canceled→late Filled1无需篡改store，当前状态再次partial，但旧PendingCancel早已结束。短共享扫描必须被真实Canceled/Expired等已完成事实终止，不能仅看当前status或跳过历史终态来“复活”取消。原生真序列须使pending/protective proof为False，仍未决的两种partial排序保持True；同一有界写集修复，全量候选遇此REWORK即停止，不将其已跑部分记作全量通过。
+
+**W5c1 Maker 单文件状态边界（2026-09-06，实施前固定）：** 先完成格式和原子写边界这一可独立审阅的小步，再实现残差分配与 bounded-carry；不把存储转换、净额算法和放宽准入混成一次提交。
+
+- 一个 `<prefix>.maker.json` 文件持有 bid/ask 两个方向 view，复用 `JsonStateStore` 的订单、fill 去重、intent 和 hedge plan 语义。显式 Maker schema v2 在文件头绑定两个 instrument ID；旧单方向 schema v1 保持不变，不让 Taker 或旧 reader 默读新格式。此步保留两方向原残差数值和 strict 门槛，不声称 E04/E09 已完成。
+- 每次实际 source fill 的持久动作同时保存该 fill/intent 与两个方向的已有或新增 freeze；不能在第一个 fill 文件写完、另一个方向尚未冻结时留下中间快照。两方向解除 freeze 也必须是一次原子写，仍须全部终态、对冲完成、零残差和原有唯一 freeze 原因证据。rename 前失败回到整份旧状态；rename 后父目录同步失败保留整份新状态并上抛，本次调用不继续发单、新源保持 HOLD；后续行情对已知义务的推进仍遵守原有对冲前提，不增设永久停 hedge 的新状态。
+- 新路径不存在但任一旧 `.bid.json`/`.ask.json` 存在时明确拒绝启动；保留原文件，不自动清空或迁移。显式暂停/独占下的旧状态转换及同 route signed residual 的唯一分配记录在 W5c 后续实现；新文件存在时以其为准，绝不重新导入保留的旧文件。schema、品种绑定和双方向身份异常均拒绝，不做兜底空状态。
+- 仅接通 Maker、离线 replay 汇总、live builder 与 canary 的实际路径识别和碰撞校验；canary 继续保留对旧文件的存在/输出碰撞检查。不改 EA、adapter、profile、账户、舍入算法、Taker 行为或 W6/W7。不执行真实 canary。
+- 编码 agent 独占 `store.py`、新 `maker_store.py`、新 store 单测；root 维护本文、Maker 及入口/既有测试接线，reviewer 独立验证。先保留旧实现反例，再测双方向快照、fill/解除冻结的写前与 rename 后故障、重载去重/义务、旧文件拒绝及路径碰撞；最终全量/静态/独立审核通过后本地提交，不推送。
+
+后续残差分配包的预审反例已固定：已有同 route BUY +0.5，再 SELL 0.6，应先合并为 -0.1 再按原舍入得0，不能先为 SELL0.6 分配 BUY1 后再抵消。BUY0.6 单独按原算法分配 SELL1、留下 -0.4，说明残差符号不等于方向 view。已分配 PENDING 也不准擦除；route 必须同时匹配文件绑定的两个品种及实际四个 account/client 字段，None 不作为通配符。W5c1 保留旧残差并 HOLD 的负对照不能计入净额验收。
 
 ### W6：重启与停止形成真实闭环
 
@@ -583,7 +593,8 @@ EA 改动额外执行现有 `tools/mt5_source_manifest.sh --lines`、MetaEditor 
   - [x] W5b4：普通两策略自动消费动态容量/杠杆，按需刷新、操作后预算、Maker旧单与双侧维护、账户时效和原未决义务门接线；普通组合及独立复核通过。
   - [x] W5b5：两策略原生连续加仓/反向/穿零矩阵，以及真实MT5 adapter提交前计划一致性、在途/拒绝/未知阻挡；独立复核与全量通过，仅接受该离线分层范围。
   - [x] W5b6：两真实execution adapter的普通连续多票矩阵、原终态/账户刷新闭环与腿间故障；Maker迟到改价拒绝及历史取消判据修复，独立复核与全量通过，仅接受规定的离线范围。
-  - [ ] W5后续：Maker原子残差与strict/bounded-carry、剩余原策略parity；不因连续离线验证完成而关闭。
+  - [x] W5c1：Maker单文件/双view、fill与双freeze同写、原子release及新旧路径识别；独立复核与全量通过，strict残差语义保持。
+  - [ ] W5后续：同route原子残差分配与strict/bounded-carry、旧双文件显式迁移、剩余原策略parity；不因单文件或连续离线验证完成而关闭。
 - [ ] W6 重启/停止。
 - [ ] W7 同节点共账户。
 - [ ] W8 入口/安装/文档/原生运行边界。
@@ -784,3 +795,12 @@ EA 改动额外执行现有 `tools/mt5_source_manifest.sh --lines`、MetaEditor 
 - 独立审核拦下初版历史扫描遗漏：真实Canceled→late PartialFill可使当前native再次partial，必须用历史Canceled等完成事实结束旧取消；不能跳过终态而复活旧PendingCancel。审核者原样原生Engine探针修前RED、修后pending/proof均False；真正新PendingCancel后两者又为True，modify拒绝不改store字节，两笔未完成义务和net_unhedged=2继续阻断新源。Expired仅验证终态结束取消，不外推其迟到partial转换。旧全量候选因此主动终止，未计为通过。
 - 最终冻结上主agent重新全量 **1954 passed / 124既有Pandas框架弃用警告 / 232.05s**，Ruff全仓、Mypy76文件、diff-check通过；6份源码/测试SHA运行前后相同。相对基线新增80项（矩阵24、MT5自检4、Maker52）。未参与编码的reviewer独立五文件 **535 passed / 6 warnings / 206.95s**，含最终24矩阵，不累加此前子集；再次核验六份SHA及上述反例后给出RECOMMEND-ACCEPT，主agent接受本包。1954全量为主agent证据，不冒称reviewer重复全量。
 - 按约定形成本地提交，不推送、部署、改profile/EA、访问真实账户或发单。UNKNOWN实测仍是adapter pending保留、mass返回None、义务未完成，不是空仓或必然断线。仅关闭上述普通离线连续范围；实际PUB/data decoder、网络/EA/DEMO、snapshot→EA竞态未认证，W5父项、原子残差、剩余parity和W6–W9继续未完。下一包按既定4.5先做Maker原子残差与strict/bounded-carry，不以本包绿色宣布上线。
+
+2026-09-06 / W5c1 Maker单文件状态边界完成并接受（基线`c7a8698`）：
+
+- 新增232行Maker owner/view，复用原v1订单、fill/intent和多腿算法，仅从`store.py`抽出原JSON解析与写入。`<prefix>.maker.json`显式schema v2绑定两个品种，bid/ask由同一写入保存；实际fill与双freeze同次提交、双release保持原证据门且同次提交。替换前失败整份回滚，替换后父目录同步失败整份保留并上抛；两既存view与reload一致，已提交义务不因随后写失败而丢失。未实现净额或carry，±0.4/±0.5仍分别保留并strict HOLD。
+- 普通Maker、离线replay、live builder与canary路径识别均接通；CID/new/legacy/transcript碰撞、旧文件存在时拒绝空启动、新文件存在时不重导旧文件都有测试。旧文件不改不删，v1 reader拒绝v2；源/对冲身份和同账户trade/deal不能跨view重复认领。旧双文件的显式转换工具尚未交付，不能将此提交直接用于旧状态在线升级。
+- 主agent保留旧实现6条语义RED：两view不同文件、首fill快照缺双freeze、release分两次写，以及新path的CID/输出碰撞和canary漏检。新store42项覆盖原子故障、重载、身份/格式和strict残差。旧私有corruption负例仍先证明obsolete proof=False；非法身份/删除seen-fill的7例现在拒绝写坏快照，回到last-good并保留HOLD和义务，其它负例继续要求UNKNOWN。全局flight夹具改为先有双工作单再交错fill，不绕过新冻结门。
+- 首次全量 **5 failed / 2002 passed / 124 warnings / 233.61s**，独立审核同样复现5 RED：两处旧fixture的fill key尾段与trade_id字段不一致。只修正两处fixture身份，不改路由拒绝、cleanup、多腿或其它断言；未把该失败全量计为通过。新候选相关六文件296项通过，普通/双adapter连续142项先前通过。
+- 最终主agent重新全量 **2007 passed / 124既有框架弃用警告 / 233.47s**；全仓Ruff、Mypy78文件及diff-check通过，12份源码/测试SHA测前测后相同。独立reviewer在最终两test SHA上原样七文件 **349 passed / 8 warnings / 5.31s**，另实跑post-rename后另一view pre-rename失败、原Maker fill callback post-rename失败并后续只推进一次义务两探针；复核12份SHA后RECOMMEND-ACCEPT。主agent据此接受W5c1，不将独立子集与全量累计。
+- 按约定本地提交，不推送、部署、改EA/profile、访问真实账户或发单。下一包沿4.5实现同route先合并再舍入的原子残差分配及有界carry，并完成显式旧状态迁移；W5父项、E04/E06完整迁移/E09、剩余parity及W6–W9仍未关闭，不据本包宣布上线。

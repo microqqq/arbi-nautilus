@@ -511,8 +511,7 @@ def test_both_adapters_stop_later_legs_and_source_at_between_leg_faults(
             assert _ticket_facts(wire) == {str(before[1]["identifier"]):
                                            D(-sign if mode == "drift" else -2 * sign)}
             # Reloading business files must retain the uncompleted obligation; never clear to flat.
-            for store in _stores(h):
-                reloaded = JsonStateStore(store.path)
+            for store, reloaded in zip(_stores(h), h.reload_stores(), strict=True):
                 assert {item.intent_id: item for item in reloaded.intents()} == {
                     item.intent_id: item for item in store.intents()
                 }

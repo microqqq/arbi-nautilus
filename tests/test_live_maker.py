@@ -325,6 +325,7 @@ def test_builds_exact_offline_maker_composition_without_creating_state(
         assert command.client_order_id == ClientOrderId("O-MAKER-QUERY")
         assert command.venue_order_id == VenueOrderId("V-MAKER-QUERY")
         assert not Path(configs.bitfinex_exec.cid_store_path).exists()
+        assert not Path(f"{configs.strategy.store_path_prefix}.maker.json").exists()
         assert not Path(f"{configs.strategy.store_path_prefix}.bid.json").exists()
         assert not Path(f"{configs.strategy.store_path_prefix}.ask.json").exists()
     finally:
@@ -406,12 +407,13 @@ def test_rejects_wrong_identities_routes_and_synthetic_live_inputs(tmp_path: Pat
         )
 
 
-def test_rejects_colliding_cid_and_maker_state_paths(tmp_path: Path) -> None:
+@pytest.mark.parametrize("suffix", ["maker", "bid", "ask"])
+def test_rejects_colliding_cid_and_maker_state_paths(tmp_path: Path, suffix: str) -> None:
     configs = _configs(tmp_path)
     colliding_prefix = str(tmp_path / "maker-state")
     execution = struct_replace(
         configs.bitfinex_exec,
-        cid_store_path=f"{colliding_prefix}.bid.json",
+        cid_store_path=f"{colliding_prefix}.{suffix}.json",
     )
 
     with pytest.raises(ValueError, match="distinct paths"):

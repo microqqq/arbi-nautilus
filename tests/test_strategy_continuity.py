@@ -61,6 +61,7 @@ from py000_nautilus.config import HedgeAccountRoute
 from py000_nautilus.economics import evaluate_taker
 from py000_nautilus.live_runtime import get_source_terminal_reconciler
 from py000_nautilus.maker_economics import maker_quote
+from py000_nautilus.maker_store import MakerStateStore
 from py000_nautilus.models import (
     BookTop,
     HedgeAccount,
@@ -257,6 +258,15 @@ class _OrdinaryStrategy:
         self.node.trader.start()
         await _pump()
         assert self.strategy.is_running
+
+    def reload_stores(self) -> tuple[JsonStateStore, ...]:
+        if not self.maker:
+            return (JsonStateStore(self.store.path),)
+        config = self.strategy._config
+        return tuple(MakerStateStore(
+            config.store_path_prefix,
+            str(config.source_instrument_id), str(config.hedge_instrument_id),
+        ).stores.values())
 
     def query_source_account(self) -> None:
         self.node.kernel.exec_engine.execute(QueryAccount(
@@ -652,7 +662,7 @@ def test_ordinary_partial_cancel_waits_for_real_hedge_then_continues(
             assert len(harness.store.source_orders()) == 1
             harness.release_hedge.set()
             await _pump()
-            state = JsonStateStore(harness.store.path)
+            state = harness.reload_stores()[0]
             assert len(state.intents()) == 1
             assert state.intents()[0].status is ObligationStatus.COMPLETED
             assert state.net_unhedged_ounces == 0
@@ -716,7 +726,7 @@ def test_ordinary_stop_cancels_query_and_preserves_unfinished_hedge(
         assert root.cancelled()
         assert all(task.done() for task in harness.source._tasks)
         assert all(task.done() for task in harness.hedge._tasks)
-        state = JsonStateStore(harness.store.path)
+        state = harness.reload_stores()[0]
         assert len(state.source_orders()) == len(state.intents()) == 1
         assert state.intents()[0].status is not ObligationStatus.COMPLETED
         assert state.net_unhedged_ounces == 1 and not state.can_submit_source()
@@ -754,7 +764,7 @@ def test_ordinary_paper_silent_terminal_recovers_without_manual_reconciliation(
                 assert not harness.store.can_submit_source()
                 harness.release_hedge.set()
                 await _pump()
-                state = JsonStateStore(harness.store.path)
+                state = harness.reload_stores()[0]
                 assert len(state.intents()) == 1
                 assert state.intents()[0].status is ObligationStatus.COMPLETED
                 assert state.net_unhedged_ounces == 0

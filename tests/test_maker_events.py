@@ -1,6 +1,7 @@
 """Real Nautilus fill identities and deterministic Maker lifecycle edges."""
 
 import asyncio
+import json
 import threading
 from collections.abc import Callable
 from dataclasses import replace
@@ -45,6 +46,7 @@ from test_taker_events import (
     _terminal_report,
 )
 
+from py000_nautilus import store as state_module
 from py000_nautilus.app import (
     _hedge_instrument,
     _maker_strategy_config,
@@ -53,7 +55,9 @@ from py000_nautilus.app import (
     _strategy_config,
 )
 from py000_nautilus.config import CarryConfig, FxConfig, MakerStrategyConfig
+from py000_nautilus.durability import replace_and_sync_parent
 from py000_nautilus.hedge import HedgeCoordinator
+from py000_nautilus.maker_store import MakerStateStore
 from py000_nautilus.models import (
     BookTop,
     BusinessOrderSide,
@@ -77,6 +81,72 @@ from py000_nautilus.strategies.maker import (
 from py000_nautilus.strategies.taker import TakerStrategy
 
 D = Decimal
+
+
+def _reload_maker_store(
+    strategy: MakerStrategy, direction: SourceDirection = SourceDirection.LONG,
+) -> JsonStateStore:
+    config = strategy._config
+    return MakerStateStore(
+        config.store_path_prefix, str(config.source_instrument_id), str(config.hedge_instrument_id),
+    ).stores[direction]
+
+
+def test_maker_directions_share_one_persistent_path(tmp_path: Path) -> None:
+    prefix = tmp_path / "atomic-maker"
+    strategy = MakerStrategy(_maker_strategy_config(prefix))
+    stores = tuple(strategy._stores.values())
+    assert {store.path for store in stores} == {Path(f"{prefix}.maker.json")}
+
+
+def test_maker_first_fill_snapshot_already_freezes_both_directions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    strategy = RecordingMakerStrategy(tmp_path / "atomic-fill")
+    strategy._stores[SourceDirection.LONG].begin_source(
+        "O-MAKER-EVENTS", BusinessOrderSide.BUY, D(1),
+        source_account_id="BITFINEX-001", hedge_account_id="MT5-001",
+    )
+    snapshots: list[dict[str, Any]] = []
+    replace_file = replace_and_sync_parent
+
+    def capture(temporary: Path, destination: Path) -> None:
+        replace_file(temporary, destination)
+        snapshots.append(json.loads(destination.read_text()))
+
+    monkeypatch.setattr(state_module, "replace_and_sync_parent", capture)
+    full, _ = _filled_events(quantity=1)
+    strategy.on_order_filled(full)
+
+    first = snapshots[0]
+    assert "directions" in first, "fill must persist both directions in its first durable act"
+    bid, ask = first["directions"]["bid"], first["directions"]["ask"]
+    assert len(bid["seen_source_fills"]) == len(bid["hedge_intents"]) == 1
+    assert bid["source_orders"]["O-MAKER-EVENTS"]["filled_ounces"] == "1"
+    assert bid["source_freeze_reason"] is not None
+    assert ask["source_freeze_reason"] == bid["source_freeze_reason"]
+
+
+def test_maker_releases_both_freezes_in_one_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    strategy = MakerStrategy(_maker_strategy_config(tmp_path / "atomic-release"))
+    for store in strategy._stores.values():
+        store.freeze_source_submissions("same cycle")
+    strategy._source_hold = True
+    snapshots: list[dict[str, Any]] = []
+    replace_file = replace_and_sync_parent
+
+    def capture(temporary: Path, destination: Path) -> None:
+        replace_file(temporary, destination)
+        snapshots.append(json.loads(destination.read_text()))
+
+    monkeypatch.setattr(state_module, "replace_and_sync_parent", capture)
+    assert strategy._try_release_cycle()
+    assert len(snapshots) == 1, "release must not leave an intermediate half-released file"
+    assert all(value["source_freeze_reason"] is None
+               for value in snapshots[0]["directions"].values())
+    assert not strategy._source_hold
 
 
 class _InstrumentLifecycleMaker(MakerStrategy):
@@ -1243,7 +1313,7 @@ def test_native_modify_rejection_during_partial_fill_cancel_preserves_pending_wo
     "no_hold", "no_freeze", "unknown", "status", "quantity", "filled", "unseen_fill",
     "route", "account", "venue", "instrument",
 ])
-def test_native_partial_modify_rejection_without_exact_protection_keeps_unknown(
+def test_native_partial_modify_rejection_without_exact_protection_keeps_hold(
     tmp_path: Path, fault: str,
 ) -> None:
     strategy = RecordingMakerStrategy(tmp_path / "partial-modify-mismatch")
@@ -1288,12 +1358,25 @@ def test_native_partial_modify_rejection_without_exact_protection_keeps_unknown(
             "venue": {"venue_order_id": VenueOrderId("OTHER")},
             "instrument": {"instrument_id": _hedge_instrument().id},
         }.get(fault, {})
-        engine.kernel.exec_engine.process(
-            (_cancel_rejected if fault == "cancel_event" else _modify_rejected)(order, **overrides),
+        rejection = (_cancel_rejected if fault == "cancel_event" else _modify_rejected)(
+            order, **overrides,
         )
+        if fault == "unseen_fill":
+            # Corrupting the private ledger now also violates the persisted
+            # intent-to-fill identity. The proof must reject it, and the owner
+            # must refuse that snapshot, retaining the known obligation.
+            assert not strategy._source_action_is_obsolete(rejection)
+            with pytest.raises(ValueError, match="Maker intent source fill identity"):
+                engine.kernel.exec_engine.process(rejection)
+            assert store.has_seen_source_fill(store.intents()[0].fill_key)
+            assert _reload_maker_store(strategy).has_unresolved_hedges()
+        else:
+            engine.kernel.exec_engine.process(rejection)
         updated = store.source_order(order.client_order_id.value)
-        assert updated is not None and updated.status == "UNKNOWN"
-        assert store.halt_reason is not None and strategy._source_hold
+        assert updated is not None
+        if fault != "unseen_fill":
+            assert updated.status == "UNKNOWN" and store.halt_reason is not None
+        assert strategy._source_hold
         assert not store.can_submit_source()
         assert len(store.intents()) == 1 and store.net_unhedged_ounces == D(1)
 
@@ -1365,7 +1448,7 @@ def test_native_late_cancel_rejection_preserves_exact_terminal_and_pending_work(
     "record_id", "quantity", "filled", "status", "side", "unknown", "unseen_fill",
 ])
 @pytest.mark.parametrize("action", ["cancel", "modify"])
-def test_native_cancel_rejection_without_exact_terminal_proof_keeps_unknown_hold(
+def test_native_cancel_rejection_without_exact_terminal_proof_keeps_hold(
     tmp_path: Path, fault: str, action: str,
 ) -> None:
     strategy = RecordingMakerStrategy(tmp_path / "cancel-mismatch")
@@ -1403,13 +1486,25 @@ def test_native_cancel_rejection_without_exact_terminal_proof_keeps_unknown_hold
             "trader": {"trader_id": type(order.trader_id)("OTHER-001")},
         }.get(fault, {})
 
-        engine.kernel.exec_engine.process(
-            (_modify_rejected if action == "modify" else _cancel_rejected)(order, **overrides),
+        rejection = (_modify_rejected if action == "modify" else _cancel_rejected)(
+            order, **overrides,
         )
+        invalid_state = fault in {"record_id", "side", "unseen_fill"}
+        if invalid_state:
+            assert not strategy._source_action_is_obsolete(rejection)
+            with pytest.raises(ValueError, match="Maker"):
+                engine.kernel.exec_engine.process(rejection)
+            restored = _reload_maker_store(strategy)
+            assert restored.source_order(order.client_order_id.value) == record
+            assert restored.has_seen_source_fill(store.intents()[0].fill_key)
+            assert restored.has_unresolved_hedges() and not restored.can_submit_source()
+        else:
+            engine.kernel.exec_engine.process(rejection)
 
         observed = store.source_order(order.client_order_id.value)
-        assert observed is not None and observed.status == "UNKNOWN"
-        assert store.halt_reason is not None
+        assert observed is not None
+        if not invalid_state:
+            assert observed.status == "UNKNOWN" and store.halt_reason is not None
         assert strategy._source_hold and not store.can_submit_source()
         assert len(store.intents()) == 1  # Known hedge is never discarded.
 
@@ -1629,7 +1724,7 @@ def test_maker_durable_hedge_client_mismatch_blocks_before_submit(
         hedge_client_id=persisted_client_id,
     )
     intent = store.reserve_source_fill(
-        fill_key="O-CLIENT-ROUTE|V|T",
+        fill_key="O-CLIENT-ROUTE|V|T-CLIENT-ROUTE",
         client_order_id="O-CLIENT-ROUTE",
         trade_id="T-CLIENT-ROUTE",
         source_side=BusinessOrderSide.BUY,
@@ -1711,8 +1806,15 @@ def test_maker_two_direction_obligations_share_one_global_mt5_flight(
             hedge_account_id="MT5-001",
             hedge_client_id="HEDGE-CLIENT",
         )
+    # Both quotes are working before either actual fill freezes the whole Maker.
+    for direction, side in (
+        (SourceDirection.LONG, BusinessOrderSide.BUY),
+        (SourceDirection.SHORT, BusinessOrderSide.SELL),
+    ):
+        store = strategy._stores[direction]
+        source_id = f"O-{direction.value}"
         assert store.reserve_source_fill(
-            fill_key=f"{source_id}|V|T",
+            fill_key=f"{source_id}|V|T-{direction.value}",
             client_order_id=source_id,
             trade_id=f"T-{direction.value}",
             source_side=side,
@@ -2234,14 +2336,13 @@ def test_live_maker_stale_timer_mutates_real_state_only_on_running_loop(
             original(event)
 
         monkeypatch.setattr(strategy, "_on_stale_timer", handle)
-        for store in strategy._stores.values():
-            persist = store._persist
+        persist = strategy._state_store._persist
 
-            def record_persist(persist: Any = persist) -> None:
-                persist_threads.append(threading.get_ident())
-                persist()
+        def record_persist() -> None:
+            persist_threads.append(threading.get_ident())
+            persist()
 
-            monkeypatch.setattr(store, "_persist", record_persist)
+        monkeypatch.setattr(strategy._state_store, "_persist", record_persist)
         try:
             strategy._schedule_stale_timer(SourceDirection.LONG, orders[0].client_order_id.value)
             # Only the real timer may wake this idle loop; no polling or market/event pump.
@@ -2249,7 +2350,7 @@ def test_live_maker_stale_timer_mutates_real_state_only_on_running_loop(
             # LiveClock may wake before the deadline and legitimately rearm.
             # Every callback, including an early one, must run on this loop.
             assert handler_threads and all(thread == loop_thread for thread in handler_threads)
-            assert persist_threads == [loop_thread, loop_thread]
+            assert persist_threads == [loop_thread]
             assert [thread for thread, _ in cancellations] == [loop_thread, loop_thread]
             assert [cmd.client_order_id for _, cmd in cancellations] == [
                 order.client_order_id for order in orders
@@ -3081,13 +3182,11 @@ def test_stale_market_gate_cancels_both_sides_without_quote_maintenance(
     assert harness.canceled == [SourceDirection.LONG, SourceDirection.SHORT]
 
 
-@pytest.mark.parametrize("failing_direction", [SourceDirection.LONG, SourceDirection.SHORT])
-def test_fill_is_durable_before_either_freeze_write_failure(
+def test_fill_and_both_freezes_are_durable_before_later_freeze_write_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    failing_direction: SourceDirection,
 ) -> None:
-    state_prefix = tmp_path / f"freeze-fault-{failing_direction.value}.state"
+    state_prefix = tmp_path / "freeze-fault.state"
     strategy = RecordingMakerStrategy(state_prefix)
     store = strategy._stores[SourceDirection.LONG]
     store.begin_source(
@@ -3098,12 +3197,15 @@ def test_fill_is_durable_before_either_freeze_write_failure(
         hedge_account_id="MT5-001",
     )
 
+    failures: list[str] = []
+
     def fail_freeze(reason: str) -> None:
+        failures.append(reason)
         raise OSError("injected freeze write failure")
 
     monkeypatch.setattr(
-        strategy._stores[failing_direction],
-        "freeze_source_submissions",
+        strategy._state_store,
+        "freeze_sources",
         fail_freeze,
     )
     full, _ = _filled_events(quantity=1)
@@ -3111,9 +3213,12 @@ def test_fill_is_durable_before_either_freeze_write_failure(
     strategy.on_order_filled(full)
     strategy.on_order_filled(full)  # duplicate identity remains idempotent
 
-    persisted = JsonStateStore(store.path)
+    persisted = _reload_maker_store(strategy)
+    assert len(failures) == 1
     assert len(persisted.intents()) == 1
     assert persisted.net_unhedged_ounces == D(1)
+    assert all(_reload_maker_store(strategy, direction).source_freeze_reason is not None
+               for direction in (SourceDirection.LONG, SourceDirection.SHORT))
     assert len(strategy.recorded) == 1
     assert strategy._global_obligation_block()
 
@@ -3150,13 +3255,13 @@ def test_fill_wal_failure_rolls_back_memory_and_replay_commits_once(
     assert strategy.recorded == []
     assert strategy.canceled == [SourceDirection.LONG, SourceDirection.SHORT]
     assert store.intents() == ()
-    assert JsonStateStore(store.path).intents() == ()
+    assert _reload_maker_store(strategy).intents() == ()
 
     monkeypatch.setattr(store, "_persist", persist)
     strategy.on_order_filled(full)
     strategy.on_order_filled(full)
 
-    assert len(JsonStateStore(store.path).intents()) == 1
+    assert len(_reload_maker_store(strategy).intents()) == 1
     assert len(strategy.recorded) == 1
     assert strategy.canceled == [
         SourceDirection.LONG,

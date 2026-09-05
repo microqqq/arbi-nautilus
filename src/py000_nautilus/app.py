@@ -38,6 +38,7 @@ from py000_nautilus.config import (
     TakerEconomicsConfig,
     TakerStrategyConfig,
 )
+from py000_nautilus.maker_store import MakerStateStore
 from py000_nautilus.models import ObligationStatus
 from py000_nautilus.store import JsonStateStore
 from py000_nautilus.strategies.maker import MakerStrategy
@@ -251,10 +252,7 @@ def run_maker_simulated_example(state_path_prefix: Path) -> MakerSimulationResul
     bid_order = next(order for order in source_orders if order.side.name == "BUY")
     ask_order = next(order for order in source_orders if order.side.name == "SELL")
     hedge_order = hedge_orders[0]
-    stores = (
-        JsonStateStore(f"{state_path_prefix}.bid.json"),
-        JsonStateStore(f"{state_path_prefix}.ask.json"),
-    )
+    stores = MakerStateStore(state_path_prefix, str(SOURCE_ID), str(HEDGE_ID)).stores.values()
     intents = tuple(intent for store in stores for intent in store.intents())
     result = MakerSimulationResult(
         orders=len(orders),

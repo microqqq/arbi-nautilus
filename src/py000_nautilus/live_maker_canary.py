@@ -47,6 +47,7 @@ from py000_nautilus.hedge import HedgePlanningError, plan_hedge_delta
 from py000_nautilus.live_maker import BITFINEX_CLIENT_ID, build_live_maker_node
 from py000_nautilus.live_runtime import get_source_terminal_reconciler
 from py000_nautilus.live_taker_entry import _dispose_node, load_bitfinex_test_credentials
+from py000_nautilus.maker_store import maker_legacy_paths, maker_state_path
 from py000_nautilus.models import (
     BookTop,
     BusinessOrderSide,
@@ -659,18 +660,18 @@ def validate_maker_canary_profile(profile: LiveMakerCanaryProfile) -> None:
     ):
         raise ValueError("Maker canary connection timeout must be in [1, 60]")
     paths = _state_paths(profile)
-    if len({path.resolve(strict=False) for path in paths}) != 3:
+    if len({path.resolve(strict=False) for path in paths}) != len(paths):
         raise ValueError("Maker canary state paths must be distinct")
 
 
-def _state_paths(profile: LiveMakerCanaryProfile) -> tuple[Path, Path, Path]:
+def _state_paths(profile: LiveMakerCanaryProfile) -> tuple[Path, ...]:
     prefix = profile.strategy_config.store_path_prefix
     if not prefix or prefix != prefix.strip():
         raise ValueError("Maker canary state prefix must be non-empty and trimmed")
     return (
         Path(profile.bitfinex_exec_config.cid_store_path),
-        Path(f"{prefix}.bid.json"),
-        Path(f"{prefix}.ask.json"),
+        maker_state_path(prefix),
+        *maker_legacy_paths(prefix),
     )
 
 

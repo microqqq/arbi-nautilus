@@ -30,6 +30,7 @@ from py000_nautilus.bitfinex_v1_execution import (
 )
 from py000_nautilus.config import MakerStrategyConfig
 from py000_nautilus.live_runtime import SourceTerminalReconciler, bind_live_account_reader
+from py000_nautilus.maker_store import maker_legacy_paths, maker_state_path
 from py000_nautilus.mt5_v1_data import (
     Mt5V1DataClient,
     Mt5V1DataClientConfig,
@@ -285,10 +286,10 @@ def _validate_composition(
     state_prefix = _required_path(strategy.store_path_prefix, "Maker state store prefix")
     paths = {
         _required_path(bitfinex_exec.cid_store_path, "Bitfinex CID store"),
-        _required_path(f"{state_prefix}.bid.json", "Maker bid state store"),
-        _required_path(f"{state_prefix}.ask.json", "Maker ask state store"),
+        maker_state_path(state_prefix).resolve(strict=False),
+        *(path.resolve(strict=False) for path in maker_legacy_paths(state_prefix)),
     }
-    if len(paths) != 3:
+    if len(paths) != 4:
         raise ValueError("Bitfinex CID and Maker state stores must use distinct paths")
 
 

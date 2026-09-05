@@ -50,6 +50,7 @@ from py000_nautilus.hedge import (
     plan_hedge_delta,
 )
 from py000_nautilus.maker_economics import maker_quote, passive_maker_price
+from py000_nautilus.maker_store import MakerStateStore
 from py000_nautilus.margin import LiveAccountReader
 from py000_nautilus.models import (
     BookTop,
@@ -61,7 +62,6 @@ from py000_nautilus.models import (
     SourceAccount,
     SourceDirection,
 )
-from py000_nautilus.store import JsonStateStore
 from py000_nautilus.strategies._mt5_costs import (
     mt5_instrument_is_fresh,
     mt5_instrument_structure,
@@ -110,10 +110,12 @@ class MakerStrategy(Strategy):
         self._account_topics: tuple[str, ...] = ()
         self._account_deadline_ns: int | None = None
         self._account_budget_waiting = False
-        self._stores = {
-            direction: JsonStateStore(f"{config.store_path_prefix}.{direction.value}.json")
-            for direction in _DIRECTIONS
-        }
+        self._state_store = MakerStateStore(
+            config.store_path_prefix,
+            str(config.source_instrument_id),
+            str(config.hedge_instrument_id),
+        )
+        self._stores = self._state_store.stores
         self._hedges = {
             direction: HedgeCoordinator(config.source_instrument_id, self._stores[direction])
             for direction in _DIRECTIONS
@@ -497,8 +499,8 @@ class MakerStrategy(Strategy):
                 f"Maker fill {event.client_order_id.value}/{event.trade_id.value} "
                 "requires authoritative two-sided reconciliation"
             )
-            # Current-process HOLD precedes I/O. The first durable act is the
-            # authoritative fill/intent reservation in the direction store.
+            # Current-process HOLD precedes I/O. The first durable act records
+            # the actual fill/intent and both directions' freezes together.
             self._source_hold = True
             try:
                 intent = self._hedges[direction].on_source_filled(event)
@@ -1282,18 +1284,8 @@ class MakerStrategy(Strategy):
         )
 
     def _try_release_cycle(self) -> bool:
-        frozen = {
-            store.source_freeze_reason
-            for store in self._stores.values()
-            if store.source_freeze_reason is not None
-        }
-        if not frozen or len(frozen) != 1:
+        if not self._state_store.clear_source_freezes():
             return False
-        if not all(store.cycle_evidence_complete() for store in self._stores.values()):
-            return False
-        for store in self._stores.values():
-            if store.source_freeze_reason is not None:
-                store.clear_source_freeze()
         self._source_hold = False
         return True
 
@@ -1303,14 +1295,13 @@ class MakerStrategy(Strategy):
         self._cancel_all_best_effort(reason)
 
     def _freeze_all_best_effort(self, reason: str) -> None:
-        for store in self._stores.values():
-            try:
-                store.freeze_source_submissions(reason)
-            except Exception as exc:
-                self.log.error(
-                    f"Maker freeze persistence failed with {type(exc).__name__}; "
-                    "current-process source HOLD remains active"
-                )
+        try:
+            self._state_store.freeze_sources(reason)
+        except Exception as exc:
+            self.log.error(
+                f"Maker freeze persistence failed with {type(exc).__name__}; "
+                "current-process source HOLD remains active"
+            )
 
     def _cancel_all_best_effort(self, reason: str) -> None:
         for direction in _DIRECTIONS:
