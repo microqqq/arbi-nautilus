@@ -35,7 +35,12 @@ from py000_nautilus.economics import (
     normalize_mt5_points_swap,
     round_hedge_ounces,
 )
-from py000_nautilus.hedge import HedgeCoordinator, HedgePlanningError, plan_hedge_delta
+from py000_nautilus.hedge import (
+    HedgeCoordinator,
+    HedgePlanningError,
+    hedge_order_params,
+    plan_hedge_delta,
+)
 from py000_nautilus.margin import LiveAccountReader
 from py000_nautilus.models import (
     BookTop,
@@ -783,6 +788,7 @@ class TakerStrategy(Strategy):
                 order,
                 position_id=position_id,
                 client_id=self._config.hedge_client_id,
+                params=hedge_order_params(leg),
             )
         except Exception as exc:
             self.state_store.update_hedge_status(

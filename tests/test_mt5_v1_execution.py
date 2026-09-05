@@ -505,7 +505,10 @@ class _Harness:
             price=self.instrument.make_price(Decimal("2400")),
         )
 
-    async def submit(self, order: Order, *, position_id: PositionId | None = None) -> None:
+    async def submit(
+        self, order: Order, *, position_id: PositionId | None = None,
+        params: dict[str, object] | None = None,
+    ) -> None:
         await self.client._submit_order(
             SubmitOrder(
                 trader_id=order.trader_id,
@@ -514,6 +517,7 @@ class _Harness:
                 command_id=UUID4(),
                 ts_init=self.clock.timestamp_ns(),
                 position_id=position_id,
+                params=params,
             )
         )
 
@@ -1438,6 +1442,133 @@ def test_exact_close_requires_reduce_only_and_position_id_together(
 
 
 @pytest.mark.parametrize("target_volume_lots", ["0.01", "0.02"])
+@pytest.mark.parametrize("expected_ounces", [Decimal(1), Decimal(2)])
+def test_planned_close_requires_exact_fresh_target_quantity(
+    target_volume_lots: str, expected_ounces: Decimal,
+) -> None:
+    async def scenario() -> None:
+        harness = _Harness(asyncio.get_running_loop(), snapshot_refresh_interval_ms=60_000)
+        cast(list[JsonObject], harness.snapshot["positions"])[0]["volume_lots"] = "0.01"
+        await harness.connect()
+        fresh = deepcopy(harness.snapshot)
+        cast(list[JsonObject], fresh["positions"])[0]["volume_lots"] = target_volume_lots
+        harness.fake.snapshot_results.append(fresh)
+        order = harness.market("1", order_side=OrderSide.SELL, reduce_only=True)
+        harness.fake.outcome = _outcome(
+            harness.identity, order, "order_filled", quantity_lots="0.01",
+            position_ticket="700000001", position_identifier="800000001",
+            venue_position_id="800000001",
+        )
+        await harness.submit(order, position_id=PositionId("800000001"), params={
+            "py000_hedge_plan": True, "py000_expected_position_ounces": expected_ounces,
+        })
+        assert len(harness.fake.snapshot_calls) == 2
+        if expected_ounces == Decimal(target_volume_lots) * 100:
+            assert len(harness.fake.close_calls) == 1
+            assert isinstance(harness.events[-1], OrderFilled)
+        else:
+            assert [type(event).__name__ for event in harness.events] == ["OrderDenied"]
+            assert "planned target quantity" in cast(OrderDenied, harness.events[0]).reason
+            assert harness.fake.close_calls == []
+            assert str(order.client_order_id) not in harness.client._seen_request_ids
+        assert harness.fake.submit_calls == []
+        assert harness.client.pending_client_order_ids == ()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("fresh_side", [None, "buy", "sell"])
+def test_planned_open_forces_snapshot_and_refuses_new_opposing_ticket(
+    fresh_side: str | None,
+) -> None:
+    async def scenario() -> None:
+        harness = _Harness(asyncio.get_running_loop(), snapshot_refresh_interval_ms=60_000)
+        fresh = deepcopy(harness.snapshot)
+        target = cast(list[JsonObject], fresh["positions"])[0]
+        target["volume_lots"] = "0.01"
+        if fresh_side is None:
+            fresh["positions"] = []
+        else:
+            target["side"] = fresh_side
+        harness.snapshot["positions"] = []
+        await harness.connect()
+        harness.fake.snapshot_results.append(fresh)
+        order = harness.market("1", order_side=OrderSide.SELL)
+        harness.fake.outcome = _outcome(
+            harness.identity, order, "order_filled", quantity_lots="0.01",
+        )
+        await harness.submit(order, params={"py000_hedge_plan": True})
+        assert len(harness.fake.snapshot_calls) == 2
+        if fresh_side == "buy":
+            assert [type(event).__name__ for event in harness.events] == ["OrderDenied"]
+            assert "opposing" in cast(OrderDenied, harness.events[0]).reason
+            assert harness.fake.submit_calls == []
+            assert str(order.client_order_id) not in harness.client._seen_request_ids
+        else:
+            assert len(harness.fake.submit_calls) == 1
+            assert isinstance(harness.events[-1], OrderFilled)
+        assert harness.fake.close_calls == []
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("params,is_close", [
+    ({"py000_hedge_plan": False}, False),
+    ({"py000_hedge_plan": 1}, False),
+    ({"py000_hedge_plan": "true"}, False),
+    ({"py000_hedge_plan": None}, False),
+    ({"py000_expected_position_ounces": Decimal(1)}, True),
+    ({"py000_hedge_plan": True}, True),
+    ({"py000_hedge_plan": True, "py000_expected_position_ounces": None}, False),
+    *[
+        ({"py000_hedge_plan": True, "py000_expected_position_ounces": value}, True)
+        for value in (None, True, 1, "1", Decimal(0), Decimal(-1), Decimal("NaN"),
+                      Decimal("Infinity"), Decimal("-Infinity"))
+    ],
+])
+def test_invalid_planned_hedge_params_deny_without_mutation(
+    params: dict[str, object], is_close: bool,
+) -> None:
+    async def scenario() -> None:
+        harness = _Harness(asyncio.get_running_loop())
+        await harness.connect()
+        order = harness.market("1", order_side=OrderSide.SELL, reduce_only=is_close)
+        harness.fake.outcome = _outcome(
+            harness.identity, order, "order_rejected", quantity_lots="0.01",
+            position_ticket="700000001" if is_close else None,
+            position_identifier="800000001" if is_close else None,
+        )
+        await harness.submit(
+            order, position_id=PositionId("800000001") if is_close else None, params=params,
+        )
+        assert [type(event).__name__ for event in harness.events] == ["OrderDenied"]
+        assert harness.fake.submit_calls == [] and harness.fake.close_calls == []
+        assert harness.client.pending_client_order_ids == ()
+        assert str(order.client_order_id) not in harness.client._seen_request_ids
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("unavailable", [False, True])
+def test_planned_open_cannot_fall_back_when_forced_snapshot_fails(unavailable: bool) -> None:
+    async def scenario() -> None:
+        harness = _Harness(asyncio.get_running_loop(), snapshot_refresh_interval_ms=60_000)
+        harness.snapshot["positions"] = []
+        await harness.connect()
+        harness.fake.snapshot_results.append(
+            Mt5V1RemoteError("SNAPSHOT_UNAVAILABLE", "incomplete") if unavailable
+            else Mt5V1RequestTimeout("forced snapshot timeout"),
+        )
+        order = harness.market("1")
+        harness.fake.outcome = _outcome(
+            harness.identity, order, "order_filled", quantity_lots="0.01",
+        )
+        await harness.submit(order, params={"py000_hedge_plan": True})
+        assert [type(event).__name__ for event in harness.events] == ["OrderDenied"]
+        assert harness.fake.submit_calls == []
+        assert harness.client.pending_client_order_ids == ()
+        assert str(order.client_order_id) not in harness.client._seen_request_ids
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("target_volume_lots", ["0.01", "0.02"])
 def test_exact_close_or_reduce_forces_snapshot_and_binds_identifier_to_ticket(
     target_volume_lots: str,
 ) -> None:
@@ -1501,9 +1632,11 @@ def test_exact_close_or_reduce_forces_snapshot_and_binds_identifier_to_ticket(
         ("bad_remainder", "invalid MT5 lot remainder"),
     ],
 )
+@pytest.mark.parametrize("planned", [False, True])
 def test_exact_close_rejects_invalid_live_target_without_transport_send(
     invalid_target: str,
     expected_reason: str,
+    planned: bool,
 ) -> None:
     async def scenario() -> None:
         identity = _identity()
@@ -1535,7 +1668,10 @@ def test_exact_close_rejects_invalid_live_target_without_transport_send(
             reduce_only=True,
         )
 
-        await harness.submit(order, position_id=position_id)
+        await harness.submit(order, position_id=position_id, params={
+            "py000_hedge_plan": True,
+            "py000_expected_position_ounces": Decimal(cast(str, target["volume_lots"])) * 100,
+        } if planned else None)
 
         assert [type(event).__name__ for event in harness.events] == ["OrderDenied"]
         assert expected_reason in cast(OrderDenied, harness.events[0]).reason

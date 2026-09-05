@@ -21,6 +21,14 @@ class HedgePlanningError(RuntimeError):
     """Current MT5 ticket state cannot safely execute a planned hedge leg."""
 
 
+def hedge_order_params(leg: HedgeLeg) -> dict[str, object]:
+    """Carry the bound leg's prerequisite through native SubmitOrder routing."""
+    params: dict[str, object] = {"py000_hedge_plan": True}
+    if leg.is_close:
+        params["py000_expected_position_ounces"] = leg.expected_position_quantity_ounces
+    return params
+
+
 def plan_hedge_delta(
     positions: Sequence[Position],
     side: BusinessOrderSide,

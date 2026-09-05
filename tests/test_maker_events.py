@@ -1577,7 +1577,9 @@ def test_maker_uses_shared_multi_ticket_planner_for_exact_close_legs(
         _quote_is_fresh=lambda _tick: True,
         _required_hedge_instrument=lambda: _hedge_instrument(),
         _hedge_positions=lambda _account_id: positions,
-        submit_order=lambda _order, *, position_id, client_id: submissions.append(position_id),
+        submit_order=lambda _order, *, position_id, client_id, params: submissions.append(
+            position_id,
+        ),
     )
 
     MakerStrategy._submit_hedge(
@@ -1687,7 +1689,9 @@ def test_maker_fresh_hedge_quote_retries_pending_leg_exactly_once(
         _quote_carry=CarryConfig(),
         _required_hedge_instrument=lambda: _hedge_instrument(),
         _hedge_positions=lambda _account_id: positions,
-        submit_order=lambda _order, *, position_id, client_id: submissions.append(position_id),
+        submit_order=lambda _order, *, position_id, client_id, params: submissions.append(
+            position_id,
+        ),
         _try_release_cycle=lambda: False,
         _inputs_are_fresh=lambda _source, _hedge, _now_ns: True,
         _global_obligation_block=lambda: True,

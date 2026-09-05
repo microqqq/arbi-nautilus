@@ -1,7 +1,9 @@
 """Ordinary live builders/strategies/Engine; only venue IO is synthetic.
 
 Bitfinex uses its actual execution adapter with fake authenticated WS/REST.
-MT5 submission/report IO is injected here; its wire/EA contract is tested separately.
+Most MT5 lifecycle cases inject submission/report IO. The planned-leg matrix
+delegates submissions to the actual MT5 adapter with the existing fake transport;
+its unrelated mass reports remain synthetic, and no test runs the EA.
 Native reported-account construction is explicit to isolate prior in-process backtests.
 No canary strategy, direct state confirmation, or replacement strategy logic is used.
 """
@@ -30,9 +32,11 @@ from nautilus_trader.model.enums import (
     OrderSide,
     OrderStatus,
     PositionSide,
+    TimeInForce,
 )
 from nautilus_trader.model.events import AccountState, OrderFilled
 from nautilus_trader.model.identifiers import (
+    AccountId,
     ClientId,
     ClientOrderId,
     PositionId,
@@ -47,6 +51,7 @@ from test_live_maker import _build as _build_maker
 from test_live_maker import _configs as _maker_configs
 from test_live_taker import _build, _configs
 from test_mt5_v1_execution import _capacity_harness, _identity, _outcome, _snapshot
+from test_mt5_v1_execution import _FakeTransport as _Mt5FakeTransport
 
 import py000_nautilus.live_runtime as runtime_module
 import py000_nautilus.margin as margin_module
@@ -65,6 +70,7 @@ from py000_nautilus.models import (
     SourceDirection,
 )
 from py000_nautilus.mt5_v1_data import instrument_from_snapshot
+from py000_nautilus.mt5_v1_execution import Mt5V1ExecutionClient
 from py000_nautilus.store import JsonStateStore
 
 D = Decimal
@@ -85,7 +91,7 @@ async def _wait_until(ready: Callable[[], bool]) -> None:
 class _OrdinaryStrategy:
     def __init__(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, maker: bool, paper: bool = False,
-        source_quantity: int = 2, two_sided: bool = False,
+        source_quantity: int = 2, two_sided: bool = False, native_mt5_transport: bool = False,
     ) -> None:
         self.maker = maker
         self.source_quantity = D(source_quantity)
@@ -128,6 +134,24 @@ class _OrdinaryStrategy:
         configs = replace(configs, mt5_exec=replace_config(
             configs.mt5_exec, expected_stream_id=_identity().stream_id,
         ))
+        if native_mt5_transport:
+            # Unlike the legacy injected MT5 IO, the real adapter authenticates
+            # hello. Bind this offline profile to the valid synthetic identity.
+            identity = _identity()
+            expected = dict(
+                expected_account_id=identity.account_id, expected_ea_build_id=identity.ea_build_id,
+                expected_source_sha256=identity.declared_source_sha256,
+            )
+            configs = replace(
+                configs, mt5_data=replace_config(configs.mt5_data, **expected),
+                mt5_exec=replace_config(configs.mt5_exec, **expected),
+                strategy=replace_config(configs.strategy, **({
+                    "hedge_accounts": (replace_config(
+                        configs.strategy.hedge_accounts[0],
+                        account_id=AccountId(f"MT5-{identity.account_id}"),
+                    ),),
+                } if maker else {"hedge_account_id": AccountId(f"MT5-{identity.account_id}")})),
+            )
         build = _build_maker if maker else _build
         self.node, self.strategy = build(configs, loop=asyncio.get_running_loop())
         self.store = (
@@ -410,17 +434,177 @@ class _OrdinaryStrategy:
 @asynccontextmanager
 async def _ordinary_strategy(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, maker: bool, paper: bool = False,
-    source_quantity: int = 2, two_sided: bool = False,
+    source_quantity: int = 2, two_sided: bool = False, native_mt5_transport: bool = False,
 ) -> AsyncIterator[_OrdinaryStrategy]:
     harness = _OrdinaryStrategy(
         tmp_path, monkeypatch, maker=maker, paper=paper, source_quantity=source_quantity,
         two_sided=two_sided,
+        native_mt5_transport=native_mt5_transport,
     )
     try:
         await harness.start()
         yield harness
     finally:
         await harness.close()
+
+
+@pytest.mark.parametrize("maker", [False, True], ids=["taker", "maker"])
+@pytest.mark.parametrize("close_first", [False, True], ids=["open", "close"])
+@pytest.mark.parametrize("mode", ["exact", "drift", "pending", "rejected", "unknown"])
+def test_ordinary_hedge_plan_reaches_real_mt5_adapter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, maker: bool,
+    close_first: bool, mode: str,
+) -> None:
+    """Real ordinary strategies/Engine/adapters; both venues' transport IO is synthetic.
+
+    The optional unmarked native order is pre-existing inventory setup, not a
+    strategy cycle. All subsequent hedge legs follow the real source fill.
+    """
+    async def run() -> None:
+        drift = mode == "drift"
+        async with _ordinary_strategy(
+            tmp_path, monkeypatch, maker=maker, native_mt5_transport=True,
+        ) as harness:
+            config = harness.hedge._mt5_config
+            identity = _identity()
+            snapshot = _snapshot(identity)
+            cast(dict[str, Any], snapshot["execution_limits"])["max_order_lots"] = str(
+                config.expected_max_order_lots,
+            )
+            template = deepcopy(cast(list[dict[str, Any]], snapshot["positions"])[0])
+            snapshot["positions"] = []
+            cast(dict[str, Any], snapshot["time"])["observed_utc_ms"] = str(
+                harness.node.kernel.clock.timestamp_ns() // 1_000_000,
+            )
+            wire = _Mt5FakeTransport(identity, snapshot)
+            monkeypatch.setattr(harness.hedge, "_transport", wire)
+            await harness.hedge._connect()
+            captured: list[SubmitOrder] = []
+            entered, release = asyncio.Event(), asyncio.Event()
+            if mode == "pending":
+                name = "close_position" if close_first else "submit_market_delta"
+                original_mutation = getattr(wire, name)
+
+                async def pending_mutation(*args: Any, **kwargs: Any) -> Any:
+                    entered.set()
+                    await release.wait()
+                    return await original_mutation(*args, **kwargs)
+
+                monkeypatch.setattr(wire, name, pending_mutation)
+
+            async def submit(command: SubmitOrder) -> None:
+                # Configure only the venue response; delegate every command to
+                # the actual adapter, including its fresh snapshot and journal.
+                assert all(previous.order.status == OrderStatus.FILLED for previous in captured)
+                captured.append(command)
+                order = command.order
+                seq = int(harness.hedge._cursor) + 2
+                target = command.position_id.value if command.position_id is not None else None
+                response = f"order_{mode}" if mode in {"rejected", "unknown"} and order.tags else (
+                    "order_filled"
+                )
+                wire.outcome = _outcome(
+                    identity, order, response, sequence=seq,
+                    quantity_lots=str(order.quantity.as_decimal() / 100),
+                    position_ticket="700000001" if target else None,
+                    position_identifier=target,
+                    venue_position_id=target or ("800000001" if seq == 3 else str(800000000 + seq)),
+                )
+                payload = cast(dict[str, Any], wire.outcome["payload"])
+                if response == "order_filled":
+                    payload["venue_deal_id"] = str(810000000 + seq)
+                    payload["venue_order_id"] = str(710000000 + seq)
+                wire.current_snapshot = deepcopy(wire.current_snapshot)
+                cast(dict[str, Any], wire.current_snapshot["time"])["observed_utc_ms"] = str(
+                    harness.node.kernel.clock.timestamp_ns() // 1_000_000,
+                )
+                await Mt5V1ExecutionClient._submit_order(harness.hedge, command)
+                if (target is not None and wire.close_calls
+                        and wire.close_calls[-1][0] == order.client_order_id.value
+                        and response == "order_filled"):
+                    # A confirmed full close removes the one fixture ticket.
+                    # The queued residual still must read the next full snapshot.
+                    wire.current_snapshot = deepcopy(wire.current_snapshot)
+                    wire.current_snapshot["positions"] = []
+
+            monkeypatch.setattr(harness.hedge, "_submit_order", submit)
+            try:
+                if close_first:
+                    initial = harness.strategy.order_factory.market(
+                        instrument_id=harness.hedge_instrument.id, order_side=OrderSide.BUY,
+                        quantity=harness.hedge_instrument.make_qty(D(1)),
+                        time_in_force=TimeInForce.FOK,
+                    )
+                    harness.strategy.submit_order(initial, client_id=harness.hedge.id)
+                    await _wait_until(lambda: initial.status == OrderStatus.FILLED)
+                    assert len(harness.node.cache.positions_open(
+                        instrument_id=harness.hedge_instrument.id,
+                    )) == 1
+                    assert not harness.store.intents()
+                    captured.clear()
+                    wire.submit_calls.clear()
+                await _publish_capacity_samples(
+                    harness, source_quantity=D(0), hedge_quantity=D(1) if close_first else D(0),
+                    available=D(10000), equity=D(10000),
+                )
+                source_order, cid = await harness.seed_source(publish_accounts=False)
+                fresh = deepcopy(snapshot)
+                fresh["positions"] = [dict(
+                    template, side="buy", volume_lots="0.02" if drift and close_first else "0.01",
+                )] if close_first or drift else []
+                wire.current_snapshot = fresh
+                await harness.finish_source(source_order, cid, filled=2)
+                if mode == "pending":
+                    await asyncio.wait_for(entered.wait(), 1)
+                    await _pump()
+                    assert captured[0].order.status == OrderStatus.SUBMITTED
+                    assert harness.hedge.pending_client_order_ids == (
+                        captured[0].order.client_order_id.value,
+                    )
+                    assert harness.store.intents()[0].status is ObligationStatus.SUBMITTED
+                    assert harness.store.net_unhedged_ounces == D(2)
+                    await harness.opportunity()
+                    assert len(captured) == len(harness.store.source_orders()) == 1
+                    assert wire.submit_calls == [] and wire.close_calls == []
+                    release.set()
+                if mode == "unknown":
+                    await _wait_until(lambda: bool(captured) and bool(harness.hedge._pending)
+                                      and next(iter(harness.hedge._pending.values())).unknown)
+                else:
+                    await _wait_until(lambda: bool(captured) and captured[0].order.is_closed)
+                await _pump()
+                first = captured[0]
+                assert first.params == ({
+                    "py000_hedge_plan": True, "py000_expected_position_ounces": D(1),
+                } if close_first else {"py000_hedge_plan": True})
+                assert first.order.is_reduce_only is close_first
+                assert first.position_id == (PositionId("800000001") if close_first else None)
+                assert len(harness.store.intents()) == 1
+                intent = harness.store.intents()[0]
+                if mode in {"drift", "rejected", "unknown"}:
+                    assert first.order.status == {
+                        "drift": OrderStatus.DENIED, "rejected": OrderStatus.REJECTED,
+                        "unknown": OrderStatus.SUBMITTED,
+                    }[mode]
+                    assert intent.status is (ObligationStatus.SUBMITTED if mode == "unknown"
+                                             else ObligationStatus.REJECTED)
+                    assert harness.store.net_unhedged_ounces == D(2)
+                    assert not harness.store.can_submit_source()
+                    assert len(captured) == 1
+                    assert len(wire.submit_calls) + len(wire.close_calls) == int(not drift)
+                    await harness.opportunity()
+                    assert len(captured) == len(harness.store.source_orders()) == 1
+                else:
+                    await _wait_until(lambda: harness.store.intents()[0].status
+                                      is ObligationStatus.COMPLETED)
+                    assert len(captured) == (2 if close_first else 1)
+                    assert len(wire.close_calls) == int(close_first)
+                    assert len(wire.submit_calls) == 1
+                    assert captured[-1].params == {"py000_hedge_plan": True}
+            finally:
+                release.set()
+                await harness.hedge._disconnect()
+    asyncio.run(run())
 
 
 @pytest.mark.parametrize("maker", [False, True], ids=["taker", "maker"])

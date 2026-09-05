@@ -475,7 +475,12 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
                 self._deny(order, "MT5 execution journal already contains this order ID")
                 return
             try:
-                await self._refresh_snapshot_if_due(force=is_close)
+                planned, expected_position_ounces = self._hedge_plan_precondition(command)
+            except Mt5V1ExecutionError as exc:
+                self._deny(order, str(exc))
+                return
+            try:
+                await self._refresh_snapshot_if_due(force=is_close or planned)
             except asyncio.CancelledError:
                 raise
             except Mt5V1RequestTimeout as exc:
@@ -492,7 +497,10 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
                 self._deny(order, "MT5 execution is blocked by an unresolved UNKNOWN submission")
                 return
             try:
-                pending = self._prepare(order, position_id=command.position_id)
+                pending = self._prepare(
+                    order, position_id=command.position_id, planned=planned,
+                    expected_position_ounces=expected_position_ounces,
+                )
             except Mt5V1ExecutionError as exc:
                 self._deny(order, str(exc))
                 return
@@ -1069,7 +1077,28 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
             self._last_failure = None
         self._refresh_execution_hold()
 
-    def _prepare(self, order: Order, *, position_id: PositionId | None) -> _Pending:
+    @staticmethod
+    def _hedge_plan_precondition(command: SubmitOrder) -> tuple[bool, Decimal | None]:
+        params = command.params or {}
+        marker = "py000_hedge_plan"
+        expected_key = "py000_expected_position_ounces"
+        if marker not in params and expected_key not in params:
+            return False, None  # Preserve unmarked manual adapter commands.
+        if params.get(marker) is not True:
+            raise Mt5V1ExecutionError("invalid hedge plan marker")
+        if command.position_id is None:
+            if expected_key in params:
+                raise Mt5V1ExecutionError("planned open cannot contain a close target quantity")
+            return True, None
+        expected = params.get(expected_key)
+        if not isinstance(expected, Decimal) or not expected.is_finite() or expected <= 0:
+            raise Mt5V1ExecutionError("planned close requires a positive finite Decimal quantity")
+        return True, expected
+
+    def _prepare(
+        self, order: Order, *, position_id: PositionId | None, planned: bool = False,
+        expected_position_ounces: Decimal | None = None,
+    ) -> _Pending:
         if order.instrument_id != self._mt5_config.instrument_id:
             raise Mt5V1ExecutionError("order instrument is outside the configured MT5 boundary")
         instrument = self._instrument_provider.find(order.instrument_id) or self._cache.instrument(
@@ -1085,6 +1114,12 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
         volume_min = Decimal(cast(str, spec["volume_min"]))
         volume_step = Decimal(cast(str, spec["volume_step"]))
         if position_id is None:
+            opposite = "sell" if order.side == OrderSide.BUY else "buy"
+            if planned and any(
+                position["side"] == opposite
+                for position in cast(list[JsonObject], self._require_snapshot()["positions"])
+            ):
+                raise Mt5V1ExecutionError("opposing MT5 ticket appeared before planned open")
             return _Pending(order=order, instrument=instrument, quantity_lots=lots)
         identifier = position_id.value
         matches = [
@@ -1102,6 +1137,8 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
         if actual_order_side != expected_order_side:
             raise Mt5V1ExecutionError("close order side does not oppose the target position")
         target_lots = Decimal(cast(str, target["volume_lots"]))
+        if planned and target_lots * Decimal(str(instrument.lot_size)) != expected_position_ounces:
+            raise Mt5V1ExecutionError("planned target quantity differs from the live snapshot")
         if lots > target_lots:
             raise Mt5V1ExecutionError("close quantity exceeds the live target position")
         remaining_lots = target_lots - lots
