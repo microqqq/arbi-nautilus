@@ -1746,7 +1746,9 @@ def test_live_maker_stale_timer_mutates_real_state_only_on_running_loop(
             strategy._schedule_stale_timer(SourceDirection.LONG, orders[0].client_order_id.value)
             # Only the real timer may wake this idle loop; no polling or market/event pump.
             await asyncio.wait_for(completed.wait(), 0.5)
-            assert handler_threads == [loop_thread]
+            # LiveClock may wake before the deadline and legitimately rearm.
+            # Every callback, including an early one, must run on this loop.
+            assert handler_threads and all(thread == loop_thread for thread in handler_threads)
             assert persist_threads == [loop_thread, loop_thread]
             assert [thread for thread, _ in cancellations] == [loop_thread, loop_thread]
             assert [cmd.client_order_id for _, cmd in cancellations] == [
