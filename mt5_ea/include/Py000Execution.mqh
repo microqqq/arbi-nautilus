@@ -17,6 +17,28 @@ struct Py000CloseTarget
    double volume_before;
    ENUM_POSITION_TYPE position_type;
 };
+bool Py000ExecutionResultIsRejected(
+   const MqlTradeResult &result
+)
+{
+   // Unknown external-system codes and contradictory execution facts stay UNKNOWN.
+   if(result.order != 0 || result.deal != 0
+      || !MathIsValidNumber(result.volume) || result.volume != 0.0
+      || result.retcode_external != 0)
+      return false;
+   switch(result.retcode)
+   {
+      case TRADE_RETCODE_REJECT:
+      case TRADE_RETCODE_MARKET_CLOSED:
+      case TRADE_RETCODE_NO_MONEY:
+      case TRADE_RETCODE_REQUOTE:
+      case TRADE_RETCODE_PRICE_CHANGED:
+      case TRADE_RETCODE_PRICE_OFF:
+         return true;
+      default:
+         return false;
+   }
+}
 string Py000ExecutionUint(ulong value)
 {
    if(value == 0) return "0";
@@ -436,6 +458,11 @@ bool Py000ExecutionSubmit(
    ResetLastError();
    bool sent = OrderSend(native_request, result);
    string retcode = Py000ExecutionUint((ulong)result.retcode);
+   if(Py000ExecutionResultIsRejected(result))
+      return Py000ExecutionFinishSimple(
+         request, boot_id, "order_rejected", "ORDER_SEND_REJECTED", retcode,
+         outcome, error_code, error_message
+      );
    if(!sent || result.retcode != TRADE_RETCODE_DONE
       || result.order == 0 || result.deal == 0
       || !HistoryDealSelect(result.deal))

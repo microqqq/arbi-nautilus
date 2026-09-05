@@ -156,6 +156,9 @@ class _SubmitHarness:
     def _subscribe_source_book(self) -> None:
         self.source_subscriptions += 1
 
+    def _evaluate_and_submit(self) -> None:
+        TakerStrategy._evaluate_and_submit(cast(Any, self))
+
     def _required_source_instrument(self) -> object:
         return _source_instrument()
 
@@ -939,6 +942,7 @@ def test_failed_hedge_stops_the_remaining_single_flight_queue(
 def test_live_readiness_is_an_independent_fail_closed_gate() -> None:
     harness = SimpleNamespace(
         live_calls=0,
+        _live_costs_from_adapters=False,
         _one_shot=False,
         _one_shot_armed=False,
         _one_shot_claimed=False,
@@ -1011,7 +1015,8 @@ def test_hedging_engine_reversal_closes_the_exact_open_ticket(tmp_path: Path) ->
     engine.add_strategy(TakerStrategy(_strategy_config(state_path)))
     engine.add_data(
         [
-            _book_snapshot(source, "2388", "2390", "5", 1_000_000_000),
+            # Introduce only the intended long at 3s, then its exact-ticket reversal at 5s.
+            _book_snapshot(source, "2402", "2403", "5", 1_000_000_000),
             _quote(hedge, "2404", "2405", "10", 2_000_000_000),
             _book_snapshot(source, "2398", "2400", "5", 3_000_000_000),
             _quote(hedge, "2400", "2401", "10", 4_000_000_000),

@@ -1,5 +1,8 @@
 """Real Nautilus fill identities and deterministic Maker lifecycle edges."""
 
+import asyncio
+import threading
+from collections.abc import Callable
 from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
@@ -7,12 +10,15 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
+import uvloop
 from msgspec.structs import replace as struct_replace
+from nautilus_trader.common.component import LiveClock
+from nautilus_trader.common.component import TestClock as NautilusTestClock
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.execution.reports import OrderStatusReport
 from nautilus_trader.model.data import FundingRateUpdate
 from nautilus_trader.model.enums import OrderSide, OrderStatus, TimeInForce
-from nautilus_trader.model.events import OrderExpired, OrderRejected
+from nautilus_trader.model.events import OrderCancelRejected, OrderExpired, OrderRejected
 from nautilus_trader.model.identifiers import (
     AccountId,
     ClientId,
@@ -22,8 +28,17 @@ from nautilus_trader.model.identifiers import (
     VenueOrderId,
 )
 from nautilus_trader.model.objects import Money, Quantity
+from nautilus_trader.test_kit.stubs.component import TestComponentStubs
 from nautilus_trader.test_kit.stubs.events import TestEventStubs
 from nautilus_trader.test_kit.stubs.execution import TestExecStubs
+from test_taker_events import (
+    _event_engine,
+    _live_cost_event_engine,
+    _process_source_terminal,
+    _seed_terminal_source,
+    _swap_instrument,
+    _terminal_report,
+)
 
 from py000_nautilus.app import (
     _hedge_instrument,
@@ -31,7 +46,7 @@ from py000_nautilus.app import (
     _quote,
     _source_instrument,
 )
-from py000_nautilus.config import CarryConfig, FxConfig
+from py000_nautilus.config import CarryConfig, FxConfig, MakerStrategyConfig
 from py000_nautilus.hedge import HedgeCoordinator
 from py000_nautilus.models import (
     BookTop,
@@ -53,6 +68,119 @@ from py000_nautilus.strategies.maker import (
 )
 
 D = Decimal
+
+
+class _InstrumentLifecycleMaker(MakerStrategy):
+    def __init__(self, config: MakerStrategyConfig, **kwargs: Any) -> None:
+        super().__init__(config, **kwargs)
+        self.cancel_ids: list[str] = []
+        self.new_quote_attempts: list[SourceDirection] = []
+
+    def cancel_order(self, order: Any, **kwargs: Any) -> None:
+        self.cancel_ids.append(order.client_order_id.value)
+        order.apply(TestEventStubs.order_pending_cancel(order, ts_event=self.clock.timestamp_ns()))
+        self.cache.update_order(order)
+
+    def _submit_source(self, quote: MakerQuote) -> None:
+        self.new_quote_attempts.append(quote.direction)
+
+
+def _seed_native_working_quotes(strategy: _InstrumentLifecycleMaker) -> list[Any]:
+    orders: list[Any] = []
+    for direction in (SourceDirection.LONG, SourceDirection.SHORT):
+        side = OrderSide.BUY if direction is SourceDirection.LONG else OrderSide.SELL
+        order = strategy.order_factory.limit(
+            instrument_id=_source_instrument().id, order_side=side,
+            quantity=_source_instrument().make_qty(2), price=_source_instrument().make_price(2400),
+            time_in_force=TimeInForce.GTC, post_only=True,
+        )
+        account_id = AccountId("BITFINEX-001")
+        order.apply(TestEventStubs.order_submitted(order, account_id=account_id, ts_event=100))
+        order.apply(TestEventStubs.order_accepted(
+            order, account_id=account_id,
+            venue_order_id=VenueOrderId(direction.value), ts_event=100,
+        ))
+        strategy.cache.add_order(order)
+        strategy._stores[direction].begin_source(
+            order.client_order_id.value,
+            BusinessOrderSide.BUY if side is OrderSide.BUY else BusinessOrderSide.SELL,
+            D(2),
+        )
+        strategy._stores[direction].update_source_status(order.client_order_id.value, "ACCEPTED")
+        strategy._working_quotes[order.client_order_id.value] = replace(
+            _bound_quote(), direction=direction,
+        )
+        orders.append(order)
+    for instrument in (_source_instrument(), _hedge_instrument()):
+        strategy.cache.add_quote_tick(_quote(instrument, "2399", "2401", "5", 100))
+    return orders
+
+
+@pytest.mark.parametrize(
+    "change", [{"swap_long": "-7.3"}, {"swap_mode": 0},
+               {"swap_rates": ("0", "1", "1", "3", "3", "1", "0")}],
+)
+def test_native_swap_change_cancels_exact_orders_and_waits_for_cancel_reconciliation(
+    tmp_path: Path, change: dict[str, Any],
+) -> None:
+    with _live_cost_event_engine(
+        "maker", tmp_path / "swap-cancel", maker_type=_InstrumentLifecycleMaker,
+    ) as (engine, strategy):
+        orders = _seed_native_working_quotes(strategy)
+        expected = [order.client_order_id.value for order in orders]
+        strategy.clock.set_time(110)
+        engine.kernel.data_engine.process(_swap_instrument(110, swap_long="-6.300"))
+        engine.kernel.data_engine.process(_swap_instrument(110))
+        assert strategy.cancel_ids == []
+        assert [store.active_source_order_id for store in strategy._stores.values()] == expected
+        strategy.clock.set_time(120)
+        engine.kernel.data_engine.process(_swap_instrument(120, **change))
+        assert strategy.cancel_ids == expected
+        assert all(order.is_pending_cancel for order in orders)
+        assert strategy._cost_ts_ns == 100
+        engine.kernel.data_engine.process(_quote(_hedge_instrument(), "2399", "2401", "5", 120))
+        assert strategy.new_quote_attempts == []
+        for order in orders:
+            canceled = TestEventStubs.order_canceled(
+                order, account_id=AccountId("BITFINEX-001"), ts_event=120,
+            )
+            order.apply(canceled)
+            strategy.cache.update_order(order)
+            strategy.on_order_canceled(canceled)
+        assert strategy._global_obligation_block()  # Acknowledgement alone is not final-fill proof.
+        assert strategy.new_quote_attempts == []
+        for store, order in zip(strategy._stores.values(), orders, strict=True):
+            store.confirm_source_reconciled(order.client_order_id.value)
+        engine.kernel.data_engine.process(_quote(_hedge_instrument(), "2399", "2401", "5", 120))
+        assert set(strategy.new_quote_attempts) == {SourceDirection.LONG, SourceDirection.SHORT}
+        assert strategy.cancel_ids == expected
+
+
+def test_native_same_swap_refresh_keeps_old_timer_then_expires_on_its_own_deadline(
+    tmp_path: Path,
+) -> None:
+    with _live_cost_event_engine(
+        "maker", tmp_path / "swap-timer", maker_type=_InstrumentLifecycleMaker,
+    ) as (engine, strategy):
+        orders = _seed_native_working_quotes(strategy)
+        strategy._schedule_stale_timer(SourceDirection.LONG, orders[0].client_order_id.value)
+        timer = _maker_timer_name(SourceDirection.LONG, orders[0].client_order_id.value)
+        assert strategy.clock.next_time_ns(timer) == 201
+        strategy.clock.set_time(150)
+        engine.kernel.data_engine.process(_swap_instrument(150))
+        strategy.clock.set_time(200)
+        engine.kernel.data_engine.process(_maker_funding("0", 200))
+        for instrument in (_source_instrument(), _hedge_instrument()):
+            strategy.cache.add_quote_tick(_quote(instrument, "2399", "2401", "5", 200))
+        assert strategy.cancel_ids == []
+        for callback in strategy.clock.advance_time(201):
+            callback.handle()
+        assert strategy.clock.next_time_ns(timer) == 251
+        assert strategy.cancel_ids == []
+        for callback in strategy.clock.advance_time(251):
+            callback.handle()
+        assert strategy.cancel_ids == [order.client_order_id.value for order in orders]
+        assert strategy._cost_ts_ns == 200
 
 
 def _bound_quote() -> MakerQuote:
@@ -633,13 +761,186 @@ def test_source_terminal_query_failure_keeps_durable_hold(
         assert completions == []
     else:
         assert len(completions) == 1
-        completions.pop()(None if failure == "none" else report)
+        assert completions[0](None if failure == "none" else report) is False
 
     record = store.source_order(order.client_order_id.value)
     assert record is not None and record.status == "CANCELED"
     assert store.active_source_order_id == order.client_order_id.value
     assert store.halt_reason is not None
-    assert strategy._source_terminal_inflight == set()
+    if failure == "exception":
+        assert strategy._source_terminal_inflight == set()
+    else:
+        assert strategy._source_terminal_inflight == {order.client_order_id.value}
+        strategy.report_is_exact = True
+        assert completions[0](report) is True
+        assert strategy._source_terminal_inflight == set()
+        observed: Any = store
+        assert observed.active_source_order_id is None and observed.halt_reason is None
+
+
+def test_native_maker_stop_invalidates_late_terminal_completion(tmp_path: Path) -> None:
+    completions: list[SourceTerminalResult] = []
+    strategy = RecordingMakerStrategy(
+        tmp_path / "native-stop",
+        source_terminal_query=lambda _cid, _vid, complete: completions.append(complete),
+    )
+    with _event_engine(cast(Any, strategy)) as engine:
+        engine.trader.start()
+        order = _seed_terminal_source(engine, strategy, maker=True)
+        store = strategy._stores[SourceDirection.LONG]
+        _process_source_terminal(engine, order)
+        assert len(completions) == 1
+        engine.trader.stop()
+        assert completions[0](_terminal_report(order)) is False
+        assert store.active_source_order_id == order.client_order_id.value
+        assert store.halt_reason is not None
+        assert not store.can_submit_source()
+
+
+def _cancel_rejected(order: Any, **overrides: Any) -> OrderCancelRejected:
+    values = dict(
+        trader_id=order.trader_id, strategy_id=order.strategy_id,
+        instrument_id=order.instrument_id, client_order_id=order.client_order_id,
+        venue_order_id=order.venue_order_id, account_id=order.account_id,
+        reason="arbitrary cancel failure", event_id=UUID4(), ts_event=11, ts_init=11,
+    )
+    values.update(overrides)
+    return OrderCancelRejected(**values)
+
+
+def _fill_maker_source(engine: Any, order: Any, quantity: int) -> None:
+    instrument = _source_instrument()
+    engine.kernel.exec_engine.process(TestEventStubs.order_filled(
+        order=order, instrument=instrument, last_qty=instrument.make_qty(quantity),
+        last_px=instrument.make_price(2400), trade_id=TradeId("S-ACTUAL"),
+        commission=Money(0, instrument.quote_currency), ts_event=5,
+    ))
+
+
+@pytest.mark.parametrize("terminal,filled", [
+    ("CANCELED", 0), ("CANCELED", 1), ("EXPIRED", 0), ("EXPIRED", 1), ("FILLED", 4),
+])
+@pytest.mark.parametrize("after_query", [False, True])
+def test_native_late_cancel_rejection_preserves_exact_terminal_and_pending_work(
+    tmp_path: Path, terminal: str, filled: int, after_query: bool,
+) -> None:
+    completions: list[SourceTerminalResult] = []
+    strategy = RecordingMakerStrategy(
+        tmp_path / "late-cancel",
+        source_terminal_query=lambda _cid, _vid, complete: completions.append(complete),
+    )
+    with _event_engine(cast(Any, strategy)) as engine:
+        engine.trader.start()
+        order = _seed_terminal_source(engine, strategy, maker=True)
+        store = strategy._stores[SourceDirection.LONG]
+        if filled:
+            _fill_maker_source(engine, order, filled)
+        if terminal != "FILLED":
+            _process_source_terminal(engine, order, expired=terminal == "EXPIRED")
+            assert len(completions) == 1
+            if after_query:
+                assert completions[0](_terminal_report(order)) is True
+        else:
+            assert completions == []
+        original = (
+            store.path.read_bytes(), store.active_source_order_id, store.halt_reason,
+            store.source_freeze_reason, strategy._source_hold,
+            set(strategy._source_terminal_inflight), tuple(store.intents()),
+        )
+
+        rejection = _cancel_rejected(order)
+        engine.kernel.exec_engine.process(rejection)
+
+        assert order.last_event == rejection  # Native Engine applied and dispatched the real event.
+        assert order.status.name == terminal
+        assert original == (
+            store.path.read_bytes(), store.active_source_order_id, store.halt_reason,
+            store.source_freeze_reason, strategy._source_hold,
+            set(strategy._source_terminal_inflight), tuple(store.intents()),
+        )
+        if terminal != "FILLED":
+            assert len(completions) == 1
+            if not after_query:
+                assert not store.can_submit_source()
+                assert completions[0](_terminal_report(order)) is True
+        if filled:
+            assert len(store.intents()) == 1
+            assert store.intents()[0].status is not ObligationStatus.COMPLETED
+            # Ignoring stale cancel did not discharge its hedge.
+            assert not store.can_submit_source()
+        else:
+            assert store.can_submit_source()
+
+
+@pytest.mark.parametrize("fault", [
+    "working", "account", "instrument", "venue", "no_venue", "trader",
+    "source_account", "source_client", "hedge_account", "hedge_client",
+    "record_id", "quantity", "filled", "status", "side", "unknown", "unseen_fill",
+])
+def test_native_cancel_rejection_without_exact_terminal_proof_keeps_unknown_hold(
+    tmp_path: Path, fault: str,
+) -> None:
+    strategy = RecordingMakerStrategy(tmp_path / "cancel-mismatch")
+    with _event_engine(cast(Any, strategy)) as engine:
+        engine.trader.start()
+        order = _seed_terminal_source(engine, strategy, maker=True)
+        store = strategy._stores[SourceDirection.LONG]
+        _fill_maker_source(engine, order, 1)
+        if fault != "working":
+            _process_source_terminal(engine, order)
+        record = store.source_order(order.client_order_id.value)
+        assert record is not None
+        record_changes_by_fault: dict[str, dict[str, Any]] = {
+            "source_account": {"source_account_id": "BITFINEX-OTHER"},
+            "source_client": {"source_client_id": "OTHER"},
+            "hedge_account": {"hedge_account_id": "MT5-OTHER"},
+            "hedge_client": {"hedge_client_id": "OTHER"},
+            "record_id": {"client_order_id": "OTHER"},
+            "quantity": {"quantity_ounces": D(5)},
+            "filled": {"filled_ounces": D(2)},
+            "status": {"status": "EXPIRED"},
+            "side": {"side": BusinessOrderSide.SELL},
+        }
+        record_changes = record_changes_by_fault.get(fault, {})
+        store._state.source_orders[order.client_order_id.value] = replace(record, **record_changes)
+        if fault == "unknown":
+            store.mark_source_unknown(order.client_order_id.value, "existing UNKNOWN")
+        if fault == "unseen_fill":
+            store._state.seen_source_fills.clear()
+        overrides: dict[str, Any] = {
+            "account": {"account_id": AccountId("BITFINEX-OTHER")},
+            "instrument": {"instrument_id": _hedge_instrument().id},
+            "venue": {"venue_order_id": VenueOrderId("OTHER")},
+            "no_venue": {"venue_order_id": None},
+            "trader": {"trader_id": type(order.trader_id)("OTHER-001")},
+        }.get(fault, {})
+
+        engine.kernel.exec_engine.process(_cancel_rejected(order, **overrides))
+
+        observed = store.source_order(order.client_order_id.value)
+        assert observed is not None and observed.status == "UNKNOWN"
+        assert store.halt_reason is not None
+        assert strategy._source_hold and not store.can_submit_source()
+        assert len(store.intents()) == 1  # Known hedge is never discarded.
+
+
+def test_native_late_cancel_rejection_does_not_clear_independent_hold(tmp_path: Path) -> None:
+    strategy = RecordingMakerStrategy(tmp_path / "cancel-existing-hold")
+    with _event_engine(cast(Any, strategy)) as engine:
+        engine.trader.start()
+        order = _seed_terminal_source(engine, strategy, maker=True)
+        _process_source_terminal(engine, order)
+        store = strategy._stores[SourceDirection.LONG]
+        store._state.halt_reason = "independent reconciliation conflict"
+        store.freeze_source_submissions("operator HOLD")
+        original = store.path.read_bytes()
+
+        engine.kernel.exec_engine.process(_cancel_rejected(order))
+
+        assert store.path.read_bytes() == original
+        assert store.halt_reason == "independent reconciliation conflict"
+        assert store.source_freeze_reason == "operator HOLD"
+        assert not store.can_submit_source()
 
 
 def _rejected(order: Any, reason: str) -> OrderRejected:
@@ -1376,6 +1677,155 @@ def test_fixed_amount_false_requote_modifies_price_with_quantity_none(tmp_path: 
     assert harness.modified[0]["quantity"] is None
 
 
+def _registered_clock_maker(tmp_path: Path, on_cancel: Any) -> tuple[MakerStrategy, list[Any]]:
+    """Real strategy, clock, cache, orders and store; only outgoing venue IO is captured."""
+    clock = LiveClock()
+    now = clock.timestamp_ns()
+    config = struct_replace(
+        _maker_strategy_config(tmp_path / "live-clock"),
+        max_quote_age_ns=50_000_000,
+        max_cost_age_ns=1_000_000_000,
+        max_session_age_ns=1_000_000_000,
+        initial_cost_ts_ns=now,
+        initial_session_ts_ns=now,
+        initial_hedge_session_open=True,
+    )
+    strategy = MakerStrategy(config)
+    cache, msgbus = TestComponentStubs.cache(), TestComponentStubs.msgbus()
+    for instrument in (_source_instrument(), _hedge_instrument()):
+        cache.add_instrument(instrument)
+    msgbus.register(endpoint="DataEngine.execute", handler=lambda _command: None)
+    msgbus.register(endpoint="ExecEngine.execute", handler=on_cancel)
+    strategy.register(
+        trader_id=msgbus.trader_id, portfolio=TestComponentStubs.portfolio(),
+        msgbus=msgbus, cache=cache, clock=clock,
+    )
+    strategy.start()
+    orders = _seed_native_working_quotes(cast(Any, strategy))
+    now = clock.timestamp_ns()
+    strategy._cost_ts_ns = strategy._session_ts_ns = now
+    for instrument in (_source_instrument(), _hedge_instrument()):
+        cache.add_quote_tick(_quote(instrument, "2399", "2401", "5", now))
+    return strategy, orders
+
+
+@pytest.mark.parametrize("loop_kind", ["asyncio", "uvloop"])
+@pytest.mark.parametrize("debug", [False, True])
+def test_live_maker_stale_timer_mutates_real_state_only_on_running_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, loop_kind: str, debug: bool,
+) -> None:
+    async def scenario() -> None:
+        loop, loop_thread = asyncio.get_running_loop(), threading.get_ident()
+        completed = asyncio.Event()
+        cancellations: list[tuple[int, Any]] = []
+        handler_threads: list[int] = []
+        persist_threads: list[int] = []
+
+        def cancel(command: Any) -> None:
+            cancellations.append((threading.get_ident(), command))
+            if len(cancellations) == 2:
+                loop.call_soon_threadsafe(completed.set)
+
+        strategy, orders = _registered_clock_maker(tmp_path, cancel)
+        original = strategy._on_stale_timer
+
+        def handle(event: Any) -> None:
+            handler_threads.append(threading.get_ident())
+            original(event)
+
+        monkeypatch.setattr(strategy, "_on_stale_timer", handle)
+        for store in strategy._stores.values():
+            persist = store._persist
+
+            def record_persist(persist: Any = persist) -> None:
+                persist_threads.append(threading.get_ident())
+                persist()
+
+            monkeypatch.setattr(store, "_persist", record_persist)
+        try:
+            strategy._schedule_stale_timer(SourceDirection.LONG, orders[0].client_order_id.value)
+            # Only the real timer may wake this idle loop; no polling or market/event pump.
+            await asyncio.wait_for(completed.wait(), 0.5)
+            assert handler_threads == [loop_thread]
+            assert persist_threads == [loop_thread, loop_thread]
+            assert [thread for thread, _ in cancellations] == [loop_thread, loop_thread]
+            assert [cmd.client_order_id for _, cmd in cancellations] == [
+                order.client_order_id for order in orders
+            ]
+            assert all(order.status == OrderStatus.PENDING_CANCEL for order in orders)
+            assert strategy._source_hold
+            assert all(store.source_freeze_reason == "stale timer"
+                       for store in strategy._stores.values())
+        finally:
+            strategy.stop()
+            strategy.dispose()
+
+    factory = uvloop.new_event_loop if loop_kind == "uvloop" else asyncio.SelectorEventLoop
+    with asyncio.Runner(loop_factory=factory, debug=debug) as runner:
+        runner.run(scenario())
+
+
+@pytest.mark.parametrize("loop_kind", ["asyncio", "uvloop"])
+@pytest.mark.parametrize("restart", [False, True])
+def test_live_maker_queued_stale_timer_cannot_cross_stop_or_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, loop_kind: str, restart: bool,
+) -> None:
+    async def scenario() -> None:
+        loop_thread = threading.get_ident()
+        cancellations: list[Any] = []
+        handled: list[Any] = []
+        timer_threads: list[int] = []
+        queued = threading.Event()
+        strategy, orders = _registered_clock_maker(tmp_path, cancellations.append)
+        original_handler = strategy._on_stale_timer
+        original_dispatch = strategy._dispatch_stale_timer
+
+        def handle(event: Any) -> None:
+            handled.append(event)
+            original_handler(event)
+
+        def dispatch(event: Any, generation: int) -> None:
+            timer_threads.append(threading.get_ident())
+            original_dispatch(event, generation)
+            queued.set()
+
+        monkeypatch.setattr(strategy, "_on_stale_timer", handle)
+        monkeypatch.setattr(strategy, "_dispatch_stale_timer", dispatch)
+        try:
+            strategy._schedule_stale_timer(SourceDirection.LONG, orders[0].client_order_id.value)
+            # Deliberately hold this loop until the real Rust callback has queued delivery.
+            assert queued.wait(0.5), "real timer did not enqueue loop delivery"
+            assert timer_threads and all(thread != loop_thread for thread in timer_threads)
+            assert handled == []
+            strategy.stop()
+            assert len(cancellations) == 2  # Actual stop cancels; late timer must not add work.
+            if restart:
+                # A surviving working CID makes name filtering insufficient: epoch must win.
+                for order in orders:
+                    order.apply(_cancel_rejected(order))
+                    strategy.cache.update_order(order)
+                    assert order.status == OrderStatus.ACCEPTED
+                strategy.reset()
+                strategy.start()
+                assert strategy.is_running
+            original = [store.path.read_bytes() for store in strategy._stores.values()]
+            await asyncio.sleep(0)
+            assert handled == []
+            assert len(cancellations) == 2
+            assert [store.path.read_bytes() for store in strategy._stores.values()] == original
+            if restart:
+                assert all(order.status == OrderStatus.ACCEPTED for order in orders)
+                assert all(not store.can_submit_source() for store in strategy._stores.values())
+        finally:
+            if strategy.is_running:
+                strategy.stop()
+            strategy.dispose()
+
+    factory = uvloop.new_event_loop if loop_kind == "uvloop" else asyncio.SelectorEventLoop
+    with asyncio.Runner(loop_factory=factory, debug=True) as runner:
+        runner.run(scenario())
+
+
 class _TimerClock:
     def __init__(self) -> None:
         self.timer_names: set[str] = set()
@@ -1399,6 +1849,7 @@ class _TimerCache:
 def test_each_side_replaces_instead_of_accumulating_stale_timers(tmp_path: Path) -> None:
     harness = SimpleNamespace(
         _stale_timer_names={},
+        _live_costs_from_adapters=False,
         _config=_maker_strategy_config(tmp_path / "timer.state"),
         _cost_ts_ns=100,
         _session_ts_ns=100,
@@ -1452,6 +1903,10 @@ class _StopCache:
 
 class _StopHarness:
     def __init__(self) -> None:
+        self._live_costs_from_adapters = False
+        self._source_terminal_stopped = False
+        self._source_terminal_generation = 0
+        self._source_terminal_inflight: set[str] = set()
         self._stores = {
             SourceDirection.LONG: _StopStore("O-BID"),
             SourceDirection.SHORT: _StopStore("O-ASK"),
@@ -1599,6 +2054,7 @@ def test_session_close_immediately_freezes_both_gtc_sides_without_a_new_tick() -
 
 def test_cost_change_immediately_cancels_exact_active_ids_without_market_tick() -> None:
     harness = _StopHarness()
+    harness.clock = SimpleNamespace(timestamp_ns=lambda: 2)
     harness._cost_ts_ns = 1
     harness._carry = CarryConfig()
     harness._fx = FxConfig()
@@ -1612,6 +2068,63 @@ def test_cost_change_immediately_cancels_exact_active_ids_without_market_tick() 
 
     assert harness.cache.requested == ["O-BID", "O-ASK"]
     assert len(harness.canceled) == 2
+
+
+class _CostTimerHarness(_StopHarness):
+    _live_submission_ready = None
+
+    def _inputs_are_fresh(self, source_tick: Any, hedge_tick: Any, now_ns: int) -> bool:
+        return MakerStrategy._inputs_are_fresh(cast(Any, self), source_tick, hedge_tick, now_ns)
+
+    def _schedule_stale_timer(self, direction: SourceDirection, order_id: str) -> None:
+        MakerStrategy._schedule_stale_timer(cast(Any, self), direction, order_id)
+
+    def _on_stale_timer(self, event: Any) -> None:
+        MakerStrategy._on_stale_timer(cast(Any, self), event)
+
+
+@pytest.mark.parametrize("expires_first", ["cost", "quote", "session"])
+def test_same_cost_refresh_preserves_orders_until_actual_input_expiry(
+    monkeypatch: pytest.MonkeyPatch,
+    expires_first: str,
+) -> None:
+    harness = _CostTimerHarness()
+    harness._config = struct_replace(
+        harness._config,
+        max_cost_age_ns=100,
+        max_quote_age_ns=120 if expires_first == "quote" else 1_000,
+        max_session_age_ns=120 if expires_first == "session" else 1_000,
+    )
+    harness._cost_ts_ns = harness._session_ts_ns = 100
+    harness.clock = NautilusTestClock()
+    harness.clock.set_time(100)
+    monkeypatch.setattr(
+        harness.cache, "quote_tick", lambda instrument_id: SimpleNamespace(ts_event=100),
+    )
+    harness._schedule_stale_timer(SourceDirection.LONG, "O-BID")
+    timer_name = _maker_timer_name(SourceDirection.LONG, "O-BID")
+    assert harness.clock.next_time_ns(timer_name) == 201
+
+    assert harness.clock.advance_time(150) == []
+    assert MakerStrategy.update_cost_snapshot(
+        cast(Any, harness), harness._carry, harness._fx, 150,
+    )
+    assert harness.canceled == []
+    assert all(store.freeze_reason is None for store in harness._stores.values())
+
+    handlers = harness.clock.advance_time(201)
+    assert len(handlers) == 1
+    handlers[0].handle()
+    deadline = 251 if expires_first == "cost" else 221
+    assert harness.clock.next_time_ns(timer_name) == deadline
+    assert harness.canceled == []
+
+    handlers = harness.clock.advance_time(deadline)
+    assert len(handlers) == 1
+    handlers[0].handle()
+    assert harness.cache.requested == ["O-BID", "O-ASK"]
+    assert len(harness.canceled) == 2
+    assert all(store.freeze_reason == "stale timer" for store in harness._stores.values())
 
 
 class _MakerCostHarness:
@@ -1660,6 +2173,20 @@ def _maker_funding(rate: str, ts_event: int) -> FundingRateUpdate:
         ts_event=ts_event,
         ts_init=ts_event,
     )
+
+
+def test_repeated_same_funding_refreshes_freshness_without_canceling_again(tmp_path: Path) -> None:
+    harness = _MakerCostHarness(tmp_path / "same-funding.state")
+    harness.on_funding_rate(_maker_funding("0.001", 98))
+    harness.frozen.clear()
+
+    harness.on_funding_rate(_maker_funding("0.001", 99))
+    harness.on_funding_rate(_maker_funding("0.001", 100))
+
+    assert harness.frozen == []
+    assert cast(Any, harness)._cost_ts_ns == 100
+    assert cast(Any, harness)._cost_snapshot_valid
+    assert cast(Any, harness)._carry.bitfinex_long == D("0.001")
 
 
 @pytest.mark.parametrize(
@@ -1789,6 +2316,8 @@ class _QuoteCache:
 
 
 class _LiveQuoteGateHarness:
+    _source_quote_refresh_paused: Callable[[], bool] | None = None
+
     def __init__(self, state_prefix: Path, *, now_ns: int) -> None:
         self._config = _maker_strategy_config(state_prefix)
         source = _source_instrument()
@@ -1802,6 +2331,7 @@ class _LiveQuoteGateHarness:
         self._live_submission_ready = lambda: self.ready
         self._live_costs_from_adapters = True
         self._cost_snapshot_valid = True
+        self._hedge_instrument_valid = True
         self._cost_recovery_after_ns = 0
         self._cost_ts_ns = now_ns - 1
         self._session_ts_ns = now_ns - 1
@@ -1817,6 +2347,9 @@ class _LiveQuoteGateHarness:
         self.quote_carries: list[CarryConfig] = []
         self.errors: list[str] = []
         self.log = SimpleNamespace(error=self.errors.append)
+
+    def _required_hedge_instrument(self) -> Any:
+        return SimpleNamespace(ts_event=self._session_ts_ns)
 
     def _inputs_are_fresh(
         self,
@@ -1915,6 +2448,7 @@ class _QuoteGateHarness:
         self._quote_carry = CarryConfig()
         self.canceled: list[SourceDirection] = []
         self.refreshed: list[SourceDirection] = []
+        self._source_quote_refresh_paused: Callable[[], bool] | None = None
         self.freshness_now_ns: list[int] = []
         self.carry_now_ns: list[int] = []
 

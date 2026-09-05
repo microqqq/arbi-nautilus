@@ -83,12 +83,32 @@ string Py000JournalEventsFile()
 {
    return g_py000_journal_namespace + ".events";
 }
+#ifndef PY000_JOURNAL_SEEK
+#define PY000_JOURNAL_SEEK FileSeek
+#endif
+#ifndef PY000_JOURNAL_WRITE
+#define PY000_JOURNAL_WRITE FileWriteString
+#endif
+#ifndef PY000_JOURNAL_FLUSH
+#define PY000_JOURNAL_FLUSH FileFlush
+#endif
 bool Py000JournalWriteLine(
    const string file_name,
    const string contents,
    const bool append
 )
 {
+   string text = contents + "\n";
+   // FILE_TXT inserts CR before each bare LF; count the resulting UTF-8 bytes.
+   string wire_text = text;
+   ResetLastError();
+   if(StringReplace(wire_text, "\r\n", "\n") < 0
+      || StringReplace(wire_text, "\n", "\r\n") < 0)
+      return false;
+   uchar bytes[];
+   int encoded = StringToCharArray(wire_text, bytes, 0, WHOLE_ARRAY, CP_UTF8);
+   if(encoded <= 1 || GetLastError() != 0)
+      return false;
    int handle = FileOpen(
       file_name,
       FILE_READ | FILE_WRITE | FILE_TXT | FILE_ANSI | FILE_COMMON,
@@ -98,11 +118,24 @@ bool Py000JournalWriteLine(
    if(handle == INVALID_HANDLE)
       return false;
    if(append)
-      FileSeek(handle, 0, SEEK_END);
-   bool written = FileWriteString(handle, contents + "\n") > 0;
-   FileFlush(handle);
+   {
+      ResetLastError();
+      bool sought = PY000_JOURNAL_SEEK(handle, 0, SEEK_END);
+      if(!sought || GetLastError() != 0)
+      {
+         FileClose(handle);
+         return false;
+      }
+   }
+   ResetLastError();
+   uint written = PY000_JOURNAL_WRITE(handle, text);
+   int write_error = GetLastError();
+   ResetLastError();
+   PY000_JOURNAL_FLUSH(handle);
+   int flush_error = GetLastError();
    FileClose(handle);
-   return written;
+   // A failed or partial append is retained for recovery, never retried here.
+   return written == (uint)(encoded - 1) && write_error == 0 && flush_error == 0;
 }
 bool Py000JournalVerifiedParts(const string line, const int expected, string &parts[])
 {

@@ -53,6 +53,37 @@ USER_ID = 269_312
 D = Decimal
 
 
+def _bind_runtime_boundary(
+    monkeypatch: pytest.MonkeyPatch, node: Any, *, timeout: float, bitfinex: Any = None,
+) -> None:
+    """Stub the owner boundary for legacy canary classification tests only.
+
+    Actual Actor budgets, native application and continuity are verified in
+    test_live_runtime/test_strategy_continuity, not by these scenario stubs.
+    """
+    class Runtime:
+        last_failure: str | None = None
+
+        async def reconcile(self, *, retry_failed: bool = True) -> bool:
+            assert retry_failed is False
+            for _ in range(2):
+                clean = await node.kernel.exec_engine.reconcile_execution_state(
+                    timeout_secs=timeout,
+                )
+                if not clean:
+                    return False
+                if bitfinex is None or not bitfinex.terminal_reconciliation_required:
+                    return True
+                bitfinex.confirm_terminal_reconciliation()
+                if not bitfinex.terminal_reconciliation_required:
+                    return True
+            self.last_failure = "source terminal is unresolved"
+            return False
+
+    runtime = Runtime()
+    monkeypatch.setattr(canary, "get_source_terminal_reconciler", lambda _node: runtime)
+
+
 def _profile(tmp_path: Path) -> LiveTakerProfile:
     bitfinex_route = RoutingConfig(default=False, venues=frozenset({"BITFINEX"}))
     mt5_route = RoutingConfig(default=False, venues=frozenset({"MT5"}))
@@ -840,6 +871,7 @@ def test_exact_success_and_position_near_miss_are_classified(
         ),
         portfolio=Portfolio(),
     )
+    _bind_runtime_boundary(monkeypatch, node, timeout=0.1)
     monkeypatch.setattr(
         canary,
         "_clients",
@@ -874,7 +906,6 @@ def test_exact_success_and_position_near_miss_are_classified(
                 strategy,
                 task,
                 SourceDirection.LONG,
-                0.1,
                 0.1,
             )
         finally:
@@ -916,6 +947,7 @@ def test_source_terminal_recovery_and_final_reconciliation_are_independent(
     bitfinex = Bitfinex()
     engine = ExecEngine()
     node = SimpleNamespace(kernel=SimpleNamespace(exec_engine=engine))
+    _bind_runtime_boundary(monkeypatch, node, timeout=0.05, bitfinex=bitfinex)
     monkeypatch.setattr(
         canary,
         "_clients",
@@ -937,7 +969,6 @@ def test_source_terminal_recovery_and_final_reconciliation_are_independent(
                 task,
                 SourceDirection.LONG,
                 0.1,
-                0.05,
             )
         finally:
             task.cancel()
@@ -952,6 +983,95 @@ def test_source_terminal_recovery_and_final_reconciliation_are_independent(
     )
     assert engine.calls == [0.05, 0.05]
     assert bitfinex.confirm_calls == 1
+
+
+@pytest.mark.parametrize("source_complete", [False, True])
+def test_canary_does_not_restart_an_exhausted_runtime_episode(
+    monkeypatch: pytest.MonkeyPatch, source_complete: bool,
+) -> None:
+    record = SimpleNamespace(client_order_id="S-HELD")
+    strategy = SimpleNamespace(
+        one_shot_claimed=True, state_store=SimpleNamespace(source_orders=lambda: (record,)),
+    )
+
+    async def failed_reconcile(*, retry_failed: bool = True) -> bool:
+        assert retry_failed is False  # The owner must not start a new recovery budget.
+        return False
+
+    owner = SimpleNamespace(last_failure="native timeout", reconcile=failed_reconcile)
+    monkeypatch.setattr(canary, "get_source_terminal_reconciler", lambda _node: owner)
+    monkeypatch.setattr(canary, "_clients", lambda _node: (
+        SimpleNamespace(terminal_reconciliation_required=not source_complete), SimpleNamespace(),
+    ))
+    monkeypatch.setattr(canary, "_terminal", lambda _strategy: None)
+    monkeypatch.setattr(canary, "_success_state", lambda _strategy: source_complete)
+
+    async def run() -> canary.TakerCanaryResult:
+        task = asyncio.create_task(asyncio.Event().wait())
+        try:
+            return await canary._wait_terminal(
+                cast(Any, SimpleNamespace()), cast(Any, strategy), cast(Any, task),
+                SourceDirection.LONG, 0.1,
+            )
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    reason = (
+        "final_reconciliation_failed" if source_complete
+        else "source_terminal_reconciliation_failed"
+    )
+    assert asyncio.run(run()) == canary.TakerCanaryResult("UNKNOWN", reason, "S-HELD")
+
+
+def test_canary_joins_existing_actor_during_its_first_failed_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from test_live_runtime import _runtime
+
+    async def run() -> None:
+        with _runtime(tmp_path, monkeypatch, timeout=0.1) as (owner, harness, engine):
+            async def reconcile_execution_state(*, timeout_secs: float) -> bool:
+                assert timeout_secs == 0.1
+                engine.calls += 1
+                return engine.calls > 1
+
+            monkeypatch.setattr(engine, "reconcile_execution_state", reconcile_execution_state)
+            engine.required = True
+            owner.start()
+            original_root = owner._root
+            async with asyncio.timeout(0.1):
+                while owner.last_failure is None:
+                    await asyncio.sleep(0)
+            assert owner.busy and engine.calls == 1
+            record = SimpleNamespace(client_order_id="S-RETRYING")
+            strategy = SimpleNamespace(
+                one_shot_claimed=True, state_store=SimpleNamespace(source_orders=lambda: (record,)),
+            )
+            monkeypatch.setattr(canary, "get_source_terminal_reconciler", lambda _node: owner)
+            monkeypatch.setattr(
+                canary, "_clients", lambda _node: (harness.client, SimpleNamespace()),
+            )
+            monkeypatch.setattr(canary, "_terminal", lambda _strategy: None)
+            monkeypatch.setattr(canary, "_success_state", lambda _strategy: not engine.required)
+            monkeypatch.setattr(canary, "_final_mismatch", lambda *_args, **_kwargs: None)
+            task = asyncio.create_task(asyncio.Event().wait())
+            try:
+                result = await canary._wait_terminal(
+                    cast(Any, SimpleNamespace()), cast(Any, strategy), cast(Any, task),
+                    SourceDirection.LONG, 0.5,
+                )
+                assert result.outcome == "PASSED_PAIRED"
+                assert original_root is not None and await original_root
+                # Two original rounds, then one healthy final check; no failed root was reopened.
+                assert engine.calls == 3
+            finally:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+                owner.stop()
+                await harness.client.cancel_pending_tasks()
+
+    asyncio.run(run())
 
 
 def test_silent_rest_terminal_reconciliation_drives_source_fill_and_hedge(
@@ -999,6 +1119,7 @@ def test_silent_rest_terminal_reconciliation_drives_source_fill_and_hedge(
     bitfinex = Bitfinex()
     engine = ExecEngine()
     node = SimpleNamespace(kernel=SimpleNamespace(exec_engine=engine))
+    _bind_runtime_boundary(monkeypatch, node, timeout=0.05, bitfinex=bitfinex)
     monkeypatch.setattr(
         canary,
         "_clients",
@@ -1018,7 +1139,6 @@ def test_silent_rest_terminal_reconciliation_drives_source_fill_and_hedge(
                 task,
                 SourceDirection.SHORT,
                 0.1,
-                0.05,
                 close_existing=True,
                 expected_source_position=D(2),
             )
@@ -1063,6 +1183,7 @@ def test_silent_terminal_reconciliation_is_bounded_when_rest_only_reports_open(
     bitfinex = Bitfinex()
     engine = ExecEngine()
     node = SimpleNamespace(kernel=SimpleNamespace(exec_engine=engine))
+    _bind_runtime_boundary(monkeypatch, node, timeout=0.01, bitfinex=bitfinex)
     monkeypatch.setattr(canary, "_clients", lambda _node: (bitfinex, SimpleNamespace()))
     monkeypatch.setattr(canary, "_terminal", lambda _strategy: None)
     monkeypatch.setattr(canary, "_success_state", lambda _strategy: False)
@@ -1079,7 +1200,6 @@ def test_silent_terminal_reconciliation_is_bounded_when_rest_only_reports_open(
                 task,
                 SourceDirection.SHORT,
                 0.02,
-                0.01,
             )
         finally:
             task.cancel()
@@ -1156,6 +1276,7 @@ def test_exact_existing_pair_closes_to_flat_only_with_reduce_only_orders(
         ),
         portfolio=SimpleNamespace(net_position=lambda *_args: D(0)),
     )
+    _bind_runtime_boundary(monkeypatch, node, timeout=0.1)
     monkeypatch.setattr(
         canary,
         "_clients",
@@ -1190,7 +1311,6 @@ def test_exact_existing_pair_closes_to_flat_only_with_reduce_only_orders(
                 strategy,
                 task,
                 SourceDirection.LONG,
-                0.1,
                 0.1,
                 close_existing=True,
                 expected_source_position=D(-2),
@@ -1233,6 +1353,7 @@ def test_source_terminal_recovery_failure_is_unknown(
 
     bitfinex = Bitfinex()
     node = SimpleNamespace(kernel=SimpleNamespace(exec_engine=ExecEngine()))
+    _bind_runtime_boundary(monkeypatch, node, timeout=0.05, bitfinex=bitfinex)
     monkeypatch.setattr(
         canary,
         "_clients",
@@ -1251,7 +1372,6 @@ def test_source_terminal_recovery_failure_is_unknown(
                 task,
                 SourceDirection.LONG,
                 0.1,
-                0.05,
             )
         finally:
             task.cancel()

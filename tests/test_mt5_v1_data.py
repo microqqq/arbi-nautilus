@@ -15,7 +15,12 @@ import zmq.asyncio
 from nautilus_trader.common.providers import InstrumentProvider
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.data.engine import DataEngine
-from nautilus_trader.data.messages import SubscribeInstrumentStatus, SubscribeQuoteTicks
+from nautilus_trader.data.messages import (
+    SubscribeInstrument,
+    SubscribeInstrumentStatus,
+    SubscribeQuoteTicks,
+    UnsubscribeInstrument,
+)
 from nautilus_trader.model.data import InstrumentStatus, QuoteTick
 from nautilus_trader.model.enums import MarketStatusAction
 from nautilus_trader.model.identifiers import ClientId, InstrumentId, Venue
@@ -130,12 +135,12 @@ def test_snapshot_builds_canonical_ounce_instrument() -> None:
     ("field", "replacement"),
     [
         ("point", "0.001"),
-        ("swap_long", "-2.5"),
-        ("swap_short", "1.5"),
-        ("swap_mode", 2),
+        ("contract_size", "10"),
+        ("volume_step", "0.1"),
+        ("tick_size", "0.1"),
     ],
 )
-def test_instrument_signature_covers_swap_inputs(field: str, replacement: object) -> None:
+def test_instrument_signature_covers_structure(field: str, replacement: object) -> None:
     original = _snapshot()
     changed = _snapshot()
     cast(JsonObject, changed["symbol_spec"])[field] = replacement
@@ -143,20 +148,21 @@ def test_instrument_signature_covers_swap_inputs(field: str, replacement: object
     assert _snapshot_instrument_signature(changed) != _snapshot_instrument_signature(original)
 
 
-def test_instrument_signature_covers_native_swap_rates() -> None:
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("swap_long", "-2.5"),
+        ("swap_short", "1.5"),
+        ("swap_mode", 2),
+        ("swap_rates", ["0", "1", "1", "1", "3", "1", "0"]),
+    ],
+)
+def test_instrument_signature_excludes_dynamic_swap(field: str, replacement: object) -> None:
     original = _snapshot()
     changed = _snapshot()
-    cast(JsonObject, changed["symbol_spec"])["swap_rates"] = [
-        "0",
-        "1",
-        "1",
-        "1",
-        "3",
-        "1",
-        "0",
-    ]
+    cast(JsonObject, changed["symbol_spec"])[field] = replacement
 
-    assert _snapshot_instrument_signature(changed) != _snapshot_instrument_signature(original)
+    assert _snapshot_instrument_signature(changed) == _snapshot_instrument_signature(original)
 
 
 def test_instrument_signature_covers_server_timezone() -> None:
@@ -598,6 +604,209 @@ def test_client_feeds_nautilus_data_engine_without_execution_surface() -> None:
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("swap_long", "-2.5"),
+        ("swap_short", "1.5"),
+        ("swap_mode", 2),
+        ("swap_rates", ["0", "1", "1", "1", "3", "1", "0"]),
+    ],
+)
+def test_snapshot_swap_updates_flow_through_native_instrument_subscription(
+    field: str,
+    replacement: object,
+) -> None:
+    async def scenario() -> None:
+        clock = TestComponentStubs.clock()
+        msgbus = TestComponentStubs.msgbus()
+        cache = TestComponentStubs.cache()
+        engine = DataEngine(msgbus=msgbus, cache=cache, clock=clock)
+        identity = _identity()
+        observed_ms = clock.timestamp_ns() // 1_000_000 - 1_000
+        initial = _fresh_snapshot(identity, observed_ms)
+        fake = _FakeTransport(identity, initial)
+        provider = InstrumentProvider()
+        client = Mt5V1DataClient(
+            loop=asyncio.get_running_loop(),
+            name="MT5",
+            config=_config(),
+            msgbus=msgbus,
+            cache=cache,
+            clock=clock,
+            instrument_provider=provider,
+            transport=fake,
+        )
+        engine.register_client(client)
+        updates: list[Cfd] = []
+
+        def observe(instrument: Cfd) -> None:
+            # Native DataEngine has already replaced cache, and the adapter commit
+            # is visible before synchronous downstream strategy callbacks run.
+            assert cache.instrument(INSTRUMENT_ID) is instrument
+            assert provider.find(INSTRUMENT_ID) is instrument
+            assert client.snapshot_refresh_healthy
+            assert client._snapshot is not None
+            spec = cast(JsonObject, client._snapshot["symbol_spec"])
+            assert instrument.info["swap_long"] == spec["swap_long"]
+            updates.append(instrument)
+
+        msgbus.subscribe("data.instrument.*", observe)
+        try:
+            client.connect()
+            await _wait_until(lambda: client.is_connected)
+            assert len(updates) == 1
+            original = updates[0]
+            engine.execute(
+                SubscribeInstrument(
+                    instrument_id=INSTRUMENT_ID,
+                    client_id=ClientId("MT5"),
+                    venue=Venue("MT5"),
+                    command_id=UUID4(),
+                    ts_init=clock.timestamp_ns(),
+                )
+            )
+            await _wait_until(lambda: len(updates) == 2)
+            assert updates[-1] is original
+
+            formatted = deepcopy(initial)
+            formatted_spec = cast(JsonObject, formatted["symbol_spec"])
+            formatted_spec["swap_long"] = "-1.2500"
+            formatted_spec["swap_short"] = "0.500"
+            formatted_spec["swap_rates"] = ["0.0", "1.0", "1.0", "3.0", "1.0", "1.0", "0.0"]
+            fake.current_snapshot = formatted
+            await client._refresh_snapshot(allow_rehandshake=False)
+            assert len(updates) == 2
+            assert cache.instrument(INSTRUMENT_ID) is original
+
+            changed = _fresh_snapshot(identity, observed_ms + 1)
+            cast(JsonObject, changed["symbol_spec"])[field] = replacement
+            fake.current_snapshot = changed
+            await client._refresh_snapshot(allow_rehandshake=False)
+            assert len(updates) == 3
+            current = updates[-1]
+            assert current is not original
+            wanted = tuple(replacement) if isinstance(replacement, list) else replacement
+            assert current.info[field] == wanted
+            assert current.ts_event == (observed_ms + 1) * 1_000_000
+            assert client.is_connected
+            assert client.last_failure is None
+
+            # Same observation is idempotent; a new observation of the same values
+            # updates MT5 freshness without fabricating another feed or funding tick.
+            await client._refresh_snapshot(allow_rehandshake=False)
+            assert len(updates) == 3
+            later = deepcopy(changed)
+            cast(JsonObject, later["time"])["observed_utc_ms"] = str(observed_ms + 2)
+            fake.current_snapshot = later
+            client._mark_snapshot_unavailable(Mt5V1RequestTimeout("temporary outage"))
+            await client._refresh_snapshot(allow_rehandshake=False)
+            assert len(updates) == 4
+            assert updates[-1].info == current.info
+            assert updates[-1].ts_event > current.ts_event
+
+            client._mark_snapshot_unavailable(Mt5V1RequestTimeout("temporary outage"))
+            # A native re-subscription during an outage must not republish stale cost.
+            engine.execute(
+                UnsubscribeInstrument(
+                    instrument_id=INSTRUMENT_ID,
+                    client_id=ClientId("MT5"),
+                    venue=Venue("MT5"),
+                    command_id=UUID4(),
+                    ts_init=clock.timestamp_ns(),
+                )
+            )
+            await asyncio.sleep(0)
+            await client._subscribe_instrument(
+                SubscribeInstrument(
+                    instrument_id=INSTRUMENT_ID,
+                    client_id=ClientId("MT5"),
+                    venue=Venue("MT5"),
+                    command_id=UUID4(),
+                    ts_init=clock.timestamp_ns(),
+                )
+            )
+            assert len(updates) == 4
+        finally:
+            client.disconnect()
+            await _wait_until(lambda: fake.closed and not client.is_connected)
+            engine.dispose()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "anomaly",
+    ["backward", "same_time_conflict", "future", "stale", "structure", "authority"],
+)
+def test_invalid_snapshot_never_replaces_last_good_instrument(anomaly: str) -> None:
+    async def scenario() -> None:
+        clock = TestComponentStubs.clock()
+        msgbus = TestComponentStubs.msgbus()
+        cache = TestComponentStubs.cache()
+        engine = DataEngine(msgbus=msgbus, cache=cache, clock=clock)
+        identity = _identity()
+        now_ms = clock.timestamp_ns() // 1_000_000
+        initial = _fresh_snapshot(identity, now_ms - 1_000)
+        fake = _FakeTransport(identity, initial)
+        client = Mt5V1DataClient(
+            loop=asyncio.get_running_loop(),
+            name="MT5",
+            config=_config(snapshot_interval_ms=250),
+            msgbus=msgbus,
+            cache=cache,
+            clock=clock,
+            instrument_provider=InstrumentProvider(),
+            transport=fake,
+        )
+        try:
+            await client._connect()
+            client._set_connected(True)
+            client._running = True
+            await client._subscribe_instrument_status(
+                SubscribeInstrumentStatus(
+                    instrument_id=INSTRUMENT_ID,
+                    client_id=ClientId("MT5"),
+                    venue=Venue("MT5"),
+                    command_id=UUID4(),
+                    ts_init=clock.timestamp_ns(),
+                )
+            )
+            original = cache.instrument(INSTRUMENT_ID)
+            bad_time = {
+                "backward": now_ms - 1_001,
+                "same_time_conflict": now_ms - 1_000,
+                "future": now_ms + 800,
+                "stale": now_ms - 60_001,
+                "structure": now_ms,
+                "authority": now_ms,
+            }[anomaly]
+            bad = _fresh_snapshot(identity, bad_time)
+            spec = cast(JsonObject, bad["symbol_spec"])
+            spec["swap_long"] = "-99"
+            if anomaly == "structure":
+                spec["contract_size"] = "10"
+            elif anomaly == "authority":
+                cast(JsonObject, bad["authority_flags"])["symbol_trade_mode"] = 0
+            fake.current_snapshot = bad
+
+            await asyncio.wait_for(client._run_snapshots(), timeout=1)
+
+            assert cache.instrument(INSTRUMENT_ID) is original
+            assert client._snapshot is initial
+            assert client.committed_snapshot_count == 1
+            assert not client.snapshot_refresh_healthy
+            assert not client.is_connected
+            assert fake.closed
+            status = cache.instrument_status(INSTRUMENT_ID)
+            assert status is not None and status.is_trading is False
+        finally:
+            await client._disconnect()
+            engine.dispose()
+
+    asyncio.run(scenario())
+
+
 def test_public_connect_immediate_reader_failure_stays_disconnected() -> None:
     async def scenario() -> None:
         clock = TestComponentStubs.clock()
@@ -623,7 +832,20 @@ def test_public_connect_immediate_reader_failure_stays_disconnected() -> None:
     asyncio.run(scenario())
 
 
-def test_periodic_snapshot_timeout_marks_unavailable_then_recovers() -> None:
+@pytest.mark.parametrize(
+    ("failure", "reason"),
+    [
+        (Mt5V1RequestTimeout("synthetic periodic timeout"), "mt5_snapshot_request_timeout"),
+        (
+            Mt5V1RemoteError("SNAPSHOT_UNAVAILABLE", "synthetic incomplete positions"),
+            "mt5_snapshot_unavailable",
+        ),
+    ],
+)
+def test_periodic_snapshot_failure_marks_unavailable_then_recovers(
+    failure: Mt5V1RequestTimeout | Mt5V1RemoteError,
+    reason: str,
+) -> None:
     async def scenario() -> None:
         clock = TestComponentStubs.clock()
         msgbus = TestComponentStubs.msgbus()
@@ -665,7 +887,7 @@ def test_periodic_snapshot_timeout_marks_unavailable_then_recovers() -> None:
             assert initially_healthy is True
             fake.snapshot_results.extend(
                 [
-                    Mt5V1RequestTimeout("synthetic periodic timeout"),
+                    failure,
                     snapshot,
                 ]
             )
@@ -678,7 +900,14 @@ def test_periodic_snapshot_timeout_marks_unavailable_then_recovers() -> None:
             status = cache.instrument_status(INSTRUMENT_ID)
             assert isinstance(status, InstrumentStatus)
             assert status.action == MarketStatusAction.NOT_AVAILABLE_FOR_TRADING
-            assert status.reason == "mt5_snapshot_request_timeout"
+            assert status.reason == reason
+            assert client._snapshot is snapshot
+            assert client.committed_snapshot_count == 1
+            # A subscription arriving during the outage must not revive old TRADING.
+            await client._subscribe_instrument_status(status_command)
+            status = cache.instrument_status(INSTRUMENT_ID)
+            assert isinstance(status, InstrumentStatus)
+            assert status.action == MarketStatusAction.NOT_AVAILABLE_FOR_TRADING
             assert client.is_connected is True
             assert client._running is True
             assert fake.opened is True
@@ -709,13 +938,22 @@ def test_periodic_snapshot_timeout_marks_unavailable_then_recovers() -> None:
     asyncio.run(scenario())
 
 
-def test_startup_snapshot_timeout_still_fails_closed() -> None:
+@pytest.mark.parametrize(
+    "failure",
+    [
+        Mt5V1RequestTimeout("synthetic startup timeout"),
+        Mt5V1RemoteError("SNAPSHOT_UNAVAILABLE", "synthetic startup unavailable"),
+    ],
+)
+def test_startup_snapshot_failure_then_same_ea_connect_recovers(
+    failure: Mt5V1RequestTimeout | Mt5V1RemoteError,
+) -> None:
     async def scenario() -> None:
         clock = TestComponentStubs.clock()
         identity = _identity()
         snapshot = _fresh_snapshot(identity, clock.timestamp_ns() // 1_000_000)
         fake = _FakeTransport(identity, snapshot)
-        fake.snapshot_results.append(Mt5V1RequestTimeout("synthetic startup timeout"))
+        fake.snapshot_results.append(failure)
         client = Mt5V1DataClient(
             loop=asyncio.get_running_loop(),
             name="MT5",
@@ -727,12 +965,28 @@ def test_startup_snapshot_timeout_still_fails_closed() -> None:
             transport=fake,
         )
 
-        with pytest.raises(Mt5V1RequestTimeout, match="startup timeout"):
+        with pytest.raises(type(failure), match="synthetic startup"):
             await client._connect()
 
-        assert client.snapshot_refresh_healthy is False
+        startup_healthy = client.snapshot_refresh_healthy
+        assert startup_healthy is False
         assert fake.opened is True
         assert fake.closed is True
+        failed_identity = client._identity
+        failed_snapshot = client._snapshot
+        failed_instrument = client._instrument
+        failed_commit_count = client.committed_snapshot_count
+        assert failed_identity is None
+        assert failed_snapshot is None
+        assert failed_instrument is None
+        assert failed_commit_count == 0
+
+        await client._connect()
+        assert client._identity == identity
+        assert client._snapshot is snapshot
+        assert client.committed_snapshot_count == 1
+        assert client.snapshot_refresh_healthy
+        await client._disconnect()
 
     asyncio.run(scenario())
 

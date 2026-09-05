@@ -77,6 +77,11 @@ class Mt5V1ExecutionError(RuntimeError):
 _REJECTED_ORDER_ID_DOMAIN = "py000-nautilus:mt5-v1:rejected-order"
 
 
+def _mt5_usd_commission(native_fee: str) -> Money:
+    """Book native signed cash flow as a USD cost without changing journal values."""
+    return Money.from_decimal(-Decimal(native_fee), USD)
+
+
 class Mt5V1ExecClientConfig(LiveExecClientConfig, kw_only=True, frozen=True):
     pub_url: str
     rep_url: str
@@ -320,6 +325,7 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
         self._identity: Identity | None = None
         self._bound_stream_id: str | None = None
         self._snapshot: JsonObject | None = None
+        self._snapshot_refresh_healthy = False
         self._cursor = "0"
         self._pending: dict[str, _Pending] = {}
         self._seen_request_ids: set[str] = set()
@@ -400,6 +406,7 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
             self._last_failure = f"{type(exc).__name__}: {exc}"[:300]
             self._identity = None
             self._snapshot = None
+            self._snapshot_refresh_healthy = False
             self._recovery_state = None
             self._execution_spec = None
             self._next_snapshot_refresh_at = None
@@ -422,6 +429,7 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
         await self._transport.close()
         self._identity = None
         self._snapshot = None
+        self._snapshot_refresh_healthy = False
         self._recovery_state = None
         self._execution_spec = None
         self._next_snapshot_refresh_at = None
@@ -581,6 +589,7 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
         await self._transport.close()
         self._identity = None
         self._snapshot = None
+        self._snapshot_refresh_healthy = False
         self._recovery_state = None
         self._execution_spec = None
         self._next_snapshot_refresh_at = None
@@ -594,6 +603,10 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
                 await self._refresh_snapshot_if_due()
             except Mt5V1RequestTimeout as exc:
                 self._mark_transient_request_timeout(exc)
+                return
+            except Mt5V1RemoteError as exc:
+                if exc.code != "SNAPSHOT_UNAVAILABLE":
+                    raise
                 return
             self._clear_transient_request_timeout()
 
@@ -713,6 +726,13 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
             raise Mt5V1ExecutionError("MT5 close fill does not match reserved target position")
         ts_event = int(cast(str, event["event_time_ms"])) * 1_000_000
         venue_order_id = VenueOrderId(cast(str, payload["venue_order_id"]))
+        position_id = PositionId(cast(str, payload["venue_position_id"]))
+        trade_id = TradeId(cast(str, payload["venue_deal_id"]))
+        quantity = pending.instrument.make_qty(
+            filled_lots * Decimal(str(pending.instrument.lot_size))
+        )
+        price = pending.instrument.make_price(Decimal(cast(str, payload["fill_price"])))
+        commission = _mt5_usd_commission(cast(str, payload["commission"]))
         if not pending.accepted:
             self.generate_order_accepted(
                 pending.order.strategy_id,
@@ -729,14 +749,14 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
             pending.order.instrument_id,
             pending.order.client_order_id,
             venue_order_id,
-            PositionId(cast(str, payload["venue_position_id"])),
-            TradeId(cast(str, payload["venue_deal_id"])),
+            position_id,
+            trade_id,
             pending.order.side,
             OrderType.MARKET,
-            pending.instrument.make_qty(filled_lots * Decimal(str(pending.instrument.lot_size))),
-            pending.instrument.make_price(Decimal(cast(str, payload["fill_price"]))),
+            quantity,
+            price,
             USD,
-            Money(Decimal(cast(str, payload["commission"])), USD),
+            commission,
             LiquiditySide.NO_LIQUIDITY_SIDE,
             ts_event,
         )
@@ -830,14 +850,28 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
             )
             await self._verify_unchanged_journal_tail(identity, self._cursor)
             self._install_snapshot(snapshot)
-            self._refresh_execution_hold()
+            self._clear_transient_request_timeout()
             self._schedule_snapshot_refresh()
-        except Mt5V1RequestTimeout:
+        except Mt5V1RequestTimeout as exc:
+            self._mark_snapshot_unavailable(exc)
+            raise
+        except Mt5V1RemoteError as exc:
+            if exc.code == "SNAPSHOT_UNAVAILABLE":
+                self._mark_snapshot_unavailable(exc)
+            else:
+                self._last_failure = f"{type(exc).__name__}: {exc}"[:300]
+                await self._fail_closed_disconnect()
             raise
         except BaseException as exc:
             self._last_failure = f"{type(exc).__name__}: {exc}"[:300]
             await self._fail_closed_disconnect()
             raise
+
+    def _mark_snapshot_unavailable(self, exc: Mt5V1TransportError) -> None:
+        self._snapshot_refresh_healthy = False
+        self._last_failure = f"{type(exc).__name__}: {exc}"[:300]
+        self._refresh_execution_hold()
+        self._schedule_snapshot_refresh()
 
     def _install_snapshot(self, snapshot: JsonObject) -> None:
         account = cast(JsonObject, snapshot["account"])
@@ -879,6 +913,7 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
                 "mt5_leverage": cast(int, account["leverage"]),
             },
         )
+        self._snapshot_refresh_healthy = True
 
     @staticmethod
     def _snapshot_execution_spec(snapshot: JsonObject) -> tuple[object, ...]:
@@ -953,6 +988,8 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
         reasons: list[str] = []
         if self._identity is None:
             reasons.append("MT5 execution is not connected")
+        elif not self._snapshot_refresh_healthy:
+            reasons.append("MT5 execution snapshot is temporarily unavailable")
         if self._recovery_state == "blocked":
             reasons.append("EA recovery state is blocked")
         projection = _JournalProjection(self._reservations, self._terminal_events)
@@ -975,7 +1012,9 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
 
     def _clear_transient_request_timeout(self) -> None:
         self._transient_request_failure = None
-        if not any(pending.unknown for pending in self._pending.values()):
+        if self._snapshot_refresh_healthy and not any(
+            pending.unknown for pending in self._pending.values()
+        ):
             self._last_failure = None
         self._refresh_execution_hold()
 
@@ -1149,6 +1188,8 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
     def _require_reportable_state(self) -> tuple[JsonObject, _JournalProjection]:
         self._require_identity()
         snapshot = self._require_snapshot()
+        if not self._snapshot_refresh_healthy:
+            raise Mt5V1ExecutionError("MT5 execution reports require a complete current snapshot")
         projection = _JournalProjection(self._reservations, self._terminal_events)
         if self._pending:
             raise Mt5V1ExecutionError(
@@ -1299,7 +1340,7 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
             ),
             last_px=price,
             avg_px=price.as_decimal(),
-            commission=Money(Decimal(cast(str, payload["commission"])), USD),
+            commission=_mt5_usd_commission(cast(str, payload["commission"])),
             liquidity_side=LiquiditySide.NO_LIQUIDITY_SIDE,
             report_id=UUID4(),
             ts_event=timestamp,
@@ -1316,6 +1357,14 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
                 await self._consume_event_pages()
                 await self._refresh_snapshot_if_due(force=True)
                 return await super().generate_mass_status(lookback_mins)
+            except Mt5V1RequestTimeout as exc:
+                self._mark_snapshot_unavailable(exc)
+                self._mark_transient_request_timeout(exc)
+                raise
+            except Mt5V1RemoteError as exc:
+                if exc.code != "SNAPSHOT_UNAVAILABLE" and self._identity is not None:
+                    await self._fail_closed_disconnect()
+                raise
             except BaseException:
                 if self._identity is not None:
                     await self._fail_closed_disconnect()

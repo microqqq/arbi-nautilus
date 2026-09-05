@@ -421,6 +421,44 @@ def test_source_reconciliation_persist_failure_rolls_back_memory_and_disk(
     assert not reloaded.can_submit_source()
 
 
+@pytest.mark.parametrize("terminal_status", ["CANCELED", "EXPIRED"])
+@pytest.mark.parametrize("prior_hold", [None, "restart", "hedge"])
+def test_source_terminal_confirmation_preserves_unrelated_durable_hold(
+    tmp_path: Path, terminal_status: str, prior_hold: str | None,
+) -> None:
+    path = _state_path(tmp_path)
+    store = JsonStateStore(path)
+    store.begin_source("O-TERMINAL", BusinessOrderSide.BUY, D(2))
+    if prior_hold == "restart":
+        store.recover_for_start()
+    elif prior_hold == "hedge":
+        intent = store.reserve_source_fill(
+            fill_key="O-TERMINAL|V-1|T-1", client_order_id="O-TERMINAL",
+            trade_id="T-1", source_side=BusinessOrderSide.BUY, fill_ounces=D(1),
+        )
+        assert intent is not None
+        store.block_hedge_intent(intent.intent_id, "exact ticket has changed")
+    original_reason = store.halt_reason
+
+    store.update_source_status("O-TERMINAL", terminal_status)
+    if prior_hold is not None:
+        assert store.halt_reason == original_reason
+        assert JsonStateStore(path).halt_reason == original_reason
+    assert not store.can_submit_source()
+    store.confirm_source_reconciled("O-TERMINAL")
+    store.confirm_source_reconciled("O-TERMINAL")  # Duplicate proof is harmless.
+
+    for state in (store, JsonStateStore(path)):
+        assert state.active_source_order_id is None
+        assert state.halt_reason == original_reason
+        assert state.can_submit_source() is (prior_hold is None)
+        record = state.source_order("O-TERMINAL")
+        assert record is not None and record.status == terminal_status
+        if prior_hold == "hedge":
+            assert state.intents()[0].status is ObligationStatus.BLOCKED
+            assert state.net_unhedged_ounces == D(1)
+
+
 def test_post_replace_sync_failure_keeps_the_source_fill_reservation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

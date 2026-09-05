@@ -24,6 +24,7 @@ from nautilus_trader.model.identifiers import ClientId, ClientOrderId
 
 from py000_nautilus.bitfinex_v1_data import PAPER_RAW_SYMBOL, BitfinexV1DataClient
 from py000_nautilus.bitfinex_v1_execution import BitfinexV1ExecutionClient
+from py000_nautilus.live_runtime import get_source_terminal_reconciler
 from py000_nautilus.live_taker import (
     BITFINEX_CLIENT_ID,
     MT5_CLIENT_ID,
@@ -281,7 +282,6 @@ async def _run_bounded(
                     task,
                     direction,
                     signal_timeout,
-                    connection_timeout,
                     close_existing=close_existing,
                     expected_source_position=expected_source_position,
                 )
@@ -501,13 +501,12 @@ async def _wait_terminal(
     task: asyncio.Task[None],
     direction: SourceDirection,
     timeout: float,
-    reconciliation_timeout: float,
     *,
     close_existing: bool = False,
     expected_source_position: Decimal = Decimal(0),
 ) -> TakerCanaryResult:
     deadline = asyncio.get_running_loop().time() + timeout
-    source_reconciliation_attempts = 0
+    source_reconciliation_requested = False
     final_reconciled = False
     while True:
         if task.done():
@@ -528,31 +527,25 @@ async def _wait_terminal(
             bitfinex, _ = _clients(node)
             needs_source_terminal_reconciliation = bitfinex.terminal_reconciliation_required
         now = asyncio.get_running_loop().time()
-        source_reconciliation_due = needs_source_terminal_reconciliation and (
-            source_reconciliation_attempts == 0
-            or (source_reconciliation_attempts == 1 and now >= deadline)
+        source_reconciliation_due = (
+            needs_source_terminal_reconciliation and not source_reconciliation_requested
         )
         if source_reconciliation_due:
             assert record is not None
             assert bitfinex is not None
-            source_reconciliation_attempts += 1
+            source_reconciliation_requested = True
             try:
-                clean = await asyncio.wait_for(
-                    node.kernel.exec_engine.reconcile_execution_state(
-                        timeout_secs=reconciliation_timeout,
-                    ),
-                    timeout=reconciliation_timeout,
-                )
+                reconciler = get_source_terminal_reconciler(node)
+                clean = await reconciler.reconcile(retry_failed=False)
                 if not clean:
                     raise RuntimeError("source terminal reconciliation was not clean")
-                bitfinex.confirm_terminal_reconciliation()
             except Exception:
                 return TakerCanaryResult(
                     "UNKNOWN",
                     "source_terminal_reconciliation_failed",
                     record.client_order_id,
                 )
-            if bitfinex.terminal_reconciliation_required and now >= deadline:
+            if bitfinex.terminal_reconciliation_required:
                 return TakerCanaryResult(
                     "UNKNOWN",
                     "source_terminal_reconciliation_failed",
@@ -565,12 +558,8 @@ async def _wait_terminal(
         if needs_reconcile and not final_reconciled:
             assert record is not None
             final_reconciled = True
-            clean = await asyncio.wait_for(
-                node.kernel.exec_engine.reconcile_execution_state(
-                    timeout_secs=reconciliation_timeout,
-                ),
-                timeout=reconciliation_timeout,
-            )
+            reconciler = get_source_terminal_reconciler(node)
+            clean = await reconciler.reconcile(retry_failed=False)
             if not clean:
                 return TakerCanaryResult(
                     "UNKNOWN",

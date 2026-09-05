@@ -15,8 +15,10 @@ from nautilus_trader.common.enums import LogColor
 from nautilus_trader.common.providers import InstrumentProvider
 from nautilus_trader.config import LiveDataClientConfig
 from nautilus_trader.data.messages import (
+    SubscribeInstrument,
     SubscribeInstrumentStatus,
     SubscribeQuoteTicks,
+    UnsubscribeInstrument,
     UnsubscribeInstrumentStatus,
     UnsubscribeQuoteTicks,
 )
@@ -381,6 +383,14 @@ class Mt5V1DataClient(LiveMarketDataClient):
         self._snapshot = None
         self._snapshot_refresh_healthy = False
 
+    async def _subscribe_instrument(self, command: SubscribeInstrument) -> None:
+        self._require_instrument(command.instrument_id)
+        if self._snapshot_refresh_healthy and self._instrument is not None:
+            self._handle_data(self._instrument)
+
+    async def _unsubscribe_instrument(self, command: UnsubscribeInstrument) -> None:
+        self._require_instrument(command.instrument_id)
+
     async def _subscribe_quote_ticks(self, command: SubscribeQuoteTicks) -> None:
         self._require_instrument(command.instrument_id)
         self._quote_subscribed = True
@@ -392,7 +402,9 @@ class Mt5V1DataClient(LiveMarketDataClient):
     async def _subscribe_instrument_status(self, command: SubscribeInstrumentStatus) -> None:
         self._require_instrument(command.instrument_id)
         self._status_subscribed = True
-        if self._snapshot is not None:
+        if not self._snapshot_refresh_healthy:
+            self._publish_unavailable("mt5_snapshot_unavailable")
+        elif self._snapshot is not None:
             self._handle_data(
                 status_from_snapshot(
                     self._snapshot,
@@ -421,8 +433,10 @@ class Mt5V1DataClient(LiveMarketDataClient):
                 await asyncio.sleep(self._mt5_config.snapshot_interval_ms / 1_000)
                 try:
                     await self._refresh_snapshot(allow_rehandshake=True)
-                except Mt5V1RequestTimeout as exc:
-                    self._mark_snapshot_timeout(exc)
+                except (Mt5V1RequestTimeout, Mt5V1RemoteError) as exc:
+                    if isinstance(exc, Mt5V1RemoteError) and exc.code != "SNAPSHOT_UNAVAILABLE":
+                        raise
+                    self._mark_snapshot_unavailable(exc)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -452,15 +466,25 @@ class Mt5V1DataClient(LiveMarketDataClient):
         signature = _snapshot_instrument_signature(snapshot)
         if self._instrument_signature is not None and signature != self._instrument_signature:
             raise Mt5V1DataError("MT5 instrument specification changed while connected")
-        if self._instrument is None:
-            self._instrument = instrument_from_snapshot(
-                snapshot,
-                self._mt5_config.instrument_id,
-                ts_init=self._clock.timestamp_ns(),
-            )
-            self._instrument_provider.add(self._instrument)
-            self._handle_data(self._instrument)
-            self._instrument_signature = signature
+        instrument = instrument_from_snapshot(
+            snapshot,
+            self._mt5_config.instrument_id,
+            ts_init=self._clock.timestamp_ns(),
+        )
+        status = status_from_snapshot(
+            snapshot,
+            self._mt5_config.instrument_id,
+            ts_init=self._clock.timestamp_ns(),
+        )
+        previous = self._instrument
+        if previous is not None:
+            if instrument.ts_event < previous.ts_event:
+                raise Mt5V1DataError("MT5 snapshot observation moved backward")
+            if instrument.ts_event == previous.ts_event and _instrument_swap_signature(
+                instrument
+            ) != _instrument_swap_signature(previous):
+                raise Mt5V1DataError("MT5 swap inputs conflict at the same observation time")
+        publish_instrument = previous is None or instrument.ts_event > previous.ts_event
         if self._identity is not None and identity.binding() != self._identity.binding():
             self._committed_snapshot_count = 0
             self._identity_matched_pub_count = 0
@@ -470,21 +494,27 @@ class Mt5V1DataClient(LiveMarketDataClient):
         self._snapshot = snapshot
         self._snapshot_refresh_healthy = True
         self._last_failure = None
-        if self._status_subscribed:
-            self._handle_data(
-                status_from_snapshot(
-                    snapshot,
-                    self._mt5_config.instrument_id,
-                    ts_init=self._clock.timestamp_ns(),
-                )
-            )
         self._committed_snapshot_count += 1
+        if publish_instrument:
+            self._instrument = instrument
+            self._instrument_signature = signature
+            self._instrument_provider.add(instrument)
+            # DataEngine replaces its cache before notifying native subscribers.
+            # Commit our snapshot first so those callbacks see the same observation.
+            self._handle_data(instrument)
+        if self._status_subscribed:
+            self._handle_data(status)
 
-    def _mark_snapshot_timeout(self, exc: Mt5V1RequestTimeout) -> None:
+    def _mark_snapshot_unavailable(self, exc: Mt5V1RequestTimeout | Mt5V1RemoteError) -> None:
         self._snapshot_refresh_healthy = False
         self._last_failure = f"{type(exc).__name__}: {exc}"[:300]
-        self._log.warning("MT5 periodic snapshot timed out; keeping PUB alive for recovery")
-        self._publish_unavailable("mt5_snapshot_request_timeout")
+        self._log.warning("MT5 snapshot is unavailable; keeping PUB alive for recovery")
+        reason = (
+            "mt5_snapshot_request_timeout"
+            if isinstance(exc, Mt5V1RequestTimeout)
+            else "mt5_snapshot_unavailable"
+        )
+        self._publish_unavailable(reason)
 
     def _publish_pub(self, topic: bytes, message: JsonObject) -> None:
         if not self._quote_subscribed or self._snapshot is None or self._instrument is None:
@@ -577,7 +607,7 @@ class Mt5V1DataClient(LiveMarketDataClient):
         observed_ms = int(cast(str, cast(JsonObject, snapshot["time"])["observed_utc_ms"]))
         now_ms = self._clock.timestamp_ns() // 1_000_000
         age_ms = now_ms - observed_ms
-        if age_ms < -1_000 or age_ms > self._mt5_config.max_snapshot_age_ms:
+        if age_ms < 0 or age_ms > self._mt5_config.max_snapshot_age_ms:
             raise Mt5V1DataError("MT5 snapshot observation is stale or future-dated")
 
     def _require_identity(self) -> Identity:
@@ -646,17 +676,23 @@ def _snapshot_instrument_signature(snapshot: JsonObject) -> tuple[object, ...]:
                 "currency_profit",
                 "digits",
                 "point",
-                "swap_long",
-                "swap_short",
-                "swap_mode",
                 "tick_size",
                 "volume_min",
                 "volume_max",
                 "volume_step",
             )
         ),
-        tuple(cast(list[object], spec["swap_rates"])),
         identity.server_timezone,
+    )
+
+
+def _instrument_swap_signature(instrument: Cfd) -> tuple[object, ...]:
+    info = instrument.info
+    return (
+        Decimal(info["swap_long"]),
+        Decimal(info["swap_short"]),
+        info["swap_mode"],
+        tuple(Decimal(rate) for rate in info["swap_rates"]),
     )
 
 

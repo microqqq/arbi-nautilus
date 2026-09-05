@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import replace
 from decimal import Decimal
 from typing import Any
 
@@ -15,6 +16,12 @@ from nautilus_trader.model.enums import (
 )
 from nautilus_trader.model.identifiers import AccountId, ClientOrderId
 
+import py000_nautilus.bitfinex_v1_reports as reports_module
+from py000_nautilus.bitfinex_v1_cids import (
+    BitfinexFeeMetadata,
+    BitfinexFeeTrade,
+    BitfinexNativeFill,
+)
 from py000_nautilus.bitfinex_v1_data import (
     INSTRUMENT_ID,
     PAPER_RAW_SYMBOL,
@@ -394,7 +401,7 @@ def test_fill_mapping_ignores_unknown_cids_and_rejects_conflicting_trade_ids(ins
         )
 
 
-def test_fill_mapping_rejects_non_usd_config_and_usd_precision_loss(instrument) -> None:  # type: ignore[no-untyped-def]
+def test_fill_mapping_rejects_non_usd_config(instrument) -> None:  # type: ignore[no-untyped-def]
     with pytest.raises(BitfinexV1ReportError, match="fee currency must be USD"):
         map_fill_reports(
             rows=[_trade_row()],
@@ -404,15 +411,48 @@ def test_fill_mapping_rejects_non_usd_config_and_usd_precision_loss(instrument) 
             fee_currency="USTF0",
             ts_init=TS_INIT,
         )
-    with pytest.raises(BitfinexV1ReportError, match="fee loses USD precision"):
-        map_fill_reports(
-            rows=[_trade_row(fee="-0.001")],
-            instrument=instrument,
-            account_id=ACCOUNT_ID,
-            cid_lookup=_lookup(101),
-            fee_currency="USD",
-            ts_init=TS_INIT,
-        )
+
+
+@pytest.mark.parametrize(
+    ("fee", "commission"),
+    [
+        ("-0.061668", "0.06"),
+        ("-0.001", "0.00"),
+        ("-0.005", "0.00"),
+        ("0.005", "0.00"),
+        ("-0.015", "0.02"),
+        ("0.015", "-0.02"),
+        ("0", "0.00"),
+    ],
+)
+def test_fill_mapping_rounds_usd_fee_half_even(fee: str, commission: str) -> None:
+    row = _trade_row(fee=fee)
+    report = map_fill_reports(
+        rows=[row],
+        instrument=_instrument(),
+        account_id=ACCOUNT_ID,
+        cid_lookup=_lookup(101),
+        fee_currency="USD",
+        ts_init=TS_INIT,
+    )[0]
+    assert report.commission.as_decimal() == Decimal(commission)
+    assert report.commission.currency.code == "USD"
+    assert row[9] == Decimal(fee)
+
+
+def test_fill_mapping_rounds_each_fee_before_aggregation() -> None:
+    rows = [_trade_row(trade_id=trade_id, fee="-0.0049") for trade_id in (5001, 5002)]
+    reports = map_fill_reports(
+        rows=[*rows, rows[0].copy()],
+        instrument=_instrument(),
+        account_id=ACCOUNT_ID,
+        cid_lookup=_lookup(101),
+        fee_currency="USD",
+        ts_init=TS_INIT,
+    )
+    assert len(reports) == 2
+    assert sum((report.commission.as_decimal() for report in reports), Decimal()) == 0
+    assert all(row[9] == Decimal("-0.0049") for row in rows)
 
 
 def test_position_mapping_covers_long_short_and_explicit_target_flat(instrument) -> None:  # type: ignore[no-untyped-def]
@@ -466,3 +506,90 @@ def test_position_mapping_rejects_non_derivative_and_multiple_target_positions(i
             account_id=ACCOUNT_ID,
             ts_init=TS_INIT,
         )
+def test_fee_summary_keeps_raw_quantized_booked_and_currency_domains_separate() -> None:
+    native = BitfinexNativeFill(
+        "1234", "te_paper", Decimal(2), Decimal("3926.75"), 123_000_000,
+        "TAKER", Decimal(0), "USD",
+    )
+    trade = BitfinexFeeTrade(
+        1234, 123, Decimal(2), Decimal("3926.75"), "IOC", Decimal(4000), False,
+        Decimal("-0.061668"), "USD",
+    )
+    metadata = BitfinexFeeMetadata(
+        100, 987, "XAUTUSDT.BITFINEX", "tTESTXAUTF0:TESTUSDTF0", (native,), (trade,),
+    )
+    summary = reports_module.summarize_fees((metadata,))
+    assert summary.complete
+    assert summary.pending_trades == summary.unknown_orders == 0
+    usd = summary.currencies["USD"]
+    assert usd.raw_cost == Decimal("0.061668")
+    assert usd.quantized_cost == Decimal("0.06")
+    assert usd.native_cost == Decimal(0)
+    assert usd.rounding_delta == Decimal("0.001668")
+    assert usd.provisional_correction == Decimal("0.06")
+
+    inferred = replace(native, trade_id="inferred-uuid", native_fill_origin="inferred",
+                       commission_currency="USDT", liquidity_side="NO_LIQUIDITY_SIDE")
+    summary = reports_module.summarize_fees((replace(metadata, native_fills=(inferred,)),))
+    assert summary.complete
+    assert summary.currencies["USD"].quantized_cost == Decimal("0.06")
+    assert summary.currencies["USDT"].native_cost == Decimal(0)
+    assert set(summary.currencies) == {"USD", "USDT"}
+
+    pending = replace(trade, raw_fee=None, fee_currency=None)
+    incomplete = reports_module.summarize_fees((replace(metadata, venue_trades=(pending,)),))
+    assert not incomplete.complete and incomplete.pending_trades == 1
+    assert not reports_module.summarize_fees((replace(metadata, native_fills=()),)).complete
+    assert not reports_module.summarize_fees((replace(metadata, venue_trades=()),)).complete
+
+
+def test_inferred_fee_coverage_rejects_offsetting_opposite_order_sides() -> None:
+    native = BitfinexNativeFill(
+        "inferred-uuid", "inferred", Decimal(2), Decimal(100), 123_000_000,
+        "NO_LIQUIDITY_SIDE", Decimal(0), "USDT",
+    )
+    buy = BitfinexFeeTrade(
+        1234, 123, Decimal(3), Decimal(100), "IOC", Decimal(100), False,
+        Decimal("-0.03"), "USD",
+    )
+    sell = replace(buy, trade_id=1235, execution_qty=Decimal(-1), raw_fee=Decimal("-0.01"))
+    metadata = BitfinexFeeMetadata(
+        100, 987, "XAUTUSDT.BITFINEX", "tTESTXAUTF0:TESTUSDTF0", (native,), (buy, sell),
+    )
+    assert not reports_module.summarize_fees((metadata,)).complete
+
+
+def test_missing_native_fee_coverage_is_unknown_not_zero_booked() -> None:
+    trade = BitfinexFeeTrade(
+        1234, 123, Decimal(2), Decimal(100), "IOC", Decimal(100), False,
+        Decimal("-0.061668"), "USD",
+    )
+    metadata = BitfinexFeeMetadata(
+        100, 987, "XAUTUSDT.BITFINEX", "tTESTXAUTF0:TESTUSDTF0", (), (trade,),
+    )
+    summary = reports_module.summarize_fees((metadata,))
+    assert not summary.complete
+    assert summary.currencies["USD"].native_cost is None
+    assert summary.currencies["USD"].provisional_correction is None
+
+
+@pytest.mark.parametrize(
+    "amount,currency,symbol",
+    [("1", "USD", PAPER_RAW_SYMBOL), ("0", "USDT", PAPER_RAW_SYMBOL), ("0", "USD", RAW_SYMBOL)],
+)
+def test_provisional_label_alone_cannot_authorize_fee_correction(
+    amount: str, currency: str, symbol: str,
+) -> None:
+    native = BitfinexNativeFill(
+        "1234", "te_paper", Decimal(2), Decimal(100), 123_000_000,
+        "TAKER", Decimal(amount), currency,
+    )
+    trade = BitfinexFeeTrade(
+        1234, 123, Decimal(2), Decimal(100), "IOC", Decimal(100), False,
+        Decimal("-0.061668"), "USD",
+    )
+    summary = reports_module.summarize_fees((BitfinexFeeMetadata(
+        100, 987, "XAUTUSDT.BITFINEX", symbol, (native,), (trade,),
+    ),))
+    assert not summary.complete
+    assert summary.currencies["USD"].provisional_correction is None

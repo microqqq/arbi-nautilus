@@ -126,7 +126,8 @@ def run_simulated_example(state_path: Path) -> SimulationResult:
     engine.add_strategy(TakerStrategy(_strategy_config(state_path)))
     engine.add_data(
         [
-            _book_snapshot(source, "2388.00", "2390.00", "5", 1_000_000_000),
+            # Keep the first pair neutral; the 3s book introduces this example's one opportunity.
+            _book_snapshot(source, "2402.00", "2403.00", "5", 1_000_000_000),
             _quote(hedge, "2404.00", "2405.00", "10.00", 2_000_000_000),
             _book_snapshot(source, "2398.00", "2400.00", "5", 3_000_000_000),
         ]

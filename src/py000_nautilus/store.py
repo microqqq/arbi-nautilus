@@ -235,7 +235,7 @@ class JsonStateStore:
             and self._state.active_source_order_id == client_order_id
         ):
             self._state.active_source_order_id = None
-        if status in {"CANCELED", "EXPIRED"}:
+        if status in {"CANCELED", "EXPIRED"} and self._state.halt_reason is None:
             self._state.halt_reason = _source_reconcile_reason(client_order_id)
         self._persist()
 

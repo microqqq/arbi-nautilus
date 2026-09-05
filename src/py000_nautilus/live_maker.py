@@ -9,17 +9,13 @@ from pathlib import Path
 from typing import Protocol, cast
 
 from nautilus_trader.config import TradingNodeConfig
-from nautilus_trader.core.uuid import UUID4
-from nautilus_trader.execution.messages import GenerateOrderStatusReport
 from nautilus_trader.live.config import LiveExecEngineConfig
 from nautilus_trader.live.execution_client import LiveExecutionClient
 from nautilus_trader.live.node import TradingNode
 from nautilus_trader.model.identifiers import (
     ClientId,
-    ClientOrderId,
     TraderId,
     Venue,
-    VenueOrderId,
 )
 
 from py000_nautilus.bitfinex_v1_data import (
@@ -33,6 +29,7 @@ from py000_nautilus.bitfinex_v1_execution import (
     BitfinexV1LiveExecClientFactory,
 )
 from py000_nautilus.config import MakerStrategyConfig
+from py000_nautilus.live_runtime import SourceTerminalReconciler
 from py000_nautilus.mt5_v1_data import (
     Mt5V1DataClient,
     Mt5V1DataClientConfig,
@@ -47,7 +44,6 @@ from py000_nautilus.mt5_v1_execution import (
 from py000_nautilus.strategies.maker import (
     MakerStrategy,
     SourceTerminalQuery,
-    SourceTerminalResult,
 )
 
 BITFINEX_CLIENT_NAME = "BITFINEX"
@@ -68,6 +64,7 @@ class MakerStrategyFactory(Protocol):
         hedge_quantity_ready: Callable[[Decimal], bool],
         live_costs_from_adapters: bool,
         source_terminal_query: SourceTerminalQuery,
+        source_quote_refresh_paused: Callable[[], bool] | None = None,
     ) -> MakerStrategy: ...
 
 
@@ -133,34 +130,13 @@ def build_live_maker_node(
         bitfinex_exec = _exec_client(node, BITFINEX_CLIENT_ID, BitfinexV1ExecutionClient)
         mt5_exec = _exec_client(node, MT5_CLIENT_ID, Mt5V1ExecutionClient)
 
-        def query_source_terminal(
-            client_order_id: ClientOrderId,
-            venue_order_id: VenueOrderId,
-            complete: SourceTerminalResult,
-        ) -> None:
-            async def run_query() -> None:
-                try:
-                    report = await bitfinex_exec.generate_order_status_report(
-                        GenerateOrderStatusReport(
-                            instrument_id=strategy_config.source_instrument_id,
-                            client_order_id=client_order_id,
-                            venue_order_id=venue_order_id,
-                            command_id=UUID4(),
-                            ts_init=cast(int, node.kernel.clock.timestamp_ns()),
-                        )
-                    )
-                except asyncio.CancelledError:
-                    complete(None)
-                    raise
-                except Exception:
-                    complete(None)
-                    raise
-                complete(report)
-
-            bitfinex_exec.create_task(
-                run_query(),
-                log_msg="maker-source-terminal-query",
-            )
+        reconciler = SourceTerminalReconciler(
+            source_client=bitfinex_exec,
+            exec_engine=node.kernel.exec_engine,
+            source_instrument_id=strategy_config.source_instrument_id,
+            timeout_seconds=connection_timeout_seconds,
+        )
+        node.trader.add_actor(reconciler)
 
         strategy = strategy_factory(
             strategy_config,
@@ -168,6 +144,11 @@ def build_live_maker_node(
                 bitfinex_data.is_connected
                 and bitfinex_data.book_is_actionable
                 and bitfinex_exec.execution_hold_reason is None
+                and bitfinex_exec.accounting_ready
+                and (
+                    reconciler.source_submission_ready
+                    or reconciler.working_observation_in_progress
+                )
                 and bitfinex_exec.get_account() is not None
                 and mt5_data.is_connected
                 and mt5_data.snapshot_refresh_healthy
@@ -176,7 +157,8 @@ def build_live_maker_node(
             ),
             hedge_quantity_ready=mt5_exec.can_execute_quantity,
             live_costs_from_adapters=True,
-            source_terminal_query=query_source_terminal,
+            source_terminal_query=reconciler.query_source_terminal,
+            source_quote_refresh_paused=lambda: reconciler.busy,
         )
         node.trader.add_strategy(strategy)
         _verify_built_composition(

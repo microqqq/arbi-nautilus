@@ -434,32 +434,88 @@ bool Py000BuildAccountJson(string &json)
       + "}";
    return true;
 }
-bool Py000BuildPositionsJson(string &json)
+// These five native getters can be replaced by the isolated snapshot test script.
+#ifndef PY000_SNAPSHOT_TOTAL
+#define PY000_SNAPSHOT_TOTAL PositionsTotal
+#define PY000_SNAPSHOT_TICKET PositionGetTicket
+#define PY000_SNAPSHOT_STRING PositionGetString
+#define PY000_SNAPSHOT_INTEGER PositionGetInteger
+#define PY000_SNAPSHOT_DOUBLE PositionGetDouble
+#endif
+struct Py000PositionSample
 {
-   json = "[";
-   bool first = true;
-   int total = PositionsTotal();
+   ulong ticket;
+   long identifier;
+   string symbol;
+   long magic;
+   long side;
+   double volume;
+   string json;
+};
+bool Py000CollectPositions(Py000PositionSample &samples[], string &error_code)
+{
+   error_code = "SNAPSHOT_UNAVAILABLE";
+   ResetLastError();
+   int total = PY000_SNAPSHOT_TOTAL();
+   if(total < 0 || GetLastError() != 0 || ArrayResize(samples, total) != total)
+      return false;
+   int count = 0;
    for(int index = 0; index < total; index++)
    {
-      ulong ticket = PositionGetTicket(index);
-      if(ticket == 0 || PositionGetString(POSITION_SYMBOL) != _Symbol)
+      ulong ticket = PY000_SNAPSHOT_TICKET(index);
+      if(ticket == 0)
+         return false;
+      string symbol;
+      if(!PY000_SNAPSHOT_STRING(POSITION_SYMBOL, symbol) || StringLen(symbol) == 0)
+         return false;
+      if(symbol != _Symbol)
          continue;
-      string comment = PositionGetString(POSITION_COMMENT);
-      if(!Py000OptionalBrokerText(comment, 128))
+      Py000PositionSample row;
+      row.ticket = ticket;
+      row.symbol = symbol;
+      long ticket_raw, time_msc;
+      string comment;
+      double open_raw, current_raw, sl_raw, tp_raw, profit_raw, swap_raw;
+      if(!PY000_SNAPSHOT_INTEGER(POSITION_TICKET, ticket_raw)
+         || !PY000_SNAPSHOT_INTEGER(POSITION_IDENTIFIER, row.identifier)
+         || !PY000_SNAPSHOT_INTEGER(POSITION_MAGIC, row.magic)
+         || !PY000_SNAPSHOT_INTEGER(POSITION_TYPE, row.side)
+         || !PY000_SNAPSHOT_INTEGER(POSITION_TIME_MSC, time_msc)
+         || !PY000_SNAPSHOT_STRING(POSITION_COMMENT, comment)
+         || !PY000_SNAPSHOT_DOUBLE(POSITION_VOLUME, row.volume)
+         || !PY000_SNAPSHOT_DOUBLE(POSITION_PRICE_OPEN, open_raw)
+         || !PY000_SNAPSHOT_DOUBLE(POSITION_PRICE_CURRENT, current_raw)
+         || !PY000_SNAPSHOT_DOUBLE(POSITION_SL, sl_raw)
+         || !PY000_SNAPSHOT_DOUBLE(POSITION_TP, tp_raw)
+         || !PY000_SNAPSHOT_DOUBLE(POSITION_PROFIT, profit_raw)
+         || !PY000_SNAPSHOT_DOUBLE(POSITION_SWAP, swap_raw)
+         || ticket_raw <= 0 || (ulong)ticket_raw != ticket || row.identifier <= 0
+         || row.magic < 0 || time_msc <= 0
+         || (row.side != POSITION_TYPE_BUY && row.side != POSITION_TYPE_SELL)
+         || !MathIsValidNumber(row.volume) || row.volume <= 0.0)
          return false;
+      for(int previous = 0; previous < count; previous++)
+         if(samples[previous].ticket == ticket
+            || samples[previous].identifier == row.identifier)
+            return false;
       string volume, open_price, current_price, stop_loss, take_profit, profit, swap;
-      if(!Py000DecimalFromDouble(PositionGetDouble(POSITION_VOLUME), 8, volume)
-         || !Py000DecimalFromDouble(PositionGetDouble(POSITION_PRICE_OPEN), _Digits, open_price)
-         || !Py000DecimalFromDouble(PositionGetDouble(POSITION_PRICE_CURRENT), _Digits, current_price)
-         || !Py000DecimalFromDouble(PositionGetDouble(POSITION_SL), _Digits, stop_loss)
-         || !Py000DecimalFromDouble(PositionGetDouble(POSITION_TP), _Digits, take_profit)
-         || !Py000DecimalFromDouble(PositionGetDouble(POSITION_PROFIT), 8, profit)
-         || !Py000DecimalFromDouble(PositionGetDouble(POSITION_SWAP), 8, swap))
+      if(!Py000OptionalBrokerText(comment, 128)
+         || !Py000DecimalFromDouble(row.volume, 8, volume)
+         || !Py000JsonPositiveDecimal(volume)
+         || !Py000DecimalFromDouble(open_raw, _Digits, open_price)
+         || !Py000DecimalFromDouble(current_raw, _Digits, current_price)
+         || !Py000DecimalFromDouble(sl_raw, _Digits, stop_loss)
+         || !Py000DecimalFromDouble(tp_raw, _Digits, take_profit)
+         || !Py000DecimalFromDouble(profit_raw, 8, profit)
+         || !Py000DecimalFromDouble(swap_raw, 8, swap))
+      {
+         error_code = "SCHEMA_MISMATCH";
          return false;
-      string side = PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY ? "buy" : "sell";
-      string item = "{\"comment\":" + Py000Quoted(comment)
-         + ",\"identifier\":" + Py000Quoted(Py000UlongString((ulong)PositionGetInteger(POSITION_IDENTIFIER)))
-         + ",\"magic\":" + Py000Quoted(Py000UlongString((ulong)PositionGetInteger(POSITION_MAGIC)))
+      }
+      string side = row.side == POSITION_TYPE_BUY ? "buy" : "sell";
+      row.json = "{\"comment\":" + Py000Quoted(comment)
+         + ",\"identifier\":" + Py000Quoted(Py000UlongString((ulong)row.identifier))
+         + ",\"magic\":" + Py000Quoted(Py000UlongString((ulong)row.magic))
          + ",\"price_current\":" + Py000Quoted(current_price)
          + ",\"price_open\":" + Py000Quoted(open_price)
          + ",\"profit\":" + Py000Quoted(profit)
@@ -468,17 +524,62 @@ bool Py000BuildPositionsJson(string &json)
          + ",\"swap\":" + Py000Quoted(swap)
          + ",\"take_profit\":" + Py000Quoted(take_profit)
          + ",\"ticket\":" + Py000Quoted(Py000UlongString(ticket))
-         + ",\"time_msc\":" + Py000Quoted(Py000UlongString((ulong)PositionGetInteger(POSITION_TIME_MSC)))
+         + ",\"time_msc\":" + Py000Quoted(Py000UlongString((ulong)time_msc))
          + ",\"volume_lots\":" + Py000Quoted(volume) + "}";
-      if(!first) json += ",";
-      json += item;
-      first = false;
+      samples[count++] = row;
    }
-   json += "]";
+   ResetLastError();
+   int final_total = PY000_SNAPSHOT_TOTAL();
+   return final_total == total && GetLastError() == 0
+      && ArrayResize(samples, count) == count;
+}
+bool Py000PositionSamplesMatch(
+   const Py000PositionSample &first[],
+   const Py000PositionSample &second[]
+)
+{
+   if(ArraySize(first) != ArraySize(second))
+      return false;
+   for(int index = 0; index < ArraySize(first); index++)
+   {
+      bool found = false;
+      for(int other = 0; other < ArraySize(second); other++)
+         if(first[index].ticket == second[other].ticket
+            && first[index].identifier == second[other].identifier
+            && first[index].symbol == second[other].symbol
+            && first[index].magic == second[other].magic
+            && first[index].side == second[other].side
+            && first[index].volume == second[other].volume)
+         {
+            found = true;
+            break;
+         }
+      if(!found) return false;
+   }
    return true;
 }
-bool Py000BuildSnapshotData(string &json)
+bool Py000BuildPositionsJson(string &json, string &error_code)
 {
+   json = "";
+   Py000PositionSample first[], second[];
+   if(!Py000CollectPositions(first, error_code)
+      || !Py000CollectPositions(second, error_code)
+      || !Py000PositionSamplesMatch(first, second))
+      return false;
+   json = "[";
+   for(int index = 0; index < ArraySize(second); index++)
+   {
+      if(index > 0) json += ",";
+      json += second[index].json;
+   }
+   json += "]";
+   error_code = "";
+   return true;
+}
+bool Py000BuildSnapshotData(string &json, string &error_code)
+{
+   json = "";
+   error_code = "SCHEMA_MISMATCH";
    datetime server_quote_time = TimeCurrent();
    datetime session_sample_time = TimeTradeServer();
    datetime observed_utc = TimeGMT();
@@ -492,13 +593,14 @@ bool Py000BuildSnapshotData(string &json)
    if(server_quote_time <= 0 || observed_utc <= 0
       || !Py000BuildSymbolSpecJson(symbol_spec)
       || !Py000BuildAccountJson(account)
-      || !Py000BuildPositionsJson(positions)
       || !Py000DecimalFromDouble(
          g_py000_execution_max_order_lots, 8, max_order_lots
       )
       || !Py000BuildSessionJson(
          session_sample_time, terminal_connected, tick_available, tick, session
       ))
+      return false;
+   if(!Py000BuildPositionsJson(positions, error_code))
       return false;
    string flags = "{\"account_trade_allowed\":"
       + Py000Bool((bool)AccountInfoInteger(ACCOUNT_TRADE_ALLOWED))
@@ -534,13 +636,15 @@ bool Py000BuildSnapshotData(string &json)
 }
 string Py000SnapshotResponse(const Py000Request &request)
 {
-   string data;
-   if(!Py000BuildSnapshotData(data))
+   string data, error_code;
+   if(!Py000BuildSnapshotData(data, error_code))
       return Py000ErrorResponse(
          request.request_id,
          request.op,
-         "SCHEMA_MISMATCH",
-         "native snapshot value cannot satisfy v1 grammar"
+         error_code,
+         error_code == "SNAPSHOT_UNAVAILABLE"
+            ? "complete stable native positions snapshot is temporarily unavailable"
+            : "native snapshot value cannot satisfy v1 grammar"
       );
    return Py000ResponsePrefix(request.request_id, request.op, true)
       + ",\"data\":" + data + "}";

@@ -25,6 +25,7 @@ from py000_nautilus.bitfinex_v1_execution import (
     BitfinexV1LiveExecClientFactory,
 )
 from py000_nautilus.config import TakerStrategyConfig
+from py000_nautilus.live_runtime import SourceTerminalReconciler
 from py000_nautilus.models import SourceDirection
 from py000_nautilus.mt5_v1_data import (
     Mt5V1DataClient,
@@ -135,12 +136,21 @@ def build_live_taker_node(
         mt5_data = _data_client(node, MT5_VENUE, Mt5V1DataClient)
         bitfinex_exec = _exec_client(node, BITFINEX_CLIENT_ID, BitfinexV1ExecutionClient)
         mt5_exec = _exec_client(node, MT5_CLIENT_ID, Mt5V1ExecutionClient)
+        reconciler = SourceTerminalReconciler(
+            source_client=bitfinex_exec,
+            exec_engine=node.kernel.exec_engine,
+            source_instrument_id=strategy_config.source_instrument_id,
+            timeout_seconds=connection_timeout_seconds,
+        )
+        node.trader.add_actor(reconciler)
         strategy = TakerStrategy(
             runtime_strategy_config,
             live_submission_ready=lambda: (
                 bitfinex_data.is_connected
                 and bitfinex_data.book_is_actionable
                 and bitfinex_exec.execution_hold_reason is None
+                and (one_shot_close_existing or bitfinex_exec.accounting_ready)
+                and reconciler.source_submission_ready
                 and bitfinex_exec.get_account() is not None
                 and mt5_data.is_connected
                 and mt5_data.snapshot_refresh_healthy
@@ -158,6 +168,7 @@ def build_live_taker_node(
             ),
             hedge_quantity_ready=mt5_exec.can_execute_quantity,
             live_costs_from_adapters=True,
+            source_terminal_query=reconciler.query_source_terminal,
             one_shot=one_shot,
             allowed_source_direction=allowed_source_direction,
             hedge_must_reduce_only=one_shot_close_existing,

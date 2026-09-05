@@ -5,6 +5,11 @@ NautilusTrader 1.231.0. Both are thin Nautilus `Strategy` implementations using
 native limit orders, order/fill events, clock custody, cache, portfolio,
 execution routing, and `BacktestEngine`.
 
+Current remediation design (2026-09-05):
+[doc-first implementation plan](docs/IMPLEMENTATION_PLAN.md).
+It defines the remaining correctness and continuous-operation work; planned features
+are not yet implemented. The checkpoints below include historical validation results.
+
 ```bash
 uv sync --extra dev
 uv run ruff check .
@@ -119,7 +124,7 @@ MetaEditor build completed with 0 errors and 0 warnings and produced
 to the paper account on ports 6001/6002 and passed a strategy-free rehearsal on 2026-09-03:
 all four clients connected, both accounts registered, reconciliation and portfolio
 initialization succeeded, and the node shut down cleanly with zero open positions. No strategy
-or order ran in that rehearsal. The final current source exposes the broker-native
+or order ran in that rehearsal. The subsequent historical e812 source exposes the broker-native
 `swap_rates` vector as exactly seven values ordered Sunday through Saturday. Its source manifest is
 `e8126bf3ef0b42d01facdd2ef30f048972062b5ca38c81b84717156fb74cad00`. MetaEditor
 compiled it with 0 errors and 0 warnings as

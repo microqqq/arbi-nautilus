@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from decimal import Decimal
 from math import isclose
@@ -13,6 +13,7 @@ from nautilus_trader.cache.cache import Cache
 from nautilus_trader.common.component import LiveClock, MessageBus
 from nautilus_trader.common.providers import InstrumentProvider
 from nautilus_trader.config import LiveExecClientConfig
+from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.execution.messages import (
     BatchCancelOrders,
     CancelAllOrders,
@@ -58,7 +59,14 @@ from nautilus_trader.model.objects import AccountBalance, Money
 from nautilus_trader.model.orders import Order
 from nautilus_trader.model.position import Position
 
-from py000_nautilus.bitfinex_v1_cids import BitfinexV1CidError, BitfinexV1CidStore
+from py000_nautilus.bitfinex_v1_cids import (
+    BitfinexFeeMetadata,
+    BitfinexFeeTrade,
+    BitfinexNativeFill,
+    BitfinexV1CidError,
+    BitfinexV1CidStore,
+    BitfinexV1FeeConflict,
+)
 from py000_nautilus.bitfinex_v1_data import INSTRUMENT_ID as SUPPORTED_INSTRUMENT_ID
 from py000_nautilus.bitfinex_v1_data import PAPER_RAW_SYMBOL
 from py000_nautilus.bitfinex_v1_data import RAW_SYMBOL as PRODUCTION_RAW_SYMBOL
@@ -82,9 +90,13 @@ from py000_nautilus.bitfinex_v1_protocol import (
     update_order_op,
 )
 from py000_nautilus.bitfinex_v1_reports import (
+    BitfinexFeeSummary,
     map_fill_reports,
     map_order_status_reports,
     map_position_status_reports,
+    native_fill_matches_trade,
+    summarize_fees,
+    usd_commission,
 )
 from py000_nautilus.bitfinex_v1_rest import BitfinexV1RestClient
 from py000_nautilus.bitfinex_v1_transport import BitfinexV1Transport
@@ -123,6 +135,10 @@ _PRIVATE_FRAME_TYPES = frozenset(
 
 class BitfinexV1ExecutionError(RuntimeError):
     """The bounded private execution stream cannot prove a safe outcome."""
+
+
+class BitfinexV1AccountingError(BitfinexV1ExecutionError):
+    """Final fee facts conflict without changing the already known execution."""
 
 
 class BitfinexV1ExecClientConfig(LiveExecClientConfig, kw_only=True, frozen=True):
@@ -189,6 +205,7 @@ class _LiveOrder:
     pending_cancel: bool = False
     terminal: OrderState | None = None
     reconciled_terminal: OrderStatusReport | None = None
+    reconciled_working: OrderStatusReport | None = None
     terminal_emitted: bool = False
     rejection_key: tuple[str, int | None, str] | None = None
     venue_flags_verified: bool = False
@@ -258,6 +275,154 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
         self._paper_interim_fills: dict[int, TradeExecution] = {}
         self._unbound_paper_interim_fills: dict[int, TradeExecution] = {}
         self._ack_deadlines: dict[tuple[int, str], asyncio.TimerHandle] = {}
+        self._accounting_failure: str | None = None
+        # The Engine publishes this topic after applying the order event. Keep
+        # observing through disconnect/drain; the subscription shares node lifetime.
+        self._msgbus.subscribe("events.order.*", self._capture_native_fee_evidence)
+
+    @property
+    def accounting_incomplete(self) -> bool:
+        """A local accounting fault, separate from execution and hedge readiness."""
+        return (
+            self._accounting_failure is not None or self._cid_store.accounting_conflict
+            or not self._cid_store.fees_durable
+        )
+
+    @property
+    def accounting_ready(self) -> bool:
+        return not self.accounting_incomplete
+
+    def fee_summary(self, client_order_id: ClientOrderId | None = None) -> BitfinexFeeSummary:
+        bindings = self._cid_store.bindings if client_order_id is None else tuple(
+            row for row in self._cid_store.bindings if row.client_order_id == client_order_id.value
+        )
+        metadata = tuple(
+            row for binding in bindings
+            if (row := self._cid_store.fee_metadata_for_cid(binding.cid)) is not None
+        )
+        proven_empty = sum(
+            self._cid_store.fee_metadata_for_cid(binding.cid) is None
+            and self._cached_zero_fill_terminal(binding.client_order_id)
+            for binding in bindings
+        )
+        return summarize_fees(
+            metadata,
+            unknown_orders=len(bindings) - len(metadata) - proven_empty + int(
+                client_order_id is not None and not bindings
+            ),
+            durable=not self.accounting_incomplete,
+        )
+
+    def _cached_zero_fill_terminal(self, client_order_id: str) -> bool:
+        order = self._cache.order(ClientOrderId(client_order_id))
+        return (
+            order is not None and order.account_id == self.account_id
+            and order.instrument_id == self._bfx_config.instrument_id
+            and order.status in {OrderStatus.CANCELED, OrderStatus.REJECTED}
+            and order.filled_qty.as_decimal() == 0
+        )
+
+    def _fee_scope(self, cid: int, venue_order_id: int) -> BitfinexFeeMetadata:
+        return BitfinexFeeMetadata(
+            cid, venue_order_id, self._bfx_config.instrument_id.value, self._bfx_config.raw_symbol,
+        )
+
+    def _record_fee_trade(self, cid: int, trade: TradeExecution | TradeUpdate) -> None:
+        try:
+            self._cid_store.record_venue_trade(
+                self._fee_scope(cid, trade.venue_order_id), _fee_trade_evidence(trade),
+            )
+        except OSError as exc:
+            # The in-memory observation remains dirty and can be retried by TU/REST.
+            # Never turn auxiliary fee I/O into a stopped reader or a blocked hedge.
+            self._log.error(f"Bitfinex fee metadata write failed: {type(exc).__name__}")
+        except BitfinexV1CidError as exc:
+            self._record_accounting_conflict("Bitfinex fee metadata has conflicting facts")
+            if isinstance(exc, BitfinexV1FeeConflict):
+                raise BitfinexV1AccountingError(str(exc)) from exc
+            raise BitfinexV1ExecutionError(str(exc)) from exc
+
+    def _record_accounting_conflict(self, reason: str) -> None:
+        self._accounting_failure = reason
+        try:
+            self._cid_store.mark_accounting_conflict()
+        except OSError as exc:
+            # Preserve the semantic conflict even when its marker cannot be synced.
+            # This auxiliary I/O must not stop publication or the known-fill hedge.
+            self._log.error(f"Bitfinex accounting conflict write failed: {type(exc).__name__}")
+
+    def _capture_native_fee_evidence(self, event: object) -> None:
+        if not isinstance(event, OrderFilled) or (
+            event.account_id != self.account_id
+            or event.instrument_id != self._bfx_config.instrument_id
+        ):
+            return
+        binding = self._cid_store.binding_for_client(event.client_order_id.value)
+        if binding is None:
+            return
+        order = self._cache.order(event.client_order_id)
+        cached = None if order is None else next(
+            (fill for fill in order.events if isinstance(fill, OrderFilled)
+             and fill.trade_id == event.trade_id), None,
+        )
+        if cached is None or OrderFilled.to_dict(cached) != OrderFilled.to_dict(event):
+            self._record_accounting_conflict("native fill publication lacks applied cache evidence")
+            return
+        origin = event.info.get("bitfinex_fill_source", "unknown")
+        if origin not in {"te_paper", "tu"}:
+            # This adapter's real venue IDs are positive integers; native inferred
+            # reconciliation IDs occupy a separate UUID namespace.
+            origin = (
+                "inferred" if event.reconciliation and not event.trade_id.value.isdecimal()
+                else "unknown"
+            )
+        if origin == "te_paper" and (
+            self._bfx_config.raw_symbol != PAPER_RAW_SYMBOL
+            or event.info.get("bitfinex_fee_status") != "pending"
+            or event.commission != Money(0, USD)
+        ):
+            self._record_accounting_conflict("invalid Paper provisional native fill evidence")
+            return
+        evidence = _native_fill_evidence(event, origin)
+        metadata = self._cid_store.fee_metadata_for_cid(binding.cid)
+        previous = None if metadata is None else next(
+            (fill for fill in metadata.native_fills if fill.trade_id == event.trade_id.value), None,
+        )
+        if previous is not None and "bitfinex_fill_source" not in event.info:
+            evidence = replace(evidence, native_fill_origin=previous.native_fill_origin)
+        try:
+            self._cid_store.record_native_fill(
+                self._fee_scope(binding.cid, int(event.venue_order_id.value)), evidence,
+            )
+        except OSError as exc:
+            self._log.error(f"Bitfinex native fee evidence write failed: {type(exc).__name__}")
+        except (BitfinexV1CidError, ValueError) as exc:
+            # A subscriber must not abort publication to the strategy/hedge subscriber.
+            self._record_accounting_conflict(f"native fee evidence conflict: {type(exc).__name__}")
+        live = self._by_cid.get(binding.cid)
+        if live is not None and (
+            live.reconciled_working is not None or live.reconciled_terminal is not None
+        ):
+            self._sync_reconciled_native_quantity(live)
+
+    def _sync_reconciled_native_quantity(self, live: _LiveOrder) -> None:
+        """Advance only from real, already-applied native fills; never from enqueue."""
+        order = self._cache.order(live.order.client_order_id)
+        metadata = self._cid_store.fee_metadata_for_cid(live.cid)
+        if order is None or metadata is None:
+            return
+        trades = {str(row.trade_id): row for row in metadata.venue_trades}
+        fills = [event for event in order.events if isinstance(event, OrderFilled)]
+        quantity = sum((fill.last_qty.as_decimal() for fill in fills), Decimal())
+        if quantity != order.filled_qty.as_decimal() or any(
+            fill.trade_id.value not in trades or not native_fill_matches_trade(
+                _native_fill_evidence(fill, "unknown"), trades[fill.trade_id.value],
+            ) for fill in fills
+        ):
+            self._record_fatal("native Bitfinex quantity lacks exact real fills", ValueError())
+            return
+        # WS fills may already be queued past the native cache's current event.
+        live.filled_qty = max(live.filled_qty, quantity)
 
     @property
     def last_failure(self) -> str | None:
@@ -285,14 +450,16 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
         ):
             return "Bitfinex terminal order is waiting for matching execution fills"
         if any(self._silent_terminal_reconciliation_due(live) for live in self._by_cid.values()):
-            return "Bitfinex paper IOC is waiting for authenticated terminal reconciliation"
+            return "Bitfinex paper order is waiting for authenticated terminal reconciliation"
+        if any(live.reconciled_working is not None for live in self._by_cid.values()):
+            return "Bitfinex working fills are waiting for native reconciliation confirmation"
         if not self._running or not self._account_ready:
             return "Bitfinex execution is not connected and account-ready"
         return None
 
     @property
     def terminal_reconciliation_required(self) -> bool:
-        """Whether an IOC terminal needs authenticated mass reconciliation."""
+        """Whether an owned terminal needs authenticated mass reconciliation."""
         return any(
             (
                 live.terminal is not None
@@ -306,78 +473,172 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
 
     def confirm_terminal_reconciliation(self) -> None:
         """Retire terminals only after Nautilus applied an exact venue report delta."""
-        streamed = [
+        pending = [
             live
             for live in self._by_cid.values()
-            if live.terminal is not None
-            and not live.terminal_emitted
-            and _terminal_filled(live.terminal) > live.filled_qty
+            if not live.terminal_emitted
+            and (live.terminal is not None or live.reconciled_terminal is not None)
         ]
-        reconciled = [
-            live
-            for live in self._by_cid.values()
-            if live.terminal is None
-            and live.reconciled_terminal is not None
-            and not live.terminal_emitted
+        for live in pending:
+            self._retire_reconciled_terminal(live, self._confirmed_terminal_quantity(live))
+        for live in tuple(self._by_cid.values()):
+            if live.reconciled_working is not None:
+                if live.terminal is not None:
+                    self._retire_reconciled_terminal(live, self._confirmed_terminal_quantity(live))
+                else:
+                    self._confirmed_terminal_quantity(live, working=True)
+                    live.reconciled_working = None
+
+    def _same_run_paper_maker(self, live: _LiveOrder) -> bool:
+        return (
+            self._bfx_config.raw_symbol == PAPER_RAW_SYMBOL and live.submitted_in_process
+            and live.accepted and live.order.time_in_force == TimeInForce.GTC
+            and cast(bool, live.order.is_post_only) and live.pending_modify_price is None
+            and "modify" not in live.unknown_operations
+        )
+
+    def _working_observation_candidate(self, live: _LiveOrder) -> bool:
+        return (
+            self._same_run_paper_maker(live) and live.venue_order_id is not None
+            and live.terminal is None and live.reconciled_terminal is None
+            and live.rejection_key is None and not live.pending_cancel
+            and not live.unknown_operations and live.order.is_open
+        )
+
+    @property
+    def has_working_orders(self) -> bool:
+        return any(self._working_observation_candidate(live) for live in self._by_cid.values())
+
+    async def check_working_orders(self) -> bool:
+        """Observe an active list; return a discrepancy hint, never apply reports."""
+        candidates = [
+            (live, live.venue_order_id, live.current_price, live.order.ts_last)
+            for live in self._by_cid.values() if self._working_observation_candidate(live)
         ]
-        for live in streamed:
-            state = live.terminal
-            assert state is not None
-            if _terminal_disposition(state) != "executed":
-                raise BitfinexV1ExecutionError(
-                    "only a fully executed Bitfinex terminal can use inferred reconciliation"
-                )
-            order = self._cache.order(live.order.client_order_id)
-            venue_order_id = VenueOrderId(str(state.venue_order_id))
-            terminal_filled = _terminal_filled(state)
+        if not candidates:
+            return False
+        reports = await self.generate_order_status_reports(GenerateOrderStatusReports(
+            instrument_id=self._bfx_config.instrument_id, start=None, end=None, open_only=True,
+            command_id=UUID4(), ts_init=self._clock.timestamp_ns(),
+        ))
+        reported = {report.client_order_id: report for report in reports}
+        for live, venue_id, price, ts_last in candidates:
             if (
-                order is None
-                or order.account_id != self.account_id
-                or order.instrument_id != self._bfx_config.instrument_id
-                or order.venue_order_id != venue_order_id
-                or order.status != OrderStatus.FILLED
-                or not order.is_closed
-                or order.quantity.as_decimal() != abs(state.original_qty)
-                or order.filled_qty.as_decimal() != terminal_filled
-                or order.avg_px is None
-                or not isclose(float(order.avg_px), float(state.average_price))
+                self._by_cid.get(live.cid) is not live or live.venue_order_id != venue_id
+                or self._cache.order(live.order.client_order_id) is not live.order
+                or not self._working_observation_candidate(live)
             ):
-                raise BitfinexV1ExecutionError(
-                    "Nautilus cache does not prove the Bitfinex terminal reconciliation"
+                continue  # WS retired/closed the order or a mutation now owns its resolution.
+            if live.current_price != price:
+                return True  # An old snapshot cannot acknowledge a new modify price.
+            report = reported.get(live.order.client_order_id)
+            if live.order.ts_last != ts_last:
+                continue  # Observe the updated native order on the next healthy cycle.
+            if report is None:
+                return True
+            try:
+                self._validate_cached_open_report(
+                    live.order, report, [],
+                    allow_missing_post_only=report.order_status == OrderStatus.ACCEPTED,
                 )
-            self._retire_reconciled_terminal(live, terminal_filled)
-        for live in reconciled:
-            report = live.reconciled_terminal
-            assert report is not None
-            order = self._cache.order(live.order.client_order_id)
-            reported_avg = None if report.avg_px is None else float(report.avg_px)
-            cached_avg = None if order is None or order.avg_px is None else float(order.avg_px)
-            if (
-                order is None
-                or order.account_id != report.account_id
-                or order.instrument_id != report.instrument_id
-                or order.client_order_id != report.client_order_id
-                or order.venue_order_id != report.venue_order_id
-                or order.side != report.order_side
-                or order.order_type != report.order_type
-                or order.time_in_force != report.time_in_force
-                or cast(bool, order.is_post_only) != report.post_only
-                or cast(bool, order.is_reduce_only) != report.reduce_only
-                or order.quantity != report.quantity
-                or order.filled_qty != report.filled_qty
-                or order.status != report.order_status
-                or not order.is_closed
-                or (cached_avg is None) != (reported_avg is None)
-                or (
-                    cached_avg is not None
-                    and reported_avg is not None
-                    and not isclose(cached_avg, reported_avg)
-                )
-            ):
-                raise BitfinexV1ExecutionError(
-                    "Nautilus cache does not prove the Bitfinex REST terminal reconciliation"
-                )
-            self._retire_reconciled_terminal(live, report.filled_qty.as_decimal())
+            except BitfinexV1ExecutionError:
+                return True
+            if report.filled_qty != live.order.filled_qty or not report.is_open:
+                return True
+        return False
+
+    def _terminal_report(self, live: _LiveOrder) -> OrderStatusReport:
+        state = live.terminal
+        if state is None:
+            if live.reconciled_terminal is None:
+                raise BitfinexV1ExecutionError("Bitfinex order has no authoritative terminal")
+            return live.reconciled_terminal
+        filled = _terminal_filled(state)
+        return OrderStatusReport(
+            account_id=self.account_id, instrument_id=live.order.instrument_id,
+            client_order_id=live.order.client_order_id,
+            venue_order_id=VenueOrderId(str(state.venue_order_id)),
+            order_side=OrderSide.BUY if state.original_qty > 0 else OrderSide.SELL,
+            order_type=OrderType.LIMIT,
+            time_in_force=TimeInForce.IOC if state.order_type == "IOC" else TimeInForce.GTC,
+            order_status=(
+                OrderStatus.FILLED if _terminal_disposition(state) == "executed"
+                else OrderStatus.CANCELED
+            ),
+            quantity=live.instrument.make_qty(abs(state.original_qty)),
+            filled_qty=live.instrument.make_qty(filled),
+            price=live.instrument.make_price(state.price),
+            avg_px=state.average_price if filled else None,
+            post_only=state.flags == POST_ONLY_FLAG, reduce_only=state.flags == REDUCE_ONLY_FLAG,
+            cancel_reason=state.status if _terminal_disposition(state) == "canceled" else None,
+            report_id=UUID4(), ts_accepted=state.ts_created_ms * 1_000_000,
+            ts_last=state.ts_updated_ms * 1_000_000, ts_init=self._clock.timestamp_ns(),
+        )
+
+    def _terminal_post_only_is_opaque(self, live: _LiveOrder) -> bool:
+        # This exact streamed terminal already passed _validate_order_state while
+        # the same-run pending cancel/accepted authority was still available.
+        return (
+            live.terminal is not None and live.terminal.flags == 0
+            and self._bfx_config.raw_symbol == PAPER_RAW_SYMBOL
+            and live.submitted_in_process and cast(bool, live.order.is_post_only)
+        )
+
+    def _confirmed_terminal_quantity(self, live: _LiveOrder, *, working: bool = False) -> Decimal:
+        report = live.reconciled_working if working else self._terminal_report(live)
+        if report is None:
+            raise BitfinexV1ExecutionError("Bitfinex working order has no reconciled report")
+        order = self._cache.order(live.order.client_order_id)
+        reported_avg = None if report.avg_px is None else float(report.avg_px)
+        cached_avg = None if order is None or order.avg_px is None else float(order.avg_px)
+        # Native zero-fill canceled orders retain their initial average of 0.0.
+        if order is not None and order.filled_qty.as_decimal() == 0 and cached_avg == 0:
+            cached_avg = None
+        if (
+            order is None or order.account_id != report.account_id
+            or order.instrument_id != report.instrument_id
+            or order.client_order_id != report.client_order_id
+            or (order.venue_order_id != report.venue_order_id
+                and not self._silent_rejection_has_no_native_venue(live, order, report))
+            or order.side != report.order_side
+            or order.order_type != report.order_type or order.time_in_force != report.time_in_force
+            or (cast(bool, order.is_post_only) != report.post_only
+                and not self._terminal_post_only_is_opaque(live))
+            or cast(bool, order.is_reduce_only) != report.reduce_only or order.price != report.price
+            or order.quantity != report.quantity or order.filled_qty != report.filled_qty
+            or (not working and (order.status != report.order_status or not order.is_closed))
+            or (working and (order.is_closed or order.status not in {
+                OrderStatus.PARTIALLY_FILLED, OrderStatus.PENDING_CANCEL,
+            }))
+            or (cached_avg is None) != (reported_avg is None)
+            or (cached_avg is not None and reported_avg is not None
+                and not isclose(cached_avg, reported_avg))
+        ):
+            raise BitfinexV1ExecutionError(
+                "Nautilus cache does not prove the Bitfinex terminal reconciliation"
+            )
+        return cast(Decimal, report.filled_qty.as_decimal())
+
+    def _silent_rejection_has_no_native_venue(
+        self, live: _LiveOrder, order: Order, report: OrderStatusReport,
+    ) -> bool:
+        # NT OrderRejected has no venue ID. Only the already-validated same-run
+        # zero-fill REST rejection can supply that one missing native field.
+        binding = self._cid_store.binding_for_cid(live.cid)
+        return (
+            self._can_reconcile_silent_terminal(live, "submit") and not live.accepted
+            and live.reconciled_terminal is report and order.venue_order_id is None
+            and order.status == report.order_status == OrderStatus.REJECTED
+            and live.filled_qty == order.filled_qty.as_decimal() == 0
+            and report.filled_qty.as_decimal() == 0
+            and not any(isinstance(event, OrderFilled) for event in order.events)
+            and binding is not None and binding.client_order_id == order.client_order_id.value
+            and self._cid_store.account_id == self.account_id.value
+            and self._cid_by_client.get(order.client_order_id) == live.cid
+            and live.venue_order_id is not None
+            and str(live.venue_order_id) == report.venue_order_id.value
+            and self._cid_by_venue.get(live.venue_order_id) == live.cid
+        )
 
     def _retire_reconciled_terminal(self, live: _LiveOrder, filled_qty: Decimal) -> None:
         live.filled_qty = filled_qty
@@ -495,7 +756,10 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
             while self._running:
                 frame = await self._transport.recv_json()
                 frame_type = _private_frame_type(frame)
-                self._consume_private_frame(frame)
+                try:
+                    self._consume_private_frame(frame)
+                except BitfinexV1AccountingError:
+                    self._log.error("Bitfinex final fee conflict; accounting remains incomplete")
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -677,6 +941,7 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
             raise BitfinexV1ExecutionError(
                 f"Bitfinex {operation} already has a pending acknowledgment"
             )
+        self._arm_terminal_reconciliation(live, operation)
         try:
             await self._transport.send_json(payload)
         except BaseException as exc:
@@ -724,8 +989,6 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
             operation,
         )
         self._ack_deadlines[key] = deadline
-        if self._can_reconcile_silent_terminal(live, operation):
-            live.terminal_reconciliation_deadline = deadline.when()
 
     def _expire_ack_deadline(self, live: _LiveOrder, operation: str) -> None:
         key = (live.cid, operation)
@@ -738,16 +1001,30 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
         )
 
     def _can_reconcile_silent_terminal(self, live: _LiveOrder, operation: str) -> bool:
-        return (
-            operation == "submit"
-            and self._bfx_config.raw_symbol == PAPER_RAW_SYMBOL
+        owned_pending = (
+            self._bfx_config.raw_symbol == PAPER_RAW_SYMBOL
             and live.submitted_in_process
-            and live.order.time_in_force == TimeInForce.IOC
-            and cast(bool, live.order.is_reduce_only)
             and live.terminal is None
             and live.rejection_key is None
             and not live.terminal_emitted
+            and live.filled_qty < live.order.quantity.as_decimal()
+            and live.pending_modify_price is None
+            and "modify" not in live.unknown_operations
         )
+        return owned_pending and (
+            (operation == "submit" and live.order.time_in_force == TimeInForce.IOC)
+            or (operation == "cancel" and live.accepted and live.pending_cancel
+                and live.order.time_in_force == TimeInForce.GTC
+                and cast(bool, live.order.is_post_only))
+        )
+
+    def _arm_terminal_reconciliation(self, live: _LiveOrder, operation: str) -> None:
+        if self._can_reconcile_silent_terminal(live, operation):
+            live.terminal_reconciliation_pending = True
+            if live.terminal_reconciliation_deadline is None:
+                live.terminal_reconciliation_deadline = (
+                    self._loop.time() + self._bfx_config.mutation_ack_timeout_ms / 1_000
+                )
 
     def _mark_mutation_unknown(
         self,
@@ -756,12 +1033,7 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
         reason: str,
     ) -> None:
         live.unknown_operations.add(operation)
-        if self._can_reconcile_silent_terminal(live, operation):
-            live.terminal_reconciliation_pending = True
-            if live.terminal_reconciliation_deadline is None:
-                live.terminal_reconciliation_deadline = (
-                    self._loop.time() + self._bfx_config.mutation_ack_timeout_ms / 1_000
-                )
+        self._arm_terminal_reconciliation(live, operation)
         self._last_failure = reason[:300]
 
     def _silent_terminal_reconciliation_due(self, live: _LiveOrder) -> bool:
@@ -770,6 +1042,8 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
             live.terminal_reconciliation_pending
             and deadline is not None
             and self._loop.time() >= deadline
+            and (self._can_reconcile_silent_terminal(live, "submit")
+                 or self._can_reconcile_silent_terminal(live, "cancel"))
         )
 
     def _resolve_mutation(self, live: _LiveOrder, operation: str) -> None:
@@ -936,6 +1210,7 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
                 raise BitfinexV1ExecutionError(
                     "duplicate Bitfinex interim trade changed its execution facts"
                 )
+            self._record_fee_trade(live.cid, trade)
             return
         final = self._seen_trades.get(trade.trade_id)
         if final is not None:
@@ -943,6 +1218,10 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
                 raise BitfinexV1ExecutionError(
                     "Bitfinex interim trade differs from its final update"
                 )
+            self._record_fee_trade(live.cid, trade)
+            return
+        self._record_fee_trade(live.cid, trade)
+        if self._cached_trade_already_applied(live, trade):
             return
         self._apply_trade_fill(
             live,
@@ -1082,6 +1361,7 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
         staged: tuple[TradeExecution, ...],
     ) -> None:
         for trade in staged:
+            self._record_fee_trade(live.cid, trade)
             self._apply_trade_fill(
                 live,
                 trade=trade,
@@ -1095,12 +1375,14 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
             self._unbound_paper_interim_fills.pop(trade.trade_id, None)
 
     def _handle_trade(self, trade: TradeUpdate) -> None:
-        live = self._resolve_live(trade.client_order_id, trade.venue_order_id)
+        live = self._resolve_live(self._fee_trade_cid(trade), trade.venue_order_id)
         if live is None:
+            self._record_retired_fee_trade(trade)
             return
         if live.rejection_key is not None:
             raise BitfinexV1ExecutionError("Bitfinex trade followed a definitive rejection")
         self._validate_trade(live, trade)
+        self._record_fee_trade(live.cid, trade)
         previous = self._seen_trades.get(trade.trade_id)
         if previous is not None:
             if previous != trade:
@@ -1115,12 +1397,12 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
             self._finish_terminal_if_ready(live)
             self._seen_trades[trade.trade_id] = trade
             return
-        if TradeId(str(trade.trade_id)) in live.order.trade_ids:
+        if self._cached_trade_already_applied(live, trade):
             return
         self._apply_trade_fill(
             live,
             trade=trade,
-            commission=_usd_commission(trade.fee),
+            commission=usd_commission(trade.fee),
             info={
                 "bitfinex_fill_source": "tu",
                 "bitfinex_fee": format(trade.fee, "f"),
@@ -1128,6 +1410,87 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
             },
         )
         self._seen_trades[trade.trade_id] = trade
+
+    def _cached_trade_already_applied(
+        self, live: _LiveOrder, trade: TradeExecution | TradeUpdate,
+    ) -> bool:
+        event = next(
+            (fill for fill in live.order.events if isinstance(fill, OrderFilled)
+             and fill.trade_id.value == str(trade.trade_id)), None,
+        )
+        if event is None:
+            if not live.order.is_closed:
+                return False
+            self._confirmed_terminal_quantity(live)
+            inferred = [
+                fill for fill in live.order.events if isinstance(fill, OrderFilled)
+                and fill.reconciliation and not fill.trade_id.value.isdecimal()
+            ]
+            metadata = self._cid_store.fee_metadata_for_cid(live.cid)
+            real_ids = {fill.trade_id.value for fill in live.order.events
+                        if isinstance(fill, OrderFilled) and fill.trade_id.value.isdecimal()}
+            remaining = [] if metadata is None else [
+                row for row in metadata.venue_trades if str(row.trade_id) not in real_ids
+            ]
+            inferred_qty = sum((fill.last_qty.as_decimal() for fill in inferred), Decimal())
+            real_qty = sum((abs(row.execution_qty) for row in remaining), Decimal())
+            if (
+                not inferred or real_qty > inferred_qty
+                or any(row.ts_event_ms * 1_000_000 > max(fill.ts_event for fill in inferred)
+                       for row in remaining)
+                or (real_qty == inferred_qty and sum(
+                    (abs(row.execution_qty) * row.execution_price for row in remaining), Decimal(),
+                ) != sum((fill.last_qty.as_decimal() * fill.last_px.as_decimal()
+                          for fill in inferred), Decimal()))
+            ):
+                raise BitfinexV1ExecutionError("late Bitfinex trade conflicts with native fills")
+            return True  # Real IDs remain fee evidence, never replace the inferred UUID.
+        if not native_fill_matches_trade(
+            _native_fill_evidence(event, "unknown"), _fee_trade_evidence(trade),
+        ):
+            raise BitfinexV1ExecutionError("cached Bitfinex trade changed its execution facts")
+        self._capture_native_fee_evidence(event)
+        return True
+
+    def _record_retired_fee_trade(self, trade: TradeUpdate) -> None:
+        """Late final facts for an already applied closed order never publish a fill."""
+        cid = self._fee_trade_cid(trade)
+        if cid is None:
+            return
+        binding = self._cid_store.binding_for_cid(cid)
+        if binding is None:
+            return
+        order = self._cache.order(ClientOrderId(binding.client_order_id))
+        if order is None or not order.is_closed:
+            return  # Execution reconstruction remains the responsibility of normal reconciliation.
+        expected_sign = 1 if order.side == OrderSide.BUY else -1
+        if (
+            order.account_id != self.account_id
+            or order.instrument_id != self._bfx_config.instrument_id
+            or order.venue_order_id != VenueOrderId(str(trade.venue_order_id))
+            or trade.symbol != self._bfx_config.raw_symbol
+            or trade.fee_currency != self._bfx_config.fee_currency
+            or trade.order_type != ("IOC" if order.time_in_force == TimeInForce.IOC else "LIMIT")
+            or trade.maker != cast(bool, order.is_post_only)
+            or trade.execution_qty * expected_sign <= 0
+            or abs(trade.execution_qty) > order.filled_qty.as_decimal()
+            or trade.execution_price <= 0 or trade.order_price <= 0
+        ):
+            raise BitfinexV1ExecutionError("late Bitfinex fee trade differs from its closed order")
+        self._record_fee_trade(binding.cid, trade)
+        for event in order.events:
+            self._capture_native_fee_evidence(event)
+
+    def _fee_trade_cid(self, trade: TradeUpdate) -> int | None:
+        if trade.client_order_id is not None:
+            return trade.client_order_id
+        matches = [
+            row.cid for row in self._cid_store.fee_metadata
+            if row.venue_order_id == trade.venue_order_id
+            and row.instrument_id == self._bfx_config.instrument_id.value
+            and row.raw_symbol == trade.symbol == self._bfx_config.raw_symbol
+        ]
+        return matches[0] if len(matches) == 1 else None
 
     def _apply_trade_fill(
         self,
@@ -1238,6 +1601,13 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
             )
             live.pending_cancel = False
             self._resolve_mutation(live, "cancel")
+
+            if (
+                self._bfx_config.raw_symbol == PAPER_RAW_SYMBOL and live.submitted_in_process
+                and live.order.time_in_force == TimeInForce.GTC and live.order.is_post_only
+            ):
+                live.terminal_reconciliation_pending = False
+                live.terminal_reconciliation_deadline = None
 
     def _accept(self, live: _LiveOrder, venue_order_id: int, ts_event: int) -> None:
         if live.venue_order_id not in {None, venue_order_id}:
@@ -1585,6 +1955,37 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
                 )
             reported[client_order_id] = report
         for live in tuple(self._by_cid.values()):
+            if live.reconciled_terminal is not None and not live.terminal_emitted:
+                current_report = reported.get(live.order.client_order_id)
+                if current_report is None or not _same_order_report_facts(
+                    live.reconciled_terminal, current_report,
+                ):
+                    raise BitfinexV1ExecutionError(
+                        "Bitfinex pending terminal is absent or changed its reconciliation facts",
+                    )
+                fills = self._reconciliation_fills(mass_status, current_report)
+                self._validate_terminal_fill_evidence(live, current_report, fills)
+                cached_order = self._cache.order(live.order.client_order_id)
+                if cached_order is None:
+                    raise BitfinexV1ExecutionError("Bitfinex pending terminal has no cached order")
+                if self._silent_rejection_has_no_native_venue(
+                    live, cached_order, live.reconciled_terminal,
+                ):
+                    self._confirmed_terminal_quantity(live)
+                else:
+                    self._validate_cached_open_report(cached_order, current_report, fills)
+                continue
+            if live.reconciled_working is not None and live.order.is_closed:
+                current_report = reported.get(live.order.client_order_id)
+                if current_report is None:
+                    raise BitfinexV1ExecutionError("Bitfinex working reconciliation lost its order")
+                fills = self._reconciliation_fills(mass_status, current_report)
+                if live.terminal is not None:
+                    self._validate_streamed_terminal_report(live, current_report, fills)
+                self._reconcile_live_report(
+                    live, current_report, fills, allow_terminal_recovery=True,
+                )
+                continue
             if (
                 not live.submitted_in_process
                 or live.accepted
@@ -1627,10 +2028,13 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
                 raise BitfinexV1ExecutionError(
                     "cached open Bitfinex order cannot be reconstructed for reconciliation"
                 )
+            fills = self._reconciliation_fills(mass_status, cached_report)
+            if cached_live.terminal is not None:
+                self._validate_streamed_terminal_report(cached_live, cached_report, fills)
             self._reconcile_live_report(
                 cached_live,
                 cached_report,
-                self._reconciliation_fills(mass_status, cached_report),
+                fills,
                 allow_terminal_recovery=True,
             )
         position_reports = mass_status.position_reports.get(
@@ -1689,6 +2093,42 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
             )
         return mass_status
 
+    def _validate_terminal_fill_evidence(
+        self, live: _LiveOrder, report: OrderStatusReport, fills: list[FillReport],
+        *, allow_working: bool = False,
+    ) -> None:
+        # NT closes canceled orders before considering missing quantity. Require
+        # actual trades for partial cancels and every silent terminal recovery.
+        self._validate_silent_terminal_fills(
+            report, fills,
+            liquidity_side=LiquiditySide.MAKER if live.order.is_post_only else LiquiditySide.TAKER,
+            allow_working=allow_working,
+        )
+        reported_ids = {fill.trade_id for fill in fills}
+        if any(
+            isinstance(event, OrderFilled) and event.trade_id.value.isdecimal()
+            and event.trade_id not in reported_ids
+            for event in live.order.events
+        ):
+            raise BitfinexV1ExecutionError(
+                "Bitfinex complete trade set omits a previously applied real fill",
+            )
+        metadata = self._cid_store.fee_metadata_for_cid(live.cid)
+        raw_trades = {} if metadata is None else {
+            str(row.trade_id): row for row in metadata.venue_trades
+        }
+        for fill in fills:
+            raw = raw_trades.get(fill.trade_id.value)
+            if (
+                raw is None
+                or raw.order_type != ("IOC" if report.time_in_force == TimeInForce.IOC else "LIMIT")
+                or raw.order_price not in live.known_prices | {live.pending_modify_price}
+                or not report.ts_accepted <= fill.ts_event <= report.ts_last
+            ):
+                raise BitfinexV1ExecutionError(
+                    "Bitfinex terminal trade differs from order execution terms",
+                )
+
     @staticmethod
     def _reconciliation_fills(
         mass_status: ExecutionMassStatus,
@@ -1736,8 +2176,8 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
             )
         )
 
-    @staticmethod
     def _validate_cached_open_report(
+        self,
         order: Order,
         report: OrderStatusReport,
         fills: list[FillReport],
@@ -1815,7 +2255,7 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
             if (
                 event.commission.currency != fill.commission.currency
                 or event.commission.as_decimal() != fill.commission.as_decimal()
-            ):
+            ) and not self._provisional_fee_supplement(event, fill):
                 fill_mismatches.append("commission")
             if event.liquidity_side != fill.liquidity_side:
                 fill_mismatches.append("liquidity_side")
@@ -1841,6 +2281,50 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
             raise BitfinexV1ExecutionError(
                 "cached open Bitfinex order is missing its venue order identity"
             )
+
+    def _provisional_fee_supplement(self, event: OrderFilled, report: FillReport) -> bool:
+        if (
+            self._bfx_config.raw_symbol != PAPER_RAW_SYMBOL
+            or event.commission != Money(0, USD)
+            or report.commission.currency != USD
+        ):
+            return False
+        binding = self._cid_store.binding_for_client(event.client_order_id.value)
+        metadata = None if binding is None else self._cid_store.fee_metadata_for_cid(binding.cid)
+        if metadata is None:
+            return False
+        native = next(
+            (row for row in metadata.native_fills if row.trade_id == event.trade_id.value), None,
+        )
+        trade = next(
+            (row for row in metadata.venue_trades if str(row.trade_id) == event.trade_id.value),
+            None,
+        )
+        return (
+            native is not None and native.native_fill_origin == "te_paper"
+            and native == _native_fill_evidence(event, "te_paper")
+            and trade is not None and trade.raw_fee is not None
+            and native_fill_matches_trade(native, trade)
+            and usd_commission(trade.raw_fee) == report.commission
+        )
+
+    def _validate_streamed_terminal_report(
+        self, live: _LiveOrder, report: OrderStatusReport, fills: list[FillReport],
+    ) -> None:
+        self._validate_cached_open_report(
+            live.order, report, fills,
+            allow_missing_post_only=self._terminal_post_only_is_opaque(live),
+        )
+        streamed = self._terminal_report(live)
+        if self._terminal_post_only_is_opaque(live) and report.post_only:
+            # Normalize only the already-authenticated missing stream bit.
+            streamed.post_only = cast(bool, live.order.is_post_only)
+        if not _same_order_report_facts(streamed, report):
+            raise BitfinexV1ExecutionError("Bitfinex REST report differs from streamed terminal")
+        if report.order_status in {OrderStatus.CANCELED, OrderStatus.EXPIRED} or (
+            live.reconciled_working is not None
+        ):
+            self._validate_terminal_fill_evidence(live, report, fills)
 
     def _reconcile_live_report(
         self,
@@ -1875,14 +2359,24 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
             allow_missing_post_only=allow_missing_post_only,
             expected_prices=expected_prices,
         )
+        working_maker = self._same_run_paper_maker(live)
+        if working_maker and (
+            report.order_status not in {OrderStatus.ACCEPTED, OrderStatus.PARTIALLY_FILLED}
+            or report.filled_qty.as_decimal() > 0
+        ):
+            self._validate_terminal_fill_evidence(live, report, fills, allow_working=True)
+        if report.order_status in {OrderStatus.CANCELED, OrderStatus.EXPIRED}:
+            self._validate_terminal_fill_evidence(live, report, fills)
         live.venue_flags_verified = True
         report_can_bind = report.order_status in {
             OrderStatus.ACCEPTED,
             OrderStatus.PARTIALLY_FILLED,
         }
         if not report_can_bind:
-            if allow_terminal_recovery and self._silent_terminal_reconciliation_due(live):
-                self._validate_silent_terminal_fills(report, fills)
+            if allow_terminal_recovery and (
+                self._silent_terminal_reconciliation_due(live) or working_maker
+            ):
+                self._validate_terminal_fill_evidence(live, report, fills)
                 previous = live.reconciled_terminal
                 if previous is not None and not _same_order_report_facts(previous, report):
                     raise BitfinexV1ExecutionError(
@@ -1891,8 +2385,11 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
                 live.venue_order_id = venue_order_id
                 self._cid_by_venue[venue_order_id] = live.cid
                 live.reconciled_terminal = report
+                live.reconciled_working = None
             return True
 
+        if working_maker and report.filled_qty.as_decimal() > 0:
+            live.reconciled_working = report
         private_stream_won = live.accepted and live.submitted_in_process
         live.venue_order_id = venue_order_id
         self._cid_by_venue[venue_order_id] = live.cid
@@ -1904,13 +2401,17 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
     def _validate_silent_terminal_fills(
         report: OrderStatusReport,
         fills: list[FillReport],
+        *,
+        liquidity_side: LiquiditySide = LiquiditySide.TAKER,
+        allow_working: bool = False,
     ) -> None:
         """Require exact authenticated trade evidence for a silent terminal fill."""
         if report.order_status not in {
             OrderStatus.FILLED,
             OrderStatus.CANCELED,
+            OrderStatus.EXPIRED,
             OrderStatus.REJECTED,
-        }:
+        } and not (allow_working and report.order_status == OrderStatus.PARTIALLY_FILLED):
             raise BitfinexV1ExecutionError(
                 "silent Bitfinex terminal recovery received a non-terminal report"
             )
@@ -1930,7 +2431,7 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
                 or fill.client_order_id != report.client_order_id
                 or fill.venue_order_id != report.venue_order_id
                 or fill.order_side != report.order_side
-                or fill.liquidity_side != LiquiditySide.TAKER
+                or fill.liquidity_side != liquidity_side
             ):
                 raise BitfinexV1ExecutionError(
                     "silent Bitfinex terminal trade differs from its order report"
@@ -2017,6 +2518,7 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
         instrument = self._report_instrument()
         start_ms, end_ms = self._report_window(command.start, command.end)
         rows = await self._trade_history_rows(start_ms, end_ms)
+        observations: list[TradeUpdate] = []
         reports = map_fill_reports(
             rows=rows,
             instrument=instrument,
@@ -2024,7 +2526,19 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
             cid_lookup=self._client_order_id_for_cid,
             fee_currency=self._bfx_config.fee_currency,
             ts_init=self._clock.timestamp_ns(),
+            trade_observations=observations,
         )
+        for trade in observations:
+            if command.venue_order_id not in {None, VenueOrderId(str(trade.venue_order_id))}:
+                continue
+            if trade.client_order_id is None:
+                continue
+            self._record_fee_trade(trade.client_order_id, trade)
+            client_order_id = self._client_order_id_for_cid(trade.client_order_id)
+            cached = None if client_order_id is None else self._cache.order(client_order_id)
+            if cached is not None:
+                for event in cached.events:
+                    self._capture_native_fee_evidence(event)
         if command.venue_order_id is not None:
             reports = [
                 report for report in reports if report.venue_order_id == command.venue_order_id
@@ -2247,16 +2761,6 @@ def _terminal_filled(state: OrderState) -> Decimal:
     return abs(state.original_qty) - abs(state.remaining_qty)
 
 
-def _usd_commission(fee: Decimal) -> Money:
-    try:
-        commission = Money(-fee, USD)
-    except ValueError as exc:
-        raise BitfinexV1ExecutionError("Bitfinex fee loses USD precision") from exc
-    if commission.as_decimal() != -fee:
-        raise BitfinexV1ExecutionError("Bitfinex fee loses USD precision")
-    return commission
-
-
 def _same_execution(interim: TradeExecution, update: TradeUpdate) -> bool:
     return (
         interim.trade_id == update.trade_id
@@ -2269,6 +2773,24 @@ def _same_execution(interim: TradeExecution, update: TradeUpdate) -> bool:
         and interim.order_price == update.order_price
         and interim.maker == update.maker
         and interim.client_order_id in {None, update.client_order_id}
+    )
+
+
+def _fee_trade_evidence(trade: TradeExecution | TradeUpdate) -> BitfinexFeeTrade:
+    return BitfinexFeeTrade(
+        trade.trade_id, trade.ts_event_ms, trade.execution_qty, trade.execution_price,
+        trade.order_type, trade.order_price, trade.maker,
+        trade.fee if isinstance(trade, TradeUpdate) else None,
+        trade.fee_currency if isinstance(trade, TradeUpdate) else None,
+    )
+
+
+def _native_fill_evidence(event: OrderFilled, origin: str) -> BitfinexNativeFill:
+    return BitfinexNativeFill(
+        event.trade_id.value, origin,
+        event.last_qty.as_decimal() * (1 if event.order_side == OrderSide.BUY else -1),
+        event.last_px.as_decimal(), event.ts_event, event.liquidity_side.name,
+        event.commission.as_decimal(), event.commission.currency.code,
     )
 
 

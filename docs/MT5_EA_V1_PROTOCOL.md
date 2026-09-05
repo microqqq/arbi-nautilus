@@ -1,6 +1,13 @@
 # PY000 MT5 EA v1 protocol
 
-Status: an earlier source passed a bounded endpoint-connected SHADOW observation and one
+Worktree status (2026-09-05): W2a adds conservative server-rejection classification; W2b adds
+two complete position samples and the closed `SNAPSHOT_UNAVAILABLE` error without changing
+the successful response shape. Both Python clients handle temporary snapshot loss and recovery.
+This is a local candidate, not a newly deployed EA. Current source
+hashes come from `tools/mt5_source_manifest.sh --lines`; implementation and native-test progress
+are recorded in [the implementation plan](IMPLEMENTATION_PLAN.md).
+
+Historical deployment evidence: an earlier source passed a bounded endpoint-connected SHADOW observation and one
 separately authorized DEMO-only `MARKET` + `FOK` open canary. The exact-ticket extension's
 first deployed open-to-close attempt exposed a pre-`OrderSend` MQL null-string regression;
 it created no reservation, order, or position and was not retried. The corrected candidate
@@ -12,13 +19,13 @@ registers both venue accounts. The cap-bound EA is now attached to the paper acc
 the same strategy-free rehearsal on 2026-09-03 with its build, source manifest, stream, and 0.02
 lot ceiling bound; both venue reconciliations and final zero-position portfolio initialization
 succeeded. No strategy or order ran, and none of this grants production authority.
-The final current source instead exposes broker-native `swap_rates` as exactly seven values ordered
-Sunday through Saturday in the closed snapshot contract. The e812 build is now attached: a fresh
+The subsequent e812 source exposes broker-native `swap_rates` as exactly seven values ordered
+Sunday through Saturday in the closed snapshot contract. At that checkpoint e812 was attached: a fresh
 read-only identity/snapshot check authenticated its full source manifest, stream, 0.02-lot ceiling,
 timezone, and swap vector with recovery ready and no open position. A strategy-free rehearsal then
 passed after the paper profile's connection-stage timeout was corrected from 10 to 20 seconds; all
 four clients connected, both venues reconciled, the empty portfolio initialized, and the node shut
-down cleanly. The current EA boot contains only `stream_started` and no mutation event.
+down cleanly. That observed EA boot contained only `stream_started` and no mutation event.
 
 ## Boundary
 
@@ -112,7 +119,17 @@ Every other request has this exact binding:
 All five values must equal the currently running EA. Any mismatch returns the same
 fail-closed `BINDING_MISMATCH`; the response does not reveal which field differed.
 
-`get_snapshot` adds only `binding`.
+`get_snapshot` adds only `binding`. The W2b candidate returns `SNAPSHOT_UNAVAILABLE`
+when it cannot obtain two complete, matching position samples. It never substitutes a
+partial list or an empty account for failed native reads. Stable position identity, side,
+and volume must match; reordering and price/PnL movement do not invalidate the sample.
+
+After connection, this error preserves the last successful snapshot for diagnostics only:
+the data client publishes unavailable status, while execution admission and all authoritative
+reports remain disabled until a new complete snapshot is installed. A successful journal
+poll alone cannot restore snapshot health. Identity/schema errors retain their existing
+hard-failure behavior. Before the first complete snapshot, connection fails without claiming
+readiness; a later node connection may succeed on the same EA without reattaching it.
 
 `submit_market_delta` adds:
 
@@ -144,6 +161,17 @@ position state. A sent order whose exact effect cannot be proved becomes `order_
 is never retried. Old open-only journal rows remain readable; new close rows persist both IDs.
 After the first close row is written, that journal must not be opened by an older EA binary,
 which does not understand the extended row shape; back up the journal before deployment.
+
+W2a classification applies to new requests only: `REJECT`, `MARKET_CLOSED`, `NO_MONEY`,
+`REQUOTE`, `PRICE_CHANGED`, and `PRICE_OFF` become `order_rejected` with reason
+`ORDER_SEND_REJECTED` only when the result has zero order/deal IDs, finite zero volume,
+and zero external retcode. Other results still require the existing exact `DONE` fill proof
+or remain `order_unknown`; old UNKNOWN journal rows are not reclassified. In particular,
+partial, timeout, connection, placed, generic error, or contradictory execution fields do
+not prove rejection. The boolean return from `OrderSend` alone proves neither fill nor
+rejection. This narrow mapping follows the [server return codes](https://www.mql5.com/en/docs/constants/errorswarnings/enum_trade_return_codes)
+and [OrderSend result contract](https://www.mql5.com/en/docs/trading/ordersend); untested codes
+remain outside the initial rejection set.
 
 `get_execution_events` adds:
 
@@ -268,6 +296,13 @@ The owner lock, identity file, and events file use only this digest namespace. F
 vectors are executed by Python tests. v1 never reads, deletes, migrates, or interprets
 any legacy journal or trade cache.
 
+Journal appends retain the existing UTF-8 `FILE_TXT` format, including native CRLF
+conversion. The writer checks seek success, the full encoded byte count, and write/flush
+errors. Any failed or partial write remains available for recovery and is not retried in
+place: a failed reservation cannot reach `OrderSend`, and a failed terminal append leaves
+the reservation unresolved. `FileFlush` error checking does not provide an OS fsync or
+power-loss durability guarantee; no such guarantee is claimed.
+
 ## PUB messages
 
 PUB uses UTF-8 multipart: frame 1 is the symbol topic and frame 2 is the JSON payload.
@@ -293,6 +328,14 @@ hash, and server timezone to `hello`, then requires full identity equality on ea
 snapshot. An EA boot change on the same journal stream may re-handshake; the replacement
 identity and its snapshot are validated and installed together, so a new-boot PUB can
 never be interpreted against an old snapshot. A journal stream change fails closed.
+
+Complete snapshots also refresh native same-ID Instrument observations. Swap values,
+mode, and rollover multipliers are dynamic; contract size, price/volume increments,
+currency and timezone remain structurally bound. Identity, observation time and session
+consistency are checked before publishing any replacement. Backward, future, stale or
+same-time conflicting costs do not replace the last-good Instrument. Native Instrument
+subscribers receive new MT5 observations independently of Bitfinex funding timestamps;
+the Maker/Taker strategies validate their own reference and freshness before new sources.
 
 The MT5 contract is represented in canonical ounces: a 100-ounce contract is the
 Nautilus `lot_size`, and a 0.01-lot MT5 volume step becomes a one-ounce
@@ -407,7 +450,9 @@ Failure:
 
 Stable v1 codes are `MALFORMED`, `SCHEMA_MISMATCH`, `UNKNOWN_OP`,
 `BINDING_MISMATCH`, `EXECUTION_DISABLED`, `IDEMPOTENCY_CONFLICT`,
-`RECOVERY_BLOCKED`, `CURSOR_AHEAD`, and `CURSOR_EXPIRED`.
+`RECOVERY_BLOCKED`, `CURSOR_AHEAD`, `CURSOR_EXPIRED`, and `SNAPSHOT_UNAVAILABLE`.
+The last code is valid only for `get_snapshot`. It extends the closed error set without
+changing successful snapshot fields; Python/EA source identities must still match at deployment.
 
 The production Python response entry point is `decode_response_for(request, raw)`.
 It binds `request_id`, operation, non-hello identity, requested page limit, contiguous
@@ -603,17 +648,17 @@ Python and EA must be replaced in lockstep: new Python rejects an older EA missi
 and older Python rejects the new field. This completed rehearsal is required evidence before,
 but does not itself authorize, any source-risk test.
 
-The current source supersedes that historical candidate and exposes the broker's native
+The historical e812 source superseded that candidate and exposes the broker's native
 Sunday-through-Saturday swap multipliers as the closed seven-item `swap_rates` vector; it does not
-infer rollover from a single weekday. The current ordered source manifest is
+infer rollover from a single weekday. Its historical ordered source manifest is
 `e8126bf3ef0b42d01facdd2ef30f048972062b5ca38c81b84717156fb74cad00`.
-Its current per-file hashes and deterministic derivation are pinned by
+The current worktree's per-file hashes and deterministic derivation are pinned by
 `tests/test_mt5_source_manifest.py` and can be recomputed with
 `tools/mt5_source_manifest.sh --lines`.
 MetaEditor compiled it with 0 errors and 0 warnings as
 `PY000_Nautilus_MT5_taker_paper_e8126bf3.ex5`; the retained binary SHA-256 is
 `686c5386e15fc74b6b622b133225c33b70f72768296912e1a3132ea738c2b551`.
-This binary is now authenticated as the attached EA. The fresh read-only snapshot reported the
+This binary was authenticated as the attached EA at that checkpoint. The fresh read-only snapshot reported the
 expected stream, `max_order_lots=0.02`, native `swap_rates=[0,1,1,3,1,1,0]`, recovery ready,
 zero positions, and zero margin. The first strategy-free rehearsal stopped cleanly at the original
 10-second connection-stage limit just before the Bitfinex paper execution session completed; it

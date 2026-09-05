@@ -41,6 +41,7 @@ from py000_nautilus.config import (
     SourceAccountRoute,
 )
 from py000_nautilus.live_maker import build_live_maker_node
+from py000_nautilus.live_runtime import get_source_terminal_reconciler
 from py000_nautilus.mt5_v1_data import Mt5V1DataClient, Mt5V1DataClientConfig
 from py000_nautilus.mt5_v1_execution import Mt5V1ExecClientConfig, Mt5V1ExecutionClient
 from py000_nautilus.mt5_v1_transport import Mt5V1Transport
@@ -217,9 +218,21 @@ def test_builds_exact_offline_maker_composition_without_creating_state(
         assert exec_engine.open_check_interval_secs is None
         assert exec_engine.position_check_interval_secs is None
         assert node.trader.strategies() == [strategy]
+        assert [type(actor).__name__ for actor in node.trader.actors()] == [
+            "SourceTerminalReconciler"
+        ]
+        reconciler = get_source_terminal_reconciler(node)
+        assert not reconciler.is_running and not reconciler.clock.timer_names
+        assert not bitfinex_exec._tasks and not asyncio.all_tasks(loop)
+        assert cast(Any, strategy)._source_terminal_query.__self__ is reconciler
 
         readiness = cast(Any, strategy)._live_submission_ready
         assert readiness is not None and readiness() is False
+
+        async def start_reconciler() -> None:
+            reconciler.start()  # Explicit lifecycle start; build itself created no work.
+
+        loop.run_until_complete(start_reconciler())
         with monkeypatch.context() as readiness_patch:
             readiness_patch.setattr(
                 BitfinexV1DataClient,
@@ -257,6 +270,10 @@ def test_builds_exact_offline_maker_composition_without_creating_state(
             assert readiness() is False
             mt5_data._snapshot_refresh_healthy = True
             assert readiness() is True
+            bitfinex_exec._accounting_failure = "synthetic final fee conflict"
+            assert readiness() is False
+            bitfinex_exec._accounting_failure = None
+            assert readiness() is True
 
         hedge_quantity_ready = cast(Any, strategy)._hedge_quantity_ready
         assert hedge_quantity_ready.__self__ is mt5_exec
@@ -276,17 +293,33 @@ def test_builds_exact_offline_maker_composition_without_creating_state(
             "generate_order_status_report",
             record_terminal_query,
         )
+
+        async def reconciled(*, timeout_secs: float) -> bool:
+            assert timeout_secs == 3.0
+            return True
+
+        monkeypatch.setattr(exec_engine, "reconcile_execution_state", reconciled)
+        bitfinex_exec._set_connected(True)
+        mt5_exec._set_connected(True)
         terminal_query = cast(Any, strategy)._source_terminal_query
         assert terminal_query is not None
         completions: list[Any] = []
-        assert terminal_query(
-            ClientOrderId("O-MAKER-QUERY"),
-            VenueOrderId("V-MAKER-QUERY"),
-            completions.append,
-        ) is None
-        loop.run_until_complete(asyncio.sleep(0))
-        assert completions == [None]
-        assert len(terminal_queries) == 1
+
+        def complete(report: Any) -> bool:
+            completions.append(report)
+            return True
+
+        assert (
+            terminal_query(
+                ClientOrderId("O-MAKER-QUERY"),
+                VenueOrderId("V-MAKER-QUERY"),
+                complete,
+            )
+            is None
+        )
+        assert loop.run_until_complete(reconciler.reconcile()) is False
+        assert completions == []  # Missing authority retains the pending callback.
+        assert len(terminal_queries) == 2
         command = terminal_queries[0]
         assert command.instrument_id == configs.strategy.source_instrument_id
         assert command.client_order_id == ClientOrderId("O-MAKER-QUERY")
@@ -295,6 +328,8 @@ def test_builds_exact_offline_maker_composition_without_creating_state(
         assert not Path(f"{configs.strategy.store_path_prefix}.bid.json").exists()
         assert not Path(f"{configs.strategy.store_path_prefix}.ask.json").exists()
     finally:
+        if get_source_terminal_reconciler(node).is_running:
+            get_source_terminal_reconciler(node).stop()
         node.dispose()
 
     assert loop.is_closed()
