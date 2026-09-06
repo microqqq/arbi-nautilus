@@ -499,6 +499,15 @@ carry 是同 route 的唯一 signed residual；下一 fill 先与它合并再分
 - 写集：实施agent负责`source_projection.py`、`store.py`、`maker_store.py`和`tests/test_source_projection.py`；主agent在`tests/test_restart_reconciliation.py`补真实native事件到业务store的组合验证及本文；另一个未实施agent独立复核。先固定反例/新功能缺口，再实现、全量含现有真实Redis回归后单独本地提交。测试需覆盖幂等零写、完整多fill单次发布、身份/前缀/已记事实冲突、Maker顺序及v4边界、原子失败前后reload，以及恢复义务不能进入现有hedge派发。
 - 本包不改adapter、builder、策略、EA、profile、CLI或canary，不调用策略成交回调、不连接真实账户，不推送/部署/发单。`apply_hedge_fill`发布前失败可能留下仅内存seen的已知遗漏随下一MT5义务投影切口修复；不把该遗漏或旧腿身份核对悄悄算作本包已完成。W6b父项和R01–R06保持未完成。
 
+**W6b3 MT5已知对冲成交的暂停投影（2026-09-06，实施前固定）：** 基线`e8c6c08`。只核对原生对冲订单与已有义务、补当前已绑定订单缺失成交；不接普通启动、推进下一腿或解除HOLD。
+
+- 短入口`project_hedge_fills(store, orders, *, hedge_instrument_id, trader_id, strategy_id, reason) -> int`，接整个Maker owner或普通JsonStateStore，以及全部已知对冲Order的完整事件。原生cache/client/position索引与venue/journal完整事实一致仍是调用前置，不把本入口当ready或报告完整性认证。准确核对CID集合/唯一归属、source与intent字典身份、已知account、显式trader/strategy/instrument、MARKET/FOK/base quantity、side、reduce_only、原始与当前quantity、fill身份及native filled总量/TradeId序列。close核对计划target、已有source/intent一票绑定和native已知PositionId；open成交必须有一致的原生PositionId。未成交订单PositionId为空是正常前态，显式cache目标索引仍由调用前置核对；历史已平票不要求仍在当前venue snapshot。
+- planned的`hedge_order_ids`按原持久顺序逐一对应legs，不按当前CID或cache遍历猜旧腿。n腿/index i：有current时ids长度为i+1且current等于ids[i]；无current时ids长度为i；i=n时必须current为空且ids长度n。已推进旧腿须native FILLED足量、seen完整且与该腿一致，旧腿漏seen/换trade/多成交、历史顺序或目标冲突均零写拒绝。未绑定或两腿之间无current是合法零差量。unplanned历史仅支持可唯一证明的单CID（兼容旧格式仅current无history）；多个历史CID或无归属的已记成交不推测。
+- 每单seen须是完整native事件的连续前缀；逐intent已见成交量须等于hedge_filled，planned当前前缀量还须等于hedge_leg_filled。补current suffix还要求native已FILLED且总量等于对应整腿quantity；native仍PARTIALLY_FILLED/未知终局时不以暂时取得的事件冒充完整FOK事实。同account TradeId跨单重复、孔洞、同累计换身份、数量回退/超量、unknown seen或缺订单先拒绝，不改旧记录。COMPLETED须足量且全部已见，只可no-op；兼容unplanned完成后仍保留current。已投影BLOCKED且当前量恰好等于leg quantity、index未推进是合法重载/no-op，不能据此自动推进。
+- 完整预检后可一次补各intent当前CID的缺失suffix；它们只更新各自成交事实，不改source分配/残差或Maker allocation。复用原无I/O hedge reducer，一次原子发布；有差量的intent首次发布即BLOCKED，保留current/index，既有halt/freeze文本原样保留，无旧暂停则记reason，Maker两view同一次暂停。零差量零写、不新增暂停、不改已完成记录；不调用策略成交回调、取消或提交。
+- 原`apply_hedge_fill`抽出无I/O reducer并补发布前Exception回滚，默认live状态推进/去重行为不变。新投影整个batch发布前失败完整回滚，Maker含两view/allocation；replace后ParentDirectorySyncError保留完整已发布候选并抛错，reload/retry不可双计。不上第二套日志、schema或事务框架。
+- 写集：编码agent独占`store.py`、新`hedge_projection.py`及`tests/test_hedge_projection.py`；主agent维护本文及新`tests/test_hedge_reconciliation.py`真实native订单/Position组合；未实施agent独立复核。先保留现有写失败RED/新入口缺口，再验历史/当前腿、blocked满量与腿间no-op、legacy单CID、未知事实零写、Maker双view原子失败、同对象及reload幂等、原live行为回归。冻结后全量含任务专用临时Redis、静态检查及独立复核通过，单独本地提交；不改adapter/builder/策略/EA/profile/CLI/canary、不访问账户、不推送/部署/发单。W6b/c、R01–R06及W6父项仍未完成。
+
 恢复分类：
 
 - 已结束订单、对冲义务均完成，venue 仓位和本地记录吻合：恢复原策略运行，保留现有仓位。
@@ -711,6 +720,7 @@ EA 改动额外执行现有 `tools/mt5_source_manifest.sh --lines`、MetaEditor 
   - [ ] W6b 完整事实核对、既有义务幂等恢复及普通策略解除HOLD。
     - [x] W6b1：MT5报告进入原生Engine前核验原订单/票据索引/已记成交；独立复核发现的量价舍入遗漏已窄修，修订全量2376项含真实Redis及独立复核通过。仅接受报告事实边界，不解除业务HOLD。
     - [x] W6b2：完整已知source成交的缺失suffix纯投影，单次原子发布BLOCKED义务，保留HOLD；修订冻结全量2429项含真实Redis及独立复核通过。仅接受source纯投影，尚未接普通启动或MT5对冲腿恢复。
+    - [x] W6b3：已知MT5当前/旧对冲腿核对及当前缺失成交的暂停投影；原对冲成交发布前失败回滚已修复，冻结全量2514项含真实Redis及独立复核通过。仅接受held投影，不推进下一腿或接普通启动。
   - [ ] W6c 执行通道在线时drain、进程重启/停止矩阵R01–R06。
 - [ ] W7 同节点共账户。
 - [ ] W8 入口/安装/文档/原生运行边界。
@@ -1005,3 +1015,12 @@ EA 改动额外执行现有 `tools/mt5_source_manifest.sh --lines`、MetaEditor 
 - 未参与实施的reviewer独立运行上述四文件及Maker迁移测试，**224 passed / 1.71s**，全仓Ruff、Mypy92文件及diff-check通过，五SHA前后相同，给出仅限W6b2的RECOMMEND-ACCEPT。额外两项临时路径探针在第二次reducer已修改候选后抛RuntimeError，Taker及Maker两view/allocation/已提交快照均完整回滚且零发布，恢复后补2、reload再投影0；临时探针目录已清理。这两项不计入pytest总数。
 - 主agent在同一冻结候选上使用全新临时Redis单次全量，**2429 passed / 129既有类别Pandas弃用警告 / 329.63s**，包含两项真实backend且无skip。仍见上一步已归因的native模拟fixture RUNNING→DISPOSE/DISPOSE_COMPLETED日志，本包不宣称生命周期已修好。临时容器`62fef4306c3b`已按完整ID停止，`--rm`清除仅用于测试的合成数据，列表复查为空；未操作既有服务、镜像或账户。
 - 主agent结合本次全量和独立RECOMMEND-ACCEPT接受W6b2，按约定仅六个既定文件形成本地提交，不推送、部署或发单。W6b/c、R01–R06及W6父项仍未完成；下一切口核对MT5当前/旧对冲腿的已知成交，并修复`apply_hedge_fill`发布前失败的内存回滚，再接普通启动与HOLD释放。不能把本入口的返回值当作ready，也不能在未知历史上自动续单。
+
+2026-09-06，W6b3对冲纯投影与原子回滚：冻结全量及独立复核通过：
+
+- 基线`e8c6c08`。原public `apply_hedge_fill`的四项真实临时JSON故障例得到3失败/1通过：Taker发布前OSError后磁盘不变但内存已seen、filled增加、index推进/current清空；两类store在reducer构造异常时均留下seen。Maker发布前I/O失败本已有owner回滚，不能算新缺陷。主agent另从基线AST仅在测试进程换回该原方法，独立复现同三个业务断言失败，不改工作树字节；修订方法及原两store回归 **139 passed / 1.43s**。此前纯内存publisher analogue仅作诊断，不冒充文件测试。
+- 主agent新增八个真实native Engine/Position组合：Maker/Taker × 当前close/旧close后当前open × 业务缺全部/最后1oz；旧义务真实打开2oz票据，新SELL4计划close2→open2。完整native当前2oz以1+1合成事件给出，核对cache后先拒绝错误旧/当前close target且零写，再补当前义务。旧义务、native订单/Position和Maker allocation不变，current/index保留、BLOCKED/HOLD保留，reload/重复零写且原策略不派发下一腿，**8 passed / 1.12s**。这不是EA多fill、真实venue或自动重启认证。中间实现误用`OrderInitialized.order_side`，真实组合报AttributeError后已按安装1.231.0改为`side`；不计为旧实现业务RED。入口缺失时的导入失败及只到投影前的fixture检查也不计恢复通过。
+- 冻结实现为237行`hedge_projection.py`及原store的无I/O reducer/原子wrapper窄抽取（净增20行），不改schema、adapter、策略或Maker分配。新增纯测试77项，覆盖三腿closeA→closeB→open的正确历史/旧IDs互换/旧seen缺失、单票绑定、当前连续前缀、完整FOK门、腿间/满量BLOCKED/legacy已完成的零写、跨intent/view整包发布、计算与replace前后失败。默认live仍正常推进，重复/unknown入口保留早返回，避免新增全历史copy。中途fill_venue非法fixture由native Order.apply先拒绝，已移除该重复参数，不能冒充projector反例；Maker既有freeze只校验保留原文，不覆盖它来凑预期。
+- 同一冻结上主agent独立六文件定向 **275 passed / 1.90s**，全仓Ruff、Mypy95文件及diff-check通过。未参与实施的reviewer另加Maker迁移测试，**309 passed / 1.96s**，静态检查通过；仅在测试进程换回基线原方法，三个旧缺陷精确在内存回滚断言处RED，恢复冻结方法后四例GREEN。reviewer给出仅限W6b3的RECOMMEND-ACCEPT，临时probe目录已清理，四个源/测试SHA测前测后相同。
+- 主agent在冻结候选上使用全新临时Redis单次全量，**2514 passed / 129既有类别Pandas弃用警告 / 327.28s**，含两项真实backend且无skip；四SHA全量前后相同。临时容器`bdebd0852efe`已按完整ID停止，`--rm`清除仅用于测试的合成数据，列表复查为空；未动既有服务、镜像或真实账户。既有W6c停止/drain问题仍须对应生命周期验证，不由本次绿色代替。
+- 主agent结合本次全量与独立RECOMMEND-ACCEPT接受W6b3，按约定仅五个既定文件形成本地提交，不推送、部署或发单。W6b/c、R01–R06及W6父项仍未完成；下一步把已验证的source/hedge纯投影接入普通启动的完整事实核对，区分可继续与保持HOLD的状态，再验证下一机会及在线drain。不以投影返回数量直接放行，也不重发未决旧request。

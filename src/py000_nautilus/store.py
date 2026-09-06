@@ -449,6 +449,28 @@ class JsonStateStore:
         trade_id: str,
         fill_ounces: Decimal,
     ) -> bool:
+        if (f"{client_order_id}|{trade_id}" in self._state.seen_hedge_fills
+                or self._intent_for_hedge_order(client_order_id) is None):
+            return False
+        previous_state = deepcopy(self._state)
+        try:
+            changed = self._apply_hedge_fill(
+                client_order_id=client_order_id, trade_id=trade_id, fill_ounces=fill_ounces,
+            )
+            if changed:
+                self._persist()
+        except ParentDirectorySyncError:
+            raise  # The candidate was already published.
+        except Exception:
+            self._state = previous_state
+            raise
+        return changed
+
+    def _apply_hedge_fill(
+        self, *, client_order_id: str, trade_id: str, fill_ounces: Decimal,
+        blocked_reason: str | None = None,
+    ) -> bool:
+        """Apply a fill without I/O; held projection never advances the current leg."""
         fill_key = f"{client_order_id}|{trade_id}"
         if fill_key in self._state.seen_hedge_fills:
             return False
@@ -459,7 +481,7 @@ class JsonStateStore:
             raise ValueError("hedge fill quantity must be positive")
         self._state.seen_hedge_fills.add(fill_key)
         filled = intent.hedge_filled_ounces + fill_ounces
-        if intent.status in {
+        if blocked_reason is not None or intent.status in {
             ObligationStatus.BLOCKED,
             ObligationStatus.REJECTED,
             ObligationStatus.UNKNOWN,
@@ -473,11 +495,13 @@ class JsonStateStore:
                 hedge_leg_filled_ounces=leg_filled,
                 status=ObligationStatus.BLOCKED,
             )
-            self._state.halt_reason = (
-                f"hedge {client_order_id} filled after unresolved status "
-                f"{intent.status.value}"
-            )
-            self._persist()
+            if blocked_reason is None:
+                self._state.halt_reason = (
+                    f"hedge {client_order_id} filled after unresolved status "
+                    f"{intent.status.value}"
+                )
+            elif self._state.halt_reason is None:
+                self._state.halt_reason = blocked_reason
             return True
         if intent.hedge_plan:
             if intent.hedge_leg_index >= len(intent.hedge_plan):
@@ -489,7 +513,6 @@ class JsonStateStore:
                 self._state.halt_reason = (
                     f"hedge {client_order_id} filled after its ticket plan completed"
                 )
-                self._persist()
                 return True
             leg = intent.hedge_plan[intent.hedge_leg_index]
             expected = leg.quantity_ounces - intent.hedge_leg_filled_ounces
@@ -506,7 +529,6 @@ class JsonStateStore:
                     f"hedge {client_order_id} fill quantity {fill_ounces} "
                     f"does not match planned leg remainder {expected}"
                 )
-                self._persist()
                 return True
             next_leg_index = intent.hedge_leg_index + 1
             completed = next_leg_index == len(intent.hedge_plan)
@@ -525,7 +547,6 @@ class JsonStateStore:
                 hedge_leg_index=next_leg_index,
                 hedge_leg_filled_ounces=Decimal(0),
             )
-            self._persist()
             return True
         status = (
             ObligationStatus.COMPLETED
@@ -537,7 +558,6 @@ class JsonStateStore:
             hedge_filled_ounces=filled,
             status=status,
         )
-        self._persist()
         return True
 
     def intent(self, intent_id: str) -> HedgeIntent:
