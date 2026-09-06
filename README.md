@@ -165,6 +165,19 @@ and Taker normalizes the signed long/short daily rates from that specification, 
 the broker server timezone, and the broker-native seven-item Sunday-through-Saturday `swap_rates`
 vector.
 
+Cost parity has a precise boundary: the original ZIP reads Bitfinex
+`position.margin_funding`, not `NEXT_FUNDING_ACCRUED`. Both map an explicitly
+supplied value to `(long=f, short=-f)`, but the producers are not interchangeable.
+The original Python MT5 enum also numbers POINTS as 0, while the current native
+protocol uses DISABLED=0 and POINTS=1. The ZIP contains no EA with which to verify
+the old wire numbering. POINTS formula comparisons therefore map the enum and
+complete weekday dictionary explicitly; they do not certify raw-wire equivalence.
+Current missing-data rejection is intentional: the legacy zero-cost and inferred
+weekday fallbacks are not restored. Expected carry is not realized cash flow.
+The checked-in [caller vectors](tests/fixtures/legacy_caller_vectors.json) and
+[carry vectors](tests/fixtures/legacy_carry_vectors.json) record the authenticated
+inputs/outputs and these limits; their tests require no local legacy ZIP.
+
 The active legacy strategy's combined fee (`0.00065`) and implicit USD/USDT parity (`1:1`) remain
 ordinary strategy configuration. They are not fabricated as periodically refreshed venue facts.
 There is no cost-file producer, daemon, database, or extra lifecycle.
@@ -443,11 +456,17 @@ exact carrier is excluded because it contains credential literals. This repo
 therefore tests that distinction explicitly and generalizes `0.2` as two
 instrument ticks, rather than claiming executable callee provenance.
 
-It does **not** establish complete oracle or live parity. The bounded Bitfinex private
-command/event and startup-report slices exist, but strategy-state restart release, hot reconnect,
-dynamic venue margin capacity, and a continuously runnable production strategy mode remain
-unimplemented. The only runnable strategy path is the separately authorized fixed-2oz one-shot
-canary described above. Its first paper execution filled the 2oz Bitfinex source order but exposed
+It does **not** establish complete oracle or live parity. The current remediation
+checkpoints cover dynamic venue margin and ordinary Maker/Taker continuous execution
+through the two execution adapters with offline venue I/O. Taker has `--run-paper`;
+Maker has the ordinary composition but still lacks a dedicated live entry point.
+Cold-cache restart ownership, complete stop/drain, shared-account operation and
+current-code DEMO acceptance remain unfinished. See the implementation plan for
+the exact accepted boundaries; these are not live-readiness claims.
+
+The following is the **historical 2026-09-03 initial checkpoint**, not the current
+capability list. At that time, the only runnable strategy path was the separately
+authorized fixed-2oz one-shot canary. Its first paper execution filled the 2oz Bitfinex source order but exposed
 the missing-`tu` propagation gap before an automatic hedge; a bounded compensating MT5 hedge restored
 an exact opposite test position. That incident remains `UNKNOWN` with paired recovery evidence—not
 `PASSED_PAIRED`. After the `te` paper-fill fix and a fresh state path, the authorized 2026-09-03
@@ -455,10 +474,10 @@ rerun returned `PASSED_PAIRED / exact_2oz_pair_reconciled`: Bitfinex BUY 2oz
 (`243269180012` / trade `1967905585`) drove the MT5 SELL 0.02-lot hedge
 (`10349046774` / deal `10065080588`). Final reconciliation and an independent account snapshot
 both showed zero open orders and exact opposite `+2oz / -2oz` positions. The general
-Taker startup entry validates exact four-client wiring and can rehearse the adapters only after
-removing the strategy. MT5 `MARKET` + `IOC`
-partial-fill handling also remains unimplemented; the isolated DEMO `MARKET` + `FOK` candidate
-is not full strategy parity.
+Taker startup entry then validated exact four-client wiring and rehearsed the adapters
+only after removing the strategy. MT5 `MARKET` + `IOC` partial-fill execution remains
+outside the current supported contract; the DEMO `MARKET` + `FOK` path is not full
+strategy parity.
 
 The first authorized close canary did not qualify. Its Bitfinex `SELL 2` IOC was accepted and
 fully executed by the venue with reduce-only flag `1024` (order `243271104376`, trade

@@ -433,6 +433,14 @@ carry 是同 route 的唯一 signed residual；下一 fill 先与它合并再分
 - 仍在`strategies/maker.py`原`_source_action_is_obsolete`内增加一个分支：仅modify rejection、业务记录ACCEPTED且filled=0、native确为PENDING_CANCEL，并保留active CID、原source hold/freeze、真实未结束cancel扫描及全部原身份/route/数量/已记账fill一致性。它只维持已在途的保护性取消，不将pending当终态、不清旧HOLD、不重发、不给新源准入；仍须原cancel终态与权威报告才能release。不按拒绝文案放行，不适用于cancel rejection或UNKNOWN。
 - 编码agent保留原生确定性RED和负对照：无pending cancel、取消历史已结束、native/store成交不一致、route/身份不符、真正cancel rejection和已有halt；root保留上述普通双adapter自然事件顺序，不额外pump排空竞态或修改8秒截止时间。修复不扩大到adapter/wire/recovery平台。
 
+**W5d 原策略经济对照（2026-09-06，已完成规定的离线验收）：** 收齐剩余纯经济规则证据，不重构执行层，不扩展多账户 live 支持。只编译已逐段阅读、哈希认证的原方法，注入合成账户/行情/时钟；不导入原模块、不运行初始化/联网方法、不复制含凭据的载体。CI 只读取入库的脱敏数值向量，不依赖本机 ZIP。
+
+- Caller 对照覆盖严格阈值与 short-first（含 short 风险拒绝后不回退 LONG）、方向价格/数量/carry、Maker signed amount/spread/leverage、固定排序与候选跳过。严格分支用可精确表示的数值及相邻边界，数值容差不能用于改变触发方向。动态容量沿用 W5a 已认证向量；只对有效、已规范化、显式配置且 `keep_last_accounts=false` 的入口作等价结论。
+- 已实跑确认 Maker 等仓位 tie 偏差：原 source 升序/hedge 降序后，bid 从前取、ask 从后取；当前 ask 反转排序但仍从前取，稳定排序使 tie 错选首个。先保留脱敏反例 RED，再仅修这两个选择器；不引入账户轮换管理。Maker 最终乘法价格、两 tick clamp、杠杆最低1及显式 FX 仍按既有迁移契约，不冒充原 callee 全链等价。FX 对照仅把当前 USD 参考价按 side 换算为原 caller 的可比价格。
+- MT5 POINTS 对照明确映射旧 enum POINTS=0 → 当前 native POINTS=1、完整星期字典 → Sunday-first 七项倍率；覆盖 Athens 夏/冬跨日、DST、正常/三倍/零倍率、正负 swap，以及两策略实际决策时刻的引用。缺字段/未知 native mode 继续拒绝，不复制原缺失返回0、缺当天倍率默认1或缺整份倍率默认周三3的 fallback。
+- 原 ZIP 不含 EA，旧 raw `swapMode` 是否曾重编号无法认证；同一 raw 0/1 在原 Python 与当前 native 含义不同，单列而不回退当前原生协议。原 Bitfinex getter 读取 `position.margin_funding`，当前已固定 `NEXT_FUNDING_ACCRUED`；仅认证同一显式 rate 的 `(f,-f)` 方向及 caller 使用，不声称 producer 相同，也不把预期 carry 当实收现金流。
+- 写集限既有 Maker economics、紧凑脱敏 fixtures/对应经济与事件测试、本文及 README 历史状态澄清。主 agent 维护边界和核验，具体测试/窄修复委派实施 agent，另一个未实施 agent 独立复核。完整候选验证后单独本地提交；C07/E08 只关闭上述已认证规则与明确差异，W6–W9、A07 和线上验收保持未完成。
+
 ### W6：重启与停止形成真实闭环
 
 范围：`store.py`、两个 execution 的报告/重连路径、live lifecycle、必要的原生 cache 配置和恢复测试。先执行 Q3。
@@ -617,18 +625,18 @@ EA 改动额外执行现有 `tools/mt5_source_manifest.sh --lines`、MetaEditor 
   - [x] W2b/F3：完整快照、Python 暂不可用/恢复；独立复核及 195 项原生 helper 检查通过。
   - [x] W2c/B07：journal seek/完整字节/flush 检查及 294 项原生故障/调用链验证，原格式和 UNKNOWN 保持。
   - [ ] W2 的真实 DEMO 返回行为、跨终端互斥及容量边界；上述 helper 通过不等于这些现场场景通过。
-- [ ] W3 行情/成本。
+- [x] W3 行情/成本（规定的规范化输入/离线范围）。
   - [x] F4：同值资金费刷新保留工作单，实际输入到期仍撤单。
   - [x] F5：Taker 任一腿新行情共享评估、同批去重、更晚行情继续加仓；真实 Engine 与独立复核通过。
   - [x] 动态 swap/Instrument：原生订阅、完整验证后发布、两策略 last-good 更新及独立过期；同值不撤单、真实变化撤旧单；独立复核通过。
-  - [ ] C07 与原策略的完整跨日/carry oracle 对照随 W5 执行；现有 Athens/倍率/缺数据回归通过不代替新增 parity 验收。
+  - [x] C07/W5d：已认证 POINTS 规范化公式、方向与 Athens 跨日/七日倍率；真实两策略事件回调对照及独立反事实通过。旧 wire 枚举、缺数据 fallback、BFX producer 差异明确单列，不将本项扩称原始生产链等价。
 - [ ] W4 普通终态闭环。
   - [x] W4a：adapter 精确终态确认、部分撤单的实际成交前置核验、已应用成交的迟到 WS 去重；真实 LiveEngine 及独立复核通过。
   - [x] W4b 核心：两普通 builder 的共享有界核对、业务确认反馈与失败后恢复、canary 复用；D01/D03/D05–D06/D08 的下述离线场景及 D07 组件级停止收束，真实 LiveClock 线程边界通过。
   - [x] W4c：当前Paper同run IOC、已发cancel Maker的静默终态与直接零成交拒绝；双客户端重试的最新事实复核、撤单新动作期限；D02按实际IOC CANCELED协议语义验收，独立复核通过。
   - [x] W4d：当前Paper同run工作中Maker漏消息主动发现、完整真实成交集合核验、健康观察暂缓报价；普通双客户端与独立复核通过。
   - [ ] W4 剩余矩阵：D04b跨重启费用/原生事件恢复及完整node启停/信号drain归W6；当前组合的组件级stop与同run恢复不替代这些验收。
-- [ ] W5 经济/仓位行为与残差。
+- [x] W5 经济/仓位行为与残差（规定的单策略、规范化输入/离线范围）。
   - [x] W5a：原容量 normalized Decimal 纯函数及脱敏固定向量，整数容量边界修正；独立复核通过，普通策略接线由W5b4交付。
   - [x] W5b1：账户原始事实、完整性和独立观察时间已实现；串联伪flat修复、普通组合与独立复核通过，仅交付事实入口。
   - [x] W5b2：Bitfinex原生QueryAccount按需联合刷新、有界去重与生命周期收束；普通组合及独立复核通过。MT5沿用既有完整刷新，不新增周期器。
@@ -641,7 +649,7 @@ EA 改动额外执行现有 `tools/mt5_source_manifest.sh --lines`、MetaEditor 
   - [x] W5c3：完整旧双v1/单v2显式转换成v4历史checkpoint，保留原件与未决义务；独立复核及全量通过。
   - [x] W5c4a：跨方向对冲按真实allocation顺序执行，不重排放大中途敞口；独立复核及全量通过。
   - [x] W5c4b：单Maker明确route的bounded-carry预算、普通双侧跨cycle及带dust停止报告；独立复核及全量通过，仅接受规定的离线范围。
-  - [ ] W5后续：剩余原策略parity；W5父项不因残差包完成而关闭，共账户预算与完整启停仍分别归W7/W6。
+  - [x] W5d/E08：脱敏原 caller 与规范化 carry 对照、Maker tie 修复及已知差异归类；独立复核与全量通过。W5仅关闭上述规定范围，共账户预算与完整启停仍分别归W7/W6，不认证原始 wire/账户生产链或现场运行。
 - [ ] W6 重启/停止。
 - [ ] W7 同节点共账户。
 - [ ] W8 入口/安装/文档/原生运行边界。
@@ -886,3 +894,12 @@ EA 改动额外执行现有 `tools/mt5_source_manifest.sh --lines`、MetaEditor 
 - 新增70项测试，其中12项为普通Maker经两个真实execution adapter及合成venue IO：±0.5带入下一轮双侧经济报价；更小限额/预算阻挡；2oz分成0.2+1.8真实对冲1+2，留下反号0.5；实际先形成票据再带dust时阻挡未来open3；原MT5 poller读取equity下降后撤销累计容量不足的工作报价。仓位、trade、journal、native报告和重载余额一致；stop保留真实signed dust且无自动平仓交易。
 - 最终十份代码/测试SHA上主agent单次全量 **2191 passed / 124既有Pandas框架弃用警告 / 292.42s**，全仓Ruff、Mypy81文件与diff-check通过。独立reviewer核心六文件 **404 passed / 2 warnings / 2.66s**，普通双adapter **12 passed / 35.40s**；原舍入/保守界的84,503个有限分片转换枚举通过，并确认余额release不绕过更小max_unhedged。十SHA前后相同，独立结论RECOMMEND-ACCEPT，主agent据新全量和独立证据接受本包；子集不累加为全量数量。
 - 按约定单独本地提交，不推送、部署、改EA/profile、访问真实账户或发单。仅关闭E09的单Maker离线carry/数量报告范围；不认证真实PUB/EA/DEMO、冷cache重启、完整drain、共账户额度或外部snapshot→mutation竞态。下一步收齐W5剩余原策略parity，再依既定Q3/W6推进恢复与停止；W5父项及W6–W9继续未关闭。
+
+2026-09-06 / W5d 原策略规范化经济对照完成并接受（基线`228f5c1`）：
+
+- 生产只改既有 Maker 两个选择器、净增2行：source固定升序、hedge固定降序，bid正向/ask反向取首个合格候选，含稳定排序tie；资格、carry预算、默认strict、Taker和adapter均不改。新测试在旧代码先得到4个身份业务RED（双tie、单source、单hedge、末个tie不合格），修后通过；多账户向量只认证既有纯helper，不扩展普通live的一对账户支持。
+- 两份紧凑fixture共91例：59个caller（Taker33/Maker26），17个规范化POINTS、11个明确差异及4个同值funding getter。主agent与独立reviewer均实际认证原ZIP/成员/选定方法并重跑全部原输出MATCH；只执行选定AST和合成依赖，不导入原模块或运行配置/初始化。caller净收益来自原函数return frame的只读局部值观测；原浮点输出保留，数值容差不用于方向、身份或风险布尔值。CI新增测试不读取本机ZIP，两个复跑探针保留在ignored runtime，不复制原载体。
+- 严格阈值使用精确`144/128-1=0.125`及相邻threshold；short-first、拒绝后不退LONG、四项数量交集、降风险例外、穿零/minimum、Maker signed量和leverage均有原输出对照。POINTS显式旧0→native1，原pytz时区及完整星期字典对当前七项向量；缺数据拒绝、原wire编号未认证、BFX `margin_funding`与`NEXT_FUNDING_ACCRUED`不同producer、FX显式预映射及Maker终价Owner冻结分别保留，不包装成原始全链parity或实收现金流。
+- 新增101项测试。真实Bitfinex data parser→FundingRateUpdate→DataEngine→两策略回调覆盖方向、fee/FX、Instrument更新不刷新funding及独立过期/恢复；夏冬四例经真实quote回调使用决策日三倍而非旧quote日正常倍率。该Maker跨日场景显式源配置量0，只认证真实经济回调，不冒称原生发单验收；正常TTL未放宽，transport未连接。
+- 冻结五份源码/测试/fixture及两份本机probe上，主agent单次全量 **2292 passed / 129既有类别Pandas弃用警告 / 291.60s**，全仓Ruff、Mypy83文件与diff-check通过；七SHA测前测后不变。独立reviewer成本40项、caller/经济117项通过；仅在内存恢复旧source选择器使单端tie重新RED，仅改用quote时间使跨日成本从`-0.0000945`错为`-0.0000315`也重新RED，恢复后原样正常。其核验七SHA后RECOMMEND-ACCEPT；主agent据新全量与独立证据接受本包，子集不累加为全量数量。
+- W3/C07及W5/E08仅在上文规定的规范化/离线范围关闭。README已分开当前普通连续能力与2026-09-03一轮canary历史。按约定单独本地提交，不推送、部署、改EA/profile、访问真实账户或发单；W4跨重启、A07、W6–W9仍未验收。下一步先执行既定Q3原生cache/订单/MT5票据归属探针，再按证据实施W6恢复与仍在线的stop/drain，不能从close canary外推重启已可用。

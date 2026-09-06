@@ -120,12 +120,13 @@ def _select_source(
     ordered = sorted(
         accounts,
         key=lambda account: account.position_ounces,
-        reverse=direction is SourceDirection.SHORT,
     )
+    # Ask walks the fixed ordering backward, including equal-position ties.
+    candidates = ordered if direction is SourceDirection.LONG else reversed(ordered)
     return next(
         (
             account
-            for account in ordered
+            for account in candidates
             if _account_allows(
                 before=account.position_ounces,
                 signed_change=quantity
@@ -153,12 +154,13 @@ def _select_hedge(
     ordered = sorted(
         accounts,
         key=lambda account: account.position_ounces,
-        reverse=direction is SourceDirection.LONG,
+        reverse=True,
     )
+    candidates = ordered if direction is SourceDirection.LONG else reversed(ordered)
     return next(
         (
             account
-            for account in ordered
+            for account in candidates
             if _account_allows(
                 before=account.position_ounces,
                 signed_change=-quantity

@@ -1,0 +1,224 @@
+{
+  "metadata": {
+    "schema_version": 1,
+    "scope": "Authenticated caller outputs for valid normalized shared-market inputs. Multiple-account cases qualify pure selector helpers only; ordinary live remains one account pair, and bounded carry remains one route.",
+    "archive": {
+      "name": "arbi_main_1_0.zip",
+      "sha256": "3e50dcc625b1f78048622f3bb5e5ee2f94eb8e4c4635f39108fcb09f6e3d1892"
+    },
+    "member": {
+      "name": "arbi_main_1_0/arbi_trader.py",
+      "sha256": "741e264c28bde67d59583b9fa49c626436e04066125e3015737add77e122d3bd"
+    },
+    "methods": [
+      {
+        "name": "get_limit_order_params",
+        "lines": [
+          88,
+          133
+        ],
+        "method_segment_sha256": "eb1cc8a6668db38a0c37044f42dbeac418a1e27803ce66f361cf80e5c8b2763f"
+      },
+      {
+        "name": "get_sorted_traders",
+        "lines": [
+          348,
+          355
+        ],
+        "method_segment_sha256": "5a1bea4888e1ab08446183b6b8ba4aceece46549b4129d1d4f226e84294d8b9f"
+      },
+      {
+        "name": "pick_candidate_trader",
+        "lines": [
+          817,
+          935
+        ],
+        "method_segment_sha256": "e9ad9f6448a18f3d50578276a3bd0f6495897a6a9cb94c3cd9d687cd92309bb7"
+      },
+      {
+        "name": "select_trader_for_create_order",
+        "lines": [
+          937,
+          993
+        ],
+        "method_segment_sha256": "26a6fbf458dc66715139b74b3d59de2192d4ea17094de19300806f46ea4d7612"
+      },
+      {
+        "name": "_calculate_arbitrage_opportunity",
+        "lines": [
+          1385,
+          1444
+        ],
+        "method_segment_sha256": "10b7a670d0b4b14d29483ea21099bd1048df19d99a4f6b6e0a9b23d2c5fe3063"
+      },
+      {
+        "name": "_prepare_short_arbitrage",
+        "lines": [
+          1446,
+          1462
+        ],
+        "method_segment_sha256": "30c134e82ddf7918945b94a1566eb2a1f225f7eb827f9e0255763fa311cb8fa9"
+      },
+      {
+        "name": "_prepare_long_arbitrage",
+        "lines": [
+          1464,
+          1480
+        ],
+        "method_segment_sha256": "a52be69134898032136833858c7c6939efc65a41b52a258ef7ce2e8778203882"
+      },
+      {
+        "name": "_validate_risk_limits",
+        "lines": [
+          1514,
+          1556
+        ],
+        "method_segment_sha256": "1a17559add82f3fdfeba94080fcfd55a715e6172ee90ed5109c4ddda7b0f2b02"
+      }
+    ],
+    "substitutions": [
+      "Compile only authenticated method AST nodes; never import or execute the original module, class, initializer, or external methods.",
+      "Synthetic getters supply one shared complete book and explicit identical carry per venue. Source depth is at least base_book_quantity; original get_symbol_price book acquisition and shallow-book behavior are not authenticated.",
+      "Capacity getters are normalized stubs, not copied callees. BFX duration=1 tuple is physical BUY/SELL; MT5 duration=-1 tuple is physical SELL/BUY. Existing legacy_margin_vectors.json authenticates the dynamic callee separately.",
+      "Synthetic config supplies all max/min limits, keep_last_trader=false, and memory-only set; logger is synthetic, asyncio.gather is real, sleep is a no-op.",
+      "FX is a migration input mapping only: original MT5 caller prices are current USD bid*FX bid and ask*FX ask, computed before float conversion. No original FX callee is authenticated.",
+      "Caller local-result observation captures real_profit_rate_long/short from the exact authenticated calculation code object's return frame, restoring the previous trace in finally.",
+      "Taker candidate and risk result are separate original outputs; a rejected SHORT candidate does not fall back to LONG."
+    ],
+    "limitations": [
+      "Explicit valid values only; no legacy missing-field, invalid-input, account production, live admission, last-account rotation, or multi-account live support claim.",
+      "Maker base_price/amount/spread/lev and selected identities are authenticated caller outputs. Final multiplicative price, passive clamp, and leverage minimum one are separate Owner-frozen migration contracts, tested elsewhere.",
+      "Bitfinex same-rate carry inputs do not authenticate the margin_funding producer or realized cash flow."
+    ],
+    "encoding": "All scalar input/output numbers are decimal strings preserving original float repr; per-case input replaces whole top-level default fields.",
+    "numeric_comparison": "Identity, direction, candidate existence, and risk bool compare exactly. Only numeric outputs use absolute 1e-12; no tolerance changes branching.",
+    "absolute_tolerance": "0.000000000001",
+    "strict_boundaries": "Both direction boundary prices use the binary-exact ratio 144/128, yielding 0.125; thresholds use math.nextafter(0.125,-inf), 0.125, math.nextafter(0.125,+inf).",
+    "case_count": 59,
+    "expected_outputs_sha256": "bb12dd4872ed170b972d45fa9708059644830a6f5528eaf6924500fd592a1273"
+  },
+  "common": {
+    "source_book": {
+      "bid": "144",
+      "ask": "152",
+      "bid_size": "8",
+      "ask_size": "8"
+    },
+    "hedge_book": {
+      "bid": "120",
+      "ask": "128",
+      "bid_size": "8",
+      "ask_size": "8"
+    },
+    "sources": [
+      {
+        "name": "BFX-BASE",
+        "position": "0",
+        "buy": "5",
+        "sell": "5",
+        "base_margin": "100"
+      }
+    ],
+    "hedges": [
+      {
+        "name": "MT5-BASE",
+        "position": "0",
+        "buy": "5",
+        "sell": "5"
+      }
+    ],
+    "carry": {
+      "bitfinex_long": "0",
+      "bitfinex_short": "0",
+      "mt5_long_swap": "0",
+      "mt5_short_swap": "0",
+      "total_trade_fee": "0"
+    },
+    "fx": {
+      "usd_usdt_bid": "1",
+      "usd_usdt_ask": "1"
+    },
+    "risk": {
+      "source_max_abs": "10",
+      "hedge_max_abs": "10",
+      "source_min_keep_abs": "0",
+      "hedge_min_keep_abs": "0",
+      "only_long": false
+    },
+    "margin_level": "500",
+    "base_book_quantity": "1",
+    "open_amount": {
+      "bid": "1",
+      "ask": "1"
+    }
+  },
+  "taker": {
+    "defaults": {"open_spread":{"bid":"0.0625","ask":"0.0625"}},
+    "cases": [
+      {"id":"short-threshold-nextafter-below","input":{"open_spread":{"bid":"0.0625","ask":"0.12499999999999999"}},"expected":{"net_return":{"bid":"-0.21052631578947367","ask":"0.125"},"candidate":{"side":"ask","source":"BFX-BASE","hedge":"MT5-BASE","quantity":"1.0","source_price":"144.0","comparable_hedge_price":"128.0","before":["0.0","0.0"],"after":["-1.0","1.0"],"risk_allows":true}}},
+      {"id":"short-threshold-exact","input":{"open_spread":{"bid":"0.0625","ask":"0.125"}},"expected":{"net_return":{"bid":"-0.21052631578947367","ask":"0.125"},"candidate":null}},
+      {"id":"short-threshold-nextafter-above","input":{"open_spread":{"bid":"0.0625","ask":"0.12500000000000003"}},"expected":{"net_return":{"bid":"-0.21052631578947367","ask":"0.125"},"candidate":null}},
+      {"id":"long-threshold-nextafter-below","input":{"source_book":{"bid":"120","ask":"128","bid_size":"8","ask_size":"8"},"hedge_book":{"bid":"144","ask":"152","bid_size":"8","ask_size":"8"},"open_spread":{"bid":"0.12499999999999999","ask":"0.0625"}},"expected":{"net_return":{"bid":"0.125","ask":"-0.21052631578947367"},"candidate":{"side":"bid","source":"BFX-BASE","hedge":"MT5-BASE","quantity":"1.0","source_price":"128.0","comparable_hedge_price":"144.0","before":["0.0","0.0"],"after":["1.0","-1.0"],"risk_allows":true}}},
+      {"id":"long-threshold-exact","input":{"source_book":{"bid":"120","ask":"128","bid_size":"8","ask_size":"8"},"hedge_book":{"bid":"144","ask":"152","bid_size":"8","ask_size":"8"},"open_spread":{"bid":"0.125","ask":"0.0625"}},"expected":{"net_return":{"bid":"0.125","ask":"-0.21052631578947367"},"candidate":null}},
+      {"id":"long-threshold-nextafter-above","input":{"source_book":{"bid":"120","ask":"128","bid_size":"8","ask_size":"8"},"hedge_book":{"bid":"144","ask":"152","bid_size":"8","ask_size":"8"},"open_spread":{"bid":"0.12500000000000003","ask":"0.0625"}},"expected":{"net_return":{"bid":"0.125","ask":"-0.21052631578947367"},"candidate":null}},
+      {"id":"both-qualified-short-first","input":{"source_book":{"bid":"128","ask":"128","bid_size":"8","ask_size":"8"},"hedge_book":{"bid":"128","ask":"128","bid_size":"8","ask_size":"8"},"open_spread":{"bid":"-0.125","ask":"-0.125"}},"expected":{"net_return":{"bid":"0.0","ask":"0.0"},"candidate":{"side":"ask","source":"BFX-BASE","hedge":"MT5-BASE","quantity":"1.0","source_price":"128.0","comparable_hedge_price":"128.0","before":["0.0","0.0"],"after":["-1.0","1.0"],"risk_allows":true}}},
+      {"id":"short-risk-rejection-does-not-fall-back-long","input":{"source_book":{"bid":"128","ask":"128","bid_size":"8","ask_size":"8"},"hedge_book":{"bid":"128","ask":"128","bid_size":"8","ask_size":"8"},"open_spread":{"bid":"-0.125","ask":"-0.125"},"sources":[{"name":"BFX-BASE","position":"-10","buy":"5","sell":"5","base_margin":"100"}]},"expected":{"net_return":{"bid":"0.0","ask":"0.0"},"candidate":{"side":"ask","source":"BFX-BASE","hedge":"MT5-BASE","quantity":"1.0","source_price":"128.0","comparable_hedge_price":"128.0","before":["-10.0","0.0"],"after":["-11.0","1.0"],"risk_allows":false}}},
+      {"id":"short-quantity-source-capacity","input":{"open_amount":{"bid":"4","ask":"4"},"sources":[{"name":"BFX-BASE","position":"0","buy":"5","sell":"2","base_margin":"100"}]},"expected":{"net_return":{"bid":"-0.21052631578947367","ask":"0.125"},"candidate":{"side":"ask","source":"BFX-BASE","hedge":"MT5-BASE","quantity":"2.0","source_price":"144.0","comparable_hedge_price":"128.0","before":["0.0","0.0"],"after":["-2.0","2.0"],"risk_allows":true}}},
+      {"id":"short-quantity-hedge-capacity","input":{"open_amount":{"bid":"4","ask":"4"},"hedges":[{"name":"MT5-BASE","position":"0","buy":"2","sell":"5"}]},"expected":{"net_return":{"bid":"-0.21052631578947367","ask":"0.125"},"candidate":{"side":"ask","source":"BFX-BASE","hedge":"MT5-BASE","quantity":"2.0","source_price":"144.0","comparable_hedge_price":"128.0","before":["0.0","0.0"],"after":["-2.0","2.0"],"risk_allows":true}}},
+      {"id":"short-quantity-source-depth","input":{"open_amount":{"bid":"4","ask":"4"},"source_book":{"bid":"144","ask":"152","bid_size":"2","ask_size":"8"}},"expected":{"net_return":{"bid":"-0.21052631578947367","ask":"0.125"},"candidate":{"side":"ask","source":"BFX-BASE","hedge":"MT5-BASE","quantity":"2.0","source_price":"144.0","comparable_hedge_price":"128.0","before":["0.0","0.0"],"after":["-2.0","2.0"],"risk_allows":true}}},
+      {"id":"short-quantity-configured","input":{"open_amount":{"bid":"2","ask":"2"}},"expected":{"net_return":{"bid":"-0.21052631578947367","ask":"0.125"},"candidate":{"side":"ask","source":"BFX-BASE","hedge":"MT5-BASE","quantity":"2.0","source_price":"144.0","comparable_hedge_price":"128.0","before":["0.0","0.0"],"after":["-2.0","2.0"],"risk_allows":true}}},
+      {"id":"long-quantity-source-capacity","input":{"source_book":{"bid":"120","ask":"128","bid_size":"8","ask_size":"8"},"hedge_book":{"bid":"144","ask":"152","bid_size":"8","ask_size":"8"},"open_amount":{"bid":"4","ask":"4"},"sources":[{"name":"BFX-BASE","position":"0","buy":"2","sell":"5","base_margin":"100"}]},"expected":{"net_return":{"bid":"0.125","ask":"-0.21052631578947367"},"candidate":{"side":"bid","source":"BFX-BASE","hedge":"MT5-BASE","quantity":"2.0","source_price":"128.0","comparable_hedge_price":"144.0","before":["0.0","0.0"],"after":["2.0","-2.0"],"risk_allows":true}}},
+      {"id":"long-quantity-hedge-capacity","input":{"source_book":{"bid":"120","ask":"128","bid_size":"8","ask_size":"8"},"hedge_book":{"bid":"144","ask":"152","bid_size":"8","ask_size":"8"},"open_amount":{"bid":"4","ask":"4"},"hedges":[{"name":"MT5-BASE","position":"0","buy":"5","sell":"2"}]},"expected":{"net_return":{"bid":"0.125","ask":"-0.21052631578947367"},"candidate":{"side":"bid","source":"BFX-BASE","hedge":"MT5-BASE","quantity":"2.0","source_price":"128.0","comparable_hedge_price":"144.0","before":["0.0","0.0"],"after":["2.0","-2.0"],"risk_allows":true}}},
+      {"id":"long-quantity-source-depth","input":{"source_book":{"bid":"120","ask":"128","bid_size":"8","ask_size":"2"},"hedge_book":{"bid":"144","ask":"152","bid_size":"8","ask_size":"8"},"open_amount":{"bid":"4","ask":"4"}},"expected":{"net_return":{"bid":"0.125","ask":"-0.21052631578947367"},"candidate":{"side":"bid","source":"BFX-BASE","hedge":"MT5-BASE","quantity":"2.0","source_price":"128.0","comparable_hedge_price":"144.0","before":["0.0","0.0"],"after":["2.0","-2.0"],"risk_allows":true}}},
+      {"id":"long-quantity-configured","input":{"source_book":{"bid":"120","ask":"128","bid_size":"8","ask_size":"8"},"hedge_book":{"bid":"144","ask":"152","bid_size":"8","ask_size":"8"},"open_amount":{"bid":"2","ask":"2"}},"expected":{"net_return":{"bid":"0.125","ask":"-0.21052631578947367"},"candidate":{"side":"bid","source":"BFX-BASE","hedge":"MT5-BASE","quantity":"2.0","source_price":"128.0","comparable_hedge_price":"144.0","before":["0.0","0.0"],"after":["2.0","-2.0"],"risk_allows":true}}},
+      {"id":"short-source-max-reject","input":{"sources":[{"name":"BFX-BASE","position":"-10","buy":"5","sell":"5","base_margin":"100"}]},"expected":{"net_return":{"bid":"-0.21052631578947367","ask":"0.125"},"candidate":{"side":"ask","source":"BFX-BASE","hedge":"MT5-BASE","quantity":"1.0","source_price":"144.0","comparable_hedge_price":"128.0","before":["-10.0","0.0"],"after":["-11.0","1.0"],"risk_allows":false}}},
+      {"id":"short-hedge-max-reject","input":{"hedges":[{"name":"MT5-BASE","position":"10","buy":"5","sell":"5"}]},"expected":{"net_return":{"bid":"-0.21052631578947367","ask":"0.125"},"candidate":{"side":"ask","source":"BFX-BASE","hedge":"MT5-BASE","quantity":"1.0","source_price":"144.0","comparable_hedge_price":"128.0","before":["0.0","10.0"],"after":["-1.0","11.0"],"risk_allows":false}}},
+      {"id":"short-reduce-both-above-max","input":{"sources":[{"name":"BFX-BASE","position":"12","buy":"5","sell":"5","base_margin":"100"}],"hedges":[{"name":"MT5-BASE","position":"-12","buy":"5","sell":"5"}]},"expected":{"net_return":{"bid":"-0.21052631578947367","ask":"0.125"},"candidate":{"side":"ask","source":"BFX-BASE","hedge":"MT5-BASE","quantity":"1.0","source_price":"144.0","comparable_hedge_price":"128.0","before":["12.0","-12.0"],"after":["11.0","-11.0"],"risk_allows":true}}},
+      {"id":"long-reduce-both-above-max","input":{"source_book":{"bid":"120","ask":"128","bid_size":"8","ask_size":"8"},"hedge_book":{"bid":"144","ask":"152","bid_size":"8","ask_size":"8"},"sources":[{"name":"BFX-BASE","position":"-12","buy":"5","sell":"5","base_margin":"100"}],"hedges":[{"name":"MT5-BASE","position":"12","buy":"5","sell":"5"}]},"expected":{"net_return":{"bid":"0.125","ask":"-0.21052631578947367"},"candidate":{"side":"bid","source":"BFX-BASE","hedge":"MT5-BASE","quantity":"1.0","source_price":"128.0","comparable_hedge_price":"144.0","before":["-12.0","12.0"],"after":["-11.0","11.0"],"risk_allows":true}}},
+      {"id":"short-only-long-source-cross-reject","input":{"sources":[{"name":"BFX-BASE","position":"0.5","buy":"5","sell":"5","base_margin":"100"}],"risk":{"source_max_abs":"10","hedge_max_abs":"10","source_min_keep_abs":"0","hedge_min_keep_abs":"0","only_long":true}},"expected":{"net_return":{"bid":"-0.21052631578947367","ask":"0.125"},"candidate":{"side":"ask","source":"BFX-BASE","hedge":"MT5-BASE","quantity":"1.0","source_price":"144.0","comparable_hedge_price":"128.0","before":["0.5","0.0"],"after":["-0.5","1.0"],"risk_allows":false}}},
+      {"id":"short-only-long-hedge-cross-reject","input":{"hedges":[{"name":"MT5-BASE","position":"-0.5","buy":"5","sell":"5"}],"risk":{"source_max_abs":"10","hedge_max_abs":"10","source_min_keep_abs":"0","hedge_min_keep_abs":"0","only_long":true}},"expected":{"net_return":{"bid":"-0.21052631578947367","ask":"0.125"},"candidate":{"side":"ask","source":"BFX-BASE","hedge":"MT5-BASE","quantity":"1.0","source_price":"144.0","comparable_hedge_price":"128.0","before":["0.0","-0.5"],"after":["-1.0","0.5"],"risk_allows":false}}},
+      {"id":"short-only-long-source-minimum-reject","input":{"sources":[{"name":"BFX-BASE","position":"1.5","buy":"5","sell":"5","base_margin":"100"}],"risk":{"source_max_abs":"10","hedge_max_abs":"10","source_min_keep_abs":"1","hedge_min_keep_abs":"0","only_long":true}},"expected":{"net_return":{"bid":"-0.21052631578947367","ask":"0.125"},"candidate":{"side":"ask","source":"BFX-BASE","hedge":"MT5-BASE","quantity":"1.0","source_price":"144.0","comparable_hedge_price":"128.0","before":["1.5","0.0"],"after":["0.5","1.0"],"risk_allows":false}}},
+      {"id":"short-only-long-hedge-minimum-reject","input":{"hedges":[{"name":"MT5-BASE","position":"-1.5","buy":"5","sell":"5"}],"risk":{"source_max_abs":"10","hedge_max_abs":"10","source_min_keep_abs":"0","hedge_min_keep_abs":"1","only_long":true}},"expected":{"net_return":{"bid":"-0.21052631578947367","ask":"0.125"},"candidate":{"side":"ask","source":"BFX-BASE","hedge":"MT5-BASE","quantity":"1.0","source_price":"144.0","comparable_hedge_price":"128.0","before":["0.0","-1.5"],"after":["-1.0","-0.5"],"risk_allows":false}}},
+      {"id":"short-only-long-exact-zero-allowed","input":{"sources":[{"name":"BFX-BASE","position":"1","buy":"5","sell":"5","base_margin":"100"}],"hedges":[{"name":"MT5-BASE","position":"-1","buy":"5","sell":"5"}],"risk":{"source_max_abs":"10","hedge_max_abs":"10","source_min_keep_abs":"0","hedge_min_keep_abs":"0","only_long":true}},"expected":{"net_return":{"bid":"-0.21052631578947367","ask":"0.125"},"candidate":{"side":"ask","source":"BFX-BASE","hedge":"MT5-BASE","quantity":"1.0","source_price":"144.0","comparable_hedge_price":"128.0","before":["1.0","-1.0"],"after":["0.0","0.0"],"risk_allows":true}}},
+      {"id":"short-only-long-from-zero-allowed","input":{"risk":{"source_max_abs":"10","hedge_max_abs":"10","source_min_keep_abs":"0","hedge_min_keep_abs":"0","only_long":true}},"expected":{"net_return":{"bid":"-0.21052631578947367","ask":"0.125"},"candidate":{"side":"ask","source":"BFX-BASE","hedge":"MT5-BASE","quantity":"1.0","source_price":"144.0","comparable_hedge_price":"128.0","before":["0.0","0.0"],"after":["-1.0","1.0"],"risk_allows":true}}},
+      {"id":"short-zero-capacity-reject","input":{"sources":[{"name":"BFX-BASE","position":"0","buy":"5","sell":"0","base_margin":"100"}]},"expected":{"net_return":{"bid":"-0.21052631578947367","ask":"0.125"},"candidate":{"side":"ask","source":"BFX-BASE","hedge":"MT5-BASE","quantity":"0.0","source_price":"144.0","comparable_hedge_price":"128.0","before":["0.0","0.0"],"after":["0.0","0.0"],"risk_allows":false}}},
+      {"id":"short-source-tie-last","input":{"sources":[{"name":"BFX-FIRST","position":"0","buy":"5","sell":"5","base_margin":"100"},{"name":"BFX-LAST","position":"0","buy":"5","sell":"5","base_margin":"100"}]},"expected":{"net_return":{"bid":"-0.21052631578947367","ask":"0.125"},"candidate":{"side":"ask","source":"BFX-LAST","hedge":"MT5-BASE","quantity":"1.0","source_price":"144.0","comparable_hedge_price":"128.0","before":["0.0","0.0"],"after":["-1.0","1.0"],"risk_allows":true}}},
+      {"id":"long-source-tie-first","input":{"source_book":{"bid":"120","ask":"128","bid_size":"8","ask_size":"8"},"hedge_book":{"bid":"144","ask":"152","bid_size":"8","ask_size":"8"},"sources":[{"name":"BFX-FIRST","position":"0","buy":"5","sell":"5","base_margin":"100"},{"name":"BFX-LAST","position":"0","buy":"5","sell":"5","base_margin":"100"}]},"expected":{"net_return":{"bid":"0.125","ask":"-0.21052631578947367"},"candidate":{"side":"bid","source":"BFX-FIRST","hedge":"MT5-BASE","quantity":"1.0","source_price":"128.0","comparable_hedge_price":"144.0","before":["0.0","0.0"],"after":["1.0","-1.0"],"risk_allows":true}}},
+      {"id":"long-side-specific-carry","input":{"source_book":{"bid":"120","ask":"128","bid_size":"8","ask_size":"8"},"hedge_book":{"bid":"144","ask":"152","bid_size":"8","ask_size":"8"},"carry":{"bitfinex_long":"0.03125","bitfinex_short":"-0.03125","mt5_long_swap":"-0.015625","mt5_short_swap":"0.015625","total_trade_fee":"0.0078125"}},"expected":{"net_return":{"bid":"0.1015625","ask":"-0.20271381578947367"},"candidate":{"side":"bid","source":"BFX-BASE","hedge":"MT5-BASE","quantity":"1.0","source_price":"128.0","comparable_hedge_price":"144.0","before":["0.0","0.0"],"after":["1.0","-1.0"],"risk_allows":true}}},
+      {"id":"short-side-specific-carry","input":{"carry":{"bitfinex_long":"0.03125","bitfinex_short":"-0.03125","mt5_long_swap":"-0.015625","mt5_short_swap":"0.015625","total_trade_fee":"0.0078125"}},"expected":{"net_return":{"bid":"-0.23396381578947367","ask":"0.1328125"},"candidate":{"side":"ask","source":"BFX-BASE","hedge":"MT5-BASE","quantity":"1.0","source_price":"144.0","comparable_hedge_price":"128.0","before":["0.0","0.0"],"after":["-1.0","1.0"],"risk_allows":true}}},
+      {"id":"long-comparable-price-fx-mapping","input":{"source_book":{"bid":"120","ask":"128","bid_size":"8","ask_size":"8"},"hedge_book":{"bid":"128","ask":"136","bid_size":"8","ask_size":"8"},"fx":{"usd_usdt_bid":"1.125","usd_usdt_ask":"1.25"}},"expected":{"net_return":{"bid":"0.125","ask":"-0.2941176470588235"},"candidate":{"side":"bid","source":"BFX-BASE","hedge":"MT5-BASE","quantity":"1.0","source_price":"128.0","comparable_hedge_price":"144.0","before":["0.0","0.0"],"after":["1.0","-1.0"],"risk_allows":true}}},
+      {"id":"short-comparable-price-fx-mapping","input":{"source_book":{"bid":"180","ask":"184","bid_size":"8","ask_size":"8"},"fx":{"usd_usdt_bid":"1.125","usd_usdt_ask":"1.25"}},"expected":{"net_return":{"bid":"-0.2663043478260869","ask":"0.125"},"candidate":{"side":"ask","source":"BFX-BASE","hedge":"MT5-BASE","quantity":"1.0","source_price":"180.0","comparable_hedge_price":"160.0","before":["0.0","0.0"],"after":["-1.0","1.0"],"risk_allows":true}}}
+    ]
+  },
+  "maker": {
+    "defaults": {"side":"bid","open_spread":{"bid":"0.01","ask":"0.02"},"delta":{"bid":"0.003","ask":"0.004"}},
+    "cases": [
+      {"id":"bid-equal-position-first","input":{"sources":[{"name":"BFX-FIRST","position":"0","buy":"5","sell":"5","base_margin":"100"},{"name":"BFX-LAST","position":"0","buy":"5","sell":"5","base_margin":"100"}],"hedges":[{"name":"MT5-FIRST","position":"0","buy":"5","sell":"5"},{"name":"MT5-LAST","position":"0","buy":"5","sell":"5"}]},"expected":{"source":"BFX-FIRST","hedge":"MT5-FIRST","params":{"base_price":"120.0","amount":"1.0","spread":"0.013000000000000001","lev":"16.0"}}},
+      {"id":"ask-equal-position-last","input":{"side":"ask","sources":[{"name":"BFX-FIRST","position":"0","buy":"5","sell":"5","base_margin":"100"},{"name":"BFX-LAST","position":"0","buy":"5","sell":"5","base_margin":"100"}],"hedges":[{"name":"MT5-FIRST","position":"0","buy":"5","sell":"5"},{"name":"MT5-LAST","position":"0","buy":"5","sell":"5"}]},"expected":{"source":"BFX-LAST","hedge":"MT5-LAST","params":{"base_price":"128.0","amount":"-1.0","spread":"0.024","lev":"16.0"}}},
+      {"id":"ask-source-only-tie-last","input":{"side":"ask","sources":[{"name":"BFX-FIRST","position":"0","buy":"5","sell":"5","base_margin":"100"},{"name":"BFX-LAST","position":"0","buy":"5","sell":"5","base_margin":"100"}]},"expected":{"source":"BFX-LAST","hedge":"MT5-BASE","params":{"base_price":"128.0","amount":"-1.0","spread":"0.024","lev":"16.0"}}},
+      {"id":"ask-hedge-only-tie-last","input":{"side":"ask","hedges":[{"name":"MT5-FIRST","position":"0","buy":"5","sell":"5"},{"name":"MT5-LAST","position":"0","buy":"5","sell":"5"}]},"expected":{"source":"BFX-BASE","hedge":"MT5-LAST","params":{"base_price":"128.0","amount":"-1.0","spread":"0.024","lev":"16.0"}}},
+      {"id":"bid-fixed-sort-front","input":{"sources":[{"name":"BFX-MID","position":"2","buy":"5","sell":"5","base_margin":"100"},{"name":"BFX-HIGH","position":"8","buy":"5","sell":"5","base_margin":"100"},{"name":"BFX-LOW","position":"-4","buy":"5","sell":"5","base_margin":"100"}],"hedges":[{"name":"MT5-LOW","position":"-4","buy":"5","sell":"5"},{"name":"MT5-HIGH","position":"8","buy":"5","sell":"5"},{"name":"MT5-MID","position":"2","buy":"5","sell":"5"}]},"expected":{"source":"BFX-LOW","hedge":"MT5-HIGH","params":{"base_price":"120.0","amount":"1.0","spread":"0.013000000000000001","lev":"16.0"}}},
+      {"id":"ask-fixed-sort-back","input":{"side":"ask","sources":[{"name":"BFX-MID","position":"2","buy":"5","sell":"5","base_margin":"100"},{"name":"BFX-HIGH","position":"8","buy":"5","sell":"5","base_margin":"100"},{"name":"BFX-LOW","position":"-4","buy":"5","sell":"5","base_margin":"100"}],"hedges":[{"name":"MT5-LOW","position":"-4","buy":"5","sell":"5"},{"name":"MT5-HIGH","position":"8","buy":"5","sell":"5"},{"name":"MT5-MID","position":"2","buy":"5","sell":"5"}]},"expected":{"source":"BFX-HIGH","hedge":"MT5-LOW","params":{"base_price":"128.0","amount":"-1.0","spread":"0.024","lev":"16.0"}}},
+      {"id":"bid-skip-capacity","input":{"sources":[{"name":"BFX-MID","position":"2","buy":"5","sell":"5","base_margin":"100"},{"name":"BFX-HIGH","position":"8","buy":"5","sell":"5","base_margin":"100"},{"name":"BFX-LOW","position":"-4","buy":"0.5","sell":"5","base_margin":"100"}],"hedges":[{"name":"MT5-LOW","position":"-4","buy":"5","sell":"5"},{"name":"MT5-HIGH","position":"8","buy":"5","sell":"0.5"},{"name":"MT5-MID","position":"2","buy":"5","sell":"5"}]},"expected":{"source":"BFX-MID","hedge":"MT5-MID","params":{"base_price":"120.0","amount":"1.0","spread":"0.013000000000000001","lev":"16.0"}}},
+      {"id":"ask-skip-last-tie-capacity","input":{"side":"ask","sources":[{"name":"BFX-FIRST","position":"0","buy":"5","sell":"5","base_margin":"100"},{"name":"BFX-LAST","position":"0","buy":"5","sell":"5","base_margin":"100"},{"name":"BFX-BLOCKED","position":"0","buy":"5","sell":"0.5","base_margin":"100"}],"hedges":[{"name":"MT5-FIRST","position":"0","buy":"5","sell":"5"},{"name":"MT5-LAST","position":"0","buy":"5","sell":"5"},{"name":"MT5-BLOCKED","position":"0","buy":"0.5","sell":"5"}]},"expected":{"source":"BFX-LAST","hedge":"MT5-LAST","params":{"base_price":"128.0","amount":"-1.0","spread":"0.024","lev":"16.0"}}},
+      {"id":"bid-capacity-equal","input":{"sources":[{"name":"BFX-BASE","position":"0","buy":"1","sell":"5","base_margin":"100"}],"hedges":[{"name":"MT5-BASE","position":"0","buy":"5","sell":"1"}]},"expected":{"source":"BFX-BASE","hedge":"MT5-BASE","params":{"base_price":"120.0","amount":"1.0","spread":"0.013000000000000001","lev":"16.0"}}},
+      {"id":"ask-capacity-equal","input":{"side":"ask","sources":[{"name":"BFX-BASE","position":"0","buy":"5","sell":"1","base_margin":"100"}],"hedges":[{"name":"MT5-BASE","position":"0","buy":"1","sell":"5"}]},"expected":{"source":"BFX-BASE","hedge":"MT5-BASE","params":{"base_price":"128.0","amount":"-1.0","spread":"0.024","lev":"16.0"}}},
+      {"id":"bid-source-max-reject","input":{"sources":[{"name":"BFX-BASE","position":"10","buy":"5","sell":"5","base_margin":"100"}]},"expected":null},
+      {"id":"ask-hedge-max-reject","input":{"side":"ask","hedges":[{"name":"MT5-BASE","position":"10","buy":"5","sell":"5"}]},"expected":null},
+      {"id":"bid-reduce-both-above-max","input":{"sources":[{"name":"BFX-BASE","position":"-12","buy":"5","sell":"5","base_margin":"100"}],"hedges":[{"name":"MT5-BASE","position":"12","buy":"5","sell":"5"}]},"expected":{"source":"BFX-BASE","hedge":"MT5-BASE","params":{"base_price":"120.0","amount":"1.0","spread":"0.013000000000000001","lev":"16.0"}}},
+      {"id":"ask-reduce-both-above-max","input":{"side":"ask","sources":[{"name":"BFX-BASE","position":"12","buy":"5","sell":"5","base_margin":"100"}],"hedges":[{"name":"MT5-BASE","position":"-12","buy":"5","sell":"5"}]},"expected":{"source":"BFX-BASE","hedge":"MT5-BASE","params":{"base_price":"128.0","amount":"-1.0","spread":"0.024","lev":"16.0"}}},
+      {"id":"bid-only-long-source-cross-reject","input":{"sources":[{"name":"BFX-BASE","position":"-0.5","buy":"5","sell":"5","base_margin":"100"}],"risk":{"source_max_abs":"10","hedge_max_abs":"10","source_min_keep_abs":"0","hedge_min_keep_abs":"0","only_long":true}},"expected":null},
+      {"id":"ask-only-long-hedge-cross-reject","input":{"side":"ask","hedges":[{"name":"MT5-BASE","position":"-0.5","buy":"5","sell":"5"}],"risk":{"source_max_abs":"10","hedge_max_abs":"10","source_min_keep_abs":"0","hedge_min_keep_abs":"0","only_long":true}},"expected":null},
+      {"id":"bid-only-long-source-minimum-reject","input":{"sources":[{"name":"BFX-BASE","position":"-1.5","buy":"5","sell":"5","base_margin":"100"}],"risk":{"source_max_abs":"10","hedge_max_abs":"10","source_min_keep_abs":"1","hedge_min_keep_abs":"0","only_long":true}},"expected":null},
+      {"id":"ask-only-long-hedge-minimum-reject","input":{"side":"ask","hedges":[{"name":"MT5-BASE","position":"-1.5","buy":"5","sell":"5"}],"risk":{"source_max_abs":"10","hedge_max_abs":"10","source_min_keep_abs":"0","hedge_min_keep_abs":"1","only_long":true}},"expected":null},
+      {"id":"bid-only-long-exact-zero-allowed","input":{"sources":[{"name":"BFX-BASE","position":"-1","buy":"5","sell":"5","base_margin":"100"}],"hedges":[{"name":"MT5-BASE","position":"1","buy":"5","sell":"5"}],"risk":{"source_max_abs":"10","hedge_max_abs":"10","source_min_keep_abs":"0","hedge_min_keep_abs":"0","only_long":true}},"expected":{"source":"BFX-BASE","hedge":"MT5-BASE","params":{"base_price":"120.0","amount":"1.0","spread":"0.013000000000000001","lev":"16.0"}}},
+      {"id":"ask-only-long-from-zero-allowed","input":{"side":"ask","risk":{"source_max_abs":"10","hedge_max_abs":"10","source_min_keep_abs":"0","hedge_min_keep_abs":"0","only_long":true}},"expected":{"source":"BFX-BASE","hedge":"MT5-BASE","params":{"base_price":"128.0","amount":"-1.0","spread":"0.024","lev":"16.0"}}},
+      {"id":"bid-carry-and-comparable-price-fx","input":{"carry":{"bitfinex_long":"0.002","bitfinex_short":"-0.003","mt5_long_swap":"-0.004","mt5_short_swap":"0.005","total_trade_fee":"0.001"},"fx":{"usd_usdt_bid":"1.125","usd_usdt_ask":"1.25"}},"expected":{"source":"BFX-BASE","hedge":"MT5-BASE","params":{"base_price":"135.0","amount":"1.0","spread":"0.011","lev":"16.0"}}},
+      {"id":"ask-carry-and-comparable-price-fx","input":{"side":"ask","carry":{"bitfinex_long":"0.002","bitfinex_short":"-0.003","mt5_long_swap":"-0.004","mt5_short_swap":"0.005","total_trade_fee":"0.001"},"fx":{"usd_usdt_bid":"1.125","usd_usdt_ask":"1.25"}},"expected":{"source":"BFX-BASE","hedge":"MT5-BASE","params":{"base_price":"160.0","amount":"-1.0","spread":"0.026000000000000002","lev":"16.0"}}},
+      {"id":"bid-leverage-floor-exact","input":{"margin_level":"625","sources":[{"name":"BFX-BASE","position":"0","buy":"5","sell":"5","base_margin":"0"}]},"expected":{"source":"BFX-BASE","hedge":"MT5-BASE","params":{"base_price":"120.0","amount":"1.0","spread":"0.013000000000000001","lev":"16.0"}}},
+      {"id":"ask-leverage-floor-next-integer","input":{"side":"ask","margin_level":"626","sources":[{"name":"BFX-BASE","position":"0","buy":"5","sell":"5","base_margin":"0"}]},"expected":{"source":"BFX-BASE","hedge":"MT5-BASE","params":{"base_price":"128.0","amount":"-1.0","spread":"0.024","lev":"15.0"}}},
+      {"id":"bid-signed-fractional-amount-negative-spread","input":{"open_amount":{"bid":"2.5","ask":"3"},"open_spread":{"bid":"-0.125","ask":"0.0625"},"delta":{"bid":"0","ask":"0.015625"}},"expected":{"source":"BFX-BASE","hedge":"MT5-BASE","params":{"base_price":"120.0","amount":"2.5","spread":"-0.125","lev":"16.0"}}},
+      {"id":"ask-signed-fractional-amount","input":{"side":"ask","open_amount":{"bid":"2.5","ask":"3.5"},"open_spread":{"bid":"-0.125","ask":"0.0625"},"delta":{"bid":"0","ask":"0.015625"}},"expected":{"source":"BFX-BASE","hedge":"MT5-BASE","params":{"base_price":"128.0","amount":"-3.5","spread":"0.078125","lev":"16.0"}}}
+    ]
+  }
+}
