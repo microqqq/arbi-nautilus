@@ -723,6 +723,8 @@ EA 改动额外执行现有 `tools/mt5_source_manifest.sh --lines`、MetaEditor 
 
 ### 收尾安排（2026-09-06，全量复盘后由用户确认继续）
 
+本轮实施补充（先固定边界，验证结果随后填写）：Maker 合格未绑定余腿沿现有全量核验、原子 owner 和原 dispatcher 恢复；有待执行腿时保留/建立同一个 cycle-only freeze，完成后由普通周期释放，不能先清冻结而遗留 `_source_hold`。原绑定前缀必须全成交，不把已拒绝/未知请求当未发送；原外因 HOLD 不自动清除。Maker 残差使用既有 owner 的 route/carry 准入，不强加 Taker 零残差；缺分配顺序的 legacy 未完义务仍暂停。真实进程测试单独执行普通入口后 SIGKILL，再由新进程加载 Redis/原业务与 CID 文件，禁止以重建 native 事件或干净退出代替突崩。A07 只读桥接原生已实现交易 PnL 与最终 trade commission，按币种 `native_realized + embedded_booked_cost - venue_raw_cost` 后显式 FX；排除尚无实收流水的 funding/swap/其它费用及未实现浮盈。历史/费用缺失则 PENDING，不称全账户最终净收益。
+
 当前实现基线 `799b472`。以下四个交付包重新组织既有 W1–W9 的剩余工作，不新增目标、不废除原验收矩阵；小步提交保留，验收单位改为普通入口可用的完整能力，不继续用内部小包数代替交付完成。
 
 1. **普通入口与完整启停恢复（W6 + W8 入口部分）**：Maker/Taker 共用薄入口、凭据加载和运行生命周期，保留原 Taker CLI；显式可选 native Redis 配置接入普通运行。离线 validate 不连接 Redis/venue、不读取凭据、不执行恢复；rehearsal 不启动策略或业务恢复 Actor、不修改业务暂停。普通 stop 在执行连接在线时停止新源准入、撤本策略源单并核对、继续已确认的 hedge，完成或到预算后才调用 native stop/dispose；信号和显式 node stop 共用路径。成功表示义务已收束，不要求已有已对冲仓位归零；未知或未完返回清楚的未完成结果并保留原持久事实。其余必交：Maker 合格余腿、明确零成交拒单的有界新 ID 尝试、旧 HOLD 诊断/恢复出口，以及安装后普通入口的真实进程 R01–R06。不得把入口接线、干净 Redis load 或停止函数单测当整包通过。
@@ -746,6 +748,12 @@ EA 改动额外执行现有 `tools/mt5_source_manifest.sh --lines`、MetaEditor 
 - fresh wheel/sdist 各自独立环境、仓库外、无 PYTHONPATH，22次 CLI help、4次离线模拟、2次 pip check 通过；44个生产模块与源码/两安装逐字节一致，主agent另独立各复跑一个模拟并取得预期数量。初始 sdist 混入本机 .git 指针，仅增排除规则修复，无依赖变动；旧产物保留为未验收。临时证据位于 `/tmp/py000-install-check-lDdhjv`。已验证 wheel SHA256 为 `f085cd869d81ef66ea3f23d9c05fb074512c851edc142c89fc27d369fb8d56ed`；最终 sdist 随本文收口重建，内容及派生 wheel 同一性以旁置 `final-artifact-manifest.json` 为准，不能用旧源码包代表最终字节。此证据仅限本机 Python3.12/macOS arm64，不等于发布、EA 原生验收或 DEMO。
 - 主agent最终新后端全量 **2795 passed / 130既有Pandas警告 / 449.98s**，两项真实Redis跨进程测试均实际执行、无skip；Ruff与Mypy104文件通过。17份改动源码/测试及pyproject测前后SHA不变。本轮两个任务专用临时容器 `254234226ee6`、`2383a2ea519d` 均已停止，自动清除仅供测试的合成数据后复查为空；未动既有服务或账户。全量含既有模拟fixture的原生日志，不据绿色宣称完整突崩/同实例重启已认证。
 - 本次接受普通入口/在线停止、Q4技术前置和上述安装边界，按约定仅形成本地检查点；没有推送、部署、连接交易账户或发单。第一交付包仍需 Maker 合格未绑定余腿、明确零成交拒单恢复、旧 HOLD 诊断出口及真实进程R矩阵；W6/W7/W8/W9父项继续未完成，不再增加新目标或继续微阶段编号。
+
+本轮继续记录（Maker 余腿已验证；其余收尾持续实施）：
+
+- 合格 Maker 未绑定余腿沿原全量核验恢复；pending 时保留 cycle-only 双侧冻结和 receipt，原 dispatcher 按 allocation 顺序完成后正常释放。未修改策略派单器或状态 schema。使用原 owner 的 signed route/carry 限额，strict、超预算及无法确定顺序的 legacy 未完义务仍保持原状态。
+- 先固定三个旧实现 TypeError 反例，再完成纯状态64项、普通双 adapter 四截点及旧HOLD/发布前后失败14项；恢复保留原订单/Position事件及IDs，只发尚未绑定的新腿，完成后下一机会通过。扩参初次漏传 Maker two-sided 配置，以及未先排空最后一次正常终态观测，均仅修测试准备，不改变原断言或生产时序守卫。相关六文件 **409 passed**；独立 reviewer 针对余腿/carry/legacy **34 passed / 57.34s**，未发现该约30行生产切片的具体 REWORK；Ruff、Mypy定向通过。
+- 本次只形成已验证 Maker 能力的本地提交；W6父项/真实进程全矩阵、拒单一次新ID与旧HOLD出口、A07、W7–W9继续实施，不据局部绿色关闭交付包。A07独立审查已实际复现“MT5 journal数量与native矛盾仍FINAL”，正复用原成交校验窄修，旧报告候选不接受；不得用本条中的恢复测试替代该费用修复及后续冻结全量。
 
 三种结论必须区分：
 

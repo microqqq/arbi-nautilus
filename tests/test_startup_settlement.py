@@ -12,12 +12,14 @@ import test_hedge_projection as hedge_fixture
 from nautilus_trader.model.events import OrderFilled
 from nautilus_trader.model.orders import Order
 from test_hedge_projection import D, _new, _observe, _record, _reload, _view
+from test_source_projection import ACCOUNT as SOURCE_ACCOUNT
 from test_source_projection import STRATEGY, _begin
 from test_source_projection import _order as _source_order
 
 import py000_nautilus.store as store_module
 from py000_nautilus.durability import ParentDirectorySyncError, replace_and_sync_parent
 from py000_nautilus.hedge_projection import project_hedge_fills
+from py000_nautilus.maker_migration import _checkpoint_orders
 from py000_nautilus.maker_store import MakerStateStore
 from py000_nautilus.models import BusinessOrderSide, HedgeLeg, ObligationStatus
 from py000_nautilus.restart_recovery import (
@@ -33,8 +35,13 @@ from py000_nautilus.store import JsonStateStore
 def _history(
     path: Path, *, maker: bool = False, legs: int = 1, planned: bool = True,
     pending_leg: bool = False, cycle_freeze: bool = False,
+    source_extra: str = "0", residual_limit: str = "0",
 ) -> tuple[JsonStateStore | MakerStateStore, list[Order], list[Order]]:
-    owner = _new(path, maker)
+    owner = (MakerStateStore(
+        path, hedge_fixture.SOURCE.value, hedge_fixture.HEDGE.value,
+        residual_limit_ounces=D(residual_limit),
+        carry_route=(SOURCE_ACCOUNT.value, "BITFINEX", "MT5-001", "MT5"),
+    ) if maker and residual_limit != "0" else _new(path, maker))
     sources: list[Order] = []
     hedges: list[Order] = []
     # Default synthetic Maker history retains the original two-view atomicity cases.
@@ -43,7 +50,8 @@ def _history(
                  else (BusinessOrderSide.BUY,)):
         view = _view(owner, side)
         cid = f"S-{side.value}"
-        source = _source_order(cid, (str(2 * legs),), side=side, quantity=str(2 * legs))
+        quantity = str(D(2 * legs) + D(source_extra))
+        source = _source_order(cid, (quantity,), side=side, quantity=quantity)
         _begin(view, source)
         fill = next(event for event in source.events if isinstance(event, OrderFilled))
         reserve = view.reserve_source_fill if cycle_freeze else view._reserve_source_fill
@@ -332,11 +340,15 @@ def test_captured_maker_cycle_is_revoked_even_by_identical_external_text(
     assert not capture_startup_receipt(_reload(owner)).eligible
 
 
-def test_maker_cycle_provenance_does_not_release_a_future_unbound_leg(tmp_path: Path) -> None:
+@pytest.mark.parametrize("cycle_freeze", [False, True])
+def test_maker_unbound_recovery_retains_cycle_freeze_until_completion(
+    tmp_path: Path, cycle_freeze: bool,
+) -> None:
     owner, sources, hedges = _history(
-        tmp_path / "cycle-future", maker=True, legs=2, pending_leg=True, cycle_freeze=True,
+        tmp_path / "cycle-future", maker=True, legs=2, pending_leg=True,
+        cycle_freeze=cycle_freeze,
     )
-    assert isinstance(owner, MakerStateStore) and owner.cycle_freeze_only
+    assert isinstance(owner, MakerStateStore)
     receipt = capture_startup_receipt(owner)
     assert receipt.eligible
     for view in owner.stores.values():
@@ -345,9 +357,22 @@ def test_maker_cycle_provenance_does_not_release_a_future_unbound_leg(tmp_path: 
     before = owner.path.read_bytes()
     with pytest.raises(ValueError, match="incomplete or unbound"):
         _settle_completed(owner, sources, hedges, receipt)
-    with pytest.raises(TypeError, match="JsonStateStore"):
-        _settle_completed(owner, sources, hedges, receipt, resume_unbound=True)
-    assert owner.path.read_bytes() == before and owner.cycle_freeze_only
+    assert owner.path.read_bytes() == before
+    _settle_completed(owner, sources, hedges, receipt, resume_unbound=True)
+    assert owner.cycle_freeze_only and owner.next_pending_hedge() is not None
+    assert all(view.halt_reason is None and view.source_freeze_reason
+               and not view.can_submit_source() for view in owner.stores.values())
+    assert all(intent.status is ObligationStatus.PENDING and intent.hedge_leg_index == 1
+               and intent.hedge_client_order_id is None
+               for view in owner.stores.values() for intent in view.intents())
+    assert not owner.clear_source_freezes()
+    published = owner.path.read_bytes()
+    _settle_completed(owner, sources, hedges, receipt, resume_unbound=True)
+    assert owner.path.read_bytes() == published
+    loaded = _reload(owner)
+    assert isinstance(loaded, MakerStateStore) and loaded.cycle_freeze_only
+    assert capture_startup_receipt(loaded).eligible
+    assert loaded._to_payload() == owner._to_payload()
 
 
 @pytest.mark.parametrize("maker", [False, True])
@@ -556,10 +581,64 @@ def test_unbound_final_candidate_still_requires_zero_rounding_residual(
     assert not publications and owner._to_payload() == before and owner.path.read_bytes() == disk
 
 
-def test_maker_cannot_enable_taker_unbound_recovery(tmp_path: Path) -> None:
+def test_completed_maker_also_accepts_explicit_unbound_recovery(tmp_path: Path) -> None:
     owner, sources, hedges, receipt = _prepared(tmp_path / "maker", maker=True)
+    _settle_completed(owner, sources, hedges, receipt, resume_unbound=True)
+    assert isinstance(owner, MakerStateStore) and not owner.cycle_freeze_only
+    assert all(view.can_submit_source() and view.cycle_evidence_complete()
+               for view in owner.stores.values())
+
+
+@pytest.mark.parametrize("source_extra", ["0.4", "-0.4"])
+@pytest.mark.parametrize("limit", ["0", "0.3", "0.4"])
+def test_maker_unbound_recovery_uses_existing_route_carry_budget(
+    tmp_path: Path, source_extra: str, limit: str,
+) -> None:
+    owner, sources, hedges = _history(
+        tmp_path / "carry", maker=True, legs=2, pending_leg=True, cycle_freeze=True,
+        source_extra=source_extra, residual_limit=limit,
+    )
+    assert isinstance(owner, MakerStateStore)
+    receipt = capture_startup_receipt(owner)
+    assert receipt.eligible
+    for view in owner.stores.values():
+        view.recover_for_start()
+    _project(owner, sources, hedges, receipt)
     before, disk = deepcopy(owner._to_payload()), owner.path.read_bytes()
-    with pytest.raises(TypeError, match="JsonStateStore"):
+    if limit != "0.4":
+        with pytest.raises(ValueError, match="inadmissible business residuals"):
+            _settle_completed(owner, sources, hedges, receipt, resume_unbound=True)
+        assert owner._to_payload() == before and owner.path.read_bytes() == disk
+        return
+    _settle_completed(owner, sources, hedges, receipt, resume_unbound=True)
+    assert owner.carry_residual_ounces == D(source_extra)
+    assert owner.cycle_freeze_only and owner.next_pending_hedge() is not None
+    assert owner._to_payload()["allocations"] == before["allocations"]
+    loaded = MakerStateStore(
+        tmp_path / "carry", hedge_fixture.SOURCE.value, hedge_fixture.HEDGE.value,
+        residual_limit_ounces=D(limit),
+        carry_route=(SOURCE_ACCOUNT.value, "BITFINEX", "MT5-001", "MT5"),
+    )
+    assert loaded._to_payload() == owner._to_payload()
+
+
+def test_legacy_maker_pending_without_execution_order_remains_held(tmp_path: Path) -> None:
+    owner, sources, hedges = _history(
+        tmp_path / "legacy-maker", maker=True, legs=2, pending_leg=True, cycle_freeze=True,
+    )
+    assert isinstance(owner, MakerStateStore)
+    owner._legacy_orders = _checkpoint_orders({key: view._state
+                                               for key, view in owner.stores.items()})
+    owner._legacy_sources = (("bid.json", "a" * 64), ("ask.json", "b" * 64))
+    owner._allocations.clear()
+    owner._persist()
+    receipt = capture_startup_receipt(owner)
+    assert receipt.eligible
+    for view in owner.stores.values():
+        view.recover_for_start()
+    _project(owner, sources, hedges, receipt)
+    before, disk = deepcopy(owner._to_payload()), owner.path.read_bytes()
+    with pytest.raises(ValueError, match="inadmissible business residuals"):
         _settle_completed(owner, sources, hedges, receipt, resume_unbound=True)
     assert owner._to_payload() == before and owner.path.read_bytes() == disk
 

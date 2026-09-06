@@ -236,38 +236,44 @@ def test_new_ordinary_node_resumes_native_netting_history_without_repairing_inde
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("maker", [False, True])
 @pytest.mark.parametrize("cut,fault", [
     ("unbound", None), ("planned", None), ("between-legs", None), ("current-filled", None),
     ("between-legs", "old-hold"), ("unbound", "before-publish"),
     ("current-filled", "after-publish"),
 ])
-def test_taker_startup_continues_only_unbound_remaining_legs(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cut: str, fault: str | None,
+def test_startup_continues_only_unbound_remaining_legs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cut: str, fault: str | None, maker: bool,
 ) -> None:
+    submit_method = "_submit_hedge" if maker else "_submit_hedge_intent"
+
     async def scenario() -> None:
         async with _continuous(
-            tmp_path, monkeypatch, maker=False, long_quantity=4, short_quantity=2,
+            tmp_path, monkeypatch, maker=maker, long_quantity=4, short_quantity=2,
         ) as (first, source, wire):
             initial = await _accepted_source(first, source, wire, -2)
             assert source.order(initial).quantity.as_decimal() == 2
             source.fill(initial, Decimal(2))
             await _settle_cycle(first, source, wire, cid=initial, expected=1)
-            original_submit = first.strategy._submit_hedge_intent
+            original_submit = getattr(first.strategy, submit_method)
 
-            def stop_before_binding(intent: HedgeIntent) -> None:
+            def stop_before_binding(*args: Any) -> None:
+                intent: HedgeIntent = args[-1]
                 # Inject a stop at an existing durable boundary; never undo a
                 # binding or pretend that a previously sent request was absent.
                 if cut == "planned":
-                    first.strategy._hedges.next_hedge_leg(
-                        intent.intent_id, first.strategy._hedge_positions(),
-                    )
+                    coordinator = (first.strategy._hedges[args[0]] if maker
+                                   else first.strategy._hedges)
+                    positions = (first.strategy._hedge_positions(args[1]) if maker
+                                 else first.strategy._hedge_positions())
+                    coordinator.next_hedge_leg(intent.intent_id, positions)
                 if cut in {"unbound", "planned"} or (
                     cut == "between-legs" and intent.hedge_leg_index == 1
                 ):
                     return
-                original_submit(intent)
+                original_submit(*args)
 
-            monkeypatch.setattr(first.strategy, "_submit_hedge_intent", stop_before_binding)
+            monkeypatch.setattr(first.strategy, submit_method, stop_before_binding)
             if cut == "current-filled":
                 verify_serial = wire.before_mutation
                 assert verify_serial is not None
@@ -282,7 +288,7 @@ def test_taker_startup_continues_only_unbound_remaining_legs(
             source.fill(cid, Decimal(4))
 
             def captured() -> bool:
-                if len(first.store.intents()) != 2:
+                if len(first.store.intents()) != (1 if maker else 2):
                     return False
                 intent = first.store.intents()[-1]
                 if cut == "between-legs":
@@ -300,7 +306,10 @@ def test_taker_startup_continues_only_unbound_remaining_legs(
             intent_before = first.store.intents()[-1]
             assert len(wire.submit_calls) == 1  # Only the initial BUY2 hedge open.
             assert len(wire.close_calls) == int(cut in {"between-legs", "current-filled"})
-            assert first.store.halt_reason is None and first.store.source_freeze_reason is None
+            assert first.store.halt_reason is None
+            assert bool(first.store.source_freeze_reason) is maker
+            if maker:
+                assert first.strategy._state_store.cycle_freeze_only
             if fault == "old-hold":
                 first.store._state.halt_reason = "operator inspection still required"
                 first.store._persist()
@@ -310,13 +319,14 @@ def test_taker_startup_continues_only_unbound_remaining_legs(
                              for position in first.node.cache.positions()}
 
         second = _OrdinaryStrategy(
-            tmp_path, monkeypatch, maker=False, source_quantity=4, source_short_quantity=2,
+            tmp_path, monkeypatch, maker=maker, source_quantity=4, source_short_quantity=2,
+            two_sided=maker,
             native_mt5_transport=True, inject_mt5_io=False,
         )
         owner = get_source_terminal_reconciler(second.node)
         source2, wire2 = history.restore(second)
         dispatch_enabled = False
-        next_submit = second.strategy._submit_hedge_intent
+        next_submit = getattr(second.strategy, submit_method)
 
         async def verify_remaining_serial(payload: JsonObject) -> None:
             request_id = str(payload["client_request_id"])
@@ -329,13 +339,13 @@ def test_taker_startup_continues_only_unbound_remaining_legs(
 
         wire2.before_mutation = verify_remaining_serial
 
-        def observe_before_dispatch(intent: HedgeIntent) -> None:
+        def observe_before_dispatch(*args: Any) -> None:
             assert not second.store.can_submit_source()
             assert set(source2.rows) == set(history.source_facts[0])
             if dispatch_enabled:
-                next_submit(intent)
+                next_submit(*args)
 
-        monkeypatch.setattr(second.strategy, "_submit_hedge_intent", observe_before_dispatch)
+        monkeypatch.setattr(second.strategy, submit_method, observe_before_dispatch)
         publications = 0
 
         def publish(candidate: Path, destination: Path) -> None:
@@ -398,6 +408,9 @@ def test_taker_startup_continues_only_unbound_remaining_legs(
             assert resumed.status is ObligationStatus.PENDING
             assert resumed.hedge_client_order_id is None and resumed.hedge_leg_filled_ounces == 0
             assert resumed.hedge_leg_index == len(resumed.hedge_order_ids)
+            if maker:
+                assert second.strategy._state_store.cycle_freeze_only
+                assert all(view.source_freeze_reason for view in second.strategy._stores.values())
             assert resumed.hedge_filled_ounces == (
                 Decimal(2) if cut in {"between-legs", "current-filled"} else Decimal(0)
             )
@@ -416,12 +429,14 @@ def test_taker_startup_continues_only_unbound_remaining_legs(
             assert completed.hedge_order_ids[:len(intent_before.hedge_order_ids)] == (
                 intent_before.hedge_order_ids
             )
-            monkeypatch.setattr(second.strategy, "_submit_hedge_intent", next_submit)
+            monkeypatch.setattr(second.strategy, submit_method, next_submit)
             wire2.before_mutation = None
             next_cid = await _accepted_source(second, source2, wire2, -2)
             assert next_cid not in history.source_facts[0]
             source2.fill(next_cid, Decimal(2))
             await _settle_cycle(second, source2, wire2, cid=next_cid, expected=3)
+            assert await second.node.kernel.exec_engine.reconcile_execution_state(timeout_secs=2)
+            second.source.confirm_terminal_reconciliation()
             await _check(second)
         finally:
             await second.hedge._disconnect()

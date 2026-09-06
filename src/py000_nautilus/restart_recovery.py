@@ -1,7 +1,7 @@
 """One startup check over native/venue facts and the existing business stores.
 
 This does not resend existing requests or clear old HOLDs. A receipt captured
-before startup can finalize completed bound legs and, for ordinary Taker only,
+before startup can finalize completed bound legs and, for ordinary Maker/Taker,
 release proven unbound remainders to its existing dispatcher. Its caller owns
 the timeout and keeps strategy callbacks gated until it returns.
 """
@@ -233,15 +233,13 @@ def _settle_completed(
     store: JsonStateStore | MakerStateStore, source_orders: list[Order],
     hedge_orders: list[Order], receipt: _StartupReceipt, *, resume_unbound: bool = False,
 ) -> None:
-    """Finalize proven facts, optionally releasing Taker's unbound remainder.
+    """Finalize proven facts, optionally releasing the existing unbound remainder.
 
     Both projectors and the complete native/venue history must already have passed.
     """
     receipt.check(store)
     if not receipt.eligible:
         raise ValueError("startup receipt does not authorize business settlement")
-    if resume_unbound and type(store) is not JsonStateStore:
-        raise TypeError("unbound hedge recovery requires a JsonStateStore")
     views = _views(store)
     sources = {order.client_order_id.value: order for order in source_orders}
     hedges = {order.client_order_id.value: order for order in hedge_orders}
@@ -279,6 +277,13 @@ def _settle_completed(
                         hedge_leg_index=len(ids), hedge_leg_filled_ounces=Decimal(0))
                 if intent.hedge_plan else replace(intent, status=status)
             )
+    pending = any(intent.status is ObligationStatus.PENDING for intent in candidates.values())
+    # Maker's normal dispatcher releases this freeze after the last obligation.
+    # Clearing it while pending would strand the strategy's in-memory source hold.
+    cycle_reason = (
+        next(iter(receipt.freezes.values()), "verified pending Maker hedge obligations")
+        if pending and isinstance(store, MakerStateStore) else None
+    )
     previous = deepcopy(views[0]._state)
     maker_previous = store._snapshot() if isinstance(store, MakerStateStore) else None
     before = store._to_payload()
@@ -293,12 +298,16 @@ def _settle_completed(
                 identity: candidates[identity] for identity in view._state.hedge_intents
             }
             view._state.halt_reason = None
-            view._state.source_freeze_reason = None
+            view._state.source_freeze_reason = cycle_reason
         if isinstance(store, MakerStateStore):
-            store._cycle_freeze_only = False
+            store._cycle_freeze_only = pending
             store._validate()
-        pending = any(intent.status is ObligationStatus.PENDING for intent in candidates.values())
-        if ((pending and any(view.rounding_residual_ounces != 0 for view in views))
+        admissible_pending = (
+            store.source_balance_is_admissible() and store.next_pending_hedge() is not None
+            if isinstance(store, MakerStateStore)
+            else all(view.rounding_residual_ounces == 0 for view in views)
+        )
+        if ((pending and not admissible_pending)
                 or (not pending and any(not view.can_submit_source()
                                        or not view.cycle_evidence_complete() for view in views))):
             raise ValueError("startup settled candidate has inadmissible business residuals")
@@ -314,8 +323,8 @@ def _settle_completed(
             views[0]._state = previous
         raise
     receipt.halts.clear()
-    receipt.freezes.clear()
-    receipt.maker_cycle_freeze = False
+    receipt.freezes = {view: cycle_reason for view in views} if cycle_reason else {}
+    receipt.maker_cycle_freeze = cycle_reason is not None
 
 
 async def reconcile_startup(
@@ -411,8 +420,7 @@ async def reconcile_startup(
     if source_position != source_filled or hedge_position != hedge_filled:
         raise ValueError("startup positions differ from complete business fills")
     if receipt is not None and receipt.eligible:
-        _settle_completed(store, source_orders, hedge_orders, receipt,
-                          resume_unbound=type(store) is JsonStateStore)
+        _settle_completed(store, source_orders, hedge_orders, receipt, resume_unbound=True)
         return
     native = {order.client_order_id.value: order for order in source_orders}
     if added_source or added_hedge or any(
