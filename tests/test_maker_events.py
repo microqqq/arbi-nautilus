@@ -2265,10 +2265,10 @@ def test_maker_fresh_hedge_quote_retries_pending_leg_exactly_once(
         submit_order=lambda _order, *, position_id, client_id, params: submissions.append(
             position_id,
         ),
-        _try_release_cycle=lambda: False,
+        _try_release_cycle=lambda **_kwargs: False,
         _inputs_are_fresh=lambda _source, _hedge, _now_ns: True,
         _global_obligation_block=lambda: True,
-        _freeze_and_cancel_all=lambda reason: frozen.append(reason),
+        _freeze_and_cancel_all=lambda reason, **_kwargs: frozen.append(reason),
         _cancel_all_best_effort=lambda reason: canceled.append(reason),
         _refresh_direction=lambda *_args: (_ for _ in ()).throw(
             AssertionError("source quote maintenance must stay blocked")
@@ -2778,7 +2778,7 @@ class _StopHarness:
             SourceDirection.LONG: _StopStore("O-BID"),
             SourceDirection.SHORT: _StopStore("O-ASK"),
         }
-        self._state_store: Any = SimpleNamespace(residuals=lambda: {})
+        self._state_store: Any = SimpleNamespace(residuals=lambda: {}, shared_strategy_ids=None)
         self.log: Any = SimpleNamespace(warning=lambda _message: None)
         self.cache = _StopCache()
         self.canceled: list[_WorkingOrder] = []
@@ -2816,8 +2816,8 @@ class _StopHarness:
         for store in self._stores.values():
             store.freeze_source_submissions(reason)
 
-    def _freeze_and_cancel_all(self, reason: str) -> None:
-        MakerStrategy._freeze_and_cancel_all(cast(Any, self), reason)
+    def _freeze_and_cancel_all(self, reason: str, *, market_input: bool = False) -> None:
+        MakerStrategy._freeze_and_cancel_all(cast(Any, self), reason, market_input=market_input)
 
     def _cancel_all_best_effort(self, reason: str) -> None:
         for direction in (SourceDirection.LONG, SourceDirection.SHORT):
@@ -2908,7 +2908,7 @@ class _SessionHarness:
     def _reschedule_active_timers(self) -> None:
         raise AssertionError("a closed session must cancel, not reschedule")
 
-    def _freeze_and_cancel_all(self, reason: str) -> None:
+    def _freeze_and_cancel_all(self, reason: str, *, market_input: bool = False) -> None:
         for direction in (SourceDirection.LONG, SourceDirection.SHORT):
             self._cancel_working(direction, reason=reason)
 
@@ -3017,7 +3017,7 @@ class _MakerCostHarness:
         self.errors: list[str] = []
         self.log = SimpleNamespace(error=self.errors.append)
 
-    def _freeze_and_cancel_all(self, reason: str) -> None:
+    def _freeze_and_cancel_all(self, reason: str, *, market_input: bool = False) -> None:
         self.frozen.append(reason)
 
     def _invalidate_cost_snapshot(self, reason: str) -> None:
@@ -3415,13 +3415,13 @@ class _LiveQuoteGateHarness:
     def _invalidate_cost_snapshot(self, reason: str) -> None:
         MakerStrategy._invalidate_cost_snapshot(cast(Any, self), reason)
 
-    def _freeze_and_cancel_all(self, reason: str) -> None:
+    def _freeze_and_cancel_all(self, reason: str, *, market_input: bool = False) -> None:
         self.canceled.extend((SourceDirection.LONG, SourceDirection.SHORT))
 
     def _global_obligation_block(self) -> bool:
         return False
 
-    def _try_release_cycle(self) -> bool:
+    def _try_release_cycle(self, *, inputs_fresh: bool = False) -> bool:
         return False
 
     def _refresh_direction(self, direction: SourceDirection, *_books: Any) -> None:
@@ -3509,7 +3509,7 @@ class _QuoteGateHarness:
     def _global_obligation_block(self) -> bool:
         return self.blocked
 
-    def _try_release_cycle(self) -> bool:
+    def _try_release_cycle(self, *, inputs_fresh: bool = False) -> bool:
         return False
 
     def _inputs_are_fresh(
@@ -3533,7 +3533,7 @@ class _QuoteGateHarness:
         for direction in (SourceDirection.LONG, SourceDirection.SHORT):
             self._cancel_working(direction, reason=reason)
 
-    def _freeze_and_cancel_all(self, reason: str) -> None:
+    def _freeze_and_cancel_all(self, reason: str, *, market_input: bool = False) -> None:
         for direction in (SourceDirection.LONG, SourceDirection.SHORT):
             self._cancel_working(direction, reason=reason)
 

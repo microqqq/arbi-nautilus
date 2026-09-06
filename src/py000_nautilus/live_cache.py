@@ -73,6 +73,7 @@ def validate_native_cache(
     trader_id: TraderId,
     strategy_id: StrategyId,
     routes: Mapping[InstrumentId, tuple[AccountId, ClientId]],
+    business_owners: Mapping[str, StrategyId] | None = None,
 ) -> bool:
     """Reject foreign/incomplete loads; return whether restart reconciliation is pending.
 
@@ -89,12 +90,18 @@ def validate_native_cache(
         raise ValueError("native cache contains an instrument outside this live composition")
 
     orders, positions = cache.orders(), cache.positions()
+    allowed = {strategy_id} if business_owners is None else set(business_owners.values())
+    if business_owners is not None and set(business_owners) != {
+        order.client_order_id.value for order in orders
+    }:
+        raise ValueError("native cache order set differs from shared business ownership")
     for order in orders:
         route = routes.get(order.instrument_id)
         if (
             route is None
             or order.trader_id != trader_id
-            or order.strategy_id != strategy_id
+            or order.strategy_id != (strategy_id if business_owners is None
+                                     else business_owners[order.client_order_id.value])
             or cache.instrument(order.instrument_id) is None
         ):
             raise ValueError(f"native cache order identity mismatch: {order.client_order_id}")
@@ -128,16 +135,23 @@ def validate_native_cache(
                 raise ValueError(
                     f"native cache order position missing or mismatched: {position_id}",
                 )
+            if (business_owners is not None and position.strategy_id != order.strategy_id
+                    and not (client_id.value == "MT5" and order.is_reduce_only)):
+                raise ValueError(f"native cache order position owner differs: {position_id}")
 
     for position in positions:
         route = routes.get(position.instrument_id)
         if (
             route is None
             or position.trader_id != trader_id
-            or position.strategy_id != strategy_id
+            or position.strategy_id not in allowed
             or position.account_id != route[0]
             or cache.account(position.account_id) is None
             or cache.instrument(position.instrument_id) is None
         ):
             raise ValueError(f"native cache position identity mismatch: {position.id}")
+        if business_owners is not None:
+            opening = cache.order(position.opening_order_id)
+            if opening is None or opening.strategy_id != position.strategy_id:
+                raise ValueError(f"native cache position opening owner differs: {position.id}")
     return bool(orders or positions)

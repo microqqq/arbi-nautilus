@@ -70,7 +70,7 @@ def test_native_stop_failure_cannot_leave_a_successful_drain_result(
         await native_stop(self)
         raise asyncio.CancelledError if cancelled else RuntimeError("synthetic native stop failure")
 
-    monkeypatch.setattr(live_lifecycle, "drain_strategy", completed_drain)
+    monkeypatch.setattr(live_lifecycle, "drain_strategies", completed_drain)
     monkeypatch.setattr(TradingNode, "stop_async", failed_native_stop)
 
     async def scenario() -> None:

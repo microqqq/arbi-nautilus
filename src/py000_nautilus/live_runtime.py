@@ -19,7 +19,7 @@ from nautilus_trader.model.identifiers import ClientOrderId, InstrumentId, Venue
 from py000_nautilus.bitfinex_v1_data import BitfinexV1DataClient
 from py000_nautilus.bitfinex_v1_execution import BitfinexV1ExecutionClient
 from py000_nautilus.config import HedgeAccountRoute, MakerStrategyConfig, TakerStrategyConfig
-from py000_nautilus.margin import bitfinex_source_account, mt5_hedge_account
+from py000_nautilus.margin import LiveAccountReader, bitfinex_source_account, mt5_hedge_account
 from py000_nautilus.models import BookTop, HedgeAccount, SourceAccount
 from py000_nautilus.mt5_v1_data import Mt5V1DataClient
 from py000_nautilus.mt5_v1_execution import Mt5V1ExecutionClient
@@ -46,7 +46,7 @@ def bind_live_account_reader(
     wallet_currency: str,
     hedge_symbol: str,
     hedge_stream_id: str,
-) -> None:
+) -> LiveAccountReader:
     """Bind the one-account live composition to native facts and demand-only refresh.
 
     The adapter owns query IO, deduplication, action causality and cancellation.
@@ -131,6 +131,7 @@ def bind_live_account_reader(
         return source, hedge, deadline, budget_ready
 
     strategy.bind_live_account_reader(read)
+    return read
 
 
 @dataclass
@@ -302,6 +303,11 @@ class SourceTerminalReconciler(Actor):
         ):
             return False
         return await asyncio.shield(self._ensure_root(retry_failed=retry_failed))
+
+    def request_reconciliation(self) -> None:
+        """Join one bounded native all-client round; repeated callbacks do not reset failures."""
+        if self._active and self._last_failure is None:
+            self._ensure_root()
 
     def _ensure_root(
         self, *, retry_failed: bool = False, working_check: bool = False

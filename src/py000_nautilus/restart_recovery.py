@@ -73,7 +73,26 @@ class StartupRecoveryOptions:
 
 
 def _views(store: JsonStateStore | MakerStateStore) -> tuple[JsonStateStore, ...]:
-    return tuple(store.stores.values()) if isinstance(store, MakerStateStore) else (store,)
+    return store.all_views() if isinstance(store, MakerStateStore) else (store,)
+
+
+def shared_business_owners(store: MakerStateStore) -> dict[str, StrategyId] | None:
+    """CID ownership is bound by the persisted view, not merely a set of allowed strategies."""
+    if store.taker_store is None:
+        return None
+    owners: dict[str, StrategyId] = {}
+    for view in store.all_views():
+        owner_id = store.strategy_id_for(view)
+        if owner_id is None:
+            raise ValueError("shared business view has no strategy identity")
+        for cid in (
+            *(record.client_order_id for record in view.source_orders()),
+            *(cid for intent in view.intents() for cid in intent.hedge_order_ids),
+        ):
+            if cid in owners:
+                raise ValueError("shared business CID belongs to multiple views")
+            owners[cid] = StrategyId(owner_id)
+    return owners
 
 
 @dataclass(slots=True)
@@ -337,7 +356,7 @@ def _complete_orders(mass: ExecutionMassStatus, orders: list[Order],
 
 
 def _positions(cache: Cache, mass: ExecutionMassStatus, instrument_id: InstrumentId,
-               *, netting: bool) -> Decimal:
+               *, netting: bool, shared_netting: bool = False) -> Decimal:
     reports = mass.position_reports.get(instrument_id, [])
     if any(key != instrument_id and rows for key, rows in mass.position_reports.items()):
         raise ValueError("startup position reports contain another instrument")
@@ -360,7 +379,7 @@ def _positions(cache: Cache, mass: ExecutionMassStatus, instrument_id: Instrumen
                 or reports[0].quantity.as_decimal() != abs(total)
                 or reports[0].signed_decimal_qty != total):
             raise ValueError("startup NETTING position differs")
-        if total:
+        if total and not shared_netting:
             weight = sum((abs(position.signed_decimal_qty()) for position in positions), Decimal(0))
             price = sum((Decimal(str(position.avg_px_open)) * abs(position.signed_decimal_qty())
                          for position in positions), Decimal(0)) / weight
@@ -486,11 +505,15 @@ def _settle_completed(
         if isinstance(store, MakerStateStore):
             store._cycle_freeze_only = pending
             store._validate()
-        admissible_pending = (
-            store.source_balance_is_admissible() and store.next_pending_hedge() is not None
-            if isinstance(store, MakerStateStore)
-            else all(view.rounding_residual_ounces == 0 for view in views)
-        )
+        if isinstance(store, MakerStateStore):
+            selected = store.first_unfinished_hedge()  # Includes the shared Taker view.
+            admissible_pending = (
+                store.source_balance_is_admissible() and selected is not None
+                and selected[1].status is ObligationStatus.PENDING
+                and selected[1].hedge_client_order_id is None
+            )
+        else:
+            admissible_pending = all(view.rounding_residual_ounces == 0 for view in views)
         if ((pending and not admissible_pending)
                 or (not pending and any(not view.can_submit_source()
                                        or not view.cycle_evidence_complete() for view in views))):
@@ -569,10 +592,11 @@ async def reconcile_startup(
     if (source_mass.account_id != source.account_id or source_mass.client_id != source.id
             or hedge_mass.account_id != hedge.account_id or hedge_mass.client_id != hedge.id):
         raise ValueError("startup report route differs")
+    shared_owners = shared_business_owners(store) if isinstance(store, MakerStateStore) else None
     validate_native_cache(cache, trader_id=trader_id, strategy_id=strategy_id, routes={
         source_instrument_id: (source.account_id, source.id),
         hedge_instrument_id: (hedge.account_id, hedge.id),
-    })
+    }, business_owners=shared_owners)
     source_orders = cast(list[Order], cache.orders(instrument_id=source_instrument_id))
     hedge_orders = cast(list[Order], cache.orders(instrument_id=hedge_instrument_id))
     if {binding.client_order_id for binding in source._cid_store.bindings} != {
@@ -585,7 +609,8 @@ async def reconcile_startup(
             hedge._synthetic_rejected_venue_order_id(order.client_order_id.value).value
         for order in hedge_orders if order.status == OrderStatus.REJECTED
     })
-    source_position = _positions(cache, source_mass, source_instrument_id, netting=True)
+    source_position = _positions(cache, source_mass, source_instrument_id, netting=True,
+                                 shared_netting=shared_owners is not None)
     hedge_position = _positions(cache, hedge_mass, hedge_instrument_id, netting=False)
     # A newer private observation may survive a rejected REST enrichment. A
     # stable pre/post snapshot alone does not certify the returned older report.

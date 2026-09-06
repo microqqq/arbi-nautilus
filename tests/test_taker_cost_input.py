@@ -265,7 +265,9 @@ def test_book_decision_captures_now_once_for_freshness_and_swap_day(
         ),
         _allowed_source_direction=None,
         _live_account_reader=None,
-        state_store=SimpleNamespace(can_submit_source=lambda: True),
+        state_store=SimpleNamespace(
+            can_submit_source=lambda: True, release_completed_cycle=lambda: False,
+        ),
         cache=SimpleNamespace(
             order_book=lambda instrument_id: source_book,
             quote_tick=lambda instrument_id: hedge_tick,

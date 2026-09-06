@@ -83,6 +83,7 @@ def build_run_accounting_report(
     trader_id: TraderId,
     strategy_id: StrategyId,
     fx: FxConfig,
+    strategy_ids: tuple[StrategyId, ...] | None = None,
 ) -> RunAccountingReport:
     """Observe retained native/fee facts synchronously, without I/O or state changes.
 
@@ -99,7 +100,11 @@ def build_run_accounting_report(
     amounts: defaultdict[str, _Amounts] = defaultdict(_Amounts)
     issues: list[str] = []
     fills: dict[tuple[ClientOrderId, TradeId], OrderFilled] = {}
-    orders = cache.orders(strategy_id=strategy_id)
+    owners = {strategy_id} if strategy_ids is None else set(strategy_ids)
+    if (not owners or strategy_id not in owners
+            or (strategy_ids is not None and len(owners) != len(strategy_ids))):
+        raise ValueError("accounting requires distinct explicit strategy owners")
+    orders = [order for order in cache.orders() if order.strategy_id in owners]
     for order in orders:
         account = routes.get(order.instrument_id)
         if (account is None or order.trader_id != trader_id
@@ -117,7 +122,7 @@ def build_run_accounting_report(
             key = event.client_order_id, event.trade_id
             if (key in fills or event.client_order_id != order.client_order_id
                     or event.account_id != account or event.instrument_id != order.instrument_id
-                    or event.trader_id != trader_id or event.strategy_id != strategy_id
+                    or event.trader_id != trader_id or event.strategy_id != order.strategy_id
                     or event.position_id is None or event.position_id != order.position_id
                     or event.venue_order_id != order.venue_order_id
                     or event.order_side != order.side or event.last_qty.as_decimal() <= 0):
@@ -128,9 +133,8 @@ def build_run_accounting_report(
 
     quantities: defaultdict[tuple[ClientOrderId, TradeId], Decimal] = defaultdict(Decimal)
     commissions: defaultdict[tuple[ClientOrderId, TradeId], Decimal] = defaultdict(Decimal)
-    positions = cache.positions(strategy_id=strategy_id) + [
-        position for position in cache.position_snapshots() if position.strategy_id == strategy_id
-    ]
+    positions = [position for position in cache.positions() + cache.position_snapshots()
+                 if position.strategy_id in owners]
     for position in positions:
         if (position.trader_id != trader_id
                 or position.account_id != routes.get(position.instrument_id)):
@@ -228,7 +232,7 @@ def build_run_accounting_report(
             issues.append(f"hedge_unattributed_cid:{key[0]}")
             unknown += 1
             continue
-        if order.strategy_id != strategy_id:
+        if order.strategy_id not in owners:
             continue
         owned_journal_keys.add(key)
         cost = usd_commission(cashflow)
@@ -261,4 +265,7 @@ def build_run_accounting_report(
     return RunAccountingReport(
         "FINAL" if complete else "PENDING", tuple(dict.fromkeys(issues)), pending, unknown,
         currencies, fx.usd_usdt_bid, fx.usd_usdt_ask, final,
+        scope=("shared_owned_cached_history:native_virtual_realized_trading_pnl_and_commission;"
+               "not_venue_realized_cashflow" if len(owners) > 1
+               else "owned_cached_history:realized_trading_pnl_and_commission"),
     )

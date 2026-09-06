@@ -11,6 +11,7 @@ from nautilus_trader.live.node import TradingNode
 from nautilus_trader.model.identifiers import ClientOrderId
 
 from py000_nautilus.live_runtime import get_source_terminal_reconciler
+from py000_nautilus.maker_store import MakerStateStore
 from py000_nautilus.models import ObligationStatus
 from py000_nautilus.store import JsonStateStore
 from py000_nautilus.strategies.maker import MakerStrategy
@@ -68,16 +69,26 @@ def _snapshot(node: TradingNode, strategy: LiveStrategy) -> DrainResult:
             if (intent.status is not ObligationStatus.COMPLETED
                     or intent.hedge_filled_ounces != intent.hedge_quantity_ounces):
                 pending.append(f"hedge:{intent.intent_id}:{intent.status.value}")
-    if isinstance(strategy, MakerStrategy):
-        if strategy._state_store._freeze_publication_failed:
+    allocation_owner = (strategy._state_store if isinstance(strategy, MakerStrategy)
+                        else getattr(strategy.state_store, "_owner", None))
+    if isinstance(allocation_owner, MakerStateStore):
+        if allocation_owner._freeze_publication_failed:
             pending.append("maker_pause_publication_failed")
-        if strategy._source_hold:
+        # Shared input freshness pauses new source admission, not a completed
+        # drain. Retain the flag; stopping must not grant permission to quote.
+        shared_settled = allocation_owner.shared_strategy_ids is not None and all(
+            view.cycle_evidence_complete() and view.source_freeze_reason is None
+            for view in allocation_owner.all_views()
+        )
+        if isinstance(strategy, MakerStrategy) and strategy._source_hold and not shared_settled:
             pending.append("maker_source_hold")
-        for route, quantity in strategy._state_store.residuals().items():
+        for route, quantity in allocation_owner.residuals().items():
             residuals["|".join(value or "" for value in route)] = str(quantity)
-        if not strategy._state_store.source_balance_is_admissible():
+        if not allocation_owner.source_balance_is_admissible():
             pending.append("residual_outside_configured_budget")
-    elif strategy.state_store.rounding_residual_ounces != Decimal(0):
+    elif isinstance(strategy, TakerStrategy) and (
+        strategy.state_store.rounding_residual_ounces != Decimal(0)
+    ):
         residuals["taker"] = str(strategy.state_store.rounding_residual_ounces)
         pending.append("unallocated_residual")
     return DrainResult(
@@ -90,15 +101,26 @@ def _snapshot(node: TradingNode, strategy: LiveStrategy) -> DrainResult:
 async def drain_strategy(
     node: TradingNode, strategy: LiveStrategy, *, timeout_seconds: float,
 ) -> DrainResult:
+    return await drain_strategies(node, (strategy,), timeout_seconds=timeout_seconds)
+
+
+async def drain_strategies(
+    node: TradingNode, strategies: tuple[LiveStrategy, ...], *, timeout_seconds: float,
+) -> DrainResult:
     """Keep callbacks online; cancel each known source at most once, never an uncertain hedge."""
     validate_stop_timeout(timeout_seconds)
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout_seconds
     canceled: set[str] = set()
-    strategy.begin_drain()
+    if not strategies or len({strategy.id for strategy in strategies}) != len(strategies):
+        raise ValueError("drain requires distinct participating strategies")
+    for strategy in strategies:
+        strategy.begin_drain()
     while True:
         reconciler = get_source_terminal_reconciler(node)
-        if not reconciler.restart_pending and strategy.is_running:
+        for strategy in strategies:
+            if reconciler.restart_pending or not strategy.is_running:
+                continue
             for store in _stores(strategy):
                 for record in store.source_orders():
                     order = node.cache.order(ClientOrderId(record.client_order_id))
@@ -112,7 +134,13 @@ async def drain_strategy(
             strategy.continue_drain()
         # Allow already queued fill/terminal callbacks to reach the durable owner first.
         await asyncio.sleep(0)
-        result = _snapshot(node, strategy)
+        snapshots = [_snapshot(node, strategy) for strategy in strategies]
+        pending = tuple(dict.fromkeys(item for snapshot in snapshots for item in snapshot.pending))
+        result = DrainResult(
+            not pending, "obligations_settled" if not pending else "obligations_pending",
+            pending, {route: qty for snapshot in snapshots
+                      for route, qty in snapshot.residuals.items()},
+        )
         if result.complete:
             return result
         remaining = deadline - loop.time()
@@ -126,14 +154,23 @@ class DrainingTradingNode(TradingNode):
 
     drain_result: DrainResult | None = None
     _drain_strategy: LiveStrategy | None = None
+    _drain_strategies: tuple[LiveStrategy, ...] = ()
     _drain_timeout: float = 10.0
     _drain_stop_task: asyncio.Task[None] | None = None
 
     def bind_strategy_drain(self, strategy: LiveStrategy, *, timeout_seconds: float) -> None:
+        self.bind_strategies_drain((strategy,), timeout_seconds=timeout_seconds)
+
+    def bind_strategies_drain(
+        self, strategies: tuple[LiveStrategy, ...], *, timeout_seconds: float,
+    ) -> None:
         validate_stop_timeout(timeout_seconds)
-        if self.is_running() or self._drain_strategy is not None:
+        if self.is_running() or self._drain_strategies:
             raise RuntimeError("strategy drain must be bound once before node start")
-        self._drain_strategy = strategy
+        if not strategies or len({strategy.id for strategy in strategies}) != len(strategies):
+            raise ValueError("drain requires distinct participating strategies")
+        self._drain_strategy = strategies[0]
+        self._drain_strategies = strategies
         self._drain_timeout = timeout_seconds
         self.drain_result = None
         self._drain_stop_task = None
@@ -154,13 +191,13 @@ class DrainingTradingNode(TradingNode):
         await asyncio.shield(self._drain_stop_task)
 
     async def _stop_after_drain(self) -> None:
-        strategy = self._drain_strategy
+        strategies = self._drain_strategies
         try:
             # Rehearsal removes the strategy and recovery Actor before running the node.
-            if (strategy is not None and self.is_running()
-                    and strategy in self.trader.strategies()):
-                self.drain_result = await drain_strategy(
-                    self, strategy, timeout_seconds=self._drain_timeout,
+            if (strategies and self.is_running()
+                    and all(strategy in self.trader.strategies() for strategy in strategies)):
+                self.drain_result = await drain_strategies(
+                    self, strategies, timeout_seconds=self._drain_timeout,
                 )
         except Exception as exc:
             self.drain_result = DrainResult(

@@ -81,6 +81,10 @@ class TakerStrategy(Strategy):
         allowed_source_direction: SourceDirection | None = None,
         hedge_must_reduce_only: bool = False,
         source_terminal_query: SourceTerminalQuery | None = None,
+        state_store: JsonStateStore | None = None,
+        source_admission: (
+            Callable[[JsonStateStore, BusinessOrderSide, Decimal], bool] | None
+        ) = None,
     ) -> None:
         super().__init__(config)
         if type(one_shot) is not bool:
@@ -120,7 +124,11 @@ class TakerStrategy(Strategy):
         self._source_book_callback_count = 0
         self._last_source_attempt_market_ts_ns: int | None = None
         self._last_decision_gate = "not_armed" if one_shot else "not_started"
-        self.state_store = JsonStateStore(config.store_path)
+        if state_store is not None and one_shot:
+            raise ValueError("injected state is supported only by the ordinary Taker")
+        self.state_store = (state_store if state_store is not None
+                            else JsonStateStore(config.store_path))
+        self._source_admission = source_admission
         self._hedges = HedgeCoordinator(config.source_instrument_id, self.state_store)
         self._source_instrument: Instrument | None = None
         self._hedge_instrument: Instrument | None = None
@@ -318,6 +326,8 @@ class TakerStrategy(Strategy):
     def continue_drain(self) -> None:
         """Progress only existing obligations through the normal hedge path."""
         self._submit_next_pending_hedge()
+        if not _restart_blocked(self):
+            self.state_store.release_completed_cycle()
 
     def on_stop(self) -> None:
         """Cancel only the exact active source and retain its durable gate."""
@@ -366,6 +376,7 @@ class TakerStrategy(Strategy):
         if _restart_blocked(self):
             self._last_decision_gate = "restart_pending"
             return
+        self.state_store.release_completed_cycle()
         if not self.state_store.can_submit_source():
             self._last_decision_gate = "state_store_closed"
             return
@@ -603,6 +614,12 @@ class TakerStrategy(Strategy):
             return False
         instrument = self._required_source_instrument()
         source_quantity = instrument.make_qty(opportunity.source_quantity_ounces)
+        business_side = (BusinessOrderSide.BUY if opportunity.direction is SourceDirection.LONG
+                         else BusinessOrderSide.SELL)
+        if self._source_admission is not None and not self._source_admission(
+            self.state_store, business_side, source_quantity.as_decimal(),
+        ):
+            return False
         if not self._source_hedge_is_executable(
             opportunity,
             Decimal(str(source_quantity)),
@@ -779,7 +796,7 @@ class TakerStrategy(Strategy):
             self._submit_hedge_intent(pending)
 
     def _submit_hedge_intent(self, intent: HedgeIntent) -> None:
-        if _restart_blocked(self):
+        if _restart_blocked(self) or not self.state_store.hedge_dispatch_ready(intent.intent_id):
             return
         source = self.state_store.source_order(intent.source_client_order_id)
         configured_client_id = (

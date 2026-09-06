@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import signal
+import time
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, cast
@@ -75,6 +76,22 @@ def test_drain_cancels_source_but_hedges_racing_fill_and_keeps_positions(
     asyncio.run(scenario())
 
 
+def test_drain_partial_ioc_cancel_echo_across_milliseconds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = _SourceWire.respond
+
+    def delayed_cancel(self: _SourceWire, message: Any) -> None:
+        if isinstance(message, list) and message[1] == "oc":
+            time.sleep(.005)  # Force the cancel echo into a later clock millisecond.
+        original(self, message)
+
+    monkeypatch.setattr(_SourceWire, "respond", delayed_cancel)
+    test_drain_cancels_source_but_hedges_racing_fill_and_keeps_positions(
+        tmp_path, monkeypatch, maker=False, fill_on_cancel=True,
+    )
+
+
 @pytest.mark.parametrize("maker", [False, True])
 def test_drain_timeout_retains_cancel_and_does_not_retry_or_clear_old_hold(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, maker: bool,
@@ -142,7 +159,7 @@ def test_native_signal_and_concurrent_explicit_stop_share_one_online_drain(
             assert node.is_running() and strategy.is_running
             return DrainResult(True, "obligations_settled", (), {})
 
-        monkeypatch.setattr(live_lifecycle, "drain_strategy", controlled_drain)
+        monkeypatch.setattr(live_lifecycle, "drain_strategies", controlled_drain)
         run = asyncio.create_task(node.run_async())
         try:
             async with asyncio.timeout(2):

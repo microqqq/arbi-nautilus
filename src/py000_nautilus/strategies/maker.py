@@ -68,6 +68,7 @@ from py000_nautilus.models import (
     SourceAccount,
     SourceDirection,
 )
+from py000_nautilus.store import JsonStateStore
 from py000_nautilus.strategies._mt5_costs import (
     mt5_instrument_is_fresh,
     mt5_instrument_structure,
@@ -99,6 +100,10 @@ class MakerStrategy(Strategy):
         live_costs_from_adapters: bool = False,
         source_terminal_query: SourceTerminalQuery | None = None,
         source_quote_refresh_paused: Callable[[], bool] | None = None,
+        state_store: MakerStateStore | None = None,
+        source_admission: (
+            Callable[[JsonStateStore, BusinessOrderSide, Decimal], bool] | None
+        ) = None,
     ) -> None:
         super().__init__(config)
         self._config = config
@@ -125,12 +130,13 @@ class MakerStrategy(Strategy):
                            source.client_id.value if source.client_id is not None else None,
                            hedge.account_id.value,
                            hedge.client_id.value if hedge.client_id is not None else None)
-        self._state_store = MakerStateStore(
+        self._state_store = state_store if state_store is not None else MakerStateStore(
             config.store_path_prefix,
             str(config.source_instrument_id),
             str(config.hedge_instrument_id),
             residual_limit_ounces=config.residual_limit_ounces, carry_route=carry_route,
         )
+        self._source_admission = source_admission
         self._stores = self._state_store.stores
         self._hedges = {
             direction: HedgeCoordinator(config.source_instrument_id, self._stores[direction])
@@ -184,7 +190,7 @@ class MakerStrategy(Strategy):
         self._cost_snapshot_valid = True
         self._cost_recovery_after_ns = 0
         if changed:
-            self._freeze_and_cancel_all("Maker costs changed")
+            self._freeze_and_cancel_all("Maker costs changed", market_input=True)
         return True
 
     def _invalidate_cost_snapshot(self, reason: str) -> None:
@@ -193,14 +199,16 @@ class MakerStrategy(Strategy):
             self._cost_recovery_after_ns,
             self._cost_ts_ns,
         )
-        self._freeze_and_cancel_all(reason)
+        self._freeze_and_cancel_all(reason, market_input=True)
 
     def update_hedge_session(self, is_open: bool, ts_event_ns: int) -> None:
         if ts_event_ns >= self._session_ts_ns:
             self._hedge_session_open = is_open
             self._session_ts_ns = ts_event_ns
             if not is_open or ts_event_ns > cast(int, self.clock.timestamp_ns()):
-                self._freeze_and_cancel_all("hedge session closed or future-dated")
+                self._freeze_and_cancel_all(
+                    "hedge session closed or future-dated", market_input=True,
+                )
             else:
                 self._reschedule_active_timers()
 
@@ -338,9 +346,9 @@ class MakerStrategy(Strategy):
             else:
                 self._quote_carry = quote_carry
         if inputs_fresh:
-            self._try_release_cycle()
+            self._try_release_cycle(inputs_fresh=True)
         if not inputs_fresh:
-            self._freeze_and_cancel_all("stale, closed, or unresolved")
+            self._freeze_and_cancel_all("stale, closed, or unresolved", market_input=True)
             return
         if self._global_obligation_block():
             self._source_hold = True
@@ -383,14 +391,14 @@ class MakerStrategy(Strategy):
         except (KeyError, TypeError, ValueError) as exc:
             self._hedge_instrument_valid = False
             self.log.error(f"MT5 instrument update rejected: {exc}")
-            self._freeze_and_cancel_all("invalid MT5 cost observation")
+            self._freeze_and_cancel_all("invalid MT5 cost observation", market_input=True)
             return
         if instrument.ts_event == previous.ts_event and not self._hedge_instrument_valid:
             return
         self._hedge_instrument = instrument
         self._hedge_instrument_valid = True
         if changed:
-            self._freeze_and_cancel_all("MT5 swap costs changed")
+            self._freeze_and_cancel_all("MT5 swap costs changed", market_input=True)
 
     def on_funding_rate(self, funding_rate: FundingRateUpdate) -> None:
         """Install the source venue's signed next-period funding observation."""
@@ -827,6 +835,11 @@ class MakerStrategy(Strategy):
         instrument = self._required_source_instrument()
         side = OrderSide.BUY if quote.direction is SourceDirection.LONG else OrderSide.SELL
         source_quantity = instrument.make_qty(quote.quantity_ounces)
+        business_side = BusinessOrderSide.BUY if side is OrderSide.BUY else BusinessOrderSide.SELL
+        if self._source_admission is not None and not self._source_admission(
+            self._stores[quote.direction], business_side, source_quantity.as_decimal(),
+        ):
+            return
         if not self._source_hedge_is_executable(quote, Decimal(str(source_quantity))):
             return
         order = self.order_factory.limit(
@@ -1084,7 +1097,8 @@ class MakerStrategy(Strategy):
         hedge_client_id: ClientId | None,
         intent: HedgeIntent,
     ) -> None:
-        if _restart_blocked(self):
+        if (_restart_blocked(self)
+                or not self._stores[direction].hedge_dispatch_ready(intent.intent_id)):
             return
         hedge_tick = self.cache.quote_tick(self._config.hedge_instrument_id)
         if hedge_tick is None or not self._quote_is_fresh(hedge_tick):
@@ -1193,7 +1207,7 @@ class MakerStrategy(Strategy):
                 return
             deadline = min(deadline, self._account_deadline_ns)
             if deadline <= self.clock.timestamp_ns():
-                self._freeze_and_cancel_all("account deadline")
+                self._freeze_and_cancel_all("account deadline", market_input=True)
                 return
         callback: Callable[[TimeEvent], None] = self._on_stale_timer
         if isinstance(self.clock, LiveClock):
@@ -1252,7 +1266,7 @@ class MakerStrategy(Strategy):
         ):
             self._schedule_stale_timer(direction, order_id)
         else:
-            self._freeze_and_cancel_all("stale timer")
+            self._freeze_and_cancel_all("stale timer", market_input=True)
 
     def _reschedule_active_timers(self) -> None:
         if self._source_instrument is None:
@@ -1389,7 +1403,7 @@ class MakerStrategy(Strategy):
             or store.source_freeze_reason is not None
             or store.has_unresolved_hedges()
             or not store._source_balance_is_admissible()
-            for store in self._stores.values()
+            for store in self._state_store.all_views()
         ))
 
     def _request_source_terminal_query(
@@ -1471,9 +1485,18 @@ class MakerStrategy(Strategy):
             source_accounts=self._config.source_accounts, maker=True,
         )
 
-    def _try_release_cycle(self) -> bool:
+    def _try_release_cycle(self, *, inputs_fresh: bool = False) -> bool:
         if _restart_blocked(self):
             return False
+        owner = self._state_store
+        if owner.shared_strategy_ids is not None and not owner.cycle_freeze_only:
+            if (not inputs_fresh or owner._freeze_publication_failed
+                    or not owner.source_balance_is_admissible()
+                    or any(view.halt_reason is not None or view.source_freeze_reason is not None
+                           or not view.cycle_evidence_complete() for view in owner.all_views())):
+                return False
+            self._source_hold = False
+            return True  # Only this healthy callback clears the instance-only market-input hold.
         if self._draining and not self._state_store.cycle_freeze_only:
             return False  # Stopping is not an operator recovery action for an external HOLD.
         if not self._state_store.clear_source_freezes():
@@ -1481,9 +1504,10 @@ class MakerStrategy(Strategy):
         self._source_hold = False
         return True
 
-    def _freeze_and_cancel_all(self, reason: str) -> None:
+    def _freeze_and_cancel_all(self, reason: str, *, market_input: bool = False) -> None:
         self._source_hold = True
-        self._freeze_all_best_effort(reason)
+        if not (market_input and self._state_store.shared_strategy_ids is not None):
+            self._freeze_all_best_effort(reason)
         if _restart_blocked(self):
             return  # External pauses remain durable; startup still forbids cancellation.
         self._cancel_all_best_effort(reason)

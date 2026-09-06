@@ -41,7 +41,7 @@ from nautilus_trader.test_kit.stubs.component import TestComponentStubs
 from nautilus_trader.test_kit.stubs.events import TestEventStubs
 from nautilus_trader.test_kit.stubs.execution import TestExecStubs
 
-from py000_nautilus import live_maker, live_taker
+from py000_nautilus import live_maker, live_node, live_taker
 from py000_nautilus.app import _hedge_instrument, _source_instrument
 from py000_nautilus.bitfinex_v1_cids import BitfinexV1CidStore
 from py000_nautilus.bitfinex_v1_data import BitfinexV1DataClient
@@ -528,7 +528,7 @@ def test_builder_forwards_native_config_and_gates_only_new_source(
         return validate_native_cache(cache, trader_id=trader_id, strategy_id=strategy_id,
                                      routes=routes)
 
-    monkeypatch.setattr(module, "DrainingTradingNode", offline_node)
+    monkeypatch.setattr(live_node, "DrainingTradingNode", offline_node)
     monkeypatch.setattr(module, "validate_native_cache", verify)
     loop = asyncio.new_event_loop()
     builder = module.build_live_taker_node if kind == "taker" else module.build_live_maker_node
@@ -679,7 +679,7 @@ def test_loaded_identity_failure_disposes_builder_without_creating_business_stat
         raise ValueError("synthetic native identity mismatch")
 
     # This is cleanup wiring only: no backend is constructed or represented as restored.
-    monkeypatch.setattr(module, "native_cache_config", lambda _database: None)
+    monkeypatch.setattr(live_node, "native_cache_config", lambda _database: None)
     monkeypatch.setattr(module, "validate_native_cache", reject)
     loop = asyncio.new_event_loop()
     builder = module.build_live_taker_node if kind == "taker" else module.build_live_maker_node
@@ -701,7 +701,7 @@ def test_one_shot_rejects_database_before_any_node_is_constructed(
     def forbidden(**_kwargs: object) -> None:
         pytest.fail("one-shot database rejection must precede node construction")
 
-    monkeypatch.setattr(live_taker, "DrainingTradingNode", forbidden)
+    monkeypatch.setattr(live_node, "DrainingTradingNode", forbidden)
     configs = taker._configs(tmp_path)
     with pytest.raises(ValueError, match="one_shot execution cannot use"):
         live_taker.build_live_taker_node(

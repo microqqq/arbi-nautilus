@@ -616,6 +616,14 @@ class JsonStateStore:
     def intents(self) -> tuple[HedgeIntent, ...]:
         return tuple(self._state.hedge_intents.values())
 
+    def hedge_dispatch_ready(self, intent_id: str) -> bool:
+        """Standalone dispatch has no peer; shared views consult their allocation owner."""
+        return True
+
+    def release_completed_cycle(self) -> bool:
+        """A standalone view never clears a pause on behalf of another strategy."""
+        return False
+
     def _hold_rejected_attempt(self, intent: HedgeIntent, client_order_id: str, fact: str) -> bool:
         """Keep contradictory old evidence out of the current leg's quantity/seen set."""
         self._revoke_restart_permission()

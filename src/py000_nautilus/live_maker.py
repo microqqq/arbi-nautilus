@@ -9,8 +9,7 @@ from functools import partial
 from pathlib import Path
 from typing import Protocol, cast
 
-from nautilus_trader.config import DatabaseConfig, TradingNodeConfig
-from nautilus_trader.live.config import LiveExecEngineConfig
+from nautilus_trader.config import DatabaseConfig
 from nautilus_trader.live.execution_client import LiveExecutionClient
 from nautilus_trader.live.node import TradingNode
 from nautilus_trader.model.identifiers import (
@@ -18,31 +17,29 @@ from nautilus_trader.model.identifiers import (
     TraderId,
     Venue,
 )
+from nautilus_trader.trading.strategy import Strategy
 
 from py000_nautilus.bitfinex_v1_data import (
     BitfinexV1DataClient,
     BitfinexV1DataClientConfig,
-    BitfinexV1LiveDataClientFactory,
 )
 from py000_nautilus.bitfinex_v1_execution import (
     BitfinexV1ExecClientConfig,
     BitfinexV1ExecutionClient,
-    BitfinexV1LiveExecClientFactory,
 )
 from py000_nautilus.config import MakerStrategyConfig
-from py000_nautilus.live_cache import native_cache_config, validate_native_cache
-from py000_nautilus.live_lifecycle import DrainingTradingNode, validate_stop_timeout
+from py000_nautilus.live_cache import validate_native_cache
+from py000_nautilus.live_lifecycle import validate_stop_timeout
+from py000_nautilus.live_node import build_execution_node
 from py000_nautilus.live_runtime import SourceTerminalReconciler, bind_live_account_reader
 from py000_nautilus.maker_store import maker_legacy_paths, maker_state_path
 from py000_nautilus.mt5_v1_data import (
     Mt5V1DataClient,
     Mt5V1DataClientConfig,
-    Mt5V1LiveDataClientFactory,
 )
 from py000_nautilus.mt5_v1_execution import (
     Mt5V1ExecClientConfig,
     Mt5V1ExecutionClient,
-    Mt5V1LiveExecClientFactory,
     mt5_v1_execution_account_id,
 )
 from py000_nautilus.restart_recovery import (
@@ -107,42 +104,13 @@ def build_live_maker_node(
     if connection_timeout_seconds <= 0:
         raise ValueError("live Maker connection timeout must be positive")
 
-    node = DrainingTradingNode(
-        config=TradingNodeConfig(
-            trader_id=LIVE_MAKER_TRADER_ID,
-            cache=native_cache_config(cache_database),
-            data_clients={
-                BITFINEX_CLIENT_NAME: bitfinex_data_config,
-                MT5_CLIENT_NAME: mt5_data_config,
-            },
-            exec_clients={
-                BITFINEX_CLIENT_NAME: bitfinex_exec_config,
-                MT5_CLIENT_NAME: mt5_exec_config,
-            },
-            exec_engine=LiveExecEngineConfig(
-                reconciliation=True,
-                reconciliation_lookback_mins=None,
-                generate_missing_orders=False,
-                inflight_check_interval_ms=0,
-                open_check_interval_secs=None,
-                position_check_interval_secs=None,
-            ),
-            timeout_connection=connection_timeout_seconds,
-            timeout_reconciliation=connection_timeout_seconds,
-            timeout_portfolio=connection_timeout_seconds,
-            timeout_disconnection=connection_timeout_seconds,
-            timeout_post_stop=0.1,
-            timeout_shutdown=connection_timeout_seconds,
-        ),
-        loop=loop,
+    node = build_execution_node(
+        trader_id=LIVE_MAKER_TRADER_ID, bitfinex_data_config=bitfinex_data_config,
+        bitfinex_exec_config=bitfinex_exec_config, mt5_data_config=mt5_data_config,
+        mt5_exec_config=mt5_exec_config, cache_database=cache_database,
+        loop=loop, connection_timeout_seconds=connection_timeout_seconds,
     )
     try:
-        node.add_data_client_factory(BITFINEX_CLIENT_NAME, BitfinexV1LiveDataClientFactory)
-        node.add_data_client_factory(MT5_CLIENT_NAME, Mt5V1LiveDataClientFactory)
-        node.add_exec_client_factory(BITFINEX_CLIENT_NAME, BitfinexV1LiveExecClientFactory)
-        node.add_exec_client_factory(MT5_CLIENT_NAME, Mt5V1LiveExecClientFactory)
-        node.build()
-
         bitfinex_data = _data_client(node, BITFINEX_VENUE, BitfinexV1DataClient)
         mt5_data = _data_client(node, MT5_VENUE, Mt5V1DataClient)
         bitfinex_exec = _exec_client(node, BITFINEX_CLIENT_ID, BitfinexV1ExecutionClient)
@@ -389,6 +357,7 @@ def _verify_built_composition(
     bitfinex_exec: BitfinexV1ExecutionClient,
     mt5_data: Mt5V1DataClient,
     mt5_exec: Mt5V1ExecutionClient,
+    *, other_strategies: tuple[Strategy, ...] = (),
 ) -> None:
     data_engine = node.kernel.data_engine
     exec_engine = node.kernel.exec_engine
@@ -416,7 +385,8 @@ def _verify_built_composition(
         or exec_engine.open_check_interval_secs is not None
         or exec_engine.position_check_interval_secs is not None
         or strategy.config.external_order_claims is not None
-        or node.trader.strategies() != [strategy]
+        or any(other.config.external_order_claims for other in other_strategies)
+        or node.trader.strategies() != [strategy, *other_strategies]
     ):
         raise RuntimeError("live Maker node did not build the exact offline composition")
 

@@ -104,6 +104,11 @@ class _SourceWire:
             self.rows[cid] = row
         else:
             row = next(item for item in self.rows.values() if item[0] == data["id"])
+            if operation == "oc" and not self._active(row):
+                # A cancel racing an IOC terminal only echoes that same venue
+                # fact; it must not invent a later terminal update timestamp.
+                self.emit("oc", row)
+                return
             row[5] = now
             if operation == "ou":
                 assert self._active(row)

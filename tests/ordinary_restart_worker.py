@@ -33,22 +33,28 @@ from nautilus_trader.model.identifiers import AccountId, ClientId, ClientOrderId
 from nautilus_trader.serialization.serializer import MsgSpecSerializer
 from test_adapter_continuity import _accepted_source, _market, _SourceWire
 from test_bitfinex_v1_execution import _FakeRest, _FakeTransport, _Harness
+from test_live_both_entry import _profile as _both_profile
 from test_live_maker_entry import _maker_profile
 from test_live_taker_entry import _paper_profile
 from test_mt5_v1_data import _tick_at_utc_ms
 from test_mt5_v1_execution import _identity, _snapshot
 from test_startup_retry import _mapped_quote
-from test_strategy_continuity import _OrdinaryStrategy
+from test_strategy_continuity import _OrdinaryStrategy, _pump
 
 import py000_nautilus
+from py000_nautilus import live_lifecycle
+from py000_nautilus.app import _book_snapshot, _quote
 from py000_nautilus.bitfinex_v1_transport import BitfinexV1Transport
 from py000_nautilus.hedge import HedgeCoordinator
+from py000_nautilus.live_both import build_live_both_node
+from py000_nautilus.live_both_entry import main as both_main
 from py000_nautilus.live_cache import native_cache_config
 from py000_nautilus.live_maker import build_live_maker_node
 from py000_nautilus.live_runtime import get_source_terminal_reconciler
 from py000_nautilus.live_taker import build_live_taker_node
 from py000_nautilus.live_taker_entry import main, maker_main
 from py000_nautilus.models import ObligationStatus
+from py000_nautilus.mt5_v1_data import instrument_from_snapshot
 from py000_nautilus.mt5_v1_protocol import JsonObject
 from py000_nautilus.mt5_v1_transport import Mt5V1Transport
 from py000_nautilus.store import JsonStateStore
@@ -120,7 +126,39 @@ def probe(kind: str, port: int) -> dict[str, Any]:
 
 
 def _profile(kind: str, directory: Path, port: int, cut: str) -> Any:
-    profile: Any = _maker_profile(directory) if kind == "maker" else _paper_profile(directory)
+    profile: Any
+    if kind == "both":
+        profile = _both_profile(directory)
+        identity = _identity()
+        binding = dict(expected_account_id=identity.account_id,
+                       expected_ea_build_id=identity.ea_build_id,
+                       expected_source_sha256=identity.declared_source_sha256)
+        maker, taker = profile.maker_config, profile.taker_config
+        account = AccountId(f"MT5-{identity.account_id}")
+        maker = replace(maker, hedge_accounts=(
+            replace(maker.hedge_accounts[0], account_id=account),
+        ), economics=replace(
+            maker.economics,
+            bid=replace(maker.economics.bid, open_quantity_ounces=Decimal(
+                0 if cut == "between-legs" else 2,
+            )),
+            ask=replace(maker.economics.ask, open_quantity_ounces=Decimal(
+                2 if cut == "between-legs" else 0,
+            )),
+        ))
+        taker = replace(taker, hedge_account_id=account, economics=replace(
+            taker.economics, base_book_quantity=Decimal(4 if cut == "between-legs" else 2),
+            open_quantity_long=Decimal(4 if cut == "between-legs" else 2),
+            open_quantity_short=Decimal(2),
+        ))
+        return replace(
+            profile, cache_database=_database(port), maker_config=maker, taker_config=taker,
+            mt5_data_config=replace(profile.mt5_data_config, **binding),
+            mt5_exec_config=replace(profile.mt5_exec_config, **binding,
+                                   expected_stream_id=identity.stream_id),
+            connection_timeout_seconds=3.0, stop_timeout_seconds=3.0,
+        )
+    profile = _maker_profile(directory) if kind == "maker" else _paper_profile(directory)
     identity = _identity()
     binding = dict(expected_account_id=identity.account_id,
                    expected_ea_build_id=identity.ea_build_id,
@@ -160,13 +198,18 @@ def run(kind: str, cut: str, phase: str, port: int, directory: Path) -> int:
                   for path in sorted(package.rglob("*.py"))}
     loaded: dict[str, Any] = {}
     driver_errors: list[str] = []
-    builder = build_live_maker_node if kind == "maker" else build_live_taker_node
+    builder = (build_live_both_node if kind == "both" else
+               build_live_maker_node if kind == "maker" else build_live_taker_node)
 
     def wire_only_builder(**kwargs: Any) -> Any:
-        node, strategy = builder(**kwargs)
+        node, returned = builder(**kwargs)
+        participants: tuple[Any, ...] = cast(tuple[Any, ...], returned) if kind == "both" else (
+            returned,
+        )
+        strategy = participants[0]
         loaded.update(native=_native(node), event_count=node.kernel.exec_engine.event_count)
         h: Any = SimpleNamespace(
-            node=node, strategy=strategy, maker=kind == "maker",
+            node=node, strategy=strategy, maker=kind in {"maker", "both"},
             source_quantity=Decimal(4 if cut == "between-legs" else 2),
             wallet_currency=kwargs["bitfinex_exec_config"].wallet_currency,
             source=node.kernel.exec_engine._clients[ClientId("BITFINEX")],
@@ -178,6 +221,9 @@ def run(kind: str, cut: str, phase: str, port: int, directory: Path) -> int:
         )
         h.store = (strategy._stores[next(iter(strategy._stores))]
                    if h.maker else strategy.state_store)
+        owner = strategy._state_store if h.maker else h.store
+        views = (owner.all_views() if kind == "both" else
+                 tuple(strategy._stores.values()) if h.maker else (h.store,))
         h.reload_stores = MethodType(_OrdinaryStrategy.reload_stores, h)
         h.wire = object.__new__(_Harness)
         h.wire.raw_symbol = kwargs["bitfinex_exec_config"].raw_symbol
@@ -194,9 +240,14 @@ def run(kind: str, cut: str, phase: str, port: int, directory: Path) -> int:
         h.hedge_data._transport = wire
         wire.topic = kwargs["mt5_data_config"].expected_symbol.encode()  # type: ignore[attr-defined]
         pub_count = 0
+        pub: asyncio.Queue[Any] = asyncio.Queue()
 
         async def finite_pub() -> Any:
             nonlocal pub_count
+            if kind == "both":
+                message = await pub.get()
+                pub_count += 1
+                return message
             if (phase != "produce" and cut in {"hedge-rejected-held", "hedge-rejected-retry"}
                     and pub_count == 0):
                 while not h.hedge_data._quote_subscribed:
@@ -214,10 +265,49 @@ def run(kind: str, cut: str, phase: str, port: int, directory: Path) -> int:
 
         wire.recv_pub = finite_pub  # type: ignore[attr-defined]
         source = _SourceWire(h)
+        if kind == "both":
+            original_source_fill = source.fill
+
+            def source_fill(cid: int, quantity: Decimal) -> None:
+                h.maker = source.order(cid).strategy_id == strategy.id
+                try:
+                    original_source_fill(cid, quantity)
+                finally:
+                    h.maker = True
+
+            source.fill = source_fill  # type: ignore[method-assign]
         venue_path = directory / "venue.json"
         source_requests: list[Any] = []
         source_while_unresolved: list[int] = []
         source_attempt_states: dict[str, dict[str, str]] = {}
+        cancel_observations: list[Any] = []
+        joint_drain: dict[str, Any] | None = None
+        hold_transitions: list[Any] = []
+        if kind == "both":
+            def observe_hold(method_name: str) -> None:
+                original = getattr(strategy, method_name)
+
+                def observed(*args: Any, **values: Any) -> Any:
+                    before = (strategy._source_hold, owner.cycle_freeze_only)
+                    try:
+                        return original(*args, **values)
+                    finally:
+                        after = (strategy._source_hold, owner.cycle_freeze_only)
+                        if after != before:
+                            hold_transitions.append({
+                                "method": method_name, "before": before, "after": after,
+                                "reason": str(args[0]) if method_name == "_freeze_and_cancel_all"
+                                else None,
+                                "market_input": values.get("market_input"),
+                                "caller": [(item.name, item.lineno)
+                                           for item in traceback.extract_stack(limit=3)[:-1]],
+                            })
+
+                setattr(strategy, method_name, observed)
+
+            for method_name in ("_freeze_and_cancel_all", "_evaluate_quotes",
+                                "on_order_filled", "_try_release_cycle"):
+                observe_hold(method_name)
         if phase != "produce":
             venue = json.loads(venue_path.read_text())
             source.rows = {int(cid): row for cid, row in venue["source_rows"].items()}
@@ -235,6 +325,7 @@ def run(kind: str, cut: str, phase: str, port: int, directory: Path) -> int:
             source_requests = venue["source_requests"]
             source_while_unresolved = venue["source_while_unresolved"]
             source_attempt_states = venue["source_attempt_states"]
+            cancel_observations = venue.get("cancel_observations", [])
             wire.current_snapshot, wire.journal = venue["mt5_snapshot"], venue["mt5_journal"]
             wire._serial = venue["mt5_serial"]
             wire.submit_calls, wire.close_calls = venue["mt5_submits"], venue["mt5_closes"]
@@ -247,6 +338,7 @@ def run(kind: str, cut: str, phase: str, port: int, directory: Path) -> int:
                 "source_requests": source_requests, "mt5_snapshot": wire.current_snapshot,
                 "source_while_unresolved": source_while_unresolved,
                 "source_attempt_states": source_attempt_states,
+                "cancel_observations": cancel_observations,
                 "mt5_journal": wire.journal, "mt5_serial": wire._serial,
                 "mt5_submits": wire.submit_calls, "mt5_closes": wire.close_calls,
             })
@@ -260,7 +352,6 @@ def run(kind: str, cut: str, phase: str, port: int, directory: Path) -> int:
         def respond(message: Any) -> None:
             if isinstance(message, list):
                 source_requests.append(message)
-                views = strategy._stores.values() if h.maker else (h.store,)
                 if message[1] == "on":
                     states = {intent.intent_id: intent.status.value
                               for view in views for intent in view.intents()}
@@ -269,6 +360,16 @@ def run(kind: str, cut: str, phase: str, port: int, directory: Path) -> int:
                            for status in states.values()):
                         source_while_unresolved.append(message[3]["cid"])
                 save_venue()  # Observe attempted sends even if the fake venue rejects them.
+                if kind == "both" and cut == "joint-stop-fill" and phase == "produce" and (
+                    message[1] == "oc"
+                ):
+                    cid = next(cid for cid, row in source.rows.items()
+                               if row[0] == message[3]["id"])
+                    cancel_observations.append({
+                        "cid": cid, "draining": [item._draining for item in participants],
+                        "connected": h.source.is_connected and h.hedge.is_connected,
+                    })
+                    source.fill(cid, Decimal(1))
             original_response(message)
 
         source.publish = publish  # type: ignore[method-assign]
@@ -304,22 +405,25 @@ def run(kind: str, cut: str, phase: str, port: int, directory: Path) -> int:
         h.source.cancel_order = cancel
 
         def observation() -> dict[str, Any]:
-            owner = strategy._state_store if h.maker else h.store
             quote = node.cache.quote_tick(strategy._config.hedge_instrument_id)
             return {
                 "pid": os.getpid(), "package": str(Path(py000_nautilus.__file__).resolve()),
                 "production": production,
                 "native": _native(node), "business": owner._to_payload(),
                 "business_bytes": owner.path.read_text() if owner.path.exists() else None,
-                "source_can_submit": [view.can_submit_source() for view in (
-                    strategy._stores.values() if h.maker else (h.store,)
-                )],
+                "source_can_submit": [view.can_submit_source() for view in views],
                 "source_requests": len(source_requests), "hedge_requests": len(wire.submit_calls),
                 "close_requests": len(wire.close_calls), "source_net": str(source.net),
                 "source_request_ids": [message[3]["cid"] for message in source_requests
                                        if message[1] == "on"],
                 "source_while_unresolved": source_while_unresolved,
                 "source_attempt_states": source_attempt_states,
+                "cancel_observations": cancel_observations,
+                "joint_drain": joint_drain,
+                "maker_source_hold": strategy._source_hold if h.maker else None,
+                "hold_transitions": hold_transitions,
+                "pause_publication_failed": owner._freeze_publication_failed
+                if h.maker else None,
                 "hedge_request_ids": [call[0] for call in wire.submit_calls],
                 "close_request_ids": [call[0] for call in wire.close_calls],
                 "pending_hedge_ids": sorted(h.hedge.pending_client_order_ids),
@@ -330,6 +434,10 @@ def run(kind: str, cut: str, phase: str, port: int, directory: Path) -> int:
                 "reconciler_busy": get_source_terminal_reconciler(node).busy,
                 "failure": get_source_terminal_reconciler(node).last_failure,
                 "node_running": node.is_running(), "strategy_running": strategy.is_running,
+                "strategy_ids": [str(item.id) for item in participants],
+                "all_strategies_running": all(item.is_running for item in participants),
+                "accounts_calculated": [client.get_account().calculate_account_state
+                                        for client in (h.source, h.hedge)],
                 "connected": h.source.is_connected and h.hedge.is_connected,
                 "mt5_pub_count": pub_count,
                 "mt5_quote": None if quote is None else {
@@ -343,6 +451,21 @@ def run(kind: str, cut: str, phase: str, port: int, directory: Path) -> int:
             name = "checkpoint-interrupt.json" if phase == "interrupt" else "checkpoint.json"
             _write(directory / name, observation())
             threading.Event().wait()  # Parent SIGKILL; no finally/stop/cache.close runs.
+
+        if kind == "both":
+            original_frame = h.source._consume_private_frame
+
+            def observed_frame(frame: Any) -> Any:
+                try:
+                    return original_frame(frame)
+                except Exception:
+                    _write(directory / "private-diagnostic.json", {
+                        "error": traceback.format_exc(), "frame": frame,
+                        "observation": observation(),
+                    })
+                    raise
+
+            h.source._consume_private_frame = observed_frame
 
         async def settle(expected: int) -> None:
             # Stop the finite feed after this opportunity. Repeated neutral ticks
@@ -362,6 +485,21 @@ def run(kind: str, cut: str, phase: str, port: int, directory: Path) -> int:
                         return
                     await asyncio.sleep(.01)
 
+        if kind == "both":
+            original_drain = live_lifecycle.drain_strategies
+
+            async def drain_observed(*args: Any, **kwargs: Any) -> Any:
+                nonlocal joint_drain
+                result = await original_drain(*args, **kwargs)
+                joint_drain = {"complete": result.complete, "reason": result.reason,
+                               "pending": result.pending, "residuals": result.residuals}
+                _write(directory / f"{phase}-drain-returned.json", observation())
+                if phase == "produce" and cut == "joint-stop-fill":
+                    assert result.complete, joint_drain
+                    checkpoint()  # Full drain returned; native disconnect has not started.
+                return result
+
+            patch.object(live_lifecycle, "drain_strategies", drain_observed).start()
         if phase == "produce" and cut == "source-reserved":
             original_begin = JsonStateStore.begin_source
 
@@ -411,7 +549,8 @@ def run(kind: str, cut: str, phase: str, port: int, directory: Path) -> int:
 
         actor = get_source_terminal_reconciler(node)
         recovery = actor._restart_recovery
-        if phase != "produce" and cut.startswith("hedge-rejected-") and recovery is not None:
+        if (phase != "produce" and (kind == "both" or cut.startswith("hedge-rejected-"))
+                and recovery is not None):
             async def observe_recovery() -> None:
                 try:
                     await recovery()
@@ -421,6 +560,126 @@ def run(kind: str, cut: str, phase: str, port: int, directory: Path) -> int:
 
             actor._restart_recovery = observe_recovery
 
+        async def joint_market(direction: int) -> None:
+            now = node.kernel.clock.timestamp_ns()
+            snapshot = await wire.snapshot(wire.identity.binding())
+            node.kernel.data_engine.process(instrument_from_snapshot(
+                snapshot, h.hedge_instrument.id, ts_init=now,
+            ))
+            for participant in participants:
+                assert participant.update_cost_snapshot(participant._carry, participant._fx, now)
+                participant.update_hedge_session(True, now)
+            bid, ask = {1: ("3926.6", "3926.7"), 0: ("3936.7", "3936.8"),
+                        -1: ("3946.8", "3946.9")}[direction]
+            h.source_data._book.apply_snapshot(
+                [[Decimal(bid) - Decimal(i) / 10, 1, Decimal(10)] for i in range(25)]
+                + [[Decimal(ask) + Decimal(i) / 10, 1, Decimal(-10)] for i in range(25)],
+            )
+            node.kernel.data_engine.process(_book_snapshot(
+                h.source_instrument, bid, ask, "10", now,
+            ))
+            node.kernel.data_engine.process(_quote(h.source_instrument, bid, ask, "10", now))
+            message = _tick_at_utc_ms(now // 1_000_000)
+            message.update(identity=wire.identity.to_wire(), bid="3936.7", ask="3936.8")
+            pub.put_nowait((wire.topic, message))  # type: ignore[attr-defined]
+            await _pump()
+
+        async def joint_sources(targets: tuple[tuple[Any, str], ...], direction: int) -> list[int]:
+            async with asyncio.timeout(8):
+                while True:
+                    found = [[cid for cid in source.rows
+                              if source.order(cid).strategy_id == participant.id
+                              and source.order(cid).side.name == side
+                              and source.order(cid).status is OrderStatus.ACCEPTED
+                              and source.order(cid).filled_qty == 0]
+                             for participant, side in targets]
+                    if all(len(cids) == 1 for cids in found):
+                        return [cids[0] for cids in found]
+                    await joint_market(direction)
+                    await asyncio.sleep(.01)
+
+        async def joint_settle(expected: int) -> None:
+            canceled: set[str] = set()
+            async with asyncio.timeout(8):
+                while True:
+                    intents = [intent for view in views for intent in view.intents()]
+                    complete = len(intents) == expected and all(
+                        intent.status is ObligationStatus.COMPLETED for intent in intents
+                    )
+                    if complete:
+                        # Finish any legitimate next passive quote through the actual
+                        # cancel path; no native or business history is rewritten.
+                        for order in node.cache.orders(instrument_id=h.source_instrument.id):
+                            if (not order.is_closed and not order.is_pending_cancel
+                                    and order.venue_order_id is not None
+                                    and order.client_order_id.value not in canceled):
+                                canceled.add(order.client_order_id.value)
+                                participant = next(item for item in participants
+                                                   if item.id == order.strategy_id)
+                                participant.cancel_order(order)
+                        if (all(view.active_source_order_id is None for view in views)
+                                and all(order.is_closed for order in node.cache.orders())
+                                and h.hedge.account_capacity_ready(strategy._config.max_cost_age_ns)
+                                and not actor.busy):
+                            assert all(view.halt_reason is None for view in views)
+                            return
+                    else:
+                        await joint_market(0)  # Original owner/lane dispatcher only.
+                    await asyncio.sleep(.01)
+
+        async def joint_driver() -> None:
+            maker, taker = participants
+            if phase != "produce":
+                async with asyncio.timeout(8):
+                    while actor.restart_pending and (actor.last_failure is None or actor.busy):
+                        await asyncio.sleep(.01)
+                _write(directory / "recovered.json", observation() | {"loaded": loaded})
+                assert not actor.restart_pending, actor.last_failure
+                async with asyncio.timeout(8):
+                    while not (directory / "advance").exists():
+                        await asyncio.sleep(.01)
+                if cut == "between-legs":
+                    await joint_settle(2)
+                    _write(directory / "continued.json", observation())
+            elif cut == "between-legs":
+                cid, = await joint_sources(((maker, "SELL"),), 0)
+                source.fill(cid, Decimal(2))
+                await joint_settle(1)
+                cid, = await joint_sources(((taker, "BUY"),), 1)
+                # Keep this cut strictly between hedge legs: an earlier passive
+                # Maker quote must finish its actual cancel/reconciliation first.
+                for order in node.cache.orders(instrument_id=h.source_instrument.id):
+                    if (order.strategy_id == maker.id and not order.is_closed
+                            and not order.is_pending_cancel):
+                        maker.cancel_order(order)
+                async with asyncio.timeout(8):
+                    while (actor.busy or any(view.active_source_order_id is not None
+                                            or view.halt_reason is not None
+                                            for view in maker._stores.values())):
+                        await asyncio.sleep(.01)
+                source.fill(cid, Decimal(4))
+                await joint_settle(2)  # Actual next-leg bind hook must interrupt this.
+                raise AssertionError("joint between-legs checkpoint was not reached")
+            direction = -1 if cut == "between-legs" else 1
+            side = "SELL" if direction == -1 else "BUY"
+            cids = await joint_sources(((maker, side), (taker, side)), direction)
+            if phase == "produce" and cut == "joint-stop-fill":
+                _write(directory / "working-ready.json", observation())
+                await asyncio.Event().wait()  # Parent SIGTERM drives the original joint drain.
+            for cid in cids:
+                source.fill(cid, Decimal(2))
+            await joint_settle(2 if phase == "produce" else 4)
+            if phase == "produce":
+                checkpoint()
+            else:
+                if cut == "joint-stop-fill":
+                    # Stop feeding quotes. Observe the ordinary shared input
+                    # hold, never clear it or supply a fresh tick to pass drain.
+                    async with asyncio.timeout(4):
+                        while not maker._source_hold:
+                            await asyncio.sleep(.01)
+                _write(directory / "final.json", observation())
+
         async def driver() -> None:
             try:
                 async with asyncio.timeout(8):
@@ -429,6 +688,10 @@ def run(kind: str, cut: str, phase: str, port: int, directory: Path) -> int:
                         await asyncio.sleep(.01)
                 h.source_instrument = node.cache.instrument(strategy._config.source_instrument_id)
                 h.hedge_instrument = node.cache.instrument(strategy._config.hedge_instrument_id)
+                if kind == "both":
+                    assert all(participant.is_running for participant in participants)
+                    await joint_driver()
+                    return
                 if phase != "produce":
                     actor = get_source_terminal_reconciler(node)
                     if cut != "request-pending":
@@ -511,7 +774,7 @@ def run(kind: str, cut: str, phase: str, port: int, directory: Path) -> int:
                 await node.stop_async()
 
         node.kernel.loop.create_task(driver())
-        return node, strategy
+        return node, returned
 
     def observed_builder(**kwargs: Any) -> Any:
         try:
@@ -523,7 +786,7 @@ def run(kind: str, cut: str, phase: str, port: int, directory: Path) -> int:
     async def forbidden(*args: Any, **kwargs: Any) -> None:
         raise AssertionError("restart test tried to open an actual trading transport")
 
-    entry = maker_main if kind == "maker" else main
+    entry = both_main if kind == "both" else maker_main if kind == "maker" else main
     with patch.object(BitfinexV1Transport, "open", forbidden), patch.object(
         Mt5V1Transport, "open", forbidden,
     ), patch.object(

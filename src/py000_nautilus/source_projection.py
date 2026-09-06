@@ -132,7 +132,7 @@ def project_source_fills(
         if maker.source_instrument_id != source_instrument_id.value:
             raise ValueError("source projection Maker instrument differs")
         maker._validate()
-        views = tuple(maker.stores.values())
+        views = maker.all_views()
     elif type(store) is JsonStateStore:
         views = (store,)
     else:
@@ -155,8 +155,10 @@ def project_source_fills(
     suffixes: dict[str, tuple[OrderFilled, ...]] = {}
     prefixes: dict[str, tuple[str, ...]] = {}
     for cid, (view, record) in records.items():
+        owner_id = maker.strategy_id_for(view) if maker is not None else None
         fills = _checked_fills(by_id[cid], record, source_instrument_id=source_instrument_id,
-                               trader_id=trader_id, strategy_id=strategy_id)
+                               trader_id=trader_id,
+                               strategy_id=StrategyId(owner_id) if owner_id else strategy_id)
         keys = tuple(_key(fill) for fill in fills)
         for key, fill in zip(keys, fills, strict=True):
             trade = (fill.account_id.value, fill.trade_id.value)

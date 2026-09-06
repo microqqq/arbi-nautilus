@@ -43,6 +43,7 @@ from py000_nautilus.restart_recovery import StartupRecoveryOptions, describe_bus
 from py000_nautilus.store import JsonStateStore
 
 if TYPE_CHECKING:
+    from py000_nautilus.live_both_entry import LiveBothNodeBuilder
     from py000_nautilus.live_lifecycle import DrainResult
 
 _ENV_NAMES = frozenset({"BFX_TEST_API_KEY", "BFX_TEST_API_SECRET", "BFX_TEST_USER_ID"})
@@ -109,7 +110,7 @@ class _LiveNodeBuilder(Protocol[_BuilderConfigT]):
         connection_timeout_seconds: float,
         stop_timeout_seconds: float,
         startup_recovery: StartupRecoveryOptions | None = None,
-    ) -> tuple[TradingNode, Strategy]: ...
+    ) -> tuple[TradingNode, Strategy | tuple[Strategy, ...]]: ...
 
 
 LiveTakerNodeBuilder = _LiveNodeBuilder[TakerStrategyConfig]
@@ -326,7 +327,7 @@ def _run_live_entry(
     loop = asyncio.new_event_loop()
     node: TradingNode | None = None
     try:
-        node, strategy = node_builder(
+        node, built = node_builder(
             bitfinex_data_config=profile.bitfinex_data_config,
             bitfinex_exec_config=bitfinex_execution,
             mt5_data_config=profile.mt5_data_config,
@@ -338,6 +339,10 @@ def _run_live_entry(
             stop_timeout_seconds=float(profile.stop_timeout_seconds),
             startup_recovery=recovery if resume_held else None,
         )
+        built_strategies = built if isinstance(built, tuple) else (built,)
+        if not built_strategies:
+            raise LiveTakerEntryError("runner requires the built strategy set")
+        strategy = built_strategies[0]
         if not rehearse and not run_paper:
             reason = (
                 "offline_composition_built" if profile.cache_database is None
@@ -347,8 +352,8 @@ def _run_live_entry(
 
         if run_paper:
             strategies = node.trader.strategies()
-            if len(strategies) != 1 or strategies[0] is not strategy:
-                raise LiveTakerEntryError("paper runner requires exactly the built strategy")
+            if strategies != list(built_strategies):
+                raise LiveTakerEntryError("paper runner requires exactly the built strategy set")
             run_failure: str | None = None
             try:
                 run_paper_node(node)
@@ -377,6 +382,8 @@ def _run_live_entry(
                     node.cache, source, hedge,
                     trader_id=node.trader.id, strategy_id=strategy.id,
                     fx=strategy_config.economics.fx,
+                    strategy_ids=(tuple(item.id for item in built_strategies)
+                                  if len(built_strategies) > 1 else None),
                 )
             except Exception as exc:
                 accounting_failure = f"accounting_report_error:{type(exc).__name__}"
@@ -399,7 +406,8 @@ def _run_live_entry(
 
         # Strategy callbacks and the bound startup Actor can mutate business state.
         # Adapter observations (including CID fees/native persistence) remain permitted.
-        node.trader.remove_strategy(strategy.id)
+        for strategy in built_strategies:
+            node.trader.remove_strategy(strategy.id)
         for actor in node.trader.actors():
             if isinstance(actor, SourceTerminalReconciler):
                 node.trader.remove_actor(actor.id)
@@ -660,9 +668,9 @@ def maker_main(
 def _main(
     argv: Sequence[str] | None,
     *,
-    mode: Literal["taker", "maker"],
+    mode: Literal["taker", "maker", "both"],
     environment: Mapping[str, str] | None,
-    node_builder: LiveTakerNodeBuilder | LiveMakerNodeBuilder,
+    node_builder: LiveTakerNodeBuilder | LiveMakerNodeBuilder | LiveBothNodeBuilder,
     rehearsal_runner: LiveTakerRehearsalRunner | None,
 ) -> int:
     parser = argparse.ArgumentParser(
@@ -689,12 +697,22 @@ def _main(
     parser.add_argument("--env-file", type=Path, default=Path(".env"))
     args = parser.parse_args(argv)
     try:
+        if mode == "both":
+            from py000_nautilus.live_both_entry import (
+                inspect_both_recovery,
+                load_live_both_profile,
+                run_live_both_entry,
+            )
         if args.inspect_recovery:
             if args.resume_held or args.retry_rejected_hedge is not None:
                 raise ValueError("offline inspection cannot consume recovery choices")
-            profile = (load_live_taker_profile(args.profile) if mode == "taker"
-                       else load_live_maker_profile(args.profile))
-            print(json.dumps(inspect_profile_recovery(profile), default=str))
+            if mode == "both":
+                inspected = inspect_both_recovery(load_live_both_profile(args.profile))
+            else:
+                profile = (load_live_taker_profile(args.profile) if mode == "taker"
+                           else load_live_maker_profile(args.profile))
+                inspected = inspect_profile_recovery(profile)
+            print(json.dumps(inspected, default=str))
             return 0
         if mode == "taker":
             result = run_live_taker_entry(
@@ -705,12 +723,21 @@ def _main(
                 rehearsal_runner=rehearsal_runner,
                 resume_held=args.resume_held, retry_rejected_hedge=args.retry_rejected_hedge,
             )
-        else:
+        elif mode == "maker":
             result = run_live_maker_entry(
                 load_live_maker_profile(args.profile),
                 rehearse=args.rehearse, run_paper=args.run_paper,
                 environment=environment, env_file=args.env_file,
                 node_builder=cast(LiveMakerNodeBuilder, node_builder),
+                rehearsal_runner=rehearsal_runner,
+                resume_held=args.resume_held, retry_rejected_hedge=args.retry_rejected_hedge,
+            )
+        else:
+            result = run_live_both_entry(
+                load_live_both_profile(args.profile),
+                rehearse=args.rehearse, run_paper=args.run_paper,
+                environment=environment, env_file=args.env_file,
+                node_builder=cast("LiveBothNodeBuilder", node_builder),
                 rehearsal_runner=rehearsal_runner,
                 resume_held=args.resume_held, retry_rejected_hedge=args.retry_rejected_hedge,
             )

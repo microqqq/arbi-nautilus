@@ -123,6 +123,7 @@ class _SubmitHarness:
         hedge_must_reduce_only: bool = False,
     ) -> None:
         self._draining = False
+        self._source_admission = None
         hedge = _hedge_instrument()
         self._config = SimpleNamespace(
             source_instrument_id=_source_instrument().id,

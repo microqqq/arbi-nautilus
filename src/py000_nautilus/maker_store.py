@@ -1,4 +1,4 @@
-"""One Maker state file with two views of the existing order/hedge algorithms."""
+"""One allocation owner: Maker views, optionally shared with a bidirectional Taker."""
 
 from __future__ import annotations
 
@@ -56,7 +56,7 @@ class _LegacyOrder:
         }
 
 
-_Snapshot = tuple[dict[SourceDirection, StoreState], list[_Allocation], bool]
+_Snapshot = tuple[dict[str, StoreState], list[_Allocation], bool]
 
 
 def _route(record: SourceOrderRecord) -> _Route:
@@ -70,6 +70,10 @@ def maker_state_path(prefix: str | Path) -> Path:
     return Path(f"{prefix}.maker.json")
 
 
+def shared_state_path(prefix: str | Path) -> Path:
+    return Path(f"{prefix}.shared.json")
+
+
 def maker_legacy_paths(prefix: str | Path) -> tuple[Path, Path]:
     return Path(f"{prefix}.bid.json"), Path(f"{prefix}.ask.json")
 
@@ -81,10 +85,19 @@ class MakerStateStore:
         self, prefix: str | Path, source_instrument_id: str, hedge_instrument_id: str,
         *, residual_limit_ounces: Decimal = Decimal(0),
         carry_route: tuple[str, str | None, str, str | None] | None = None,
+        shared_strategy_ids: tuple[str, str] | None = None,
     ) -> None:
         if not source_instrument_id or not hedge_instrument_id:
             raise ValueError("Maker state requires both instrument bindings")
-        self.path = maker_state_path(prefix)
+        if shared_strategy_ids is not None and (
+            not isinstance(shared_strategy_ids, tuple) or len(shared_strategy_ids) != 2
+            or any(not isinstance(value, str) or not value.strip() for value in shared_strategy_ids)
+            or shared_strategy_ids[0] == shared_strategy_ids[1]
+        ):
+            raise ValueError("shared state requires distinct Maker and Taker strategy IDs")
+        self._shared_strategy_ids = shared_strategy_ids
+        self.path = (maker_state_path(prefix) if shared_strategy_ids is None
+                     else shared_state_path(prefix))
         self.source_instrument_id = source_instrument_id
         self.hedge_instrument_id = hedge_instrument_id
         if (not residual_limit_ounces.is_finite()
@@ -102,17 +115,42 @@ class MakerStateStore:
         self._freeze_publication_failed = False  # Instance-only; never restored into eligibility.
         if not self.path.exists() and any(path.exists() for path in maker_legacy_paths(prefix)):
             raise ValueError("legacy Maker state requires explicit migration before startup")
+        if (shared_strategy_ids is not None and not self.path.exists()
+                and maker_state_path(prefix).exists()):
+            raise ValueError("shared state cannot merge an existing standalone Maker file")
         states = self._load() if self.path.exists() else {
-            direction: JsonStateStore._empty_state() for direction in _DIRECTIONS
+            key: JsonStateStore._empty_state() for key in self._view_keys()
         }
         self.stores: dict[SourceDirection, JsonStateStore] = {
-            direction: _MakerDirectionStore(self, state) for direction, state in states.items()
+            direction: _MakerDirectionStore(self, states[key])
+            for direction, key in _DIRECTIONS.items()
         }
+        self.taker_store: JsonStateStore | None = (
+            _MakerDirectionStore(self, states["taker"]) if shared_strategy_ids is not None else None
+        )
         self._validate()
         self._committed = self._snapshot()
 
+    @property
+    def shared_strategy_ids(self) -> tuple[str, str] | None:
+        return self._shared_strategy_ids
+
+    def _view_keys(self) -> tuple[str, ...]:
+        return ("bid", "ask", "taker") if self.shared_strategy_ids is not None else ("bid", "ask")
+
+    def all_views(self) -> tuple[JsonStateStore, ...]:
+        views = tuple(self.stores[direction] for direction in _DIRECTIONS)
+        return views if self.taker_store is None else (*views, self.taker_store)
+
+    def strategy_id_for(self, view: JsonStateStore) -> str | None:
+        if not any(view is known for known in self.all_views()):
+            raise ValueError("view does not belong to this state owner")
+        if self.shared_strategy_ids is None:
+            return None
+        return self.shared_strategy_ids[int(view is self.taker_store)]
+
     def freeze_sources(self, reason: str) -> None:
-        self._freeze_external(reason, tuple(self.stores.values()))
+        self._freeze_external(reason, self.all_views())
 
     @property
     def cycle_freeze_only(self) -> bool:
@@ -133,14 +171,14 @@ class MakerStateStore:
                 raise
 
     def clear_source_freezes(self) -> bool:
-        reasons = {view.source_freeze_reason for view in self.stores.values()
+        reasons = {view.source_freeze_reason for view in self.all_views()
                    if view.source_freeze_reason is not None}
         if (self._freeze_publication_failed or not self.source_balance_is_admissible()
                 or len(reasons) != 1 or not all(
-                    view.cycle_evidence_complete() for view in self.stores.values()
+                    view.cycle_evidence_complete() for view in self.all_views()
                 )):
             return False
-        for view in self.stores.values():
+        for view in self.all_views():
             view._state.source_freeze_reason = None
         self._cycle_freeze_only = False
         self._persist()
@@ -153,7 +191,9 @@ class MakerStateStore:
     def carry_residual_ounces(self) -> Decimal:
         if self._carry_route is None:
             return Decimal(0)
-        return self._route_balances().get(self._carry_route, (Decimal(0), SourceDirection.LONG))[0]
+        return self._route_balances().get(
+            self._carry_route, (Decimal(0), self.stores[SourceDirection.LONG]),
+        )[0]
 
     def residuals(self) -> dict[_Route, Decimal]:
         return {route: balance for route, (balance, _) in self._route_balances().items() if balance}
@@ -165,9 +205,19 @@ class MakerStateStore:
         )
 
     def next_pending_hedge(self) -> tuple[SourceDirection, HedgeIntent] | None:
-        """Select the first unfinished allocation; never infer legacy execution order."""
-        intents = {intent.fill_key: (direction, intent)
-                   for direction, view in self.stores.items() for intent in view.intents()}
+        """Keep the Maker-only API; a Taker allocation must not become an ask."""
+        selected = self.first_unfinished_hedge()
+        if selected is not None:
+            view, intent = selected
+            if intent.status is ObligationStatus.PENDING and intent.hedge_client_order_id is None:
+                return next(((direction, intent) for direction, known in self.stores.items()
+                             if known is view), None)
+        return None
+
+    def first_unfinished_hedge(self) -> tuple[JsonStateStore, HedgeIntent] | None:
+        """Hold the complete earliest intent, including gaps between its bound legs."""
+        intents = {intent.fill_key: (view, intent)
+                   for view in self.all_views() for intent in view.intents()}
         legacy_ids = {intent_id for item in self._legacy_orders for intent_id in item.intent_ids}
         if any(intent.intent_id in legacy_ids and intent.status is not ObligationStatus.COMPLETED
                for _, intent in intents.values()):
@@ -176,10 +226,7 @@ class MakerStateStore:
             selected = intents.get(allocation.fill_key)
             if selected is None or selected[1].status is ObligationStatus.COMPLETED:
                 continue
-            intent = selected[1]
-            if intent.status is ObligationStatus.PENDING and intent.hedge_client_order_id is None:
-                return selected
-            return None
+            return selected
         return None
 
     def _validate_source_projection_tail(self, cid: str, prefix: tuple[str, ...]) -> None:
@@ -195,29 +242,29 @@ class MakerStateStore:
                                 for item in self._allocations[index + 1:]):
             raise ValueError("source projection Maker suffix crosses another source allocation")
 
-    def _route_balances(self) -> dict[_Route, tuple[Decimal, SourceDirection]]:
-        directions = {key: direction for direction, view in self.stores.items()
-                      for key in view._state.seen_source_fills}
+    def _route_balances(self) -> dict[_Route, tuple[Decimal, JsonStateStore]]:
+        views = {key: view for view in self.all_views() for key in view._state.seen_source_fills}
         balances = self._checkpoint_balances()
         for item in self._allocations:
-            previous = balances.get(item.route, (Decimal(0), directions[item.fill_key]))[0]
+            previous = balances.get(item.route, (Decimal(0), views[item.fill_key]))[0]
             balances[item.route] = (
                 previous + item.signed_fill_ounces - item.allocated_ounces,
-                directions[item.fill_key],
+                views[item.fill_key],
             )
         return balances
 
-    def _checkpoint_balances(self) -> dict[_Route, tuple[Decimal, SourceDirection]]:
-        balances: dict[_Route, tuple[Decimal, SourceDirection]] = {}
+    def _checkpoint_balances(self) -> dict[_Route, tuple[Decimal, JsonStateStore]]:
+        balances: dict[_Route, tuple[Decimal, JsonStateStore]] = {}
         # This is a fixed historical display projection, not reconstructed fill order.
         for item in sorted(self._legacy_orders, key=lambda item: (
             item.direction is SourceDirection.SHORT, item.client_order_id,
         )):
             if item.filled_ounces == item.allocated_ounces == 0:
                 continue
-            previous = balances.get(item.route, (Decimal(0), item.direction))[0]
+            view = self.stores[item.direction]
+            previous = balances.get(item.route, (Decimal(0), view))[0]
             signed = item.filled_ounces * (1 if item.direction is SourceDirection.LONG else -1)
-            balances[item.route] = (previous + signed - item.allocated_ounces, item.direction)
+            balances[item.route] = (previous + signed - item.allocated_ounces, view)
         return balances
 
     def _allocate(self, record: SourceOrderRecord, fill_key: str, signed_fill: Decimal) -> int:
@@ -230,19 +277,20 @@ class MakerStateStore:
 
     def _set_freezes(self, reason: str, views: tuple[JsonStateStore, ...] | None = None) -> bool:
         changed = False
-        for view in self.stores.values() if views is None else views:
+        for view in self.all_views() if views is None else views:
             if view.source_freeze_reason is None:
                 view._state.source_freeze_reason = reason
                 changed = True
         return changed
 
     def _snapshot(self) -> _Snapshot:
-        return ({direction: deepcopy(view._state) for direction, view in self.stores.items()},
+        return ({key: deepcopy(view._state)
+                 for key, view in zip(self._view_keys(), self.all_views(), strict=True)},
                 self._allocations.copy(), self._cycle_freeze_only)
 
     def _restore(self, snapshot: _Snapshot) -> None:
-        for direction, state in snapshot[0].items():
-            self.stores[direction]._state = deepcopy(state)
+        for key, view in zip(self._view_keys(), self.all_views(), strict=True):
+            view._state = deepcopy(snapshot[0][key])
         self._allocations = snapshot[1].copy()
         self._cycle_freeze_only = snapshot[2]
 
@@ -264,14 +312,18 @@ class MakerStateStore:
 
     def _to_payload(self) -> dict[str, object]:
         payload: dict[str, object] = {
-            "schema_version": 7 if self._legacy_sources is None else 8,
+            "schema_version": (9 if self.shared_strategy_ids is not None
+                               else 7 if self._legacy_sources is None else 8),
             "cycle_freeze_only": self._cycle_freeze_only,
-            "kind": "maker", "source_instrument_id": self.source_instrument_id,
+            "kind": "shared" if self.shared_strategy_ids is not None else "maker",
+            "source_instrument_id": self.source_instrument_id,
             "hedge_instrument_id": self.hedge_instrument_id,
             "allocations": [item.payload() for item in self._allocations],
-            "directions": {key: self.stores[direction]._to_payload()
-                           for direction, key in _DIRECTIONS.items()},
+            "directions": {key: view._to_payload() for key, view in
+                           zip(self._view_keys(), self.all_views(), strict=True)},
         }
+        if self.shared_strategy_ids is not None:
+            payload["strategy_ids"] = self._strategy_bindings()
         if self._legacy_sources is not None:
             payload["legacy_checkpoint"] = {
                 "projection": "bid_then_ask",
@@ -281,7 +333,12 @@ class MakerStateStore:
             }
         return payload
 
-    def _load(self) -> dict[SourceDirection, StoreState]:
+    def _strategy_bindings(self) -> dict[str, str]:
+        assert self.shared_strategy_ids is not None
+        maker, taker = self.shared_strategy_ids
+        return {"bid": maker, "ask": maker, "taker": taker}
+
+    def _load(self) -> dict[str, StoreState]:
         raw = json.loads(self.path.read_text(encoding="utf-8"))
         version = raw.get("schema_version") if isinstance(raw, dict) else None
         fields = {
@@ -290,25 +347,32 @@ class MakerStateStore:
         }
         if type(version) is int and version in {4, 6, 8}:
             fields.add("legacy_checkpoint")
-        if type(version) is int and version in {5, 6, 7, 8}:
+        if type(version) is int and version in {5, 6, 7, 8, 9}:
             fields.add("cycle_freeze_only")
+        if self.shared_strategy_ids is not None:
+            fields.add("strategy_ids")
         if (not isinstance(raw, dict) or set(raw) != fields
-                or type(version) is not int or version not in {3, 4, 5, 6, 7, 8}):
+                or type(version) is not int
+                or version not in ({9} if self.shared_strategy_ids is not None
+                                   else {3, 4, 5, 6, 7, 8})):
             raise ValueError("unsupported Maker state schema; legacy state requires migration")
+        if (self.shared_strategy_ids is not None
+                and raw["strategy_ids"] != self._strategy_bindings()):
+            raise ValueError("shared state strategy bindings differ")
         self._cycle_freeze_only = raw.get("cycle_freeze_only", False)
         if type(self._cycle_freeze_only) is not bool:
             raise ValueError("Maker cycle freeze provenance must be a boolean")
         if (
-            raw["kind"] != "maker"
+            raw["kind"] != ("shared" if self.shared_strategy_ids is not None else "maker")
             or raw["source_instrument_id"] != self.source_instrument_id
             or raw["hedge_instrument_id"] != self.hedge_instrument_id
         ):
             raise ValueError("Maker state kind or instrument binding differs")
         directions = raw["directions"]
-        if not isinstance(directions, dict) or set(directions) != {"bid", "ask"}:
-            raise ValueError("Maker state requires exactly both directions")
+        if not isinstance(directions, dict) or set(directions) != set(self._view_keys()):
+            raise ValueError("state owner requires exactly its configured views")
         if any(not isinstance(state, dict) or type(state.get("schema_version")) is not int
-               or state["schema_version"] != (2 if version in {7, 8} else 1)
+               or state["schema_version"] != (2 if version in {7, 8, 9} else 1)
                for state in directions.values()):
             raise ValueError("invalid Maker direction schema")
         try:
@@ -318,18 +382,21 @@ class MakerStateStore:
                 )
             self._allocations = _read_allocations(raw["allocations"])
             return {
-                direction: JsonStateStore._from_payload(directions[key])
-                for direction, key in _DIRECTIONS.items()
+                key: JsonStateStore._from_payload(directions[key]) for key in self._view_keys()
             }
         except (KeyError, TypeError, AttributeError) as exc:
             raise ValueError("invalid Maker direction state") from exc
 
     def _validate(self) -> None:
+        if self.shared_strategy_ids is not None and (
+            self._legacy_sources is not None or self._legacy_orders
+        ):
+            raise ValueError("shared state cannot claim legacy allocation order")
         if type(self._cycle_freeze_only) is not bool:
             raise ValueError("Maker cycle freeze provenance must be a boolean")
         if self._cycle_freeze_only and (
-            not all(view.source_freeze_reason for view in self.stores.values())
-            or len({view.source_freeze_reason for view in self.stores.values()}) != 1
+            not all(view.source_freeze_reason for view in self.all_views())
+            or len({view.source_freeze_reason for view in self.all_views()}) != 1
         ):
             raise ValueError("Maker cycle freeze provenance requires both matching freezes")
         source_ids: set[str] = set()
@@ -339,10 +406,10 @@ class MakerStateStore:
         hedge_fill_keys: set[str] = set()
         source_trades: set[tuple[str | None, str]] = set()
         hedge_trades: set[tuple[str | None, str]] = set()
-        for direction, view in self.stores.items():
+        for view in self.all_views():
             state = view._state
-            side = (BusinessOrderSide.BUY if direction is SourceDirection.LONG
-                    else BusinessOrderSide.SELL)
+            side = (None if view is self.taker_store else BusinessOrderSide.BUY
+                    if view is self.stores[SourceDirection.LONG] else BusinessOrderSide.SELL)
             if state.active_source_order_id is not None and (
                 state.active_source_order_id not in state.source_orders
             ):
@@ -352,7 +419,7 @@ class MakerStateStore:
             for key, record in state.source_orders.items():
                 if key != record.client_order_id or not key or key in source_ids:
                     raise ValueError("conflicting Maker source identity")
-                if record.side is not side:
+                if side is not None and record.side is not side:
                     raise ValueError("Maker source direction differs from its view")
                 source_ids.add(key)
             if fill_keys & state.seen_source_fills or hedge_fill_keys & state.seen_hedge_fills:
@@ -371,11 +438,14 @@ class MakerStateStore:
             for key, intent in state.hedge_intents.items():
                 if key != intent.intent_id or key in intent_ids:
                     raise ValueError("conflicting Maker intent identity")
-                if intent.source_side is not side:
+                if side is not None and intent.source_side is not side:
                     raise ValueError("Maker intent direction differs from its view")
                 if (intent.source_client_order_id not in state.source_orders
                         or intent.fill_key not in state.seen_source_fills):
                     raise ValueError("Maker intent source fill identity is missing")
+                if (intent.source_side
+                        is not state.source_orders[intent.source_client_order_id].side):
+                    raise ValueError("intent direction differs from its source order")
                 parts = intent.fill_key.split("|")
                 if parts[0] != intent.source_client_order_id or parts[2] != intent.source_trade_id:
                     raise ValueError("Maker intent source fill identity differs")
@@ -401,12 +471,12 @@ class MakerStateStore:
         self._validate_allocations()
 
     def _validate_allocations(self) -> None:
-        records = {key: record for view in self.stores.values()
+        records = {key: record for view in self.all_views()
                    for key, record in view._state.source_orders.items()}
-        seen = set().union(*(view._state.seen_source_fills for view in self.stores.values()))
-        intents = {intent.fill_key: intent for view in self.stores.values()
+        seen = set().union(*(view._state.seen_source_fills for view in self.all_views()))
+        intents = {intent.fill_key: intent for view in self.all_views()
                    for intent in view.intents()}
-        if len(intents) != sum(len(view.intents()) for view in self.stores.values()):
+        if len(intents) != sum(len(view.intents()) for view in self.all_views()):
             raise ValueError("multiple Maker intents claim the same allocation")
         allocated_fills, source_totals = self._validate_checkpoint(records, intents)
         balances = {route: balance for route, (balance, _) in self._checkpoint_balances().items()}
@@ -499,9 +569,19 @@ class _MakerDirectionStore(JsonStateStore):
 
     @property
     def rounding_residual_ounces(self) -> Decimal:
-        direction = next(key for key, view in self._owner.stores.items() if view is self)
-        return sum((balance for balance, last_direction in self._owner._route_balances().values()
-                    if last_direction is direction), Decimal(0))
+        return sum((balance for balance, last_view in self._owner._route_balances().values()
+                    if last_view is self), Decimal(0))
+
+    def hedge_dispatch_ready(self, intent_id: str) -> bool:
+        if self._owner.shared_strategy_ids is None:
+            return True
+        selected = self._owner.first_unfinished_hedge()
+        return (selected is not None and selected[0] is self
+                and selected[1].intent_id == intent_id)
+
+    def release_completed_cycle(self) -> bool:
+        return (self._owner.shared_strategy_ids is not None and self._owner.cycle_freeze_only
+                and self._owner.clear_source_freezes())
 
     def _source_balance_is_admissible(self) -> bool:
         return (
@@ -524,9 +604,9 @@ class _MakerDirectionStore(JsonStateStore):
             return None
         previous = self._owner._snapshot()
         if not self._owner._freeze_publication_failed and all(
-            view.halt_reason is None for view in self._owner.stores.values()
+            view.halt_reason is None for view in self._owner.all_views()
         ) and (self._owner.cycle_freeze_only or all(
-            view.source_freeze_reason is None for view in self._owner.stores.values()
+            view.source_freeze_reason is None for view in self._owner.all_views()
         )):
             self._owner._cycle_freeze_only = True
         self._owner._set_freezes(
@@ -546,7 +626,7 @@ class _MakerDirectionStore(JsonStateStore):
 
     def clear_source_freeze(self) -> None:
         if not self._owner.clear_source_freezes() and any(
-            view.source_freeze_reason is not None for view in self._owner.stores.values()
+            view.source_freeze_reason is not None for view in self._owner.all_views()
         ):
             raise RuntimeError("Maker cycle evidence is incomplete")
 

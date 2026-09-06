@@ -120,7 +120,7 @@ def project_hedge_fills(
         if maker.hedge_instrument_id != hedge_instrument_id.value:
             raise ValueError("hedge projection Maker instrument differs")
         maker._validate()
-        views = tuple(maker.stores.values())
+        views = maker.all_views()
     elif type(store) is JsonStateStore:
         views = (store,)
     else:
@@ -172,9 +172,11 @@ def project_hedge_fills(
     missing: list[tuple[JsonStateStore, OrderFilled]] = []
     for cid, (view, intent, record, index) in bindings.items():
         order = by_id[cid]
+        owner_id = maker.strategy_id_for(view) if maker is not None else None
         fills = _checked_fills(order, record, intent, index,
                                hedge_instrument_id=hedge_instrument_id,
-                               trader_id=trader_id, strategy_id=strategy_id)
+                               trader_id=trader_id,
+                               strategy_id=StrategyId(owner_id) if owner_id else strategy_id)
         attempt = intent.rejected_attempt
         if attempt is not None and cid == attempt.client_order_id:
             if (order.status != OrderStatus.REJECTED or order.filled_qty != 0

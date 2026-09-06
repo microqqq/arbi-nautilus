@@ -451,7 +451,7 @@ class _CachedTriggerProbe(canary.MakerCanaryStrategy):
     ) -> CarryConfig:
         return CarryConfig()
 
-    def _try_release_cycle(self) -> bool:
+    def _try_release_cycle(self, *, inputs_fresh: bool = False) -> bool:
         return False
 
     def _global_obligation_block(self) -> bool:
