@@ -79,12 +79,22 @@ class MakerStateStore:
 
     def __init__(
         self, prefix: str | Path, source_instrument_id: str, hedge_instrument_id: str,
+        *, residual_limit_ounces: Decimal = Decimal(0),
+        carry_route: tuple[str, str | None, str, str | None] | None = None,
     ) -> None:
         if not source_instrument_id or not hedge_instrument_id:
             raise ValueError("Maker state requires both instrument bindings")
         self.path = maker_state_path(prefix)
         self.source_instrument_id = source_instrument_id
         self.hedge_instrument_id = hedge_instrument_id
+        if (not residual_limit_ounces.is_finite()
+                or not 0 <= residual_limit_ounces <= Decimal("0.5")):
+            raise ValueError("Maker residual limit must be finite and between zero and 0.5")
+        if residual_limit_ounces > 0 and (carry_route is None or len(carry_route) != 4
+                                        or not carry_route[0] or not carry_route[2]):
+            raise ValueError("bounded Maker state requires an explicit account route")
+        self._residual_limit = residual_limit_ounces
+        self._carry_route: _Route | None = (*carry_route, None) if carry_route is not None else None
         self._allocations: list[_Allocation] = []
         self._legacy_sources: tuple[tuple[str, str], ...] | None = None
         self._legacy_orders: tuple[_LegacyOrder, ...] = ()
@@ -108,7 +118,7 @@ class MakerStateStore:
     def clear_source_freezes(self) -> bool:
         reasons = {view.source_freeze_reason for view in self.stores.values()
                    if view.source_freeze_reason is not None}
-        if self.has_residuals() or len(reasons) != 1 or not all(
+        if not self.source_balance_is_admissible() or len(reasons) != 1 or not all(
             view.cycle_evidence_complete() for view in self.stores.values()
         ):
             return False
@@ -119,6 +129,21 @@ class MakerStateStore:
 
     def has_residuals(self) -> bool:
         return any(balance != 0 for balance, _direction in self._route_balances().values())
+
+    @property
+    def carry_residual_ounces(self) -> Decimal:
+        if self._carry_route is None:
+            return Decimal(0)
+        return self._route_balances().get(self._carry_route, (Decimal(0), SourceDirection.LONG))[0]
+
+    def residuals(self) -> dict[_Route, Decimal]:
+        return {route: balance for route, (balance, _) in self._route_balances().items() if balance}
+
+    def source_balance_is_admissible(self) -> bool:
+        return all(
+            route == self._carry_route and abs(balance) <= self._residual_limit
+            for route, balance in self.residuals().items()
+        )
 
     def next_pending_hedge(self) -> tuple[SourceDirection, HedgeIntent] | None:
         """Select the first unfinished allocation; never infer legacy execution order."""
@@ -427,11 +452,13 @@ class _MakerDirectionStore(JsonStateStore):
         return sum((balance for balance, last_direction in self._owner._route_balances().values()
                     if last_direction is direction), Decimal(0))
 
-    def can_submit_source(self) -> bool:
-        return not self._owner.has_residuals() and super().can_submit_source()
-
-    def cycle_evidence_complete(self) -> bool:
-        return not self._owner.has_residuals() and super().cycle_evidence_complete()
+    def _source_balance_is_admissible(self) -> bool:
+        return (
+            self._owner.source_balance_is_admissible()
+            and self.net_unhedged_ounces == self.rounding_residual_ounces
+            and all(intent.hedge_quantity_ounces == intent.hedge_filled_ounces
+                    for intent in self.intents())
+        )
 
     def _allocate_source_fill(
         self, record: SourceOrderRecord, fill_key: str, signed_fill: Decimal,

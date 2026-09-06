@@ -2,8 +2,8 @@
 
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 
-from py000_nautilus.config import CarryConfig, FxConfig, MakerEconomicsConfig
-from py000_nautilus.economics import expected_leverage
+from py000_nautilus.config import CarryConfig, FxConfig, MakerEconomicsConfig, RiskConfig
+from py000_nautilus.economics import expected_leverage, round_hedge_ounces
 from py000_nautilus.models import BookTop, MakerAccount, MakerQuote, SourceAccount, SourceDirection
 
 
@@ -34,6 +34,7 @@ def maker_quote(
     *,
     carry: CarryConfig | None = None,
     fx: FxConfig | None = None,
+    hedge_quantity_ounces: Decimal | None = None,
 ) -> MakerQuote | None:
     """Build from active-caller inputs and the Owner-frozen multiplicative price law."""
     current_fx = fx or config.fx
@@ -50,7 +51,7 @@ def maker_quote(
     hedge = _select_hedge(
         hedge_accounts,
         direction,
-        quantity,
+        quantity if hedge_quantity_ounces is None else hedge_quantity_ounces,
         config,
     )
     if source is None or hedge is None:
@@ -195,3 +196,39 @@ def _account_allows(
     if before * after < 0:
         return False
     return not (abs(after) < minimum and abs(after) < abs(before))
+
+
+def maker_carry_bounds(
+    residual: Decimal, buy_leaves: Decimal, sell_leaves: Decimal,
+) -> tuple[Decimal, Decimal, Decimal]:
+    """Return max unhedged exposure and cumulative BUY/SELL hedge delta bounds."""
+    if (not all(value.is_finite() for value in (residual, buy_leaves, sell_leaves))
+            or abs(residual) > Decimal("0.5") or min(buy_leaves, sell_leaves) < 0):
+        raise ValueError("invalid Maker carry budget inputs")
+    half = Decimal("0.5")
+    exposure = (half + max(buy_leaves, sell_leaves) if buy_leaves and sell_leaves
+                else max(abs(residual), abs(residual + buy_leaves - sell_leaves)))
+    buy = (max(Decimal(0), (-residual + sell_leaves + half).to_integral_value(ROUND_FLOOR))
+           if sell_leaves else Decimal(0))
+    sell = (max(Decimal(0), (residual + buy_leaves + half).to_integral_value(ROUND_FLOOR))
+            if buy_leaves else Decimal(0))
+    return exposure, buy, sell
+
+
+def maker_hedge_quantity_bound(
+    residual: Decimal, source_quantity: Decimal, direction: SourceDirection,
+    opposite_working: bool,
+) -> Decimal:
+    """Maximum single intent, distinct from a partitioned order's cumulative hedge."""
+    signed = residual if direction is SourceDirection.LONG else -residual
+    initial = Decimal("0.5") if opposite_working else signed
+    return Decimal(max(0, round_hedge_ounces(initial + source_quantity)))
+
+
+def maker_hedge_bounds_allow(
+    account: MakerAccount, risk: RiskConfig, buy: Decimal, sell: Decimal,
+) -> bool:
+    return all(_account_allows(
+        before=account.position_ounces, signed_change=delta, capacity=capacity,
+        maximum=risk.hedge_max_abs, minimum=risk.hedge_min_keep_abs, only_long=risk.only_long,
+    ) for delta, capacity in ((buy, account.max_long_ounces), (-sell, account.max_short_ounces)))

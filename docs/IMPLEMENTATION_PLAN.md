@@ -209,7 +209,7 @@ Taker 将同一 `max(source_book.ts_last, hedge_tick.ts_event)` 的行情回调�
 - `positions[]` 按 venue/account/instrument 限定，列表元素是 position 不是 order。MT5 用票据集合，Bitfinex 每 symbol 的 venue 净仓是单一投影。
 - 目标是执行 signed delta，不是每次重设某个净仓目标：已有同向票据不吸收新增 delta；先关闭反向票，再开剩余；下一腿前重新读取当前票据。
 - 比如当前 MT5 BUY 1oz + BUY 2oz，执行 SELL 4oz，应 close 1、close 2、open SELL 1；中间任何未决结果都不继续后续腿。
-- Maker bid/ask 同 route 的已确认小额成交可以按净额抵消，但必须同一原子写单元记录抵消量和原始 fill 身份。旧两个 JSON 不能依次扣减后宣称原子；W5 使用一个 Maker 状态文件、两个方向 view，复用原协调器，不引入两阶段提交。W5c2 已通过 strict 同 route 净额验收（E04/E05），W5c3 已交付显式旧状态转换；非零 carry 仍待后续。
+- Maker bid/ask 同 route 的已确认小额成交可以按净额抵消，但必须同一原子写单元记录抵消量和原始 fill 身份。旧两个 JSON 不能依次扣减后宣称原子；W5 使用一个 Maker 状态文件、两个方向 view，复用原协调器，不引入两阶段提交。W5c2 已通过 strict 同 route 净额验收（E04/E05），W5c3 已交付显式旧状态转换，W5c4b 已通过单Maker有界carry离线验收；共账户残差额度仍归W7。
 - 只有相同账户/品种/route 的未分配残差可抵消；已经提交 hedge 的义务不可被另一个方向擦掉；净额不为零的 dust 保留并应用明确额度/暂停规则。
 
 非零 dust 的交付规则也要闭环：实现 `strict` 与 `bounded-carry` 两种明确模式。strict 保持当前零残差才开启下一 cycle；bounded-carry 只允许相关源单终态已确认、无 UNKNOWN/在途义务时把小额残差带入下一轮，残差必须持久化并计入共享敞口预算。现有 1oz hedge 舍入步长下 carry 上限不得超过 0.5oz，也不得超过 profile 的残差限；±边界、累计越界和反向抵消均测试，不暗改舍入算法。
@@ -415,15 +415,23 @@ carry 是同 route 的唯一 signed residual；下一 fill 先与它合并再分
 - 编码agent独占`maker_store.py`、`strategies/maker.py`及各自单测；root维护本文与普通双adapter交错集成，reviewer只读审核。先将原selector真实反例转为RED，覆盖调度顺序、重载、旧checkpoint未决阻断、多腿完成与既有互斥；普通native/adapter必须实际展示交错对冲/票据结果，不靠手动改intent状态充当集成证明。
 - 全量、静态及独立复核后本地单独提交，不推送、部署、改EA/profile或访问账户。只修执行顺序，不据此关闭E09；后续carry预算须在本顺序前提下同时覆盖分片舍入和撤单前双边late fill，不能只放宽残差gate。
 
-**W5c4b 有界carry接线（W5c4a接受后实施，未交付）：** 在有序执行前提下连接余额资格、实际工作单预算和MT5预检；不靠禁用双侧Maker或自动消除dust简化验收。
+**W5c4b 有界carry接线（2026-09-06，已完成离线验收）：** 在有序执行前提下连接余额资格、实际工作单预算和MT5预检；不靠禁用双侧Maker或自动消除dust简化验收。
 
 - Maker配置新增`residual_mode`（默认`strict`）、`residual_limit_ounces`（默认0）、`max_unhedged_ounces`（默认None）。`bounded-carry`须显式给有限正预算和`0 < residual_limit <= 0.5`，先限定一个明确source/hedge账户route；其余非零route或CID隔离余额不得借用本额度。已有`CarryConfig`表示资金费率/swap，不混用。余额仍从原ledger唯一导出；strict默认和Taker不变，未决/UNKNOWN/原HOLD不因额度足够而放行。
 - 上一cycle只有双源终态证据齐、原义务全部完成且未对冲量恰等于允许的残差时，才能一次性解除原双freeze。可从原store提取小余额资格hook；不得删除原已分配未完成量检查。这个终态要求属于上轮release，不额外要求新一轮第二侧入场时第一侧也终态；第二侧继续遵守W5b4的exact ACCEPTED、账户action与无partial/pending资格。
 - 新单以native规范化数量计算；维护旧单按精确CID排除自身后放回候选，不重复计量。当前route的真实BUY/SELL leaves分别记B/S，不把相反挂单提前抵消，第二侧须重读第一侧已经占用的事实。新单和维护共用预算校验，不以报价意图代替cache/store事实，不重复从现金和方向容量扣同一挂单。
 - `max_unhedged`单侧上界为`max(abs(R), abs(R + signed_Q))`；双侧均可能成交时取保守`0.5 + max(B, S)`，不是初始净端点。已复现`R=-0.5, B=2, S=0.1`：SELL0.1→BUY1完成后R=+0.4，再迟到BUY2会产生2.4oz未对冲，初始端点1.5不足。W5c4a有序完成前缀k满足`U=r_k+后续BUY成交-后续SELL成交`且`abs(r_k)<=0.5`，多腿部分执行在相邻前缀间单调变化；这是保守准入界，不是舍入策略变更。
-- MT5容量与净仓风险检查采用有序净delta的保守端点：SELL上界`max(0,floor(R+B+0.5))`，BUY上界`max(0,floor(-R+S+0.5))`，经原动态容量、持仓上限/minimum/only_long规则验证。它们不是gross成交量或单腿手数上界：R=+0.5的BUY2整笔对冲2，分成0.2+1.8可对冲1再2、合计3，不能只按`round(R+Q)`校验累计风险。
+- MT5容量与净仓风险检查采用有序净delta的保守端点：有BUY工作量时SELL上界`max(0,floor(R+B+0.5))`，有SELL工作量时BUY上界`max(0,floor(-R+S+0.5))`，经原动态容量、持仓上限/minimum/only_long规则验证。某侧工作量为0则相应对冲界也为0，不因R恰为±0.5虚造反方向义务；所有0量均跳过planner/quantity-ready。它们不是gross成交量或单腿手数上界：R=+0.5的BUY2整笔对冲2，分成0.2+1.8可对冲1再2、合计3，不能只按`round(R+Q)`校验累计风险。
 - 单intent/lot预检与上述净delta分开：存在反侧working时，对每侧用`round_hedge_ounces(0.5+Q)`上界；没有反侧才按`max(0,round_hedge_ounces(sign*R+Q))`收窄。沿原`plan_hedge_delta`逐腿验量，不把累计3误当必须单腿3；R=-0.5的BUY1初算0，也不能在SELL1先成交后仍忽略它实际可能产生SELL2。现有已成交义务继续原对冲流程，不能用新准入预算切断它；实际下一腿仍重新读票据，snapshot到EA外部竞态不据此消除。
+- 独立预审在实施期间补充票据演化反例：R=+0.5、BUY4、MT5初始BUY2，初始最大intent4规划为close2+open2虽符合单腿2，但真实0.2+3.8分片会产生SELL1再SELL4，后者close1+open3超限。另初始BUY2(id1)+BUY5(id2)、R=0、源B4/S0.2，初始SELL4的close2+close2通过，但BUY1.6→SELL0.2→BUY2.4分配SELL2/BUY1/SELL3后，会暴露id2上的close3。故保留当前planner逐腿检查，另验证每张初始反向票的`min(单intent上界,票据qty)`，覆盖小票耗尽后的大票；未来新open上界分别为SELL `min(K_sell,max(0,C_sell-P))`、BUY `min(K_buy,max(0,C_buy+P))`（P为初始真实净仓，C为上述累计净delta，K为单intent上界），仍经原quantity-ready校验。新open时反侧票已耗尽，单open不超过该端点总仓；后续新票close亦被这条量界覆盖。此法刻意保守，不引入成交路径求解器，不简单强制K小于单腿上限而禁掉纯减仓多票；须保留初始BUY4由两张2oz组成、R=0/BUY4纯减仓可通过的正对照。
+- quantity-ready包含最小量和步长，不仅是最大量。有非零intent上界时同时校验原舍入单位1oz可执行；否则当前2oz上界虽通过，真实0.6oz部分成交产生的1oz对冲可能不满足新min/step。0义务不查1oz、不虚造交易。本包不修改strict旧行为，也不扩成任意broker手数规格求解器。
 - 先离线验收strict不变、±0.5/更小限额/越界、异route、重载、双侧占用、分片与交错、lot和动态容量下降、正常经济机会跨cycle、带dust停止的真实数量报告。停止保留ledger和原保护撤单，不声称FLAT、不自动补偿交易。当前profiles/canary仍strict且不提高0.02lots；W9明定在线预算，W7另接Maker/Taker共享额度，不让两个实例各领一份残差额度。
+- 实施分工：编码agent负责`config.py`、`store.py`最小余额资格hook、`maker_store.py`、`strategies/maker.py`和必要的短纯预算helper及对应单测；复用原经济容量判据，不另造账户或执行层。root负责本文、README和普通双adapter跨cycle验证，既有continuity夹具只增加构建前正常配置参数；reviewer独立只读验证。先记录strict残差阻挡及预算反例，再按上述契约实现；冻结后全量、静态与独立复核，通过后单独本地提交，不推送或操作账户。
+
+**W5c4b 普通双adapter首轮9过1失败的窄修复（确认反例后、修改前）：** BUY0.5真实fill触发双freeze/双cancel；对侧SELL尚未成交，native实际为Accepted→PendingUpdate→PendingCancel→OrderModifyRejected→Canceled。终态owner核对成功、无hedge义务、源均CANCELED，但W5b6旧proof只接受本单partial，导致零成交对侧残留`maker modify rejected` halt，无法进入carry下一轮。
+
+- 仍在`strategies/maker.py`原`_source_action_is_obsolete`内增加一个分支：仅modify rejection、业务记录ACCEPTED且filled=0、native确为PENDING_CANCEL，并保留active CID、原source hold/freeze、真实未结束cancel扫描及全部原身份/route/数量/已记账fill一致性。它只维持已在途的保护性取消，不将pending当终态、不清旧HOLD、不重发、不给新源准入；仍须原cancel终态与权威报告才能release。不按拒绝文案放行，不适用于cancel rejection或UNKNOWN。
+- 编码agent保留原生确定性RED和负对照：无pending cancel、取消历史已结束、native/store成交不一致、route/身份不符、真正cancel rejection和已有halt；root保留上述普通双adapter自然事件顺序，不额外pump排空竞态或修改8秒截止时间。修复不扩大到adapter/wire/recovery平台。
 
 ### W6：重启与停止形成真实闭环
 
@@ -632,7 +640,8 @@ EA 改动额外执行现有 `tools/mt5_source_manifest.sh --lines`、MetaEditor 
   - [x] W5c2：同route原子残差分配、逐fill唯一账与strict净额；独立复核及普通双adapter/全量通过。
   - [x] W5c3：完整旧双v1/单v2显式转换成v4历史checkpoint，保留原件与未决义务；独立复核及全量通过。
   - [x] W5c4a：跨方向对冲按真实allocation顺序执行，不重排放大中途敞口；独立复核及全量通过。
-  - [ ] W5后续：W5c4b bounded-carry预算/跨cycle/带dust停止、剩余原策略parity；不因strict净额或顺序修复完成而关闭。
+  - [x] W5c4b：单Maker明确route的bounded-carry预算、普通双侧跨cycle及带dust停止报告；独立复核及全量通过，仅接受规定的离线范围。
+  - [ ] W5后续：剩余原策略parity；W5父项不因残差包完成而关闭，共账户预算与完整启停仍分别归W7/W6。
 - [ ] W6 重启/停止。
 - [ ] W7 同节点共账户。
 - [ ] W8 入口/安装/文档/原生运行边界。
@@ -868,3 +877,12 @@ EA 改动额外执行现有 `tools/mt5_source_manifest.sh --lines`、MetaEditor 
 - 最终五份源码/测试SHA上主agent全量 **2121 passed / 124既有Pandas框架弃用警告 / 258.82s**，全仓Ruff、Mypy80文件、diff-check通过。独立reviewer五文件 **340 passed / 4 warnings / 2.29s**，普通双adapter **2 passed / 7.41s**；原selector探针镜像通过，内存反事实恢复bid/ask选择使原生两例重新精确RED。核验五SHA后给出RECOMMEND-ACCEPT；主agent据全量与上述证据接受本小步，不累加子集。
 - 一次额外adapter子集为31 passed/1 timeout，明确受到主agent在运行中发出的Ctrl-C干预，不记成自然回归或通过。工具独立实测确认非TTY的该操作也发送SIGINT；固定NT源码注册信号并stop当前node而非退出pytest，与失败第五cycle的02:00:58时间相符。主agent随后仅对自身隔离测试进程发SIGINT，原第五cycle再次出现全部义务完成/owner无错但node与MT5断开、原8秒条件超时（21.64s探针通过）；无中断的该case17.14s通过。临时诊断字段已撤回，最终五SHA与全量/独立审核一致，不修改timeout、就绪门或adapter来消除这项人为失败。
 - 按约定本地单独提交，不推送、部署、改EA/profile、访问账户或发单。W5c4b的单/双侧最坏敞口、分片累计净delta与单intent/lot分别验量规则已固定但尚未实现；E09、剩余parity、W6–W9仍未关闭。此次信号诊断只解释受干预测试，不把完整启停/drain认证提前计入W6。
+
+2026-09-06 / W5c4b 单Maker有界残差跨cycle完成并接受（基线`9bd9e5e`）：
+
+- 五个既有生产模块净增231行：配置显式选择strict或bounded-carry；复用原ledger与小余额资格hook，无新schema、余额账、执行层或持久队列。默认strict/线上profile/Taker不放宽；一个明确account+client route才可使用残差额度，异route、UNKNOWN、未完成义务及原HOLD保留。双终态release与下一cycle第二侧准入分开，逐intent真实剩余不能被正负净和0掩盖。
+- 准入以native规范化后的实际BUY/SELL leaves分别计算，维护精确排除自身CID且复核原数量；沿原动态容量/净仓规则查累计delta，再独立检查每intent、初始各票及未来open的保守单腿上界与1oz可执行单位。预算或回调失败拒新源/撤旧报价，已成交义务继续原有序对冲；不把累计3oz误作单腿3oz，也不遗漏票据演化后实际可能的open3/close3。
+- 原strict dust双adapter2例先实测仍HOLD；新config接口先RED。首轮新普通10例9过1失败，真实零fill对侧PendingUpdate→PendingCancel→ModifyRejected留下永久halt。按上文窄合同补原proof，原生确定性RED及负对照通过，原普通失败case单独回验通过；未改deadline或排空竞态。维护helper精确CID但候选1oz/native leaves2oz的反例也先RED后窄修，不低估占用。
+- 新增70项测试，其中12项为普通Maker经两个真实execution adapter及合成venue IO：±0.5带入下一轮双侧经济报价；更小限额/预算阻挡；2oz分成0.2+1.8真实对冲1+2，留下反号0.5；实际先形成票据再带dust时阻挡未来open3；原MT5 poller读取equity下降后撤销累计容量不足的工作报价。仓位、trade、journal、native报告和重载余额一致；stop保留真实signed dust且无自动平仓交易。
+- 最终十份代码/测试SHA上主agent单次全量 **2191 passed / 124既有Pandas框架弃用警告 / 292.42s**，全仓Ruff、Mypy81文件与diff-check通过。独立reviewer核心六文件 **404 passed / 2 warnings / 2.66s**，普通双adapter **12 passed / 35.40s**；原舍入/保守界的84,503个有限分片转换枚举通过，并确认余额release不绕过更小max_unhedged。十SHA前后相同，独立结论RECOMMEND-ACCEPT，主agent据新全量和独立证据接受本包；子集不累加为全量数量。
+- 按约定单独本地提交，不推送、部署、改EA/profile、访问真实账户或发单。仅关闭E09的单Maker离线carry/数量报告范围；不认证真实PUB/EA/DEMO、冷cache重启、完整drain、共账户额度或外部snapshot→mutation竞态。下一步收齐W5剩余原策略parity，再依既定Q3/W6推进恢复与停止；W5父项及W6–W9继续未关闭。

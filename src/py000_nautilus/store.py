@@ -98,7 +98,7 @@ class JsonStateStore:
             self._state.halt_reason is None
             and self._state.source_freeze_reason is None
             and self._state.active_source_order_id is None
-            and self.net_unhedged_ounces == 0
+            and self._source_balance_is_admissible()
             and all(
                 intent.status is ObligationStatus.COMPLETED
                 for intent in self._state.hedge_intents.values()
@@ -110,6 +110,9 @@ class JsonStateStore:
             intent.status is not ObligationStatus.COMPLETED
             for intent in self._state.hedge_intents.values()
         )
+
+    def _source_balance_is_admissible(self) -> bool:
+        return self.rounding_residual_ounces == 0 and self.net_unhedged_ounces == 0
 
     def freeze_source_submissions(self, reason: str) -> None:
         """Persist a Maker-wide hold without inventing an order terminal state."""
@@ -130,8 +133,7 @@ class JsonStateStore:
                 intent.status is ObligationStatus.COMPLETED
                 for intent in self._state.hedge_intents.values()
             )
-            and self.rounding_residual_ounces == 0
-            and self.net_unhedged_ounces == 0
+            and self._source_balance_is_admissible()
         )
 
     def clear_source_freeze(self) -> None:

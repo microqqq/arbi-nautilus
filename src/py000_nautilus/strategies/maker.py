@@ -49,7 +49,13 @@ from py000_nautilus.hedge import (
     hedge_order_params,
     plan_hedge_delta,
 )
-from py000_nautilus.maker_economics import maker_quote, passive_maker_price
+from py000_nautilus.maker_economics import (
+    maker_carry_bounds,
+    maker_hedge_bounds_allow,
+    maker_hedge_quantity_bound,
+    maker_quote,
+    passive_maker_price,
+)
 from py000_nautilus.maker_store import MakerStateStore
 from py000_nautilus.margin import LiveAccountReader
 from py000_nautilus.models import (
@@ -110,10 +116,18 @@ class MakerStrategy(Strategy):
         self._account_topics: tuple[str, ...] = ()
         self._account_deadline_ns: int | None = None
         self._account_budget_waiting = False
+        carry_route = None
+        if config.residual_mode == "bounded-carry":
+            source, hedge = config.source_accounts[0], config.hedge_accounts[0]
+            carry_route = (source.account_id.value,
+                           source.client_id.value if source.client_id is not None else None,
+                           hedge.account_id.value,
+                           hedge.client_id.value if hedge.client_id is not None else None)
         self._state_store = MakerStateStore(
             config.store_path_prefix,
             str(config.source_instrument_id),
             str(config.hedge_instrument_id),
+            residual_limit_ounces=config.residual_limit_ounces, carry_route=carry_route,
         )
         self._stores = self._state_store.stores
         self._hedges = {
@@ -272,6 +286,10 @@ class MakerStrategy(Strategy):
         self._account_loop = None
         for direction in _DIRECTIONS:
             self._cancel_working(direction, reason="strategy stop")
+        for route, residual in self._state_store.residuals().items():
+            self.log.warning(
+                f"Maker stopped with signed residual {residual} ounces on route {route}",
+            )
 
     def on_quote_tick(self, tick: QuoteTick) -> None:
         if tick.instrument_id not in {
@@ -442,8 +460,12 @@ class MakerStrategy(Strategy):
         terminal_matches = order.is_closed and terminal.get(record.status) == order.status
         protective_cancel = (
             isinstance(event, OrderModifyRejected)
-            and record.status == "PARTIALLY_FILLED"
-            and 0 < record.filled_ounces < record.quantity_ounces
+            and (
+                (record.status == "PARTIALLY_FILLED"
+                 and 0 < record.filled_ounces < record.quantity_ounces)
+                or (record.status == "ACCEPTED" and record.filled_ounces == 0
+                    and order.status is OrderStatus.PENDING_CANCEL)
+            )
             and self._stores[direction].active_source_order_id == event.client_order_id.value
             and self._source_hold
             and self._stores[direction].source_freeze_reason is not None
@@ -551,7 +573,8 @@ class MakerStrategy(Strategy):
             store.mark_source_unknown(active_id, "Maker account pair missing for active order")
             self._cancel_working(direction, expected_order_id=active_id, reason="route missing")
             return
-        if self._live_account_reader is not None and not self._live_working_order_is_exact(
+        if (self._live_account_reader is not None or self._config.residual_mode == "bounded-carry"
+        ) and not self._live_working_order_is_exact(
             direction, order, bound,
         ):
             store.mark_source_unknown(active_id, "Maker live order/route evidence differs")
@@ -667,14 +690,26 @@ class MakerStrategy(Strategy):
             sources, hedges = (view[0],), (view[1],)
         else:
             sources, hedges = self._source_accounts(), self._hedge_accounts()
+        economics = self._config.economics
+        hedge_quantity = None
+        if self._config.residual_mode == "bounded-carry":
+            quantity = self._required_source_instrument().make_qty(
+                side.open_quantity_ounces,
+            ).as_decimal()
+            economics = replace_config(economics, **{
+                "bid" if direction is SourceDirection.LONG else "ask":
+                    replace_config(side, open_quantity_ounces=quantity),
+            })
+            hedge_quantity = self._carry_hedge_delta_bound(direction, quantity)
         quote = maker_quote(
             direction,
             hedge_book,
             sources,
             hedges,
-            self._config.economics,
+            economics,
             carry=self._quote_carry,
             fx=self._fx,
+            hedge_quantity_ounces=hedge_quantity,
         )
         return self._passive_quote(quote, source_book)
 
@@ -714,6 +749,14 @@ class MakerStrategy(Strategy):
         else:
             source = self._source_account(bound.source_account.account_id)
             hedge = self._hedge_account(bound.hedge_account.account_id)
+        hedge_quantity = None
+        if self._config.residual_mode == "bounded-carry":
+            side_name = "bid" if bound.direction is SourceDirection.LONG else "ask"
+            side = economics.bid if bound.direction is SourceDirection.LONG else economics.ask
+            economics = replace_config(economics, **{
+                side_name: replace_config(side, open_quantity_ounces=bound.quantity_ounces),
+            })
+            hedge_quantity = self._carry_hedge_delta_bound(bound.direction, bound.quantity_ounces)
         quote = maker_quote(
             bound.direction,
             hedge_book,
@@ -722,7 +765,14 @@ class MakerStrategy(Strategy):
             economics,
             carry=self._quote_carry,
             fx=self._fx,
+            hedge_quantity_ounces=hedge_quantity,
         )
+        if (quote is not None and self._config.residual_mode == "bounded-carry"
+                and not self._carry_source_is_executable(
+                    quote, quote.quantity_ounces,
+                    self._stores[bound.direction].active_source_order_id,
+                )):
+            return None
         return self._passive_quote(quote, source_book)
 
     def _passive_quote(
@@ -794,6 +844,8 @@ class MakerStrategy(Strategy):
         quote: MakerQuote,
         source_quantity_ounces: Decimal,
     ) -> bool:
+        if self._config.residual_mode == "bounded-carry":
+            return self._carry_source_is_executable(quote, source_quantity_ounces, None)
         hedge_side = (
             BusinessOrderSide.SELL
             if quote.direction is SourceDirection.LONG
@@ -829,6 +881,101 @@ class MakerStrategy(Strategy):
                     f"quantity {leg.quantity_ounces} ounces"
                 )
                 return False
+        return True
+
+    def _carry_hedge_delta_bound(self, direction: SourceDirection, quantity: Decimal) -> Decimal:
+        _, buy, sell = maker_carry_bounds(
+            self._state_store.carry_residual_ounces,
+            quantity if direction is SourceDirection.LONG else Decimal(0),
+            quantity if direction is SourceDirection.SHORT else Decimal(0),
+        )
+        return sell if direction is SourceDirection.LONG else buy
+
+    def _carry_working_leaves(
+        self, quote: MakerQuote, quantity: Decimal, exclude_source_id: str | None,
+    ) -> tuple[Decimal, Decimal] | None:
+        source, hedge = self._config.source_accounts[0], self._config.hedge_accounts[0]
+        if (quote.source_account.account_id != source.account_id
+                or quote.source_account.client_id != source.client_id
+                or quote.hedge_account.account_id != hedge.account_id
+                or quote.hedge_account.client_id != hedge.client_id
+                or (exclude_source_id is not None and exclude_source_id
+                    != self._stores[quote.direction].active_source_order_id)):
+            return None
+        amounts = {SourceDirection.LONG: Decimal(0), SourceDirection.SHORT: Decimal(0)}
+        amounts[quote.direction] = quantity
+        for direction, store in self._stores.items():
+            active_id = store.active_source_order_id
+            if active_id is None:
+                continue
+            order = self.cache.order(ClientOrderId(active_id))
+            bound = self._working_quotes.get(active_id)
+            if (order is None or order.is_closed or bound is None
+                    or not self._live_working_order_is_exact(direction, order, bound)
+                    or (exclude_source_id is None and order.status is not OrderStatus.ACCEPTED)):
+                return None
+            if active_id == exclude_source_id:
+                if quantity != order.leaves_qty.as_decimal():
+                    return None
+                continue
+            amounts[direction] += order.leaves_qty.as_decimal()
+        return amounts[SourceDirection.LONG], amounts[SourceDirection.SHORT]
+
+    def _carry_source_is_executable(
+        self, quote: MakerQuote, quantity: Decimal, exclude_source_id: str | None,
+    ) -> bool:
+        if self._global_obligation_block():
+            return False
+        leaves = self._carry_working_leaves(quote, quantity, exclude_source_id)
+        if leaves is None:
+            return False
+        residual = self._state_store.carry_residual_ounces
+        exposure, hedge_buy, hedge_sell = maker_carry_bounds(residual, *leaves)
+        budget = self._config.max_unhedged_ounces
+        if budget is None or exposure > budget or not maker_hedge_bounds_allow(
+            quote.hedge_account, self._config.economics.risk, hedge_buy, hedge_sell,
+        ):
+            return False
+        positions = self._hedge_positions(quote.hedge_account.account_id)
+        quantity_ready = self._hedge_quantity_ready
+        try:
+            for direction, amount, cumulative in (
+                (SourceDirection.LONG, leaves[0], hedge_sell),
+                (SourceDirection.SHORT, leaves[1], hedge_buy),
+            ):
+                if amount == 0:
+                    continue
+                largest = maker_hedge_quantity_bound(
+                    residual, amount, direction, bool(leaves[0] and leaves[1]),
+                )
+                if largest == 0:
+                    continue
+                side = (BusinessOrderSide.SELL if direction is SourceDirection.LONG
+                        else BusinessOrderSide.BUY)
+                plan = plan_hedge_delta(positions, side, largest)
+                quantities = [Decimal(1), *(leg.quantity_ounces for leg in plan)]
+                # Earlier fills can reduce a ticket before a later larger intent.
+                quantities.extend(min(largest, position.quantity.as_decimal())
+                                  for position in positions
+                                  if position.is_long == (side is BusinessOrderSide.SELL))
+                signed_net = quote.hedge_account.position_ounces
+                future_open = min(largest, max(Decimal(0), cumulative + (
+                    -signed_net if side is BusinessOrderSide.SELL else signed_net
+                )))
+                if future_open > 0:
+                    quantities.append(future_open)
+                if quantity_ready is not None:
+                    try:
+                        if any(not quantity_ready(q) for q in quantities):
+                            return False
+                    except Exception as exc:
+                        self.log.error(
+                            f"Maker carry quantity preflight raised {type(exc).__name__}",
+                        )
+                        return False
+        except (HedgePlanningError, TypeError, ValueError, ArithmeticError) as exc:
+            self.log.error(f"Maker carry hedge preflight failed: {exc}")
+            return False
         return True
 
     def _requote(self, order: Order, desired: MakerQuote) -> None:
@@ -1192,11 +1339,11 @@ class MakerStrategy(Strategy):
         )
 
     def _global_obligation_block(self) -> bool:
-        return self._source_hold or self._state_store.has_residuals() or any(
+        return self._source_hold or not self._state_store.source_balance_is_admissible() or any(
             store.halt_reason is not None
             or store.source_freeze_reason is not None
             or store.has_unresolved_hedges()
-            or store.net_unhedged_ounces != 0
+            or not store._source_balance_is_admissible()
             for store in self._stores.values()
         )
 

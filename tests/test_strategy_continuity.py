@@ -94,6 +94,7 @@ class _OrdinaryStrategy:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, maker: bool, paper: bool = False,
         source_quantity: int = 2, two_sided: bool = False, native_mt5_transport: bool = False,
         source_short_quantity: int | None = None, inject_mt5_io: bool = True,
+        maker_config: dict[str, object] | None = None,
     ) -> None:
         self.maker = maker
         self.source_quantity = D(source_quantity)
@@ -116,6 +117,10 @@ class _OrdinaryStrategy:
                     ),
                 ),
             ))
+            if maker_config is not None:
+                configs = replace(
+                    configs, strategy=replace_config(configs.strategy, **maker_config),
+                )
         else:
             configs = _configs(tmp_path)
             configs = replace(configs, strategy=replace_config(

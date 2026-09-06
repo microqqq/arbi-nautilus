@@ -4,6 +4,7 @@ import json
 import os
 from collections.abc import Callable
 from copy import deepcopy
+from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -27,8 +28,8 @@ LONG = SourceDirection.LONG
 SHORT = SourceDirection.SHORT
 
 
-def _owner(prefix: Path) -> MakerStateStore:
-    return MakerStateStore(prefix, "SOURCE.BITFINEX", "HEDGE.MT5")
+def _owner(prefix: Path, **kwargs: Any) -> MakerStateStore:
+    return MakerStateStore(prefix, "SOURCE.BITFINEX", "HEDGE.MT5", **kwargs)
 
 
 def _begin(
@@ -56,6 +57,87 @@ def _fill(owner: MakerStateStore, direction: SourceDirection, quantity: str = "2
 
 def _memory(owner: MakerStateStore) -> object:
     return deepcopy(owner._snapshot())
+
+
+@pytest.mark.parametrize("first", [LONG, SHORT])
+@pytest.mark.parametrize(("limit", "amount", "allowed"), [
+    ("0.5", "0.5", True), ("0.49", "0.5", False), ("0", "0.5", False),
+    ("0.1", "0.1", True), ("0.1", "0.2", False),
+])
+def test_bounded_residual_releases_only_after_both_terminals_and_retains_signed_history(
+    tmp_path: Path, first: SourceDirection, limit: str, amount: str, allowed: bool,
+) -> None:
+    prefix = tmp_path / "bounded"
+    route = ("BITFINEX-001", "BITFINEX", "MT5-001", "MT5")
+    options = dict(residual_limit_ounces=D(limit), carry_route=route if D(limit) else None)
+    owner = _owner(prefix, **options)
+    for direction in (LONG, SHORT):
+        _begin(owner, direction, "1")
+    assert _fill(owner, first, amount) is None
+    for index, direction in enumerate((LONG, SHORT)):
+        view = owner.stores[direction]
+        view.update_source_status(f"S-{direction.value}", "CANCELED")
+        view.confirm_source_reconciled(f"S-{direction.value}")
+        if index == 0:
+            assert not owner.clear_source_freezes()
+    assert owner.has_residuals()
+    assert owner.clear_source_freezes() is allowed
+    assert all(view.can_submit_source() is allowed for view in owner.stores.values())
+    before = owner.path.read_bytes()
+    reloaded = _owner(prefix, **options)
+    expected = D(amount) if first is LONG else -D(amount)
+    assert sum((v.rounding_residual_ounces for v in reloaded.stores.values()), D(0)) == expected
+    assert all(view.can_submit_source() is allowed for view in reloaded.stores.values())
+    strict = _owner(prefix)
+    assert all(not view.can_submit_source() for view in strict.stores.values())
+    assert owner.path.read_bytes() == before
+    if allowed:
+        view = reloaded.stores[LONG]
+        view.begin_source("NEXT-BID", BUY, D(1), source_account_id=route[0],
+                          source_client_id=route[1], hedge_account_id=route[2],
+                          hedge_client_id=route[3])
+        assert reloaded.stores[SHORT].can_submit_source()
+
+
+def test_bounded_release_checks_each_completed_intent_not_zero_net_remaining(
+    tmp_path: Path,
+) -> None:
+    owner = _owner(tmp_path / "incomplete", residual_limit_ounces=D("0.5"),
+                   carry_route=("BITFINEX-001", "BITFINEX", "MT5-001", "MT5"))
+    for direction in (LONG, SHORT):
+        _begin(owner, direction)
+    for direction in (LONG, SHORT):
+        intent = _fill(owner, direction, "0.6")
+        assert intent is not None
+        view = owner.stores[direction]
+        # Deliberately inconsistent completion evidence, not simulated venue success.
+        view._state.hedge_intents[intent.intent_id] = replace(
+            intent, status=ObligationStatus.COMPLETED, hedge_filled_ounces=D("0.8"),
+        )
+        view.update_source_status(f"S-{direction.value}", "CANCELED")
+        view.confirm_source_reconciled(f"S-{direction.value}")
+    assert sum((view.net_unhedged_ounces for view in owner.stores.values()), D(0)) == 0
+    assert not owner.clear_source_freezes()
+    assert all(not view.can_submit_source() for view in owner.stores.values())
+
+
+@pytest.mark.parametrize("different", [
+    {"hedge_account_id": "MT5-OTHER"}, {"source_account_id": None},
+    {"hedge_client_id": "OTHER"}, {"hedge_position_id": "ONE-SHOT",
+                                  "hedge_position_quantity_ounces": D(1)},
+])
+def test_bounded_residual_cannot_use_another_or_isolated_route_budget(
+    tmp_path: Path, different: dict[str, Any],
+) -> None:
+    owner = _owner(tmp_path / "foreign-carry", residual_limit_ounces=D("0.5"),
+                   carry_route=("BITFINEX-001", "BITFINEX", "MT5-001", "MT5"))
+    _begin(owner, LONG, **different)
+    assert _fill(owner, LONG, "0.4") is None
+    owner.stores[LONG].update_source_status("S-bid", "CANCELED")
+    owner.stores[LONG].confirm_source_reconciled("S-bid")
+    assert not owner.source_balance_is_admissible()
+    assert not owner.clear_source_freezes()
+    assert all(not view.can_submit_source() for view in owner.stores.values())
 
 
 @pytest.mark.parametrize("first", [LONG, SHORT])

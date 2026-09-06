@@ -169,14 +169,16 @@ def _seed_native_working_quotes(
     strategy: _InstrumentLifecycleMaker, *, exact_route: bool = False,
     directions: tuple[SourceDirection, ...] = (SourceDirection.LONG, SourceDirection.SHORT),
     native_status: OrderStatus = OrderStatus.ACCEPTED,
+    quantity: Decimal | None = None,
 ) -> list[Any]:
+    quantity = D(2) if quantity is None else quantity
     orders: list[Any] = []
     instrument = strategy.cache.instrument(_source_instrument().id)
     for direction in directions:
         side = OrderSide.BUY if direction is SourceDirection.LONG else OrderSide.SELL
         order = strategy.order_factory.limit(
             instrument_id=_source_instrument().id, order_side=side,
-            quantity=instrument.make_qty(2), price=instrument.make_price(2400),
+            quantity=instrument.make_qty(quantity), price=instrument.make_price(2400),
             time_in_force=TimeInForce.GTC, post_only=True,
         )
         account_id = AccountId("BITFINEX-001")
@@ -191,7 +193,7 @@ def _seed_native_working_quotes(
         strategy._stores[direction].begin_source(
             order.client_order_id.value,
             BusinessOrderSide.BUY if side is OrderSide.BUY else BusinessOrderSide.SELL,
-            D(2),
+            quantity,
             source_account_id="BITFINEX-001" if exact_route else None,
             hedge_account_id="MT5-001" if exact_route else None,
         )
@@ -199,7 +201,7 @@ def _seed_native_working_quotes(
             strategy._stores[direction].update_source_status(
                 order.client_order_id.value, native_status.name,
             )
-        bound = replace(_bound_quote(), direction=direction)
+        bound = replace(_bound_quote(), direction=direction, quantity_ounces=quantity)
         if exact_route:
             bound = replace(
                 bound, source_account=replace(bound.source_account, client_id=None),
@@ -1176,6 +1178,53 @@ def test_native_maker_net_residual_before_allocating_new_hedge(
             reloaded = _reload_maker_store(strategy, direction)
             assert reloaded.rounding_residual_ounces == store.rounding_residual_ounces
             assert reloaded.can_submit_source() is (expected == 0)
+
+
+@pytest.mark.parametrize("fault", ["none", "no_pending", "native_partial", "identity",
+                                   "cancel_rejected", "old_hold", "cancel_completed"])
+def test_zero_fill_peer_protective_cancel_keeps_exact_facts_on_obsolete_modify_rejection(
+    tmp_path: Path, fault: str,
+) -> None:
+    strategy = RecordingMakerStrategy(tmp_path / "zero-peer")
+    with _event_engine(cast(Any, strategy)) as engine:
+        values = CryptoPerpetual.to_dict(_source_instrument())
+        values.update(size_precision=1, size_increment="0.1", lot_size="0.1")
+        engine.add_instrument(CryptoPerpetual.from_dict(values))
+        engine.trader.start()
+        filled, peer = _seed_native_working_quotes(cast(Any, strategy), exact_route=True)
+        engine.kernel.exec_engine.process(TestEventStubs.order_pending_update(peer, ts_event=101))
+        _fill_maker_source(engine, filled, D("0.5"), ts_event=102)
+        if fault != "no_pending":
+            engine.kernel.exec_engine.process(
+                TestEventStubs.order_pending_cancel(peer, ts_event=103),
+            )
+        view = strategy._stores[SourceDirection.SHORT]
+        if fault == "native_partial":
+            # A real native fill not yet applied to the business store is not exact evidence.
+            peer.apply(TestEventStubs.order_filled(
+                order=peer, instrument=engine.cache.instrument(peer.instrument_id),
+                last_qty=Quantity.from_str("0.1"), trade_id=TradeId("UNAPPLIED"), ts_event=104,
+            ))
+            strategy.cache.update_order(peer)
+        if fault == "old_hold":
+            view._state.halt_reason = "independent HOLD"
+            view._persist()
+        if fault == "cancel_completed":
+            _process_source_terminal(engine, peer)
+            assert not _cancel_is_pending(peer)
+        before = view.path.read_bytes()
+        event = (_cancel_rejected(peer) if fault == "cancel_rejected" else
+                 _modify_rejected(peer, **({"account_id": AccountId("BITFINEX-OTHER")}
+                                           if fault == "identity" else {})))
+        engine.kernel.exec_engine.process(event)
+        record = view.source_order(peer.client_order_id.value)
+        assert record is not None and record.filled_ounces == 0
+        if fault in {"none", "old_hold", "cancel_completed"}:
+            assert view.path.read_bytes() == before
+            assert record.status == ("CANCELED" if fault == "cancel_completed" else "ACCEPTED")
+        else:
+            assert record.status == "UNKNOWN" and view.halt_reason is not None
+        assert strategy._source_hold and view.source_freeze_reason is not None
 
 
 @pytest.mark.parametrize("completion", ["partial", "rejected", "canceled"])
@@ -2656,6 +2705,8 @@ class _StopHarness:
             SourceDirection.LONG: _StopStore("O-BID"),
             SourceDirection.SHORT: _StopStore("O-ASK"),
         }
+        self._state_store: Any = SimpleNamespace(residuals=lambda: {})
+        self.log: Any = SimpleNamespace(warning=lambda _message: None)
         self.cache = _StopCache()
         self.canceled: list[_WorkingOrder] = []
         self._source_hold = False
@@ -3017,6 +3068,7 @@ def test_live_hedge_quantity_preflight_checks_each_planned_mt5_ticket() -> None:
         return len(checked) == 1
 
     harness = SimpleNamespace(
+        _config=SimpleNamespace(residual_mode="strict"),
         _hedge_quantity_ready=quantity_ready,
         _hedge_positions=lambda _account_id: positions,
         log=SimpleNamespace(error=lambda _message: None),
@@ -3028,6 +3080,179 @@ def test_live_hedge_quantity_preflight_checks_each_planned_mt5_ticket() -> None:
         D(2),
     )
     assert checked == [D(1), D(1)]
+
+
+def _bounded_test_strategy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, residual: str = "0.5",
+    positions: list[Any] | None = None, budget: str = "10", quantity: str = "2",
+) -> tuple[MakerStrategy, MakerQuote, list[Decimal]]:
+    config = struct_replace(
+        _maker_strategy_config(tmp_path / "carry"), residual_mode="bounded-carry",
+        residual_limit_ounces=D("0.5"), max_unhedged_ounces=D(budget),
+    )
+    config = struct_replace(config, economics=struct_replace(
+        config.economics, bid=struct_replace(config.economics.bid,
+                                           open_quantity_ounces=D(quantity)),
+    ))
+    strategy = MakerStrategy(config)
+    if D(residual):
+        direction = SourceDirection.LONG if D(residual) > 0 else SourceDirection.SHORT
+        side = BusinessOrderSide.BUY if D(residual) > 0 else BusinessOrderSide.SELL
+        store = strategy._stores[direction]
+        store.begin_source("PRIOR", side, D(1), source_account_id="BITFINEX-001",
+                           hedge_account_id="MT5-001")
+        assert store.reserve_source_fill(
+            fill_key="PRIOR|VENUE|DUST", client_order_id="PRIOR", trade_id="DUST",
+            source_side=side, fill_ounces=abs(D(residual)),
+        ) is None
+        store.update_source_status("PRIOR", "CANCELED")
+        store.confirm_source_reconciled("PRIOR")
+        assert strategy._state_store.clear_source_freezes()
+    observed = positions or []
+    monkeypatch.setattr(strategy, "_hedge_positions", lambda _account_id: observed)
+    checked: list[Decimal] = []
+    def quantity_ready(quantity: Decimal) -> bool:
+        checked.append(quantity)
+        return quantity <= 2
+    strategy._hedge_quantity_ready = quantity_ready
+    quote = _bound_quote()
+    net = sum((p.quantity.as_decimal() * (1 if p.is_long else -1) for p in observed), D(0))
+    quote = replace(quote, source_account=replace(quote.source_account, client_id=None),
+                    hedge_account=replace(quote.hedge_account, client_id=None, position_ounces=net))
+    return strategy, quote, checked
+
+
+@pytest.mark.parametrize(("positions", "residual", "expected"), [
+    ([2], "0.5", False),  # First .2 closes1; later3.8 would close1 + open3.
+    ([2, 2], "0", True),  # Pure reduction remains executable in two2oz legs.
+    ([], "0.5", False),
+])
+def test_bounded_preflight_covers_ticket_evolution_and_preserves_multiticket_reduction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, positions: list[int],
+    residual: str, expected: bool,
+) -> None:
+    tickets = [SimpleNamespace(id=PositionId(str(index + 1)), quantity=Quantity.from_int(amount),
+                               is_long=True, is_short=False)
+               for index, amount in enumerate(positions)]
+    strategy, quote, checked = _bounded_test_strategy(
+        tmp_path, monkeypatch, residual=residual, positions=tickets,
+    )
+    assert strategy._source_hedge_is_executable(quote, D(4)) is expected
+    assert (D(3) in checked) is (positions == [2])
+
+
+@pytest.mark.parametrize("fault", ["callback", "unit_step", "source_route", "hedge_route"])
+def test_bounded_preflight_rejects_callback_failure_unit_step_and_other_candidate_route(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: str,
+) -> None:
+    strategy, quote, _ = _bounded_test_strategy(tmp_path, monkeypatch)
+    if fault == "callback":
+        def unavailable(_quantity: Decimal) -> bool:
+            raise RuntimeError("quantity callback unavailable")
+        strategy._hedge_quantity_ready = unavailable
+    elif fault == "unit_step":
+        strategy._hedge_quantity_ready = lambda quantity: quantity == 2
+    elif fault == "source_route":
+        quote = replace(quote, source_account=replace(quote.source_account,
+                                                      client_id=ClientId("OTHER")))
+    else:
+        quote = replace(quote, hedge_account=replace(quote.hedge_account,
+                                                    account_id=AccountId("MT5-OTHER")))
+    original = strategy._state_store.path.read_bytes()
+    assert not strategy._source_hedge_is_executable(quote, D(2))
+    assert strategy._state_store.path.read_bytes() == original
+
+
+def test_bounded_native_working_leaves_exclude_exact_self_and_do_not_net_two_sides(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    strategy, _, _ = _bounded_test_strategy(tmp_path, monkeypatch, budget="2.5")
+    with _event_engine(cast(Any, strategy)) as engine:
+        engine.trader.start()
+        orders = _seed_native_working_quotes(cast(Any, strategy), exact_route=True)
+        bid = orders[0]
+        quote = strategy._working_quotes[bid.client_order_id.value]
+        assert strategy._carry_source_is_executable(
+            quote, D(2), bid.client_order_id.value,
+        )
+        assert not strategy._carry_source_is_executable(
+            quote, D(1), bid.client_order_id.value,
+        )  # Maintenance cannot replace actual leaves2 with an invented smaller amount.
+        assert not strategy._source_hedge_is_executable(quote, D(2))
+        other = orders[1]
+        other.apply(TestEventStubs.order_pending_cancel(other, ts_event=101))
+        strategy.cache.update_order(other)
+        # Pending cancellation retains native leaves during maintenance.
+        assert strategy._carry_source_is_executable(
+            quote, D(2), bid.client_order_id.value,
+        )
+
+
+def test_bounded_stop_reports_signed_dust_without_changing_ledger(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    strategy, _, _ = _bounded_test_strategy(tmp_path, monkeypatch, residual="-0.5")
+    messages: list[str] = []
+    harness = _StopHarness()
+    harness._state_store = strategy._state_store
+    harness.log = SimpleNamespace(warning=messages.append)
+    before = strategy._state_store.path.read_bytes()
+    MakerStrategy.on_stop(cast(Any, harness))
+    assert len(messages) == 1 and "signed residual -0.5 ounces" in messages[0]
+    assert "FLAT" not in messages[0]
+    assert strategy._state_store.path.read_bytes() == before
+
+
+@pytest.mark.parametrize("normalize", [False, True])
+def test_bounded_normal_quote_uses_native_quantity_and_net_hedge_requirement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, normalize: bool,
+) -> None:
+    strategy, template, checked = _bounded_test_strategy(
+        tmp_path, monkeypatch, residual="0" if normalize else "-0.5",
+        quantity="1.26" if normalize else "0.5", budget="1.26" if normalize else "1",
+    )
+    account = (template.hedge_account if normalize else replace(
+        template.hedge_account, max_long_ounces=D(0), max_short_ounces=D(0),
+    ))
+    monkeypatch.setattr(strategy, "_hedge_accounts", lambda: (account,))
+    with _event_engine(cast(Any, strategy)) as engine:
+        values = CryptoPerpetual.to_dict(_source_instrument())
+        values.update(size_precision=1, size_increment="0.1", lot_size="0.1")
+        engine.add_instrument(CryptoPerpetual.from_dict(values))
+        engine.trader.start()
+        book = BookTop(D(2399), D(2401), D(10), D(10))
+        quote = strategy._new_quote(SourceDirection.LONG, book, book)
+        assert quote is not None
+        assert quote.quantity_ounces == (D("1.3") if normalize else D("0.5"))
+        if normalize:
+            # Native1.3 exceeds U1.26, even though the unnormalized input did not.
+            strategy._submit_source(quote)
+            assert strategy._stores[SourceDirection.LONG].active_source_order_id is None
+        else:
+            assert strategy._source_hedge_is_executable(quote, quote.quantity_ounces)
+            assert checked == []  # R-.5 + BUY.5 allocates0: no synthetic 1oz requirement.
+
+
+def test_bounded_preflight_checks_later_initial_ticket_not_only_first_plan_pieces(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tickets = [SimpleNamespace(id=PositionId(str(index + 1)),
+                               quantity=Quantity.from_int(amount), is_long=True, is_short=False)
+               for index, amount in enumerate((2, 5))]
+    strategy, quote, checked = _bounded_test_strategy(
+        tmp_path, monkeypatch, residual="0", positions=tickets,
+    )
+    with _event_engine(cast(Any, strategy)) as engine:
+        values = CryptoPerpetual.to_dict(_source_instrument())
+        values.update(size_precision=1, size_increment="0.1", lot_size="0.1")
+        engine.add_instrument(CryptoPerpetual.from_dict(values))
+        engine.trader.start()
+        _seed_native_working_quotes(cast(Any, strategy), exact_route=True,
+                                    directions=(SourceDirection.SHORT,), quantity=D("0.2"))
+        # Initial SELL4 is close2+close2, but BUY1.6/SELL.2/BUY2.4 later closes3 on id2.
+        assert not strategy._source_hedge_is_executable(quote, D(4))
+        assert checked[:3] == [D(1), D(2), D(2)]
+        assert D(4) in checked  # min(K4, original ticket5), not just its first2 slice.
 
 
 class _NowClock:

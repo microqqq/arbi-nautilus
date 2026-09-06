@@ -142,10 +142,12 @@ class _SourceWire:
 async def _continuous(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, maker: bool,
     long_quantity: int, short_quantity: int,
+    maker_config: dict[str, object] | None = None,
 ) -> AsyncIterator[tuple[_OrdinaryStrategy, _SourceWire, ContinuousMt5Wire]]:
     h = _OrdinaryStrategy(
         tmp_path, monkeypatch, maker=maker, two_sided=maker, native_mt5_transport=True,
         source_quantity=long_quantity, source_short_quantity=short_quantity, inject_mt5_io=False,
+        maker_config=maker_config,
     )
     snapshot = _snapshot(_identity())
     snapshot["positions"] = []
@@ -458,6 +460,208 @@ def test_both_adapters_maker_net_actual_dual_fills_then_obey_strict_next_cycle(
                     "submission_reserved", "order_filled",
                 ]
                 assert all(store.rounding_residual_ounces == 0 for store in stores)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("first_sign", [1, -1], ids=["buy-first", "sell-first"])
+@pytest.mark.parametrize("limit", [D("0.5"), D("0.49")], ids=["boundary", "over-limit"])
+def test_bounded_maker_carries_actual_dust_into_next_economic_dual_cycle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, first_sign: int, limit: Decimal,
+) -> None:
+    async def run() -> None:
+        async with _continuous(
+            tmp_path, monkeypatch, maker=True, long_quantity=2, short_quantity=2,
+            maker_config={"residual_mode": "bounded-carry", "residual_limit_ounces": limit,
+                          "max_unhedged_ounces": D("2.5")},
+        ) as (h, source, wire):
+            first = await _accepted_source(h, source, wire, first_sign)
+            await _accepted_source(h, source, wire, -first_sign)
+            original_ids = set(source.rows)
+            assert len(original_ids) == 2  # The ordinary second side remains admissible.
+            source.fill(first, D("0.5"))
+            stores = _stores(h)
+            owner = get_source_terminal_reconciler(h.node)
+            await _drive(h, wire, lambda: not owner.busy and all(
+                source.order(cid).is_closed for cid in original_ids
+            ) and all(store.active_source_order_id not in {
+                source.order(cid).client_order_id.value for cid in original_ids
+            } for store in stores), direction=0)
+            assert source.net == D("0.5") * first_sign
+            assert all(not store.intents() for store in stores)
+            assert wire.submit_calls == [] and wire.close_calls == []
+
+            if limit < D("0.5"):
+                for direction in (1, -1, 0):
+                    await _market(h, wire, direction)
+                assert set(source.rows) == original_ids
+                assert h.strategy._global_obligation_block()
+                assert all(store.source_freeze_reason is not None for store in stores)
+                return
+
+            await _settle_cycle(h, source, wire, cid=first, expected=0)
+            cid = await _accepted_source(h, source, wire, first_sign)
+            opposite = await _accepted_source(h, source, wire, -first_sign)
+            assert {cid, opposite}.isdisjoint(original_ids)
+            assert source.order(cid).quantity.as_decimal() == 2
+            assert source.order(opposite).quantity.as_decimal() == 2
+            source.fill(cid, D(2))
+            await _settle_cycle(h, source, wire, cid=cid, expected=1)
+            residual = D("0.5") * first_sign
+            assert source.net == h.node.portfolio.net_position(h.source_instrument.id) == (
+                D("2.5") * first_sign
+            )
+            assert h.node.portfolio.net_position(h.hedge_instrument.id) == -D(2) * first_sign
+            assert sum((store.net_unhedged_ounces for store in stores), D(0)) == residual
+            assert sum((store.rounding_residual_ounces for store in h.reload_stores()), D(0)) == (
+                residual
+            )
+            await _assert_reports(h, source, wire, _ticket_facts(wire))
+            before = (len(source.trades), deepcopy(wire.journal))
+            # Normal stop retains actual signed exposure; it never manufactures
+            # a dust-flattening trade. Full stop/drain recovery is a later W6 test.
+            h.node.trader.stop()
+            await _pump()
+            assert (len(source.trades), wire.journal) == before
+            assert sum((store.net_unhedged_ounces for store in h.reload_stores()), D(0)) == residual
+            assert source.net + sum(_ticket_facts(wire).values(), D(0)) == residual
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("first_sign", [1, -1], ids=["buy-first", "sell-first"])
+def test_bounded_maker_budget_blocks_next_actual_single_side_with_dust(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, first_sign: int,
+) -> None:
+    async def run() -> None:
+        async with _continuous(
+            tmp_path, monkeypatch, maker=True,
+            long_quantity=2 if first_sign > 0 else 0,
+            short_quantity=2 if first_sign < 0 else 0,
+            maker_config={"residual_mode": "bounded-carry", "residual_limit_ounces": D("0.5"),
+                          "max_unhedged_ounces": D(2)},
+        ) as (h, source, wire):
+            cid = await _accepted_source(h, source, wire, first_sign)
+            source.fill(cid, D("0.5"))
+            await _settle_cycle(h, source, wire, cid=cid, expected=0)
+            for direction in (first_sign, 0, first_sign):
+                await _market(h, wire, direction)
+            assert set(source.rows) == {cid}  # .5 + 2 is above the explicit budget of 2.
+            assert all(store.source_freeze_reason is None for store in _stores(h))
+            assert source.net == D("0.5") * first_sign
+            assert wire.submit_calls == [] and wire.close_calls == []
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("first_sign", [1, -1], ids=["buy-first", "sell-first"])
+def test_bounded_maker_split_fill_carries_without_confusing_total_and_per_leg_lots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, first_sign: int,
+) -> None:
+    async def run() -> None:
+        async with _continuous(
+            tmp_path, monkeypatch, maker=True,
+            long_quantity=2 if first_sign > 0 else 0,
+            short_quantity=2 if first_sign < 0 else 0,
+            maker_config={"residual_mode": "bounded-carry", "residual_limit_ounces": D("0.5"),
+                          "max_unhedged_ounces": D("2.5")},
+        ) as (h, source, wire):
+            first = await _accepted_source(h, source, wire, first_sign)
+            source.fill(first, D("0.5"))
+            await _settle_cycle(h, source, wire, cid=first, expected=0)
+            cid = await _accepted_source(h, source, wire, first_sign)
+            assert cid != first
+            # Both genuine venue fills precede the protective cancel. Starting
+            # from .5, the unchanged rounding allocates 1 and then 2, not 2 total.
+            source.fill(cid, D("0.2"))
+            source.fill(cid, D("1.8"))
+            await _settle_cycle(h, source, wire, cid=cid, expected=2)
+            fills = [cast(JsonObject, event["payload"]) for event in wire.journal
+                     if event["event_type"] == "order_filled"]
+            assert [D(str(fill["filled_quantity_lots"])) for fill in fills] == [D(".01"), D(".02")]
+            assert [fill["side"] for fill in fills] == ["sell" if first_sign > 0 else "buy"] * 2
+            assert source.net == D("2.5") * first_sign
+            assert h.node.portfolio.net_position(h.hedge_instrument.id) == -D(3) * first_sign
+            residual = D("-0.5") * first_sign
+            assert sum((store.net_unhedged_ounces for store in _stores(h)), D(0)) == residual
+            assert sum((store.rounding_residual_ounces for store in h.reload_stores()), D(0)) == (
+                residual
+            )
+            assert all(store.source_freeze_reason is None for store in _stores(h))
+            await _assert_reports(h, source, wire, _ticket_facts(wire))
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("first_sign", [1, -1], ids=["buy-first", "sell-first"])
+def test_bounded_maker_rechecks_future_open_lot_after_real_ticket_and_dust_cycles(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, first_sign: int,
+) -> None:
+    async def run() -> None:
+        async with _continuous(
+            tmp_path, monkeypatch, maker=True,
+            long_quantity=4 if first_sign > 0 else 2,
+            short_quantity=2 if first_sign > 0 else 4,
+            maker_config={"residual_mode": "bounded-carry", "residual_limit_ounces": D("0.5"),
+                          "max_unhedged_ounces": D("4.5")},
+        ) as (h, source, wire):
+            first = await _accepted_source(h, source, wire, -first_sign)
+            source.fill(first, D(2))
+            await _settle_cycle(h, source, wire, cid=first, expected=1)
+            assert sum(_ticket_facts(wire).values(), D(0)) == D(2) * first_sign
+            # From zero residual this ordinary quote can close 2 and open 2.
+            cid = await _accepted_source(h, source, wire, first_sign)
+            assert source.order(cid).quantity.as_decimal() == 4
+            source.fill(cid, D("0.5"))
+            await _settle_cycle(h, source, wire, cid=cid, expected=1)
+            for direction in (first_sign, 0, first_sign):
+                await _market(h, wire, direction)
+            # With .5 carried, a future .2+3.8 split could close 1, close 1,
+            # then open 3. The unchanged .02lot ceiling blocks this new quote.
+            assert [other for other in source.rows
+                    if source.order(other).side is source.order(cid).side] == [cid]
+            assert len(wire.submit_calls) == 1 and wire.close_calls == []
+            assert source.net == D("-1.5") * first_sign
+            assert sum((store.rounding_residual_ounces for store in h.reload_stores()), D(0)) == (
+                D("0.5") * first_sign
+            )
+            await _assert_reports(h, source, wire, _ticket_facts(wire))
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("first_sign", [1, -1], ids=["buy-first", "sell-first"])
+def test_bounded_maker_cancels_carried_quote_when_fresh_mt5_capacity_shrinks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, first_sign: int,
+) -> None:
+    async def run() -> None:
+        async with _continuous(
+            tmp_path, monkeypatch, maker=True,
+            long_quantity=2 if first_sign > 0 else 0,
+            short_quantity=2 if first_sign < 0 else 0,
+            maker_config={"residual_mode": "bounded-carry", "residual_limit_ounces": D("0.5"),
+                          "max_unhedged_ounces": D("2.5")},
+        ) as (h, source, wire):
+            first = await _accepted_source(h, source, wire, first_sign)
+            source.fill(first, D("0.5"))
+            await _settle_cycle(h, source, wire, cid=first, expected=0)
+            cid = await _accepted_source(h, source, wire, first_sign)
+            # Publish changed venue facts through the real MT5 poller. With
+            # margin target500/base60 and ask3936.8, equity500 permits 2oz.
+            # The quote's carried/split exposure needs a cumulative hedge of3.
+            cast(JsonObject, wire.current_snapshot["account"]).update({
+                "balance": "500", "equity": "500", "margin": "10",
+                "margin_free": "490", "margin_level": "5000",
+            })
+            await _drive(h, wire, lambda: source.order(cid).is_closed, direction=first_sign)
+            event = h.node.cache.account(h.hedge.account_id).last_event
+            assert event.info["mt5_equity"] == "500"
+            assert h.hedge.account_capacity_ready(h.strategy._config.max_cost_age_ns)
+            assert source.order(cid).status is OrderStatus.CANCELED
+            assert source.order(cid).filled_qty.as_decimal() == 0
+            assert set(source.rows) == {first, cid}
+            assert len(source.trades) == 1 and wire.submit_calls == [] and wire.close_calls == []
+            assert source.net == D("0.5") * first_sign
 
     asyncio.run(run())
 

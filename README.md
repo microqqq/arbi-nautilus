@@ -59,6 +59,39 @@ Review the result before selecting the new `store_path_prefix`. Conversion is no
 reconciliation or recovery of Nautilus's runtime cache. Nonzero route residuals
 still block new orders in strict mode; bounded carry is not enabled by migration.
 
+## Maker residual budgets
+
+`MakerStrategyConfig` defaults to `residual_mode="strict"`,
+`residual_limit_ounces=Decimal("0")`, and `max_unhedged_ounces=None`.
+Strict requires zero residual before the next cycle. For offline bounded-carry
+tests, normal strategy configuration can explicitly select:
+
+```python
+residual_mode="bounded-carry"
+residual_limit_ounces=Decimal("0.5")
+max_unhedged_ounces=Decimal("2.5")
+```
+
+Bounded carry is limited to one explicit source/hedge account route. It preserves
+the existing allocation ledger and only releases a completed cycle after source
+terminal reconciliation and full hedge completion. UNKNOWN, unfinished hedges,
+foreign-route residuals and existing holds do not gain an exemption. The next
+order must still be an ordinary economic opportunity, not a dust-cleanup trade.
+
+Both working sides consume the exposure budget separately. With 2oz on each
+side, admission uses a conservative 2.5oz unhedged bound; opposite quotes are not
+assumed to cancel each other. MT5 cumulative exposure and individual order-lot
+limits are checked separately, including ticket changes after partial fills.
+The current broker minimum and step must also permit the original 1oz rounding
+unit whenever a hedge may be required.
+The residual limit may be smaller than 0.5oz, but never larger. A stop retains
+and reports signed residuals; nonzero residual is not FLAT.
+
+These fields do not change funding/swap `CarryConfig`. Existing online profiles
+and canaries remain strict with their original lot limits. This single-strategy
+offline capability does not certify restart/drain recovery or a shared
+Maker/Taker budget; those remain subsequent implementation-plan work.
+
 ## MT5 EA v1 checkpoint
 
 The PY000-specific protocol and EA are specified in
