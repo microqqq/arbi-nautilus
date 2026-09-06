@@ -19,6 +19,7 @@ from py000_nautilus.maker_store import (
     maker_state_path,
 )
 from py000_nautilus.models import BusinessOrderSide, HedgeLeg, ObligationStatus, SourceDirection
+from py000_nautilus.restart_recovery import capture_startup_receipt
 from py000_nautilus.store import JsonStateStore
 
 D = Decimal
@@ -295,7 +296,8 @@ def test_fill_and_both_freezes_are_in_first_and_only_durable_snapshot(
     intent = _fill(owner, LONG)
     assert intent is not None and len(snapshots) == 1
     payload = snapshots[0]
-    assert payload["schema_version"] == 3 and payload["kind"] == "maker"
+    assert payload["schema_version"] == 5 and payload["kind"] == "maker"
+    assert payload["cycle_freeze_only"] is (existing_freeze is None)
     assert payload["source_instrument_id"] == "SOURCE.BITFINEX"
     assert payload["hedge_instrument_id"] == "HEDGE.MT5"
     assert len(payload["allocations"]) == 1
@@ -310,6 +312,28 @@ def test_fill_and_both_freezes_are_in_first_and_only_durable_snapshot(
     assert ask["source_freeze_reason"] == (existing_freeze or reason)
     assert _memory(_owner(tmp_path / "atomic-fill")) == _memory(owner)
     assert not any(path.exists() for path in maker_legacy_paths(tmp_path / "atomic-fill"))
+
+
+@pytest.mark.parametrize("through_view", [False, True])
+@pytest.mark.parametrize("same_reason", [False, True])
+def test_external_freeze_after_fill_has_a_durable_distinct_fact(
+    tmp_path: Path, through_view: bool, same_reason: bool,
+) -> None:
+    owner = _owner(tmp_path / "freeze-origin")
+    _begin(owner, LONG)
+    _fill(owner, LONG)
+    before = owner.path.read_bytes()
+    reason = owner.stores[LONG].source_freeze_reason
+    assert reason is not None
+    external = reason if same_reason else "independent account HOLD"
+    if through_view:
+        owner.stores[LONG].freeze_source_submissions(external)
+    else:
+        owner.freeze_sources(external)
+    assert owner.path.read_bytes() != before, "external pause must not disappear behind first-wins"
+    assert all(view.source_freeze_reason == reason for view in owner.stores.values())
+    assert not owner.cycle_freeze_only
+    assert not _owner(tmp_path / "freeze-origin").cycle_freeze_only
 
 
 def test_round_trip_dedup_and_ticket_plan_reuse_existing_algorithms(tmp_path: Path) -> None:
@@ -342,9 +366,146 @@ def test_round_trip_dedup_and_ticket_plan_reuse_existing_algorithms(tmp_path: Pa
     assert _fill(reloaded, LONG) is None
     assert reloaded.path.read_bytes() == before
     assert all(item.source_freeze_reason is None for item in reloaded.stores.values())
+    assert not reloaded.cycle_freeze_only
     assert _memory(_owner(prefix)) == _memory(reloaded)
     with pytest.raises(ValueError, match="schema"):
         JsonStateStore(reloaded.path)
+
+
+@pytest.mark.parametrize("pause", [None, "owner-before", "view-before", "halt-before", "after"])
+def test_only_a_clean_atomic_fill_can_grant_or_retain_cycle_provenance(
+    tmp_path: Path, pause: str | None,
+) -> None:
+    owner = _owner(tmp_path / "provenance")
+    _begin(owner, LONG)
+    view = owner.stores[LONG]
+    if pause == "owner-before":
+        owner.freeze_sources("external")
+    elif pause == "view-before":
+        owner.stores[SHORT].freeze_source_submissions("external")
+    elif pause == "halt-before":
+        view._state.halt_reason = "external"
+        view._persist()
+    _fill(owner, LONG, "1")
+    assert owner.cycle_freeze_only is (pause in {None, "after"})
+    if pause == "after":
+        owner.freeze_sources("external")
+    before = owner.path.read_bytes()
+    assert _fill(owner, LONG, "1") is None
+    assert owner.path.read_bytes() == before
+    view.reserve_source_fill(
+        fill_key="S-bid|V-bid|LATE", client_order_id="S-bid", trade_id="LATE",
+        source_side=BUY, fill_ounces=D(1),
+    )
+    assert owner.cycle_freeze_only is (pause is None)
+    assert _owner(tmp_path / "provenance").cycle_freeze_only is (pause is None)
+
+
+def test_old_v3_freeze_loads_without_writing_or_inventing_provenance(tmp_path: Path) -> None:
+    prefix = tmp_path / "v3"
+    owner = _owner(prefix)
+    _begin(owner, LONG)
+    _fill(owner, LONG, "1")
+    payload = owner._to_payload()
+    payload["schema_version"] = 3
+    payload.pop("cycle_freeze_only")
+    owner.path.write_text(json.dumps(payload))
+    before = owner.path.read_bytes()
+    old = _owner(prefix)
+    assert not old.cycle_freeze_only and not capture_startup_receipt(old).eligible
+    assert old.path.read_bytes() == before
+    old.stores[LONG].reserve_source_fill(
+        fill_key="S-bid|V-bid|LATE", client_order_id="S-bid", trade_id="LATE",
+        source_side=BUY, fill_ounces=D(1),
+    )
+    assert json.loads(old.path.read_text())["schema_version"] == 5
+    assert not _owner(prefix).cycle_freeze_only
+
+
+@pytest.mark.parametrize("fault", ["missing", "int", "string", "null", "one-freeze",
+                                   "different-freeze", "list-version"])
+def test_new_provenance_schema_is_strict_and_must_match_both_freezes(
+    tmp_path: Path, fault: str,
+) -> None:
+    prefix = tmp_path / "invalid-provenance"
+    owner = _owner(prefix)
+    _begin(owner, LONG)
+    _fill(owner, LONG)
+    raw = json.loads(owner.path.read_text())
+    if fault == "missing":
+        raw.pop("cycle_freeze_only")
+    elif fault == "list-version":
+        raw["schema_version"] = []
+    elif fault.endswith("freeze"):
+        raw["directions"]["ask"]["source_freeze_reason"] = (
+            None if fault == "one-freeze" else "different"
+        )
+    else:
+        raw["cycle_freeze_only"] = {"int": 1, "string": "true", "null": None}[fault]
+    owner.path.write_text(json.dumps(raw))
+    before = owner.path.read_bytes()
+    with pytest.raises(ValueError, match="schema|provenance"):
+        _owner(prefix)
+    assert owner.path.read_bytes() == before
+
+
+@pytest.mark.parametrize("through_view", [False, True])
+@pytest.mark.parametrize("after_replace", [False, True])
+def test_external_revocation_failure_is_sticky_and_later_publish_cannot_restore_true(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, through_view: bool, after_replace: bool,
+) -> None:
+    prefix = tmp_path / "failed-revocation"
+    owner = _owner(prefix)
+    _begin(owner, LONG)
+    intent = _fill(owner, LONG)
+    view = owner.stores[LONG]
+    view.bind_hedge_order(intent.intent_id, "H")
+    view.apply_hedge_fill(client_order_id="H", trade_id="HT", fill_ounces=D(2))
+    receipt = capture_startup_receipt(owner)
+    assert receipt.eligible and bool(owner.cycle_freeze_only)
+    before, disk = owner._snapshot(), owner.path.read_bytes()
+
+    def fail(source: Path, destination: Path) -> None:
+        if after_replace:
+            os.replace(source, destination)
+            raise ParentDirectorySyncError("external revocation published")
+        raise OSError("external revocation not published")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(store_module, "replace_and_sync_parent", fail)
+        with pytest.raises(ParentDirectorySyncError if after_replace else OSError):
+            if through_view:
+                view.freeze_source_submissions("external")
+            else:
+                owner.freeze_sources("external")
+    assert owner._snapshot() == _owner(prefix)._snapshot()
+    assert (owner._snapshot() != before) is after_replace
+    assert (owner.path.read_bytes() != disk) is after_replace
+    assert not owner.cycle_freeze_only and not owner.clear_source_freezes()
+    assert not capture_startup_receipt(owner).eligible
+    with pytest.raises(RuntimeError, match="publication failure"):
+        receipt.check(owner)
+    owner._persist()  # A later successful business publication must include the revocation.
+    assert not json.loads(owner.path.read_text())["cycle_freeze_only"]
+    assert not _owner(prefix).cycle_freeze_only and not owner.clear_source_freezes()
+
+
+def test_failed_external_freeze_remains_ineligible_even_without_persisted_pauses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    owner = _owner(tmp_path / "empty-pauses")
+    _begin(owner, LONG)
+    before = owner.path.read_bytes()
+    with monkeypatch.context() as patch:
+        patch.setattr(store_module, "replace_and_sync_parent",
+                      lambda *_: (_ for _ in ()).throw(OSError("before replace")))
+        with pytest.raises(OSError):
+            owner.freeze_sources("external")
+    assert owner.path.read_bytes() == before
+    assert all(view.source_freeze_reason is None for view in owner.stores.values())
+    assert not capture_startup_receipt(owner).eligible
+    _fill(owner, LONG)  # Neither a later actual fill nor its successful write clears the latch.
+    assert not owner.cycle_freeze_only and not capture_startup_receipt(owner).eligible
 
 
 def test_unknown_fill_does_not_freeze_or_create_file(tmp_path: Path) -> None:
@@ -392,6 +553,9 @@ def test_whole_candidate_rollback_or_post_replace_retention(
     assert owner.path.read_bytes() == (candidates[0] if after_replace else disk_before)
     assert _memory(owner) == _memory(_owner(prefix))
     assert (_memory(owner) != previous) is after_replace
+    if after_replace:
+        assert not capture_startup_receipt(owner).eligible
+        assert not owner.clear_source_freezes()
     if after_replace and operation.startswith("fill"):
         assert all(view.source_freeze_reason is not None for view in owner.stores.values())
         assert len(owner.stores[LONG].intents()) == (1 if operation == "fill" else 0)

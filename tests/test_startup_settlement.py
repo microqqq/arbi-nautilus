@@ -32,21 +32,22 @@ from py000_nautilus.store import JsonStateStore
 
 def _history(
     path: Path, *, maker: bool = False, legs: int = 1, planned: bool = True,
-    pending_leg: bool = False,
+    pending_leg: bool = False, cycle_freeze: bool = False,
 ) -> tuple[JsonStateStore | MakerStateStore, list[Order], list[Order]]:
     owner = _new(path, maker)
     sources: list[Order] = []
     hedges: list[Order] = []
-    # Synthetic eligible Maker state exercises its atomic owner only. Ordinary
-    # Maker fill freezes are retained and tested separately, never waived here.
-    for side in ((BusinessOrderSide.BUY, BusinessOrderSide.SELL) if maker
+    # Default synthetic Maker history retains the original two-view atomicity cases.
+    # cycle_freeze uses one actual public reserve, including its durable provenance.
+    for side in ((BusinessOrderSide.BUY, BusinessOrderSide.SELL) if maker and not cycle_freeze
                  else (BusinessOrderSide.BUY,)):
         view = _view(owner, side)
         cid = f"S-{side.value}"
         source = _source_order(cid, (str(2 * legs),), side=side, quantity=str(2 * legs))
         _begin(view, source)
         fill = next(event for event in source.events if isinstance(event, OrderFilled))
-        intent = view._reserve_source_fill(
+        reserve = view.reserve_source_fill if cycle_freeze else view._reserve_source_fill
+        intent = reserve(
             fill_key=f"{cid}|{fill.venue_order_id.value}|{fill.trade_id.value}",
             client_order_id=cid, trade_id=fill.trade_id.value,
             source_side=side, fill_ounces=fill.last_qty.as_decimal(),
@@ -102,8 +103,11 @@ def _project(
 
 def _prepared(
     path: Path, *, maker: bool = False, legs: int = 1, planned: bool = True,
+    cycle_freeze: bool = False,
 ) -> tuple[JsonStateStore | MakerStateStore, list[Order], list[Order], _StartupReceipt]:
-    owner, sources, hedges = _history(path, maker=maker, legs=legs, planned=planned)
+    owner, sources, hedges = _history(
+        path, maker=maker, legs=legs, planned=planned, cycle_freeze=cycle_freeze,
+    )
     receipt = capture_startup_receipt(owner)
     assert receipt.eligible
     for view in (owner.stores.values() if isinstance(owner, MakerStateStore) else (owner,)):
@@ -280,6 +284,70 @@ def test_candidate_validation_failure_restores_both_maker_views(
             _settle_completed(owner, sources, hedges, receipt)
     assert not publications and owner._to_payload() == before and owner.path.read_bytes() == disk
     _settle_completed(owner, sources, hedges, receipt)
+
+
+@pytest.mark.parametrize("planned", [False, True])
+def test_new_maker_cycle_provenance_settles_only_full_facts_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, planned: bool,
+) -> None:
+    owner, sources, hedges, receipt = _prepared(
+        tmp_path / "maker-cycle", maker=True, planned=planned, cycle_freeze=True,
+    )
+    assert isinstance(owner, MakerStateStore) and bool(owner.cycle_freeze_only)
+    before = deepcopy(owner._to_payload())
+    events = [tuple(order.events) for order in (*sources, *hedges)]
+    publications = _observe(monkeypatch)
+    _settle_completed(owner, sources, hedges, receipt)
+    assert len(publications) == 1 and not owner.cycle_freeze_only
+    assert all(view.can_submit_source() and view.cycle_evidence_complete()
+               for view in owner.stores.values())
+    assert owner._to_payload()["allocations"] == before["allocations"]
+    assert [tuple(order.events) for order in (*sources, *hedges)] == events
+    _settle_completed(owner, sources, hedges, receipt)
+    loaded = _reload(owner)
+    _settle_completed(loaded, sources, hedges, capture_startup_receipt(loaded))
+    assert len(publications) == 1 and loaded._to_payload() == owner._to_payload()
+
+
+@pytest.mark.parametrize("through_view", [False, True])
+def test_captured_maker_cycle_is_revoked_even_by_identical_external_text(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, through_view: bool,
+) -> None:
+    owner, sources, hedges, receipt = _prepared(
+        tmp_path / "revoke", maker=True, cycle_freeze=True,
+    )
+    assert isinstance(owner, MakerStateStore)
+    view = _view(owner)
+    reason = view.source_freeze_reason
+    assert reason is not None
+    if through_view:
+        view.freeze_source_submissions(reason)
+    else:
+        owner.freeze_sources(reason)
+    before, disk = deepcopy(owner._to_payload()), owner.path.read_bytes()
+    publications = _observe(monkeypatch)
+    with pytest.raises(ValueError, match="no longer owned"):
+        _settle_completed(owner, sources, hedges, receipt)
+    assert not publications and owner._to_payload() == before and owner.path.read_bytes() == disk
+    assert not capture_startup_receipt(_reload(owner)).eligible
+
+
+def test_maker_cycle_provenance_does_not_release_a_future_unbound_leg(tmp_path: Path) -> None:
+    owner, sources, hedges = _history(
+        tmp_path / "cycle-future", maker=True, legs=2, pending_leg=True, cycle_freeze=True,
+    )
+    assert isinstance(owner, MakerStateStore) and owner.cycle_freeze_only
+    receipt = capture_startup_receipt(owner)
+    assert receipt.eligible
+    for view in owner.stores.values():
+        view.recover_for_start()
+    _project(owner, sources, hedges, receipt)
+    before = owner.path.read_bytes()
+    with pytest.raises(ValueError, match="incomplete or unbound"):
+        _settle_completed(owner, sources, hedges, receipt)
+    with pytest.raises(TypeError, match="JsonStateStore"):
+        _settle_completed(owner, sources, hedges, receipt, resume_unbound=True)
+    assert owner.path.read_bytes() == before and owner.cycle_freeze_only
 
 
 @pytest.mark.parametrize("maker", [False, True])

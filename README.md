@@ -25,7 +25,13 @@ operator reconciles it.
 
 ## Explicit Maker state migration (offline)
 
-Fresh Maker states use schema 3. To convert an old single-file schema 2 state or
+Fresh Maker states use schema 5. Existing schema 3/4 files remain readable and
+upgrade on their next write, without inferring the cause of old freezes. New
+files record whether a freeze came only from a normal fill cycle; this alone
+does not authorize recovery without complete native and venue evidence.
+Older binaries cannot read schema 5/6; do not downgrade them against upgraded
+active state or restore stale state to bypass that check.
+To convert an old single-file schema 2 state or
 both schema 1 direction files, stop the old strategy and write to a **different**
 state prefix:
 
@@ -45,7 +51,7 @@ files must be present for schema 1, including a valid empty file if one directio
 never traded. Its instrument IDs are operator-supplied bindings because schema 1
 has no instrument header; schema 2 must match its existing header.
 
-The new schema 4 file preserves old orders, fill identities, hedge plans and
+The new schema 6 file preserves old orders, fill identities, hedge plans and
 UNKNOWN/HOLD states. A labeled legacy checkpoint retains known historical totals
 without inventing missing individual fill quantities or replaying old hedges.
 Only subsequent real fills enter the new per-fill allocation ledger. The old

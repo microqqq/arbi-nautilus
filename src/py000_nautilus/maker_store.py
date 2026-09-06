@@ -56,7 +56,7 @@ class _LegacyOrder:
         }
 
 
-_Snapshot = tuple[dict[SourceDirection, StoreState], list[_Allocation]]
+_Snapshot = tuple[dict[SourceDirection, StoreState], list[_Allocation], bool]
 
 
 def _route(record: SourceOrderRecord) -> _Route:
@@ -98,6 +98,8 @@ class MakerStateStore:
         self._allocations: list[_Allocation] = []
         self._legacy_sources: tuple[tuple[str, str], ...] | None = None
         self._legacy_orders: tuple[_LegacyOrder, ...] = ()
+        self._cycle_freeze_only = False
+        self._freeze_publication_failed = False  # Instance-only; never restored into eligibility.
         if not self.path.exists() and any(path.exists() for path in maker_legacy_paths(prefix)):
             raise ValueError("legacy Maker state requires explicit migration before startup")
         states = self._load() if self.path.exists() else {
@@ -110,20 +112,35 @@ class MakerStateStore:
         self._committed = self._snapshot()
 
     def freeze_sources(self, reason: str) -> None:
+        self._freeze_external(reason, tuple(self.stores.values()))
+
+    @property
+    def cycle_freeze_only(self) -> bool:
+        return self._cycle_freeze_only and not self._freeze_publication_failed
+
+    def _freeze_external(self, reason: str, views: tuple[JsonStateStore, ...]) -> None:
         if not reason:
             raise ValueError("freeze reason must not be empty")
-        if self._set_freezes(reason):
-            self._persist()
+        changed = self._set_freezes(reason, views) or self._cycle_freeze_only
+        self._cycle_freeze_only = False
+        if changed:
+            try:
+                self._persist()
+            except Exception:
+                self._freeze_publication_failed = True
+                raise
 
     def clear_source_freezes(self) -> bool:
         reasons = {view.source_freeze_reason for view in self.stores.values()
                    if view.source_freeze_reason is not None}
-        if not self.source_balance_is_admissible() or len(reasons) != 1 or not all(
-            view.cycle_evidence_complete() for view in self.stores.values()
-        ):
+        if (self._freeze_publication_failed or not self.source_balance_is_admissible()
+                or len(reasons) != 1 or not all(
+                    view.cycle_evidence_complete() for view in self.stores.values()
+                )):
             return False
         for view in self.stores.values():
             view._state.source_freeze_reason = None
+        self._cycle_freeze_only = False
         self._persist()
         return True
 
@@ -209,9 +226,9 @@ class MakerStateStore:
         self._allocations.append(_Allocation(fill_key, route, signed_fill, Decimal(allocated)))
         return allocated
 
-    def _set_freezes(self, reason: str) -> bool:
+    def _set_freezes(self, reason: str, views: tuple[JsonStateStore, ...] | None = None) -> bool:
         changed = False
-        for view in self.stores.values():
+        for view in self.stores.values() if views is None else views:
             if view.source_freeze_reason is None:
                 view._state.source_freeze_reason = reason
                 changed = True
@@ -219,20 +236,24 @@ class MakerStateStore:
 
     def _snapshot(self) -> _Snapshot:
         return ({direction: deepcopy(view._state) for direction, view in self.stores.items()},
-                self._allocations.copy())
+                self._allocations.copy(), self._cycle_freeze_only)
 
     def _restore(self, snapshot: _Snapshot) -> None:
         for direction, state in snapshot[0].items():
             self.stores[direction]._state = deepcopy(state)
         self._allocations = snapshot[1].copy()
+        self._cycle_freeze_only = snapshot[2]
 
     def _persist(self) -> None:
+        if self._freeze_publication_failed:
+            self._cycle_freeze_only = False  # Later writes cannot republish the revoked True.
         candidate = self._snapshot()
         try:
             self._validate()
             _persist_payload(self.path, self._to_payload())
         except ParentDirectorySyncError:
             self._committed = candidate
+            self._freeze_publication_failed = True
             raise
         except Exception:
             self._restore(self._committed)
@@ -241,7 +262,8 @@ class MakerStateStore:
 
     def _to_payload(self) -> dict[str, object]:
         payload: dict[str, object] = {
-            "schema_version": 3 if self._legacy_sources is None else 4,
+            "schema_version": 5 if self._legacy_sources is None else 6,
+            "cycle_freeze_only": self._cycle_freeze_only,
             "kind": "maker", "source_instrument_id": self.source_instrument_id,
             "hedge_instrument_id": self.hedge_instrument_id,
             "allocations": [item.payload() for item in self._allocations],
@@ -259,15 +281,21 @@ class MakerStateStore:
 
     def _load(self) -> dict[SourceDirection, StoreState]:
         raw = json.loads(self.path.read_text(encoding="utf-8"))
+        version = raw.get("schema_version") if isinstance(raw, dict) else None
         fields = {
             "schema_version", "kind", "source_instrument_id", "hedge_instrument_id", "directions",
             "allocations",
         }
-        if isinstance(raw, dict) and raw.get("schema_version") == 4:
+        if type(version) is int and version in {4, 6}:
             fields.add("legacy_checkpoint")
+        if type(version) is int and version in {5, 6}:
+            fields.add("cycle_freeze_only")
         if (not isinstance(raw, dict) or set(raw) != fields
-                or type(raw["schema_version"]) is not int or raw["schema_version"] not in {3, 4}):
+                or type(version) is not int or version not in {3, 4, 5, 6}):
             raise ValueError("unsupported Maker state schema; legacy state requires migration")
+        self._cycle_freeze_only = raw.get("cycle_freeze_only", False)
+        if type(self._cycle_freeze_only) is not bool:
+            raise ValueError("Maker cycle freeze provenance must be a boolean")
         if (
             raw["kind"] != "maker"
             or raw["source_instrument_id"] != self.source_instrument_id
@@ -281,7 +309,7 @@ class MakerStateStore:
                for state in directions.values()):
             raise ValueError("invalid Maker direction schema")
         try:
-            if raw["schema_version"] == 4:
+            if raw["schema_version"] in {4, 6}:
                 self._legacy_sources, self._legacy_orders = _read_checkpoint(
                     raw["legacy_checkpoint"],
                 )
@@ -294,6 +322,13 @@ class MakerStateStore:
             raise ValueError("invalid Maker direction state") from exc
 
     def _validate(self) -> None:
+        if type(self._cycle_freeze_only) is not bool:
+            raise ValueError("Maker cycle freeze provenance must be a boolean")
+        if self._cycle_freeze_only and (
+            not all(view.source_freeze_reason for view in self.stores.values())
+            or len({view.source_freeze_reason for view in self.stores.values()}) != 1
+        ):
+            raise ValueError("Maker cycle freeze provenance requires both matching freezes")
         source_ids: set[str] = set()
         fill_keys: set[str] = set()
         intent_ids: set[str] = set()
@@ -485,6 +520,12 @@ class _MakerDirectionStore(JsonStateStore):
         if self.has_seen_source_fill(fill_key) or not self.knows_source_order(client_order_id):
             return None
         previous = self._owner._snapshot()
+        if not self._owner._freeze_publication_failed and all(
+            view.halt_reason is None for view in self._owner.stores.values()
+        ) and (self._owner.cycle_freeze_only or all(
+            view.source_freeze_reason is None for view in self._owner.stores.values()
+        )):
+            self._owner._cycle_freeze_only = True
         self._owner._set_freezes(
             f"Maker fill {client_order_id}/{trade_id} "
             "requires authoritative two-sided reconciliation",
@@ -505,6 +546,9 @@ class _MakerDirectionStore(JsonStateStore):
             view.source_freeze_reason is not None for view in self._owner.stores.values()
         ):
             raise RuntimeError("Maker cycle evidence is incomplete")
+
+    def freeze_source_submissions(self, reason: str) -> None:
+        self._owner._freeze_external(reason, (self,))
 
 
 def _read_allocations(raw: object) -> list[_Allocation]:

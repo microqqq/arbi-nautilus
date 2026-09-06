@@ -553,6 +553,14 @@ carry 是同 route 的唯一 signed residual；下一 fill 先与它合并再分
 - 独立预审补充：schema可构造“SUBMITTED却无current CID”，`recover_for_start`会把它和合法PENDING无CID一起改成相同UNKNOWN快照，不能在事后靠absence区分。capture须在该覆盖前拒绝SUBMITTING/SUBMITTED/ACCEPTED缺current CID，以及PENDING却带current CID的矛盾入口；只否定资格、不修写原状态。此为入口形状反例，不声称正常bind-before-submit会产生它。rounding residual为0不同于总net_unhedged为0，后者在合法剩余义务恢复时本来非零。
 - 写集仅实施agent的`restart_recovery.py`、`tests/test_startup_settlement.py`，主agent的本文及`tests/test_startup_recovery.py`。主agent用真实普通双adapter先SELL2→hedgeBUY2，再BUY4的close2/open2计划，在未计划、计划后未绑定、腿间和已成交回调滞后处注入暂停，恢复新节点只发剩余腿；原生/业务历史不重放，新source先被挡住，完成后新机会正常。另保留旧暂停、已绑定未决、原子发布失败和零重复反例；这仍是合成venue新节点组合，不冒充进程突崩或DEMO认证。先固定旧路径RED再改生产，全量包含新的专用临时Redis，独立复核通过后仅本地提交，W6父项/R01–R06仍未完成。
 
+**W6b9 Maker成交周期暂停的最小来源与已全成交恢复（2026-09-06，实施前固定）：** 基线`86b339a`。只在现有Maker owner文件补足丢失的暂停来源，不建暂停账、恢复Actor或新调度器；Maker未绑定剩余腿仍不放行。
+
+- 两个独立只读探针均确认：原子reserve已写双侧成交freeze后，后续成本失效/休市走first-wins而零发布，正常与外因暂停的payload完全相同；旧文案、成交齐全或seen集合均不能还原外因是否发生。新schema 5/6分别承接3/4，在原owner增加严格布尔`cycle_freeze_only`；旧3/4可读但默认false，迁移checkpoint不推断资格，正常后续写才升级。只允许真实reserve在此前无暂停/无halt或既有cycle-only周期内赋予来源，外因在前/后、同文案及direction view入口都不能变回cycle-only。
+- 来源与双view、allocation、fill/intent进入同一snapshot/rollback/原子发布。公共freeze即使首文案不变，仍须持久撤销来源；正常fill成功后的冗余公共freeze去除，失败fallback仍为外因。健康行情下已有义务阻挡只保持暂停并撤源单，不伪装成新外因；真实stale/cost/session仍撤销。启动门继续禁止派单/撤单/提前release，但不得吞掉捕获后的真实外因失效。现有健康行情下live临时暂停释放语义不扩大为永久停机。
+- 仅新来源为真、双侧相同非空freeze、无旧halt、无UNKNOWN/BLOCKED/REJECTED及原入口形状合格时，启动receipt可认领这份已持久的周期暂停；随后仍必须经过全部native/CID/venue逐单逐笔、费用、当前仓位/逐票、投影与守恒校验。receipt检查来源仍有效；已有全完成finalizer单次原子清双方暂停和来源，保留原计划/IDs/成交/仓位，原策略再响应新机会。任何未完成/未绑定腿、旧格式freeze、真实外因或矛盾入口保持HOLD，不重发未知旧请求。
+- 外因撤销持久失败、或任何replace后目录同步失败，在当前实例必须阻止自动release及receipt使用，原普通全局source准入门也直接检查此失败闩锁，避免begin-source发布失败后对侧继续新开；replace前经济状态和旧磁盘回滚，replace后保留完整候选并废弃本次资格。本次finalizer的replace前失败仍按W6b6整包回滚、允许原receipt在重新核对后重试，不误当成外因撤销失败。未成功发布的外因无法从旧磁盘跨重启凭空辨别，本步不宣称关闭该突崩窗口；这仍需W6c进程/故障矩阵而非另一份暂停账。旧文件加载不重写，格式错误/缺字段/非布尔及marker与双freeze矛盾拒绝，不能靠手改状态取得现场授权。
+- 写集：实施agent负责`maker_store.py`、`strategies/maker.py`、`restart_recovery.py`及紧凑store/events/settlement回归，必要时只更新原migration测试的新输出版本预期；主agent负责本文及`tests/test_startup_recovery.py`普通两节点真实adapter滞后回调、旧格式/外因仍HOLD、发布前后失败、恢复零交易且继续新cycle，并同步README两处当前输出版本与`test_adapter_continuity.py`一处checkpoint版本断言，不改其历史/交易判据。主agent先固定普通旧路径RED，未实施reviewer独立复核，冻结全量含专用临时Redis。通过后仅本地提交，不推送、部署、连接账户或发单；W6父项、R01–R06与W7–W9仍未完成。
+
 恢复分类：
 
 - 已结束订单、对冲义务均完成，venue 仓位和本地记录吻合：恢复原策略运行，保留现有仓位。
@@ -771,6 +779,7 @@ EA 改动额外执行现有 `tools/mt5_source_manifest.sh --lines`、MetaEditor 
     - [x] W6b6：仅收尾本次receipt有资格、原绑定义务已全成交的业务滞后；冻结全量2628项含真实Redis及独立复核通过。旧Maker freeze/旧失败状态、待发腿仍HOLD；当时额外普通round-trip的Bitfinex归零索引红例由下项W6b7闭环，原失败记录保留。
     - [x] W6b7：兼容原生NETTING缺省副索引及显式FLAT报告；两策略同向加仓/归零/重开/再归零的新节点恢复后均可继续新机会，冻结全量2664项含真实Redis及独立复核通过。不补索引、不放宽MT5按票约束，不计作突崩或在线drain认证。
     - [x] W6b8：本次receipt合格的普通Taker只续做原义务中未绑定的剩余腿，保留完整旧成交/计划/IDs，未完期间新source仍受阻；冻结全量2697项含真实Redis及独立复核通过。旧HOLD、Maker旧freeze、已绑定未决/拒单和突崩矩阵不在本包放行。
+    - [x] W6b9：现有Maker owner增加单一持久cycle-only来源，仅新来源合格且全成交的周期暂停可由原启动核验收尾；外因/旧格式不猜测、未绑定腿仍HOLD，冻结全量2737项含真实Redis及独立复核通过。不认证未发布外因的跨重启窗口或突崩/在线drain。
   - [ ] W6c 执行通道在线时drain、进程重启/停止矩阵R01–R06。
 - [ ] W7 同节点共账户。
 - [ ] W8 入口/安装/文档/原生运行边界。
@@ -1119,3 +1128,11 @@ EA 改动额外执行现有 `tools/mt5_source_manifest.sh --lines`、MetaEditor 
 - 未实施reviewer独立十文件454 passed / 113.18s，无skip；原MT5送前目标/反向仓门另9 passed / 0.98s。仅在其测试进程换回旧finalizer，真实普通两节点腿间恢复精确RED，冻结实现GREEN；三个未来腿目标量变/消失/新反向票探针均被原coordinator阻挡、无新CID或重规划。这三个探针属于finalizer＋原生Position＋原coordinator层，不冒充完整两节点漂移认证。三份源码/测试SHA测前测后相同，结论为仅限W6b8的RECOMMEND-ACCEPT。
 - 主agent同一冻结上单次全量**2697 passed / 130既有Pandas警告 / 441.74s**，包括两项真实Redis跨进程测试且无skip；全仓Ruff、Mypy98文件及diff-check通过。三SHA全量前后不变，专用临时容器`863c9d594b20`按完整ID停止，`--rm`清除合成测试数据后列表复查为空；未动既有服务、镜像或账户。该结果不代替W6c的完整停止/信号/drain验证。
 - 主agent据全量与独立证据接受W6b8，仅将四个既定文件形成本地提交，不推送、部署或发单。Maker旧freeze/外因HOLD、已绑定未决和明确拒单恢复仍按既定后续分类处理；W6a/b/c父项、R01–R06与W7–W9保持未完成，不能据本包宣布突崩恢复或上线验收完成。
+
+2026-09-06，W6b9 Maker周期暂停来源与全成交恢复：冻结全量与独立复核通过，仅接受固定窄类别：
+
+- 基线`86b339a`。主agent先取得真实普通双adapter新节点的旧路径RED：native/venue已全成交，而业务仍BLOCKED而非COMPLETED。实施者另以owner/view×同/不同文案取得4个真实文件RED：外因发生后原文件字节完全不变，不是缺API/属性错误。生产只改原owner、Maker策略与恢复模块，净增66行；增加一个持久布尔来源及实例失败闩锁，复用原freeze、snapshot、receipt、finalizer与quote调度，不新增暂停账、Actor、adapter或EA协议。
+- 新schema 5/6分别承接3/4；旧文件读取不重写且旧freeze无资格，后续升级也不推断来源。真实fill和双侧freeze同次发布，外因owner/view入口即使同文案也撤销，迟到fill不能升级已撤销/旧暂停。正常fill成功冗余外因调用去除，健康义务等待只保持暂停并撤单；实际成本/休市失效在启动门内也能撤销但不派发/撤单。任何post-replace失败及外因撤销pre失败阻止当前实例release/receipt；后续发布仍携带false，正常finalizer pre失败则整包回滚后可按原核验重试。全局失败闩锁另有原生策略gate层RED→GREEN：不冒称普通live漏单，因为live account reader已有active CID/native order二次门。
+- 新增/扩参40项（实施者33、普通组合7），实施者定向435 passed / 3.13s，主agent预冻结两文件96 passed / 336.68s；子集不累计作全量。普通11参数保留真实健康quote在hedge pending时的cycle资格，正常恢复后保留旧native事件、计划/IDs、仓位且核验零交易，再由原策略完成新cycle；旧格式、同文本外因、成本/休市及capture后撤销继续阻挡，最后一种在入口拒绝且保留旧filled/seen，其他旧暂停仅作BLOCKED事实投影。整份owner reload与内存payload一致，双方marker/暂停原子清除或保留。
+- 未实施reviewer独立11文件**707 passed / 117.16s**，原legacy双格式HOLD另2 passed / 1.21s，无skip；Ruff、Mypy98及diff-check通过。其在同一普通Maker新节点仅换回旧capture，精确得到BLOCKED、filled2/2、启动仍受阻、零派发；冻结capture恢复后完成新cycle。owner/view×成功/pre/post撤销六探针，以及双方public reserve的原生Order＋两projector＋finalizer正常/pre/post对照均通过，allocation/native事件不改。初次独立探针将默认close订单配open plan被正确拒绝，修正fixture后通过，不计产品RED。九SHA测前测后相同，结论仅为W6b9的RECOMMEND-ACCEPT；reviewer未连接Redis或账户。
+- 主agent同一冻结上单次全量**2737 passed / 130既有Pandas警告 / 443.34s**，包括两项真实Redis跨进程测试且无skip；全仓Ruff、Mypy98文件及diff-check通过。九SHA全量前后不变，专用临时容器`b5f994710c34`按完整ID停止，`--rm`清除合成数据后列表为空；未动既有服务、镜像或账户。主agent接受W6b9并只将11个既定源/测试/文档文件形成本地提交，不推送、部署或交易。Maker未绑定剩余腿、明确拒单恢复、未发布外因的跨重启窗口及在线drain仍未完成；W6a/b/c父项、R01–R06与W7–W9保持未完成，下一步沿既定剩余义务和在线停止边界推进。

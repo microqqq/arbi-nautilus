@@ -6,6 +6,7 @@ No live account or EA is used; process durability has its separate Redis tests.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -42,6 +43,7 @@ from py000_nautilus.app import _source_instrument
 from py000_nautilus.bitfinex_v1_reports import map_position_status_reports
 from py000_nautilus.durability import ParentDirectorySyncError, replace_and_sync_parent
 from py000_nautilus.live_runtime import get_source_terminal_reconciler
+from py000_nautilus.maker_store import MakerStateStore
 from py000_nautilus.models import HedgeIntent, ObligationStatus
 from py000_nautilus.mt5_v1_protocol import JsonObject
 from py000_nautilus.restart_recovery import _positions, reconcile_startup
@@ -496,7 +498,13 @@ def test_new_ordinary_node_only_resumes_complete_settled_history(
 
 @pytest.mark.parametrize("maker,fault", [
     (False, None), (True, None), (False, "before-publish"), (False, "after-publish"),
-], ids=["taker-resumes", "maker-old-freeze-held", "retry-before-publish", "hold-after-publish"])
+    (True, "old-format"), (True, "same-text-external"), (True, "invalid-cost"),
+    (True, "closed-session"), (True, "after-capture"),
+    (True, "before-publish"), (True, "after-publish"),
+], ids=["taker-resumes", "maker-cycle-resumes", "retry-before-publish", "hold-after-publish",
+        "maker-old-format-held", "maker-same-text-external-held", "maker-cost-held",
+        "maker-session-held", "maker-capture-revoked", "maker-retry-before-publish",
+        "maker-hold-after-publish"])
 def test_new_node_settles_actual_hedge_fill_with_lagging_business_callback(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, maker: bool, fault: str | None,
 ) -> None:
@@ -510,6 +518,13 @@ def test_new_node_settles_actual_hedge_fill_with_lagging_business_callback(
 
             async def stop_business_delivery(payload: JsonObject) -> None:
                 await verify_serial(payload)
+                if maker:
+                    # A real healthy quote while the hedge is still pending
+                    # must not relabel normal cycle waiting as an external pause.
+                    rows_before = set(source.rows)
+                    await _market(first, wire, 0)
+                    assert first.strategy._state_store.cycle_freeze_only
+                    assert set(source.rows) == rows_before
                 # The venue still fills and Nautilus records its actual events;
                 # only the strategy's last business update is withheld.
                 first.strategy.bind_restart_gate(lambda: True)
@@ -530,9 +545,24 @@ def test_new_node_settles_actual_hedge_fill_with_lagging_business_callback(
             assert first.store.halt_reason is None
             old_freeze = first.store.source_freeze_reason
             assert bool(old_freeze) is maker
+            old_seen = first.store._state.seen_hedge_fills.copy()
             history = _History(first, source, wire)
             old_positions = {position.id: position.signed_decimal_qty()
                              for position in first.node.cache.positions_open()}
+            if fault == "old-format":
+                payload = json.loads(first.store.path.read_text())
+                payload["schema_version"] = 3
+                payload.pop("cycle_freeze_only", None)
+                first.store.path.write_text(json.dumps(payload))
+            elif fault == "same-text-external":
+                assert old_freeze is not None
+                first.strategy._state_store.freeze_sources(old_freeze)
+            elif fault == "invalid-cost":
+                first.strategy.update_cost_snapshot(
+                    first.strategy._carry, first.strategy._fx, 0,
+                )
+            elif fault == "closed-session":
+                first.strategy.update_hedge_session(False, first.strategy._session_ts_ns + 1)
 
         second = _OrdinaryStrategy(
             tmp_path, monkeypatch, maker=maker, two_sided=maker,
@@ -541,6 +571,12 @@ def test_new_node_settles_actual_hedge_fill_with_lagging_business_callback(
         owner = get_source_terminal_reconciler(second.node)
         assert owner.restart_pending
         source2, wire2 = history.restore(second)
+        if fault == "after-capture":
+            # The receipt was captured by the ordinary builder. A real later
+            # health invalidation must revoke it even while callbacks are gated.
+            second.strategy.update_cost_snapshot(
+                second.strategy._carry, second.strategy._fx, 0,
+            )
         publications = 0
 
         def publish(candidate: Path, destination: Path) -> None:
@@ -559,7 +595,7 @@ def test_new_node_settles_actual_hedge_fill_with_lagging_business_callback(
                     raise OSError("synthetic failure before final publication")
             replace_and_sync_parent(candidate, destination)
 
-        if fault is not None:
+        if fault in {"before-publish", "after-publish"}:
             monkeypatch.setattr(store_module, "replace_and_sync_parent", publish)
         try:
             second.hedge.connect()
@@ -574,17 +610,23 @@ def test_new_node_settles_actual_hedge_fill_with_lagging_business_callback(
             assert current.intent_id == old_intent.intent_id
             assert current.hedge_order_ids == old_intent.hedge_order_ids
             assert current.hedge_plan == old_intent.hedge_plan
-            assert current.hedge_filled_ounces == current.hedge_quantity_ounces
+            assert current.hedge_filled_ounces == (
+                old_intent.hedge_filled_ounces if fault == "after-capture"
+                else current.hedge_quantity_ounces
+            )
             assert {order.client_order_id: tuple(event.id for event in order.events)
                     for order in second.node.cache.orders()} == {
                 events[0].client_order_id: tuple(event.id for event in events)
                 for events, _, _ in history.orders
             }
-            assert second.store._state.seen_hedge_fills == {
+            expected_seen = {
                 f"{order.client_order_id.value}|{event.trade_id.value}"
                 for order in second.node.cache.orders(instrument_id=second.hedge_instrument.id)
                 for event in order.events if isinstance(event, OrderFilled)
             }
+            assert second.store._state.seen_hedge_fills == (
+                old_seen if fault == "after-capture" else expected_seen
+            )
             assert {position.id: position.signed_decimal_qty()
                     for position in second.node.cache.positions_open()} == old_positions
             assert not wire2.submit_calls and not wire2.close_calls
@@ -592,8 +634,19 @@ def test_new_node_settles_actual_hedge_fill_with_lagging_business_callback(
             assert set(source2.rows) == set(history.source_facts[0])
             assert second.reload_stores()[0].intents() == second.store.intents()
             if maker:
+                reloaded_owner = MakerStateStore(
+                    second.strategy._config.store_path_prefix,
+                    str(second.source_instrument.id), str(second.hedge_instrument.id),
+                )
+                assert reloaded_owner._to_payload() == second.strategy._state_store._to_payload()
+                assert not reloaded_owner.cycle_freeze_only
+            if fault in {"old-format", "same-text-external", "invalid-cost",
+                         "closed-session", "after-capture"}:
                 assert owner.restart_pending and owner.last_failure is not None
-                assert current.status is ObligationStatus.BLOCKED
+                assert current.status is (
+                    ObligationStatus.UNKNOWN if fault == "after-capture"
+                    else ObligationStatus.BLOCKED
+                )
                 assert current.hedge_leg_index == old_intent.hedge_leg_index
                 assert second.store.source_freeze_reason == old_freeze
                 return
@@ -602,6 +655,10 @@ def test_new_node_settles_actual_hedge_fill_with_lagging_business_callback(
             assert current.hedge_client_order_id is None
             assert current.hedge_leg_filled_ounces == 0
             assert second.store.halt_reason is None and second.store.source_freeze_reason is None
+            if maker:
+                assert not second.strategy._state_store.cycle_freeze_only
+                assert all(view.source_freeze_reason is None
+                           for view in second.strategy._state_store.stores.values())
             if fault == "after-publish":
                 # The Actor's existing second attempt must not certify the
                 # published-looking business file after its durability failure.

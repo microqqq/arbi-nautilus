@@ -325,8 +325,12 @@ class MakerStrategy(Strategy):
                 self._quote_carry = quote_carry
         if inputs_fresh:
             self._try_release_cycle()
-        if self._global_obligation_block() or not inputs_fresh:
+        if not inputs_fresh:
             self._freeze_and_cancel_all("stale, closed, or unresolved")
+            return
+        if self._global_obligation_block():
+            self._source_hold = True
+            self._cancel_all_best_effort("unresolved Maker obligations")
             return
         # A healthy active-list read pauses quoting, not protection of working
         # orders. Real health failures and obligations have already run above.
@@ -543,7 +547,6 @@ class MakerStrategy(Strategy):
                 self._freeze_all_best_effort(freeze_reason)
                 self._cancel_all_best_effort("source fill WAL failed")
                 raise
-            self._freeze_all_best_effort(freeze_reason)
             try:
                 if intent is not None:
                     self._submit_next_pending_hedge()
@@ -1364,13 +1367,14 @@ class MakerStrategy(Strategy):
         )
 
     def _global_obligation_block(self) -> bool:
-        return self._source_hold or not self._state_store.source_balance_is_admissible() or any(
+        return (self._source_hold or self._state_store._freeze_publication_failed
+                or not self._state_store.source_balance_is_admissible() or any(
             store.halt_reason is not None
             or store.source_freeze_reason is not None
             or store.has_unresolved_hedges()
             or not store._source_balance_is_admissible()
             for store in self._stores.values()
-        )
+        ))
 
     def _request_source_terminal_query(
         self,
@@ -1460,10 +1464,10 @@ class MakerStrategy(Strategy):
         return True
 
     def _freeze_and_cancel_all(self, reason: str) -> None:
-        if _restart_blocked(self):
-            return
         self._source_hold = True
         self._freeze_all_best_effort(reason)
+        if _restart_blocked(self):
+            return  # External pauses remain durable; startup still forbids cancellation.
         self._cancel_all_best_effort(reason)
 
     def _freeze_all_best_effort(self, reason: str) -> None:

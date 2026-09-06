@@ -67,6 +67,39 @@ def _migrate(source: Path, destination: Path, *, stopped: bool = True) -> MakerS
     return migrate_maker_state(source, destination, SOURCE, HEDGE, stopped=stopped)
 
 
+@pytest.mark.parametrize("version", [4, 6])
+def test_checkpoint_origin_is_not_adopted_by_loading_or_later_fill(
+    tmp_path: Path, version: int,
+) -> None:
+    prefix, output = tmp_path / "legacy", tmp_path / "output"
+    _legacy(prefix)
+    owner = _migrate(prefix, output)
+    raw = owner._to_payload()
+    raw["schema_version"] = version
+    if version == 4:
+        raw.pop("cycle_freeze_only")
+    owner.path.write_text(json.dumps(raw))
+    before = owner.path.read_bytes()
+    loaded = MakerStateStore(output, SOURCE, HEDGE)
+    assert not loaded.cycle_freeze_only and loaded.path.read_bytes() == before
+    _fill(loaded.stores[LONG], "OLD", BUY, "0.5", "LATE")
+    updated = json.loads(loaded.path.read_text())
+    assert updated["schema_version"] == 6 and updated["cycle_freeze_only"] is False
+    assert updated["legacy_checkpoint"] == raw["legacy_checkpoint"]
+
+
+@pytest.mark.parametrize("marker", [1, "false", None])
+def test_checkpoint_v6_also_requires_a_strict_boolean(tmp_path: Path, marker: object) -> None:
+    prefix, output = tmp_path / "legacy", tmp_path / "invalid"
+    _legacy(prefix)
+    owner = _migrate(prefix, output)
+    raw = owner._to_payload()
+    raw["cycle_freeze_only"] = marker
+    owner.path.write_text(json.dumps(raw))
+    with pytest.raises(ValueError, match="boolean"):
+        MakerStateStore(output, SOURCE, HEDGE)
+
+
 @pytest.mark.parametrize("kind", ["v1", "v2"])
 def test_migrate_explicit_checkpoint_without_fabricating_unknown_fill_sizes(
     tmp_path: Path, kind: str,
@@ -79,7 +112,8 @@ def test_migrate_explicit_checkpoint_without_fabricating_unknown_fill_sizes(
         MakerStateStore(prefix, SOURCE, HEDGE)
     owner = _migrate(prefix, tmp_path / "new")
     payload = json.loads(owner.path.read_text())
-    assert payload["schema_version"] == 4 and payload["allocations"] == []
+    assert payload["schema_version"] == 6 and payload["allocations"] == []
+    assert payload["cycle_freeze_only"] is False
     checkpoint = payload["legacy_checkpoint"]
     assert checkpoint["projection"] == "bid_then_ask"
     assert checkpoint["sources"] == [
@@ -108,6 +142,7 @@ def test_migrate_explicit_checkpoint_without_fabricating_unknown_fill_sizes(
     updated = json.loads(owner.path.read_text())
     assert updated["legacy_checkpoint"] == checkpoint and len(updated["allocations"]) == 1
     assert reloaded.stores[LONG].intents() == owner.stores[LONG].intents()
+    assert not reloaded.cycle_freeze_only  # A late fill cannot adopt the old checkpoint pause.
     assert not reloaded.has_residuals()
 
 

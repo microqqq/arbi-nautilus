@@ -390,7 +390,7 @@ def test_both_adapters_maker_hold_legacy_checkpoint_without_native_history(
                 assert store.source_freeze_reason == "legacy matched source fills"
                 assert restored._state == store._state
             payload = json.loads(h.store.path.read_text())
-            assert payload["schema_version"] == 4
+            assert payload["schema_version"] == 6
             assert payload["legacy_checkpoint"] == checkpoint
             assert not payload["allocations"]
             assert migrated.path.read_bytes() == migrated_bytes

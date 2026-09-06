@@ -48,6 +48,7 @@ class _StartupReceipt:
     halts: dict[JsonStateStore, str] = field(default_factory=dict)
     freezes: dict[JsonStateStore, str] = field(default_factory=dict)
     publication_failed: bool = False
+    maker_cycle_freeze: bool = False
 
     def fail_publication(self) -> None:
         self.publication_failed = True
@@ -61,6 +62,11 @@ class _StartupReceipt:
             raise ValueError("startup receipt belongs to another business store")
         if self.publication_failed:
             raise RuntimeError("startup receipt invalid after publication sync failure")
+        if isinstance(store, MakerStateStore):
+            if store._freeze_publication_failed:
+                raise RuntimeError("startup receipt invalid after Maker freeze publication failure")
+            if self.eligible and store.cycle_freeze_only != self.maker_cycle_freeze:
+                raise ValueError("Maker cycle freeze is no longer owned by this startup receipt")
         if self.eligible and any(
             view.halt_reason != self.halts.get(view)
             or view.source_freeze_reason != self.freezes.get(view)
@@ -85,8 +91,13 @@ def capture_startup_receipt(store: JsonStateStore | MakerStateStore) -> _Startup
     forbidden = {"UNKNOWN", "BLOCKED", "REJECTED"}
     bound_statuses = {ObligationStatus.SUBMITTING, ObligationStatus.SUBMITTED,
                       ObligationStatus.ACCEPTED}
+    cycle_freeze = (
+        isinstance(store, MakerStateStore) and store.cycle_freeze_only
+        and all(view.source_freeze_reason for view in _views(store))
+        and len({view.source_freeze_reason for view in _views(store)}) == 1
+    )
     receipt = _StartupReceipt(store, all(
-        view.halt_reason is None and view.source_freeze_reason is None
+        view.halt_reason is None and (view.source_freeze_reason is None or cycle_freeze)
         and all(record.status not in forbidden for record in view.source_orders())
         and all(
             intent.status.value not in forbidden
@@ -96,7 +107,12 @@ def capture_startup_receipt(store: JsonStateStore | MakerStateStore) -> _Startup
             for intent in view.intents()
         )
         for view in _views(store)
-    ))
+    ) and not (isinstance(store, MakerStateStore) and (
+        store._freeze_publication_failed or (store.cycle_freeze_only and not cycle_freeze)
+    )),
+        maker_cycle_freeze=cycle_freeze)
+    if receipt.eligible and cycle_freeze:
+        receipt.freezes = {view: cast(str, view.source_freeze_reason) for view in _views(store)}
     for view in _views(store):
         view._restart_halt_recorder = partial(receipt.record_halt, view)
         view._restart_failure_recorder = receipt.fail_publication
@@ -279,6 +295,7 @@ def _settle_completed(
             view._state.halt_reason = None
             view._state.source_freeze_reason = None
         if isinstance(store, MakerStateStore):
+            store._cycle_freeze_only = False
             store._validate()
         pending = any(intent.status is ObligationStatus.PENDING for intent in candidates.values())
         if ((pending and any(view.rounding_residual_ounces != 0 for view in views))
@@ -298,6 +315,7 @@ def _settle_completed(
         raise
     receipt.halts.clear()
     receipt.freezes.clear()
+    receipt.maker_cycle_freeze = False
 
 
 async def reconcile_startup(

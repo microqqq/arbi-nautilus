@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import os
 import threading
 from collections.abc import Callable
 from copy import deepcopy
@@ -57,7 +58,7 @@ from py000_nautilus.app import (
     _strategy_config,
 )
 from py000_nautilus.config import CarryConfig, FxConfig, MakerStrategyConfig
-from py000_nautilus.durability import replace_and_sync_parent
+from py000_nautilus.durability import ParentDirectorySyncError, replace_and_sync_parent
 from py000_nautilus.hedge import HedgeCoordinator
 from py000_nautilus.maker_store import MakerStateStore
 from py000_nautilus.models import (
@@ -152,7 +153,7 @@ def test_maker_releases_both_freezes_in_one_write(
 
 
 @pytest.mark.parametrize("frozen", [False, True])
-def test_restart_gate_prevents_maker_early_release_freeze_cancel_and_stop(
+def test_restart_gate_records_external_freeze_but_prevents_release_cancel_and_stop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, frozen: bool,
 ) -> None:
     strategy = MakerStrategy(_maker_strategy_config(tmp_path / "startup-gate"))
@@ -161,7 +162,7 @@ def test_restart_gate_prevents_maker_early_release_freeze_cancel_and_stop(
     strategy.bind_restart_gate(lambda: True)
     canceled: list[object] = []
     monkeypatch.setattr(strategy, "cancel_order", lambda *args, **kwargs: canceled.append(args))
-    before = deepcopy(strategy._state_store._snapshot())
+    before = deepcopy(strategy._state_store._to_payload())
     with _event_engine(cast(Any, strategy)) as engine:
         engine.trader.start()  # on_start must not release the old Maker freeze.
         assert not strategy._try_release_cycle()
@@ -170,9 +171,49 @@ def test_restart_gate_prevents_maker_early_release_freeze_cancel_and_stop(
         strategy.update_hedge_session(False, strategy._session_ts_ns + 1)
         strategy._evaluate_quotes()
         strategy.stop()
-        assert strategy._state_store._snapshot() == before
-        assert not strategy._source_hold and not canceled
+        after = strategy._state_store._to_payload()
+        assert after["allocations"] == before["allocations"]
+        expected = "original external HOLD" if frozen else "new stale observation"
+        assert all(view.source_freeze_reason == expected for view in strategy._stores.values())
+        assert not strategy._state_store.cycle_freeze_only
+        assert strategy._source_hold and not canceled
         assert strategy._source_terminal_stopped
+
+
+def test_post_replace_failure_blocks_the_sibling_source_even_without_pause_text(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    strategy = RecordingMakerStrategy(tmp_path / "publication-gate")
+    refreshed: list[SourceDirection] = []
+    monkeypatch.setattr(strategy, "_inputs_are_fresh", lambda *_: True)
+    monkeypatch.setattr(strategy, "_carry_for_hedge_tick", lambda *_: CarryConfig())
+    monkeypatch.setattr(strategy, "_refresh_direction",
+                        lambda direction, *_: refreshed.append(direction))
+    with _event_engine(cast(Any, strategy)) as engine:
+        engine.trader.start()
+        for instrument in (_source_instrument(), _hedge_instrument()):
+            engine.cache.add_quote_tick(_quote(instrument, "2399", "2401", "5", 100))
+        strategy._evaluate_quotes()
+        assert refreshed == [SourceDirection.LONG, SourceDirection.SHORT]
+        refreshed.clear()
+
+        def fail(source: Path, destination: Path) -> None:
+            os.replace(source, destination)
+            raise ParentDirectorySyncError("begin source published without directory sync")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(state_module, "replace_and_sync_parent", fail)
+            with pytest.raises(ParentDirectorySyncError):
+                strategy._stores[SourceDirection.LONG].begin_source(
+                    "BID", BusinessOrderSide.BUY, D(1),
+                )
+        assert not strategy._source_hold
+        assert all(view.halt_reason is None and view.source_freeze_reason is None
+                   for view in strategy._stores.values())
+        assert strategy._stores[SourceDirection.SHORT].can_submit_source()
+        strategy._evaluate_quotes()
+        assert not refreshed and strategy._global_obligation_block()
+        assert not engine.cache.orders() and not strategy.recorded
 
 
 class _InstrumentLifecycleMaker(MakerStrategy):
@@ -1485,7 +1526,7 @@ def test_native_partial_modify_rejection_without_exact_protection_keeps_hold(
         rejection = (_cancel_rejected if fault == "cancel_event" else _modify_rejected)(
             order, **overrides,
         )
-        invalid_state = fault in {"unseen_fill", "filled", "route"}
+        invalid_state = fault in {"unseen_fill", "filled", "route", "no_freeze"}
         if invalid_state:
             # Private corruption conflicts with the actual allocation history.
             # The proof and the atomic owner must both reject it, retaining the
@@ -2192,6 +2233,7 @@ def test_maker_fresh_hedge_quote_retries_pending_leg_exactly_once(
     market_calls: list[dict[str, object]] = []
     submissions: list[PositionId | None] = []
     frozen: list[str] = []
+    canceled: list[str] = []
 
     def quote_tick(instrument_id: object) -> Any:
         if instrument_id == config.hedge_instrument_id:
@@ -2226,6 +2268,7 @@ def test_maker_fresh_hedge_quote_retries_pending_leg_exactly_once(
         _inputs_are_fresh=lambda _source, _hedge, _now_ns: True,
         _global_obligation_block=lambda: True,
         _freeze_and_cancel_all=lambda reason: frozen.append(reason),
+        _cancel_all_best_effort=lambda reason: canceled.append(reason),
         _refresh_direction=lambda *_args: (_ for _ in ()).throw(
             AssertionError("source quote maintenance must stay blocked")
         ),
@@ -2281,7 +2324,8 @@ def test_maker_fresh_hedge_quote_retries_pending_leg_exactly_once(
     assert submitted.status is ObligationStatus.SUBMITTING
     assert submitted.hedge_client_order_id == "H-WAKE-2"
     if not source_missing:
-        assert frozen == ["stale, closed, or unresolved"] * 2
+        assert canceled == ["unresolved Maker obligations"] * 2
+    assert not frozen and owner.cycle_freeze_only
 
 
 def _seed_filled_two_sided_cycle(
@@ -3476,8 +3520,12 @@ class _QuoteGateHarness:
         return CarryConfig()
 
     def _cancel_working(self, direction: SourceDirection, *, reason: str) -> None:
-        assert reason == "stale, closed, or unresolved"
+        assert reason in {"stale, closed, or unresolved", "unresolved Maker obligations"}
         self.canceled.append(direction)
+
+    def _cancel_all_best_effort(self, reason: str) -> None:
+        for direction in (SourceDirection.LONG, SourceDirection.SHORT):
+            self._cancel_working(direction, reason=reason)
 
     def _freeze_and_cancel_all(self, reason: str) -> None:
         for direction in (SourceDirection.LONG, SourceDirection.SHORT):
@@ -3568,7 +3616,7 @@ def test_stale_market_gate_cancels_both_sides_without_quote_maintenance(
     assert harness.canceled == [SourceDirection.LONG, SourceDirection.SHORT]
 
 
-def test_fill_and_both_freezes_are_durable_before_later_freeze_write_failure(
+def test_atomic_fill_does_not_call_the_external_freeze_entrypoint(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3600,7 +3648,7 @@ def test_fill_and_both_freezes_are_durable_before_later_freeze_write_failure(
     strategy.on_order_filled(full)  # duplicate identity remains idempotent
 
     persisted = _reload_maker_store(strategy)
-    assert len(failures) == 1
+    assert not failures and strategy._state_store.cycle_freeze_only
     assert len(persisted.intents()) == 1
     assert persisted.net_unhedged_ounces == D(1)
     assert all(_reload_maker_store(strategy, direction).source_freeze_reason is not None
