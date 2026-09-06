@@ -43,7 +43,11 @@ from py000_nautilus.mt5_v1_execution import (
     Mt5V1LiveExecClientFactory,
     mt5_v1_execution_account_id,
 )
-from py000_nautilus.restart_recovery import has_business_history, reconcile_startup
+from py000_nautilus.restart_recovery import (
+    capture_startup_receipt,
+    has_business_history,
+    reconcile_startup,
+)
 from py000_nautilus.strategies.maker import (
     MakerStrategy,
     SourceTerminalQuery,
@@ -188,6 +192,8 @@ def build_live_maker_node(
             or bitfinex_exec._cid_store.bindings
             or has_business_history(strategy._state_store)
         ):
+            receipt = capture_startup_receipt(strategy._state_store)
+
             async def recover_startup() -> None:
                 await reconcile_startup(
                     node.cache, strategy._state_store,
@@ -195,6 +201,7 @@ def build_live_maker_node(
                     source=bitfinex_exec, hedge=mt5_exec,
                     source_instrument_id=strategy_config.source_instrument_id,
                     hedge_instrument_id=strategy_config.hedge_instrument_id,
+                    receipt=receipt,
                 )
 
             reconciler.bind_restart_recovery(recover_startup)

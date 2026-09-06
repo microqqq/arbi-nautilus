@@ -6,6 +6,7 @@ No live account or EA is used; process durability has its separate Redis tests.
 from __future__ import annotations
 
 import asyncio
+import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from copy import deepcopy
@@ -17,7 +18,7 @@ from typing import Any, cast
 import pytest
 from continuous_mt5_wire import ContinuousMt5Wire
 from nautilus_trader.execution.reports import ExecutionMassStatus
-from nautilus_trader.model.enums import OmsType, OrderSide
+from nautilus_trader.model.enums import OmsType, OrderSide, OrderStatus
 from nautilus_trader.model.events import OrderFilled
 from nautilus_trader.model.identifiers import ClientOrderId, VenueOrderId
 from nautilus_trader.model.orders.unpacker import OrderUnpacker
@@ -33,8 +34,11 @@ from test_adapter_continuity import (
 )
 from test_strategy_continuity import _OrdinaryStrategy, _pump
 
+from py000_nautilus import store as store_module
+from py000_nautilus.durability import ParentDirectorySyncError, replace_and_sync_parent
 from py000_nautilus.live_runtime import get_source_terminal_reconciler
 from py000_nautilus.models import ObligationStatus
+from py000_nautilus.mt5_v1_protocol import JsonObject
 from py000_nautilus.restart_recovery import reconcile_startup
 
 
@@ -62,6 +66,53 @@ async def _settled(
         yield h, source, wire
 
 
+class _History:
+    """Copy native events and synthetic venue facts, never business progress."""
+
+    def __init__(
+        self, h: _OrdinaryStrategy, source: _SourceWire, wire: ContinuousMt5Wire,
+    ) -> None:
+        cache = h.node.cache
+        self.orders = [(tuple(order.events), cache.client_id(order.client_order_id),
+                        cache.position_id(order.client_order_id)) for order in cache.orders()]
+        self.positions = [(position.instrument_id, tuple(position.events))
+                          for position in cache.positions()]
+        self.source_facts = deepcopy((source.rows, source.trades, source.net, source.average_price))
+        self.hedge_facts = deepcopy((
+            wire.identity, wire.current_snapshot, wire.journal, wire._serial,
+        ))
+
+    def restore(
+        self, second: _OrdinaryStrategy, fault: str | None = None,
+    ) -> tuple[_SourceWire, ContinuousMt5Wire]:
+        # Materialize a fresh native cache from native events/indices. This is
+        # explicitly not a Redis durability or new-process claim.
+        for events, client, position_id in ([] if fault == "missing-native" else self.orders):
+            order = OrderUnpacker.from_init(events[0])
+            for event in events[1:]:
+                order.apply(event)
+            second.node.cache.add_order(order, client_id=client, position_id=position_id)
+            second.node.cache.update_order(order)
+        for instrument_id, events in ([] if fault == "missing-native" else self.positions):
+            position = Position(second.node.cache.instrument(instrument_id), events[0])
+            for event in events[1:]:
+                position.apply(event)
+            second.node.cache.add_position(
+                position, OmsType.NETTING if instrument_id == second.source_instrument.id
+                else OmsType.HEDGING,
+            )
+        source = _SourceWire(second)
+        source.rows, source.trades, source.net, source.average_price = deepcopy(self.source_facts)
+        if fault == "missing-source":
+            source.rows.clear()
+        source.publish()
+        identity, snapshot, journal, serial = deepcopy(self.hedge_facts)
+        wire = ContinuousMt5Wire(identity, snapshot, now_ns=second.node.kernel.clock.timestamp_ns)
+        wire.journal, wire._serial = journal, serial
+        second.hedge._transport = wire
+        return source, wire
+
+
 @pytest.mark.parametrize("maker", [False, True], ids=["taker", "maker"])
 def test_settled_ordinary_history_passes_complete_startup_check(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, maker: bool,
@@ -80,14 +131,7 @@ def test_new_ordinary_node_only_resumes_complete_settled_history(
     async def scenario() -> None:
         async with _settled(tmp_path, monkeypatch, maker=maker) as (first, source, wire):
             cache = first.node.cache
-            orders = [(tuple(order.events), cache.client_id(order.client_order_id),
-                       cache.position_id(order.client_order_id)) for order in cache.orders()]
-            positions = [(position.instrument_id, tuple(position.events))
-                         for position in cache.positions()]
-            source_facts = deepcopy((source.rows, source.trades, source.net, source.average_price))
-            hedge_facts = deepcopy((
-                wire.identity, wire.current_snapshot, wire.journal, wire._serial,
-            ))
+            history = _History(first, source, wire)
             old_intents = deepcopy(first.store.intents())
             old_positions = {position.id: position.signed_decimal_qty()
                              for position in cache.positions_open()}
@@ -97,31 +141,7 @@ def test_new_ordinary_node_only_resumes_complete_settled_history(
         )
         owner = get_source_terminal_reconciler(second.node)
         assert owner.restart_pending  # The actual builder loaded existing business files.
-        # Materialize a fresh native cache from native events/indices. This is
-        # explicitly not a Redis durability or new-process claim.
-        for events, client, position_id in ([] if fault == "missing-native" else orders):
-            order = OrderUnpacker.from_init(events[0])
-            for event in events[1:]:
-                order.apply(event)
-            second.node.cache.add_order(order, client_id=client, position_id=position_id)
-            second.node.cache.update_order(order)
-        for instrument_id, events in ([] if fault == "missing-native" else positions):
-            position = Position(second.node.cache.instrument(instrument_id), events[0])
-            for event in events[1:]:
-                position.apply(event)
-            second.node.cache.add_position(
-                position, OmsType.NETTING if instrument_id == second.source_instrument.id
-                else OmsType.HEDGING,
-            )
-        source2 = _SourceWire(second)
-        source2.rows, source2.trades, source2.net, source2.average_price = deepcopy(source_facts)
-        if fault == "missing-source":
-            source2.rows.clear()
-        source2.publish()
-        identity, snapshot, journal, serial = hedge_facts
-        wire2 = ContinuousMt5Wire(identity, snapshot, now_ns=second.node.kernel.clock.timestamp_ns)
-        wire2.journal, wire2._serial = journal, serial
-        second.hedge._transport = wire2
+        source2, wire2 = history.restore(second, fault)
         if fault == "old-hold":
             second.store._state.halt_reason = "external operator hold"
             second.store._persist()
@@ -144,7 +164,7 @@ def test_new_ordinary_node_only_resumes_complete_settled_history(
                 assert not wire2.submit_calls and not wire2.close_calls
                 assert not second.source_cancel_commands
                 assert set(source2.rows) == (
-                    set() if fault == "missing-source" else set(source_facts[0])
+                    set() if fault == "missing-source" else set(history.source_facts[0])
                 )
                 return
             try:
@@ -159,11 +179,144 @@ def test_new_ordinary_node_only_resumes_complete_settled_history(
             assert not wire2.submit_calls and not wire2.close_calls
             assert not second.source_cancel_commands
             cid = await _accepted_source(second, source2, wire2, 2)
-            assert cid not in source_facts[0]
+            assert cid not in history.source_facts[0]
             source2.fill(cid, second.source_quantity)
             await _settle_cycle(second, source2, wire2, cid=cid, expected=2)
             assert not wire2.close_calls  # Same direction appends a ticket, never auto-flattens.
             assert len(wire2.submit_calls) == 1
+        finally:
+            await second.hedge._disconnect()
+            await second.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("maker,fault", [
+    (False, None), (True, None), (False, "before-publish"), (False, "after-publish"),
+], ids=["taker-resumes", "maker-old-freeze-held", "retry-before-publish", "hold-after-publish"])
+def test_new_node_settles_actual_hedge_fill_with_lagging_business_callback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, maker: bool, fault: str | None,
+) -> None:
+    async def scenario() -> None:
+        async with _continuous(
+            tmp_path, monkeypatch, maker=maker, long_quantity=2, short_quantity=2,
+        ) as (first, source, wire):
+            cid = await _accepted_source(first, source, wire, 2)
+            verify_serial = wire.before_mutation
+            assert verify_serial is not None
+
+            async def stop_business_delivery(payload: JsonObject) -> None:
+                await verify_serial(payload)
+                # The venue still fills and Nautilus records its actual events;
+                # only the strategy's last business update is withheld.
+                first.strategy.bind_restart_gate(lambda: True)
+
+            wire.before_mutation = stop_business_delivery
+            source.fill(cid, first.source_quantity)
+            await _drive(first, wire, lambda: bool(wire.submit_calls) and all(
+                order.status is OrderStatus.FILLED for order in first.node.cache.orders()
+            ), direction=0)
+            assert await first.node.kernel.exec_engine.reconcile_execution_state(timeout_secs=2)
+            first.source.confirm_terminal_reconciliation()
+            old_intent = first.store.intents()[0]
+            assert old_intent.status in (
+                ObligationStatus.SUBMITTING, ObligationStatus.SUBMITTED, ObligationStatus.ACCEPTED,
+            )
+            assert old_intent.hedge_filled_ounces == 0
+            assert old_intent.hedge_client_order_id == old_intent.hedge_order_ids[-1]
+            assert first.store.halt_reason is None
+            old_freeze = first.store.source_freeze_reason
+            assert bool(old_freeze) is maker
+            history = _History(first, source, wire)
+            old_positions = {position.id: position.signed_decimal_qty()
+                             for position in first.node.cache.positions_open()}
+
+        second = _OrdinaryStrategy(
+            tmp_path, monkeypatch, maker=maker, two_sided=maker,
+            native_mt5_transport=True, inject_mt5_io=False,
+        )
+        owner = get_source_terminal_reconciler(second.node)
+        assert owner.restart_pending
+        source2, wire2 = history.restore(second)
+        publications = 0
+
+        def publish(candidate: Path, destination: Path) -> None:
+            nonlocal publications
+            finalizing = (
+                destination == second.store.path and second.store.halt_reason is None
+                and all(intent.status is ObligationStatus.COMPLETED
+                        for intent in second.store.intents())
+            )
+            if finalizing:
+                publications += 1
+                if publications == 1:
+                    if fault == "after-publish":
+                        os.replace(candidate, destination)
+                        raise ParentDirectorySyncError("synthetic final publication sync failure")
+                    raise OSError("synthetic failure before final publication")
+            replace_and_sync_parent(candidate, destination)
+
+        if fault is not None:
+            monkeypatch.setattr(store_module, "replace_and_sync_parent", publish)
+        try:
+            second.hedge.connect()
+            async with asyncio.timeout(2):
+                while second.hedge._poll_task is None:
+                    await asyncio.sleep(.005)
+            await second.start(initial_reconciliation=True)
+            await _drive(second, wire2, lambda: not owner.busy and (
+                not owner.restart_pending or owner.last_failure is not None
+            ), direction=0)
+            current = second.store.intents()[0]
+            assert current.intent_id == old_intent.intent_id
+            assert current.hedge_order_ids == old_intent.hedge_order_ids
+            assert current.hedge_plan == old_intent.hedge_plan
+            assert current.hedge_filled_ounces == current.hedge_quantity_ounces
+            assert {order.client_order_id: tuple(event.id for event in order.events)
+                    for order in second.node.cache.orders()} == {
+                events[0].client_order_id: tuple(event.id for event in events)
+                for events, _, _ in history.orders
+            }
+            assert second.store._state.seen_hedge_fills == {
+                f"{order.client_order_id.value}|{event.trade_id.value}"
+                for order in second.node.cache.orders(instrument_id=second.hedge_instrument.id)
+                for event in order.events if isinstance(event, OrderFilled)
+            }
+            assert {position.id: position.signed_decimal_qty()
+                    for position in second.node.cache.positions_open()} == old_positions
+            assert not wire2.submit_calls and not wire2.close_calls
+            assert not second.source_cancel_commands
+            assert set(source2.rows) == set(history.source_facts[0])
+            assert second.reload_stores()[0].intents() == second.store.intents()
+            if maker:
+                assert owner.restart_pending and owner.last_failure is not None
+                assert current.status is ObligationStatus.BLOCKED
+                assert current.hedge_leg_index == old_intent.hedge_leg_index
+                assert second.store.source_freeze_reason == old_freeze
+                return
+            assert current.status is ObligationStatus.COMPLETED
+            assert current.hedge_leg_index == len(current.hedge_plan)
+            assert current.hedge_client_order_id is None
+            assert current.hedge_leg_filled_ounces == 0
+            assert second.store.halt_reason is None and second.store.source_freeze_reason is None
+            if fault == "after-publish":
+                # The Actor's existing second attempt must not certify the
+                # published-looking business file after its durability failure.
+                assert owner.restart_pending and owner.last_failure is not None
+                assert publications == 1
+                return
+            assert not get_source_terminal_reconciler(second.node).restart_pending, (
+                owner.last_failure
+            )
+            if fault == "before-publish":
+                assert publications == 2
+                monkeypatch.setattr(
+                    store_module, "replace_and_sync_parent", replace_and_sync_parent,
+                )
+            next_cid = await _accepted_source(second, source2, wire2, 2)
+            assert next_cid not in history.source_facts[0]
+            source2.fill(next_cid, second.source_quantity)
+            await _settle_cycle(second, source2, wire2, cid=next_cid, expected=2)
+            assert not wire2.close_calls and len(wire2.submit_calls) == 1
         finally:
             await second.hedge._disconnect()
             await second.close()

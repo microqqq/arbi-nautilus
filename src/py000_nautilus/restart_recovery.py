@@ -1,6 +1,7 @@
 """One startup check over native/venue facts and the existing business stores.
 
-This does not resume pending requests, normalize held legs, or clear old HOLDs.
+This does not resume pending requests or clear old HOLDs. A receipt captured
+before startup can authorize final settlement of already completed bound legs.
 Its caller owns the timeout and keeps strategy callbacks gated until it returns.
 """
 
@@ -8,17 +9,21 @@ from __future__ import annotations
 
 import asyncio
 from copy import deepcopy
+from dataclasses import dataclass, field, replace
 from decimal import Decimal
+from functools import partial
 from math import isclose
 from typing import cast
 
 from nautilus_trader.cache.cache import Cache
 from nautilus_trader.execution.reports import ExecutionMassStatus, PositionStatusReport
+from nautilus_trader.model.enums import OrderStatus
 from nautilus_trader.model.events import OrderFilled
 from nautilus_trader.model.identifiers import InstrumentId, StrategyId, TraderId
 from nautilus_trader.model.orders import Order
 
 from py000_nautilus.bitfinex_v1_execution import BitfinexV1ExecutionClient
+from py000_nautilus.durability import ParentDirectorySyncError
 from py000_nautilus.hedge_projection import project_hedge_fills
 from py000_nautilus.live_cache import validate_native_cache
 from py000_nautilus.maker_store import MakerStateStore
@@ -33,6 +38,60 @@ _HELD = "startup facts projected; business recovery remains held"
 
 def _views(store: JsonStateStore | MakerStateStore) -> tuple[JsonStateStore, ...]:
     return tuple(store.stores.values()) if isinstance(store, MakerStateStore) else (store,)
+
+
+@dataclass(slots=True)
+class _StartupReceipt:
+    store: JsonStateStore | MakerStateStore
+    eligible: bool
+    halts: dict[JsonStateStore, str] = field(default_factory=dict)
+    freezes: dict[JsonStateStore, str] = field(default_factory=dict)
+    publication_failed: bool = False
+
+    def fail_publication(self) -> None:
+        self.publication_failed = True
+
+    def record_halt(self, view: JsonStateStore, reason: str) -> None:
+        if self.eligible:
+            self.halts[view] = reason
+
+    def check(self, store: JsonStateStore | MakerStateStore) -> None:
+        if self.store is not store:
+            raise ValueError("startup receipt belongs to another business store")
+        if self.publication_failed:
+            raise RuntimeError("startup receipt invalid after publication sync failure")
+        if self.eligible and any(
+            view.halt_reason != self.halts.get(view)
+            or view.source_freeze_reason != self.freezes.get(view)
+            for view in _views(store)
+        ):
+            raise ValueError("startup pause is not owned by this startup receipt")
+
+    def claim_projected(self, before: tuple[tuple[str | None, str | None], ...]) -> None:
+        if not self.eligible:
+            return
+        for view, (halt, freeze) in zip(_views(self.store), before, strict=True):
+            if halt is None and view.halt_reason == _HELD:
+                self.halts[view] = _HELD
+            if freeze is None and view.source_freeze_reason == _HELD:
+                self.freezes[view] = _HELD
+
+
+def capture_startup_receipt(store: JsonStateStore | MakerStateStore) -> _StartupReceipt:
+    """Capture before on_start; old text/status never grants recovery permission."""
+    if type(store) is not JsonStateStore and not isinstance(store, MakerStateStore):
+        raise TypeError("startup receipt requires a whole Maker owner or JsonStateStore")
+    forbidden = {"UNKNOWN", "BLOCKED", "REJECTED"}
+    receipt = _StartupReceipt(store, all(
+        view.halt_reason is None and view.source_freeze_reason is None
+        and all(record.status not in forbidden for record in view.source_orders())
+        and all(intent.status.value not in forbidden for intent in view.intents())
+        for view in _views(store)
+    ))
+    for view in _views(store):
+        view._restart_halt_recorder = partial(receipt.record_halt, view)
+        view._restart_failure_recorder = receipt.fail_publication
+    return receipt
 
 
 def has_business_history(store: JsonStateStore | MakerStateStore) -> bool:
@@ -141,13 +200,81 @@ def _positions(cache: Cache, mass: ExecutionMassStatus, instrument_id: Instrumen
     return total
 
 
+def _settle_completed(
+    store: JsonStateStore | MakerStateStore, source_orders: list[Order],
+    hedge_orders: list[Order], receipt: _StartupReceipt,
+) -> None:
+    """Finalize only fully proven facts; the caller already checked both projectors."""
+    receipt.check(store)
+    if not receipt.eligible:
+        raise ValueError("startup receipt does not authorize business settlement")
+    views = _views(store)
+    sources = {order.client_order_id.value: order for order in source_orders}
+    hedges = {order.client_order_id.value: order for order in hedge_orders}
+    for view in views:
+        if any(not sources[record.client_order_id].is_closed
+               or record.filled_ounces != sources[record.client_order_id].filled_qty.as_decimal()
+               for record in view.source_orders()):
+            raise ValueError("startup source facts are not fully terminal")
+        for intent in view.intents():
+            ids = intent.hedge_order_ids or (
+                (intent.hedge_client_order_id,) if intent.hedge_client_order_id else ()
+            )
+            if (intent.hedge_filled_ounces != intent.hedge_quantity_ounces
+                    or len(ids) != (len(intent.hedge_plan) if intent.hedge_plan else 1)
+                    or any(hedges[cid].status != OrderStatus.FILLED for cid in ids)):
+                raise ValueError("startup hedge still has an incomplete or unbound leg")
+    previous = deepcopy(views[0]._state)
+    maker_previous = store._snapshot() if isinstance(store, MakerStateStore) else None
+    before = store._to_payload()
+    try:
+        for view in views:
+            view._state.source_orders = {
+                cid: replace(record, status=sources[cid].status.name)
+                for cid, record in view._state.source_orders.items()
+            }
+            view._state.active_source_order_id = None
+            view._state.hedge_intents = {
+                identity: (
+                    replace(intent, status=ObligationStatus.COMPLETED,
+                            hedge_client_order_id=None, hedge_leg_index=len(intent.hedge_plan),
+                            hedge_leg_filled_ounces=Decimal(0))
+                    if intent.hedge_plan else replace(intent, status=ObligationStatus.COMPLETED)
+                ) for identity, intent in view._state.hedge_intents.items()
+            }
+            view._state.halt_reason = None
+            view._state.source_freeze_reason = None
+        if isinstance(store, MakerStateStore):
+            store._validate()
+        if any(not view.can_submit_source() or not view.cycle_evidence_complete()
+               for view in views):
+            raise ValueError("startup settled candidate has inadmissible business residuals")
+        if store._to_payload() != before:
+            views[0]._persist()
+    except ParentDirectorySyncError:
+        receipt.fail_publication()
+        raise  # The finalized candidate is published, but this process must stay gated.
+    except Exception:
+        if isinstance(store, MakerStateStore) and maker_previous is not None:
+            store._restore(maker_previous)
+        else:
+            views[0]._state = previous
+        raise
+    receipt.halts.clear()
+    receipt.freezes.clear()
+
+
 async def reconcile_startup(
     cache: Cache, store: JsonStateStore | MakerStateStore, *,
     trader_id: TraderId, strategy_id: StrategyId,
     source: BitfinexV1ExecutionClient, hedge: Mt5V1ExecutionClient,
     source_instrument_id: InstrumentId, hedge_instrument_id: InstrumentId,
+    receipt: _StartupReceipt | None = None,
 ) -> None:
-    """Release only already-settled, fully covered history; project missing facts held."""
+    """Prove complete history; only a fresh eligible receipt can finalize held facts."""
+    if receipt is not None:
+        receipt.check(store)
+    business_before = store._to_payload()
     before = _observed(cache, source, hedge)
     async with asyncio.TaskGroup() as group:
         source_task = group.create_task(source.generate_mass_status(None))
@@ -155,6 +282,8 @@ async def reconcile_startup(
     source_mass, hedge_mass = source_task.result(), hedge_task.result()
     if before != _observed(cache, source, hedge):
         raise ValueError("startup execution facts changed during report collection")
+    if business_before != store._to_payload():
+        raise ValueError("startup business facts changed during report collection")
     if (source_mass is None or hedge_mass is None or not source.is_connected
             or not hedge.is_connected or source.execution_hold_reason is not None
             or not source.accounting_ready or not hedge.execution_admitted
@@ -199,15 +328,37 @@ async def reconcile_startup(
         if report.signed_decimal_qty
     }:
         raise ValueError("startup hedge reports differ from current tickets")
-    added_source = project_source_fills(
-        store, source_orders, source_instrument_id=source_instrument_id,
-        trader_id=trader_id, strategy_id=strategy_id, reason=_HELD,
-    )
-    added_hedge = project_hedge_fills(
-        store, hedge_orders, hedge_instrument_id=hedge_instrument_id,
-        trader_id=trader_id, strategy_id=strategy_id, reason=_HELD,
-    )
     views = _views(store)
+    try:
+        pauses = tuple((view.halt_reason, view.source_freeze_reason) for view in views)
+        added_source = project_source_fills(
+            store, source_orders, source_instrument_id=source_instrument_id,
+            trader_id=trader_id, strategy_id=strategy_id, reason=_HELD,
+        )
+        if receipt is not None:
+            receipt.claim_projected(pauses)
+        pauses = tuple((view.halt_reason, view.source_freeze_reason) for view in views)
+        added_hedge = project_hedge_fills(
+            store, hedge_orders, hedge_instrument_id=hedge_instrument_id,
+            trader_id=trader_id, strategy_id=strategy_id, reason=_HELD,
+        )
+        if receipt is not None:
+            receipt.claim_projected(pauses)
+    except ParentDirectorySyncError:
+        if receipt is not None:
+            receipt.fail_publication()
+        raise
+    source_filled = sum((record.filled_ounces * (
+        1 if record.side is BusinessOrderSide.BUY else -1
+    ) for view in views for record in view.source_orders()), Decimal(0))
+    hedge_filled = sum((intent.hedge_filled_ounces * (
+        1 if intent.hedge_side is BusinessOrderSide.BUY else -1
+    ) for view in views for intent in view.intents()), Decimal(0))
+    if source_position != source_filled or hedge_position != hedge_filled:
+        raise ValueError("startup positions differ from complete business fills")
+    if receipt is not None and receipt.eligible:
+        _settle_completed(store, source_orders, hedge_orders, receipt)
+        return
     native = {order.client_order_id.value: order for order in source_orders}
     if added_source or added_hedge or any(
         not view.can_submit_source() or not view.cycle_evidence_complete()
@@ -219,11 +370,3 @@ async def reconcile_startup(
         for view in views
     ):
         raise ValueError("startup business history remains held or unsettled")
-    source_filled = sum((record.filled_ounces * (
-        1 if record.side is BusinessOrderSide.BUY else -1
-    ) for view in views for record in view.source_orders()), Decimal(0))
-    hedge_filled = sum((intent.hedge_filled_ounces * (
-        1 if intent.hedge_side is BusinessOrderSide.BUY else -1
-    ) for view in views for intent in view.intents()), Decimal(0))
-    if source_position != source_filled or hedge_position != hedge_filled:
-        raise ValueError("startup positions differ from complete business fills")

@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import tempfile
+from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import asdict, dataclass, replace
 from decimal import Decimal
@@ -49,6 +50,9 @@ class StoreState:
 
 class JsonStateStore:
     """Atomically persist the small state needed to fail closed on restart."""
+
+    _restart_halt_recorder: Callable[[str], None] | None = None
+    _restart_failure_recorder: Callable[[], None] | None = None
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
@@ -171,9 +175,20 @@ class JsonStateStore:
                         status=ObligationStatus.UNKNOWN,
                     )
             details.append(f"hedges={','.join(intent.intent_id for intent in unresolved)}")
-        if self._state.halt_reason is None:
+        new_halt = self._state.halt_reason is None
+        if new_halt:
             self._state.halt_reason = "restart requires reconciliation: " + " ".join(details)
-        self._persist()
+        try:
+            self._persist()
+        except ParentDirectorySyncError:
+            failed = getattr(self, "_restart_failure_recorder", None)
+            if failed is not None:
+                failed()
+            raise
+        recorder = getattr(self, "_restart_halt_recorder", None)
+        if new_halt and recorder is not None:
+            assert self._state.halt_reason is not None
+            recorder(self._state.halt_reason)
         return self._state.halt_reason
 
     def begin_source(
