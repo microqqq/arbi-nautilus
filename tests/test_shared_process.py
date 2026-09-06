@@ -13,11 +13,15 @@ import os
 import signal
 import subprocess
 import time
+from copy import deepcopy
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
 import pytest
+from nautilus_trader.core.uuid import UUID4
+from nautilus_trader.data.messages import SubscribeInstrument
+from nautilus_trader.model.identifiers import ClientId, Venue
 from test_restart_process import (
     _command,
     _environment,
@@ -28,12 +32,14 @@ from test_restart_process import (
 )
 from test_restart_process import restart_redis as _restart_redis
 from test_shared_strategy import _Joint
+from test_strategy_continuity import _pump
 
 from py000_nautilus import maker_store
 from py000_nautilus.durability import ParentDirectorySyncError
 from py000_nautilus.live_lifecycle import _snapshot
 from py000_nautilus.live_runtime import get_source_terminal_reconciler
 from py000_nautilus.models import BusinessOrderSide
+from py000_nautilus.mt5_v1_data import instrument_from_snapshot
 from py000_nautilus.store import _persist_payload
 
 restart_redis = _restart_redis
@@ -55,6 +61,142 @@ def _settled(observation: Any, count: int, expected_net: int) -> None:
         assert sum((Decimal(row["quantity"]) for row in positions
                     if row["instrument"].endswith(f".{venue}")), Decimal(0)) == net
     assert Decimal(observation["source_net"]) == expected_net
+
+
+def _assert_settled_stop_facts(final: Any, stopped: Any, expected_net: int) -> None:
+    """Permit only a completed-cycle Maker quote canceled across the SIGTERM gap."""
+    _settled(stopped, 4, expected_net)
+    assert stopped["native"]["positions"] == final["native"]["positions"]
+    old_orders, orders = final["native"]["orders"], stopped["native"]["orders"]
+    for cid, order in old_orders.items():
+        assert orders[cid] == order  # Every old UUID, fill, owner and index is unchanged.
+    for key in ("hedge_request_ids", "close_request_ids"):
+        assert stopped[key] == final[key]
+    intents = {intent["intent_id"]: intent for intent in _intents(final)}
+    assert len(intents) == 4
+    assert {intent["intent_id"]: intent for intent in _intents(stopped)} == intents
+    assert stopped["business"]["allocations"] == final["business"]["allocations"]
+    added = orders.keys() - old_orders.keys()
+    for cid in added:
+        order = orders[cid]
+        assert order["owner"] == final["strategy_ids"][0]
+        assert order["instrument"].endswith(".BITFINEX") and order["client"] == "BITFINEX"
+        assert order["status"] == "CANCELED" and Decimal(order["filled"]) == 0
+        assert order["fills"] == order["trades"] == []
+    before, after = final["source_request_ids"], stopped["source_request_ids"]
+    assert after[:len(before)] == before
+    appended = after[len(before):]
+    assert len(appended) == len(set(appended)) == len(added)
+    for cid in appended:
+        assert stopped["source_attempt_states"][str(cid)] == {
+            intent_id: "COMPLETED" for intent_id in intents
+        }
+
+
+@pytest.mark.parametrize("change", [
+    "unchanged", "canceled", "old-order", "filled", "wrong-owner", "wrong-venue",
+    "pending-at-send", "position", "intent", "hedge-id", "close-id",
+])
+def test_settled_stop_fact_comparison_controls(change: str) -> None:
+    """Small observation controls, not native execution or process certification."""
+    intents = {f"I{i}": {"intent_id": f"I{i}", "status": "COMPLETED",
+                         "hedge_filled_ounces": "2", "hedge_quantity_ounces": "2"}
+               for i in range(4)}
+    final: dict[str, Any] = {
+        "restart_pending": False, "failure": None, "source_while_unresolved": [],
+        "strategy_ids": ["MakerStrategy-M", "TakerStrategy-T"], "source_net": "8",
+        "source_request_ids": [1, 2], "hedge_request_ids": ["H1", "H2"],
+        "close_request_ids": ["C1"], "source_attempt_states": {},
+        "business": {"directions": {
+            "bid": {"hedge_intents": {key: value for key, value in intents.items()
+                                      if key in {"I0", "I1"}}},
+            "ask": {"hedge_intents": {}},
+            "taker": {"hedge_intents": {key: value for key, value in intents.items()
+                                        if key in {"I2", "I3"}}},
+        }, "allocations": []},
+        "native": {"orders": {
+            "M": {"owner": "MakerStrategy-M", "status": "FILLED", "events": ["M-fill"]},
+            "T": {"owner": "TakerStrategy-T", "status": "FILLED", "events": ["T-fill"]},
+        }, "positions": {
+            "S": {"instrument": "XAUTUSDT-PERP.BITFINEX", "quantity": "8"},
+            "H": {"instrument": "XAUUSD.MT5", "quantity": "-8"},
+        }},
+    }
+    stopped = deepcopy(final)
+    if change != "unchanged":
+        stopped["native"]["orders"]["NEW"] = {
+            "owner": "MakerStrategy-M", "instrument": "XAUTUSDT-PERP.BITFINEX",
+            "client": "BITFINEX", "status": "CANCELED", "filled": "0",
+            "fills": [], "trades": [],
+        }
+        stopped["source_request_ids"].append(3)
+        stopped["source_attempt_states"]["3"] = {key: "COMPLETED" for key in intents}
+    if change == "old-order":
+        stopped["native"]["orders"]["M"]["events"].append("changed-old-UUID")
+    elif change == "filled":
+        stopped["native"]["orders"]["NEW"]["filled"] = "1"
+    elif change == "wrong-owner":
+        stopped["native"]["orders"]["NEW"]["owner"] = "TakerStrategy-T"
+    elif change == "wrong-venue":
+        stopped["native"]["orders"]["NEW"]["instrument"] = "XAUUSD.MT5"
+    elif change == "pending-at-send":
+        stopped["source_attempt_states"]["3"]["I0"] = "PENDING"
+    elif change == "position":
+        stopped["native"]["positions"]["S"]["events"] = ["new-position-event"]
+    elif change == "intent":
+        stopped["business"]["directions"]["bid"]["hedge_intents"]["I0"]["extra"] = True
+    elif change in {"hedge-id", "close-id"}:
+        stopped[change.split("-")[0] + "_request_ids"].append("new-request")
+    if change in {"unchanged", "canceled"}:
+        _assert_settled_stop_facts(final, stopped, 8)
+    else:
+        with pytest.raises(AssertionError):
+            _assert_settled_stop_facts(final, stopped, 8)
+
+
+def test_joint_instrument_subscription_replay_requires_original_client_refresh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Delivery-order control with a real node/data client, not process certification."""
+    async def scenario() -> None:
+        h = _Joint(tmp_path, monkeypatch)
+        try:
+            await h.start()
+            original = h.hedge_data._instrument
+            await asyncio.sleep(.005)  # Force distinct valid snapshot milliseconds.
+            sample = await h.wire.snapshot(h.wire.identity.binding())
+            now = h.node.kernel.clock.timestamp_ns()
+            newer = instrument_from_snapshot(sample, original.id, ts_init=now)
+            assert original.ts_event < newer.ts_event <= now
+            command = SubscribeInstrument(
+                instrument_id=original.id, client_id=ClientId("MT5"), venue=Venue("MT5"),
+                command_id=UUID4(), ts_init=now,
+            )
+            h.node.kernel.data_engine.process(newer)  # The old worker bypassed the client.
+            await h.hedge_data._subscribe_instrument(command)  # Replays the actual old reference.
+            await _pump()
+            assert h.hedge_data._instrument.ts_event == original.ts_event
+            for strategy in (h.maker, h.taker):
+                assert strategy._hedge_instrument is not None
+                assert strategy._hedge_instrument.ts_event == newer.ts_event
+                assert not strategy._hedge_instrument_valid  # Rejected the backward replay.
+            assert h.maker._source_hold
+
+            await asyncio.sleep(.005)
+            await h.hedge_data._refresh_snapshot(allow_rehandshake=False)
+            await h.hedge_data._subscribe_instrument(command)
+            await _pump()
+            assert h.hedge_data._instrument.ts_event > newer.ts_event
+            for strategy in (h.maker, h.taker):
+                assert strategy._hedge_instrument is not None
+                assert strategy._hedge_instrument_valid
+                assert strategy._hedge_instrument.ts_event == h.hedge_data._instrument.ts_event
+            assert not h.node.cache.orders() and not h.node.cache.positions()
+            assert not h.venue.rows and not h.wire.submit_calls and not h.wire.close_calls
+        finally:
+            await h.close()
+
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize("cut", ["settled", "between-legs", "joint-stop-fill"])
@@ -171,13 +313,14 @@ def test_both_ordinary_process_kill_then_native_load_and_joint_continuation(
             assert exit_code == 0 and result["outcome"] == "PAPER_STOPPED"
             stopped = json.loads((tmp_path / "recover-drain-returned.json").read_text())
             assert stopped["joint_drain"]["complete"] is True
-            assert stopped["native"] == final["native"]
+            _assert_settled_stop_facts(final, stopped, net)
             if cut == "joint-stop-fill":
+                assert stopped["native"] == final["native"]
                 assert final["maker_source_hold"] is True
                 assert stopped["maker_source_hold"] is True  # Stop does not release admission.
                 assert not stopped["pause_publication_failed"]
                 assert stopped["business"] == final["business"]
-            assert _probe("both", cut, port, tmp_path) == final["native"]
+            assert _probe("both", cut, port, tmp_path) == stopped["native"]
         finally:
             for process in processes:
                 if process.poll() is None:

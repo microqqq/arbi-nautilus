@@ -54,7 +54,6 @@ from py000_nautilus.live_runtime import get_source_terminal_reconciler
 from py000_nautilus.live_taker import build_live_taker_node
 from py000_nautilus.live_taker_entry import main, maker_main
 from py000_nautilus.models import ObligationStatus
-from py000_nautilus.mt5_v1_data import instrument_from_snapshot
 from py000_nautilus.mt5_v1_protocol import JsonObject
 from py000_nautilus.mt5_v1_transport import Mt5V1Transport
 from py000_nautilus.store import JsonStateStore
@@ -561,11 +560,10 @@ def run(kind: str, cut: str, phase: str, port: int, directory: Path) -> int:
             actor._restart_recovery = observe_recovery
 
         async def joint_market(direction: int) -> None:
+            # Keep the adapter's snapshot/provider current before its normal
+            # subscription replay; direct engine injection leaves a stale client reference.
+            await h.hedge_data._refresh_snapshot(allow_rehandshake=False)
             now = node.kernel.clock.timestamp_ns()
-            snapshot = await wire.snapshot(wire.identity.binding())
-            node.kernel.data_engine.process(instrument_from_snapshot(
-                snapshot, h.hedge_instrument.id, ts_init=now,
-            ))
             for participant in participants:
                 assert participant.update_cost_snapshot(participant._carry, participant._fx, now)
                 participant.update_hedge_session(True, now)
