@@ -14,6 +14,7 @@ from types import SimpleNamespace
 from typing import cast
 
 import pytest
+import test_bitfinex_v1_execution as bfx
 import test_mt5_v1_execution as mt5
 import test_restart_ownership as q3
 from nautilus_trader.core.uuid import UUID4
@@ -144,6 +145,106 @@ def test_complete_cache_close_targets_must_match_journal_before_native_reconcili
             assert not harness.fake.submit_calls and not harness.fake.close_calls
         finally:
             await harness.client._disconnect()
+            engine.dispose()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("fault", [None, "order-price", "opposing-extra-fills", "unknown-cid"])
+@pytest.mark.parametrize("partial_cancel", [False, True], ids=["filled", "partial-canceled"])
+def test_closed_source_history_cannot_hide_conflicts_behind_matching_net_position(
+    tmp_path: Path, fault: str | None, partial_cancel: bool,
+) -> None:
+    async def scenario() -> None:
+        harness = bfx._Harness(cid_store_path=tmp_path / "cids.json")
+        engine = q3._source_engine(harness)
+        engine.start()
+        now_ms = harness.clock.timestamp_ns() // 1_000_000
+        try:
+            # Seed known events through the actual engine, with no live adapter
+            # order objects. These are two historical fills, not new submissions.
+            for index, side in enumerate((OrderSide.BUY, OrderSide.SELL)):
+                order = harness.order(
+                    client_order_id=ClientOrderId(f"W6B4-CLOSED-{index}"),
+                    side=side, quantity="4" if partial_cancel else "2", price="3926.75",
+                    tif=TimeInForce.IOC, post_only=False,
+                )
+                binding = harness.client._cid_store.allocate(
+                    order.client_order_id.value, epoch_ms=now_ms,
+                )
+                venue_id = VenueOrderId(str(bfx.VENUE_ORDER_ID + index))
+                trade_id = TradeId(str(810000100 + index))
+                harness.cache.add_order(order, client_id=harness.client.id)
+                engine.process(TestEventStubs.order_submitted(
+                    order, harness.client.account_id, ts_event=(now_ms - 200) * 1_000_000,
+                ))
+                engine.process(TestEventStubs.order_accepted(
+                    order, harness.client.account_id, venue_id,
+                    ts_event=(now_ms - 100) * 1_000_000,
+                ))
+                engine.process(TestEventStubs.order_filled(
+                    order=order, instrument=harness.instrument,
+                    account_id=harness.client.account_id, venue_order_id=venue_id,
+                    trade_id=trade_id, last_qty=harness.instrument.make_qty(2),
+                    last_px=harness.instrument.make_price(Decimal("3926.75")),
+                    commission=Money("0.10", USD), ts_event=now_ms * 1_000_000,
+                ))
+                for _ in range(20):
+                    await asyncio.sleep(0)
+                if partial_cancel:
+                    engine.process(TestEventStubs.order_canceled(
+                        order, harness.client.account_id,
+                        ts_event=now_ms * 1_000_000,
+                    ))
+                    for _ in range(20):
+                        await asyncio.sleep(0)
+                assert order.status is (
+                    OrderStatus.CANCELED if partial_cancel else OrderStatus.FILLED
+                )
+                sign = 1 if side is OrderSide.BUY else -1
+                terminal = cast(list[object], harness.order_frame(
+                    "oc", binding.cid, order, remaining=str(2 * sign) if partial_cancel else "0",
+                    status="CANCELED" if partial_cancel else "EXECUTED @ 3926.75(2)",
+                )[2])
+                terminal[0] = int(venue_id.value)
+                terminal[4:6] = [now_ms - 100, now_ms]
+                terminal[17] = Decimal("3926.75")
+                trade = cast(list[object], harness.trade_frame(
+                    binding.cid, order, trade_id=int(trade_id.value),
+                    quantity="2", maker=-1,
+                )[2])
+                trade[2:4] = [now_ms, int(venue_id.value)]
+                if fault == "order-price":
+                    terminal[16] = Decimal("3926.76")
+                elif fault == "opposing-extra-fills":
+                    trade[4] = Decimal(3 * sign)
+                    if partial_cancel:
+                        terminal[6] = Decimal(sign)  # Original quantity stays four.
+                    else:
+                        terminal[7] = trade[4]
+                        terminal[13] = "EXECUTED @ 3926.75(3)"
+                elif fault == "unknown-cid":
+                    terminal[2] = trade[-1] = binding.cid + 10000
+                harness.rest.history.append(terminal)
+                harness.rest.trades.append(trade)
+
+            assert not harness.cache.positions_open()
+            assert not harness.client._by_cid  # Cold/retired closed orders take the same path.
+            harness.rest.position_rows = []  # Venue net remains zero even with both extra fills.
+            before = _summary(harness)
+            await harness.connect()
+            sent_before = deepcopy(harness.fake.sent)
+            assert all(isinstance(message, dict) for message in sent_before)  # Auth only.
+            assert await engine.reconcile_execution_state(timeout_secs=1) is (fault is None)
+            assert _summary(harness) == before  # Neither conflict nor duplicate rewrites history.
+            if fault is None:
+                assert await engine.reconcile_execution_state(timeout_secs=1)
+                assert _summary(harness) == before
+            assert harness.fake.sent == sent_before
+        finally:
+            engine.stop()
+            await asyncio.sleep(0)
+            await harness.close()
             engine.dispose()
 
     asyncio.run(scenario())

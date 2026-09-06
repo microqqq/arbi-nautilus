@@ -6211,6 +6211,263 @@ def test_working_maker_observation_only_detects_differences(tmp_path: Path, stat
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("entry", ["single", "batch", "mass"])
+@pytest.mark.parametrize("fault", ["flags", "price", "filled", "average"])
+def test_returned_closed_order_conflict_is_rejected_without_live_table(
+    tmp_path: Path, entry: str, fault: str,
+) -> None:
+    async def scenario() -> None:
+        async with _terminal_recovery_case(tmp_path, partial=False) as case:
+            harness, engine, store, order, _ = case
+            assert await engine.reconcile_execution_state(timeout_secs=1)
+            harness.client.confirm_terminal_reconciliation()
+            assert order.status == OrderStatus.FILLED
+            assert harness.client._live_for_client(order.client_order_id) is None
+            events, intents = list(order.events), store.intents()
+            positions = [position.to_dict() for position in harness.cache.positions()]
+            sent = list(harness.fake.sent)
+            row = cast(list[object], harness.rest.history[0])
+            if fault == "filled":
+                row[6], row[13] = Decimal(1), "CANCELED"
+            else:
+                index = {"flags": 12, "price": 16, "average": 17}[fault]
+                row[index] = REDUCE_ONLY_FLAG if fault == "flags" else Decimal("3927.00")
+            if entry == "mass":
+                try:
+                    result = await harness.client.generate_mass_status(None)
+                except BitfinexV1ExecutionError:
+                    result = None
+                assert result is None
+            elif entry == "single":
+                with pytest.raises(BitfinexV1ExecutionError):
+                    await harness.client.generate_order_status_report(GenerateOrderStatusReport(
+                        instrument_id=SOURCE_ID, client_order_id=order.client_order_id,
+                        venue_order_id=order.venue_order_id, command_id=UUID4(), ts_init=0,
+                    ))
+            else:
+                with pytest.raises(BitfinexV1ExecutionError):
+                    await harness.client.generate_order_status_reports(GenerateOrderStatusReports(
+                        instrument_id=SOURCE_ID, start=None, end=None, open_only=False,
+                        command_id=UUID4(), ts_init=0,
+                    ))
+            assert order.events == events and store.intents() == intents
+            assert [position.to_dict() for position in harness.cache.positions()] == positions
+            assert harness.fake.sent == sent
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("fault", ["mass_missing_trade", "fill_unknown_trade"])
+def test_returned_closed_fill_identity_cannot_be_missing_or_replaced(
+    tmp_path: Path, fault: str,
+) -> None:
+    async def scenario() -> None:
+        async with _terminal_recovery_case(tmp_path, partial=False) as case:
+            harness, engine, store, order, _ = case
+            assert await engine.reconcile_execution_state(timeout_secs=1)
+            harness.client.confirm_terminal_reconciliation()
+            assert harness.client._live_for_client(order.client_order_id) is None
+            events, intents, sent = list(order.events), store.intents(), list(harness.fake.sent)
+            if fault == "mass_missing_trade":
+                harness.rest.trades = []
+                try:
+                    result = await harness.client.generate_mass_status(None)
+                except BitfinexV1ExecutionError:
+                    result = None
+                assert result is None
+            else:
+                cast(list[object], harness.rest.trades[0])[0] = 9999
+                with pytest.raises(BitfinexV1ExecutionError):
+                    await harness.client.generate_fill_reports(GenerateFillReports(
+                        instrument_id=SOURCE_ID, venue_order_id=order.venue_order_id,
+                        start=None, end=None, command_id=UUID4(), ts_init=0,
+                    ))
+            assert order.events == events and store.intents() == intents
+            assert harness.fake.sent == sent
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("entry", ["order", "fill"])
+@pytest.mark.parametrize("identity", ["missing", "unknown", "another_binding"])
+def test_returned_closed_venue_identity_survives_unowned_history_filter(
+    tmp_path: Path, entry: str, identity: str,
+) -> None:
+    async def scenario() -> None:
+        async with _terminal_recovery_case(tmp_path, partial=False) as case:
+            harness, engine, store, order, _ = case
+            assert await engine.reconcile_execution_state(timeout_secs=1)
+            harness.client.confirm_terminal_reconciliation()
+            assert harness.client._live_for_client(order.client_order_id) is None
+            assert harness.cache.client_order_id(order.venue_order_id) == order.client_order_id
+            events, intents, sent = list(order.events), store.intents(), list(harness.fake.sent)
+            row = cast(list[object], (
+                harness.rest.history[0] if entry == "order" else harness.rest.trades[0]
+            ))
+            cid_index = 2 if entry == "order" else 11
+            original_cid = cast(int, row[cid_index])
+            if identity == "another_binding":
+                row[cid_index] = harness.client._cid_store.allocate(
+                    "ANOTHER-ORDER", epoch_ms=original_cid + 1,
+                ).cid
+            else:
+                row[cid_index] = None if identity == "missing" else original_cid + 1000
+            with pytest.raises(BitfinexV1ExecutionError, match="CID identity"):
+                if entry == "order":
+                    await harness.client.generate_order_status_reports(GenerateOrderStatusReports(
+                        instrument_id=SOURCE_ID, start=None, end=None, open_only=False,
+                        command_id=UUID4(), ts_init=0,
+                    ))
+                else:
+                    await harness.client.generate_fill_reports(GenerateFillReports(
+                        instrument_id=SOURCE_ID, venue_order_id=order.venue_order_id,
+                        start=None, end=None, command_id=UUID4(), ts_init=0,
+                    ))
+            assert order.events == events and store.intents() == intents
+            assert harness.fake.sent == sent
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("fault", ["quantity", "price", "fee", "liquidity", "time"])
+def test_returned_closed_fill_immutable_fact_cannot_change(
+    tmp_path: Path, fault: str,
+) -> None:
+    async def scenario() -> None:
+        async with _terminal_recovery_case(tmp_path, partial=False) as case:
+            harness, engine, store, order, _ = case
+            assert await engine.reconcile_execution_state(timeout_secs=1)
+            harness.client.confirm_terminal_reconciliation()
+            events, intents = list(order.events), store.intents()
+            row = cast(list[object], harness.rest.trades[0])
+            if fault == "quantity":
+                row[4] = Decimal(1)
+            elif fault == "price":
+                row[5] = Decimal("3926.85")
+            elif fault == "fee":
+                row[9] = Decimal("-0.20")
+            elif fault == "liquidity":
+                row[8] = 1
+            else:
+                row[2] = cast(int, row[2]) - 1
+            with pytest.raises(BitfinexV1ExecutionError):
+                await harness.client.generate_fill_reports(GenerateFillReports(
+                    instrument_id=SOURCE_ID, venue_order_id=order.venue_order_id,
+                    start=None, end=None, command_id=UUID4(), ts_init=0,
+                ))
+            assert order.events == events and store.intents() == intents
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("selection", ["full", "suffix", "empty", "absent_history"])
+def test_closed_report_queries_preserve_window_and_missing_history_semantics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, selection: str,
+) -> None:
+    async def scenario() -> None:
+        async with _terminal_recovery_case(tmp_path, partial=False) as case:
+            harness, engine, store, order, final = case
+            first, second = cast(list[object], final[2]).copy(), cast(list[object], final[2]).copy()
+            first[2], first[4] = cast(int, first[2]) - 1, Decimal(1)
+            second[0], second[4] = 1235, Decimal(1)
+            harness.rest.trades = [first, second]
+            assert await engine.reconcile_execution_state(timeout_secs=1)
+            harness.client.confirm_terminal_reconciliation()
+            events, intents = list(order.events), store.intents()
+            positions = [position.to_dict() for position in harness.cache.positions()]
+            sent = list(harness.fake.sent)
+
+            async def no_trade_request(*args: object, **kwargs: object) -> object:
+                raise AssertionError("order-only query must not fetch trade history")
+
+            with monkeypatch.context() as patch:
+                patch.setattr(harness.rest, "trades_by_symbol", no_trade_request)
+                for _ in range(2):
+                    assert await harness.client.generate_order_status_report(
+                        GenerateOrderStatusReport(
+                            instrument_id=SOURCE_ID, client_order_id=order.client_order_id,
+                            venue_order_id=order.venue_order_id, command_id=UUID4(), ts_init=0,
+                        ),
+                    ) is not None
+                    assert len(await harness.client.generate_order_status_reports(
+                        GenerateOrderStatusReports(
+                            instrument_id=SOURCE_ID, start=None, end=None, open_only=False,
+                            command_id=UUID4(), ts_init=0,
+                        ),
+                    )) == 1
+            if selection == "absent_history":
+                harness.rest.history = harness.rest.trades = []
+                # A successful periodic mass does not certify unreturned closed history.
+                assert await harness.client.generate_mass_status(None) is not None
+            else:
+                selected = {"full": [first, second], "suffix": [second], "empty": []}[selection]
+                harness.rest.trades = list(selected)
+                start = datetime.fromtimestamp(cast(int, second[2]) / 1000, tz=UTC)
+                reports = await harness.client.generate_fill_reports(GenerateFillReports(
+                    instrument_id=SOURCE_ID, venue_order_id=order.venue_order_id,
+                    start=None if selection == "full" else start, end=None,
+                    command_id=UUID4(), ts_init=0,
+                ))
+                assert {report.trade_id.value for report in reports} == {
+                    str(row[0]) for row in selected
+                }
+                harness.rest.trades = [first, second]
+                assert await harness.client.generate_mass_status(None) is not None
+                assert await engine.reconcile_execution_state(timeout_secs=1)
+            assert order.events == events and store.intents() == intents
+            assert [position.to_dict() for position in harness.cache.positions()] == positions
+            assert harness.fake.sent == sent
+    asyncio.run(scenario())
+
+
+def test_closed_paper_first_rest_fee_supplement_keeps_native_fill_unchanged(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        async with _terminal_recovery_case(tmp_path, partial=False) as case:
+            harness, engine, store, order, final = case
+            interim = cast(list[object], final[2]).copy()
+            interim[9:11] = [None, None]
+            harness.client._consume_private_frame([0, "te", interim])
+            for _ in range(20):
+                await asyncio.sleep(0)
+            assert order.status == OrderStatus.FILLED
+            event = next(event for event in order.events if isinstance(event, OrderFilled))
+            assert event.commission == Money(0, USD)
+            events, intents = list(order.events), store.intents()
+            assert not harness.client.fee_summary(order.client_order_id).complete
+            reports = await harness.client.generate_fill_reports(GenerateFillReports(
+                instrument_id=SOURCE_ID, venue_order_id=order.venue_order_id,
+                start=None, end=None, command_id=UUID4(), ts_init=0,
+            ))
+            assert len(reports) == 1 and reports[0].commission == Money("0.06", USD)
+            assert harness.client.fee_summary(order.client_order_id).complete
+            assert await engine.reconcile_execution_state(timeout_secs=1)
+            assert order.events == events and store.intents() == intents
+            assert event.commission == Money(0, USD)
+    asyncio.run(scenario())
+
+
+def test_closed_inferred_fill_fee_closure_does_not_certify_real_trade_identity(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        async with _terminal_recovery_case(tmp_path, partial=False) as case:
+            harness, engine, store, order, final = case
+            harness.rest.trades = []
+            assert await engine.reconcile_execution_state(timeout_secs=1)
+            harness.client.confirm_terminal_reconciliation()
+            event = next(event for event in order.events if isinstance(event, OrderFilled))
+            assert event.trade_id.value != "1234"  # NT's inferred aggregate keeps its own ID.
+            harness.client._consume_private_frame(final)
+            assert harness.client.fee_summary(order.client_order_id).complete
+            events, intents = list(order.events), store.intents()
+            harness.rest.trades = [final[2]]
+            with pytest.raises(BitfinexV1ExecutionError, match="unknown fill"):
+                await harness.client.generate_fill_reports(GenerateFillReports(
+                    instrument_id=SOURCE_ID, venue_order_id=order.venue_order_id,
+                    start=None, end=None, command_id=UUID4(), ts_init=0,
+                ))
+            assert not await engine.reconcile_execution_state(timeout_secs=1)
+            assert order.events == events and store.intents() == intents
+            assert harness.client.fee_summary(order.client_order_id).complete
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("terminal", ["zero", "partial", "full", "working"])
 def test_working_maker_mass_registers_exact_applied_quantities(
     tmp_path: Path, terminal: str,

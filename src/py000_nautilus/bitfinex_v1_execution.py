@@ -2261,6 +2261,24 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
             return None
         reported: dict[ClientOrderId, OrderStatusReport] = {}
         for report in mass_status.order_reports.values():
+            closed = self._validate_closed_order_report(report)
+            if closed is not None:
+                fills = self._reconciliation_fills(mass_status, report)
+                self._validate_silent_terminal_fills(
+                    report, fills,
+                    liquidity_side=(
+                        LiquiditySide.MAKER if closed.is_post_only else LiquiditySide.TAKER
+                    ),
+                )
+                expected = {
+                    event.trade_id for event in closed.events if isinstance(event, OrderFilled)
+                }
+                if {fill.trade_id for fill in fills} != expected:
+                    raise BitfinexV1ExecutionError(
+                        "closed Bitfinex order reconciliation has an incomplete trade ID set"
+                    )
+                for fill in fills:
+                    self._validate_closed_fill_report(fill)
             client_order_id = report.client_order_id
             if client_order_id is None:
                 continue
@@ -2553,34 +2571,7 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
                         "venue reconciliation contains an unknown fill for a cached open order"
                     )
                 continue
-            fill_mismatches: list[str] = []
-            if event.account_id != fill.account_id:
-                fill_mismatches.append("account_id")
-            if event.instrument_id != fill.instrument_id:
-                fill_mismatches.append("instrument_id")
-            if event.client_order_id != fill.client_order_id:
-                fill_mismatches.append("client_order_id")
-            if event.venue_order_id != fill.venue_order_id:
-                fill_mismatches.append("venue_order_id")
-            if event.order_side != fill.order_side:
-                fill_mismatches.append("side")
-            if event.last_qty != fill.last_qty:
-                fill_mismatches.append("last_qty")
-            if event.last_px != fill.last_px:
-                fill_mismatches.append("last_px")
-            if (
-                event.commission.currency != fill.commission.currency
-                or event.commission.as_decimal() != fill.commission.as_decimal()
-            ) and not self._provisional_fee_supplement(event, fill):
-                fill_mismatches.append("commission")
-            if event.liquidity_side != fill.liquidity_side:
-                fill_mismatches.append("liquidity_side")
-            if event.ts_event != fill.ts_event:
-                fill_mismatches.append("ts_event")
-            if fill_mismatches:
-                raise BitfinexV1ExecutionError(
-                    "cached Bitfinex fill differs from venue report: " + ", ".join(fill_mismatches)
-                )
+            self._validate_cached_fill(event, fill)
 
         if same_filled_quantity:
             cached_avg_px = float(order.avg_px)
@@ -2597,6 +2588,77 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
             raise BitfinexV1ExecutionError(
                 "cached open Bitfinex order is missing its venue order identity"
             )
+
+    def _validate_cached_fill(self, event: OrderFilled, fill: FillReport) -> None:
+        mismatched: list[str] = []
+        for field in (
+            "account_id", "instrument_id", "client_order_id", "venue_order_id",
+            "order_side", "last_qty", "last_px", "liquidity_side", "ts_event",
+        ):
+            if getattr(event, field) != getattr(fill, field):
+                mismatched.append("side" if field == "order_side" else field)
+        if (
+            event.commission.currency != fill.commission.currency
+            or event.commission.as_decimal() != fill.commission.as_decimal()
+        ) and not self._provisional_fee_supplement(event, fill):
+            mismatched.append("commission")
+        if mismatched:
+            raise BitfinexV1ExecutionError(
+                "cached Bitfinex fill differs from venue report: " + ", ".join(mismatched)
+            )
+
+    def _cached_closed_order(self, report: OrderStatusReport | FillReport) -> Order | None:
+        indexed = self._cache.client_order_id(report.venue_order_id)
+        for client_order_id in (indexed, report.client_order_id):
+            order = None if client_order_id is None else self._cache.order(client_order_id)
+            if order is not None and order.is_closed:
+                return cast(Order, order)
+        return None
+
+    def _validate_closed_raw_identity(self, venue_order_id: int, cid: int | None) -> None:
+        # The report mappers intentionally drop unowned history. A known closed
+        # venue identity must not disappear through that filter when its CID changes.
+        indexed = self._cache.client_order_id(VenueOrderId(str(venue_order_id)))
+        order = None if indexed is None else self._cache.order(indexed)
+        reported = None if cid is None else self._client_order_id_for_cid(cid)
+        if order is not None and order.is_closed and reported != order.client_order_id:
+            raise BitfinexV1ExecutionError("closed Bitfinex venue order changed its CID identity")
+
+    def _validate_closed_order_report(self, report: OrderStatusReport) -> Order | None:
+        order = self._cached_closed_order(report)
+        if order is None:
+            return None
+        if order.status != report.order_status or order.filled_qty != report.filled_qty:
+            raise BitfinexV1ExecutionError(
+                "closed Bitfinex order terminal status or filled quantity changed"
+            )
+        live = self._live_for_client(order.client_order_id)
+        if live is not None and live.reconciled_terminal is not None:
+            prior = live.reconciled_terminal
+            if _same_order_report_facts(prior, report) and (
+                self._silent_rejection_has_no_native_venue(live, order, prior)
+            ):
+                return order
+        self._validate_cached_open_report(
+            order, report, [],
+            allow_missing_post_only=(
+                live is not None and self._terminal_post_only_is_opaque(live)
+            ),
+        )
+        return order
+
+    def _validate_closed_fill_report(self, fill: FillReport) -> None:
+        order = self._cached_closed_order(fill)
+        if order is None:
+            return
+        event = next(
+            (event for event in order.events
+             if isinstance(event, OrderFilled) and event.trade_id == fill.trade_id),
+            None,
+        )
+        if event is None:
+            raise BitfinexV1ExecutionError("closed Bitfinex order report contains an unknown fill")
+        self._validate_cached_fill(event, fill)
 
     def _provisional_fee_supplement(self, event: OrderFilled, report: FillReport) -> bool:
         if (
@@ -2799,6 +2861,7 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
                 and report.venue_order_id != command.venue_order_id
             ):
                 continue
+            self._validate_closed_order_report(report)
             if report.client_order_id is not None:
                 live = self._live_for_client(report.client_order_id)
                 if live is not None and live.terminal is None and live.rejection_key is None:
@@ -2828,11 +2891,14 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
     ) -> list[OrderStatusReport]:
         if command.instrument_id not in {None, self._bfx_config.instrument_id}:
             return []
-        return await self._order_reports(
+        reports = await self._order_reports(
             start=command.start,
             end=command.end,
             open_only=command.open_only,
         )
+        for report in reports:
+            self._validate_closed_order_report(report)
+        return reports
 
     async def generate_fill_reports(self, command: GenerateFillReports) -> list[FillReport]:
         if command.instrument_id not in {None, self._bfx_config.instrument_id}:
@@ -2840,6 +2906,11 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
         instrument = self._report_instrument()
         start_ms, end_ms = self._report_window(command.start, command.end)
         rows = await self._trade_history_rows(start_ms, end_ms)
+        for row in rows:
+            trade = parse_private_message([0, "tu", row])
+            assert isinstance(trade, TradeUpdate)
+            if command.venue_order_id in {None, VenueOrderId(str(trade.venue_order_id))}:
+                self._validate_closed_raw_identity(trade.venue_order_id, trade.client_order_id)
         observations: list[TradeUpdate] = []
         reports = map_fill_reports(
             rows=rows,
@@ -2865,6 +2936,8 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
             reports = [
                 report for report in reports if report.venue_order_id == command.venue_order_id
             ]
+        for report in reports:
+            self._validate_closed_fill_report(report)
         return reports
 
     async def generate_position_status_reports(
@@ -2913,6 +2986,10 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
         if not open_only:
             start_ms, end_ms = self._report_window(start, end)
             history_rows = await self._order_history_rows(start_ms, end_ms)
+        snapshot = parse_private_message([0, "os", active_rows + history_rows])
+        assert isinstance(snapshot, OrderSnapshot)
+        for state in snapshot.orders:
+            self._validate_closed_raw_identity(state.venue_order_id, state.client_order_id)
         return map_order_status_reports(
             active_rows=active_rows,
             history_rows=history_rows,

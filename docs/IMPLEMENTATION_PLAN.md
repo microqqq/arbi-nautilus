@@ -508,6 +508,14 @@ carry 是同 route 的唯一 signed residual；下一 fill 先与它合并再分
 - 原`apply_hedge_fill`抽出无I/O reducer并补发布前Exception回滚，默认live状态推进/去重行为不变。新投影整个batch发布前失败完整回滚，Maker含两view/allocation；replace后ParentDirectorySyncError保留完整已发布候选并抛错，reload/retry不可双计。不上第二套日志、schema或事务框架。
 - 写集：编码agent独占`store.py`、新`hedge_projection.py`及`tests/test_hedge_projection.py`；主agent维护本文及新`tests/test_hedge_reconciliation.py`真实native订单/Position组合；未实施agent独立复核。先保留现有写失败RED/新入口缺口，再验历史/当前腿、blocked满量与腿间no-op、legacy单CID、未知事实零写、Maker双view原子失败、同对象及reload幂等、原live行为回归。冻结后全量含任务专用临时Redis、静态检查及独立复核通过，单独本地提交；不改adapter/builder/策略/EA/profile/CLI/canary、不访问账户、不推送/部署/发单。W6b/c、R01–R06及W6父项仍未完成。
 
+**W6b4 Bitfinex已闭缓存报告边界（2026-09-06，实施前固定）：** 基线`e826911`。接普通启动时核对发现：冷启动的已闭source不经`_rehydrate_open_order`进入live表，mass原路径只强核验open/live；NT会跳过已闭单的新成交。同净仓或`reconcile=True`不足以认证这些事实。本包先封住这一具体遗漏，再接启动放行，不把未验证前置留给一个新的恢复状态机。
+
+- 复用现有Bitfinex报告/逐笔核验，仅核对实际返回且命中本地已闭订单的事实。在单单/批量订单报告入口核对已有身份、方向、类型、期限、flags、量价、终态和累计成交量；在fill入口核对实际返回成交的原TradeId和已记事实；完整mass还要求命中已闭单的完整TradeId集合、精确成交量及均价。在进入原生Engine前拒绝冲突，不手修closed订单、不补造事件或仓位、不重发旧请求。现有mapper会过滤无CID绑定的行，因此必须在过滤前以已有native venue→client索引识别原venue ID下的CID缺失/变化，不能将已知身份冲突当无归属历史忽略；不另建索引或推测owner。
+- 保持查询语义：不为一个带时间窗的fill查询要求它返回订单全部历史，不新增REST轮询或扩大两周报告窗口。完整mass中的已知闭单报告必须有完整真实成交集合；缺报告或超窗并不因本包通过而成为已认证历史，后续启动放行必须另行核对全部业务/native订单的报告覆盖。空cache、未返回的久远闭单及本地无venue的零成交拒单不靠“查不到”认证。
+- 不放宽既有same-run terminal/opaque post-only或paper `te_paper`来源规则；合法最终费用补充沿现有CID fee证据判断，不把金额不同一律视为重复成交，也不将测试账号容差推广到冷启动或实盘。单笔费用仍以原生Money语义核对。原生UUID推断聚合成交即使后来经旧fee规则完成费用核对，也不等于已有真实TradeId；新closed报告守卫会拒绝不同真实ID，包括同轮后续fill/mass，不做UUID到真实ID重映射或声称所有已闭历史均可恢复。拒绝不得污染native订单、Position或业务义务；现有CID费用观测/失败状态语义保持，不宣称整个报告查询无任何持久副作用。
+- 写集：实施agent独占`bitfinex_v1_execution.py`及原`tests/test_bitfinex_v1_execution.py`，主agent在`tests/test_restart_reconciliation.py`补真实adapter→native反例/无污染和正常重复对照并维护本文；未实施agent独立复核。先固定旧实现实际接受错误闭单报告的RED，再修复、定向及全量含任务专用真实Redis、静态检查，通过后单独本地提交。不改builder、策略、store、EA、profile或canary，不访问账户、不推送/部署/发单。
+- 普通启动整合仍待完成：复用现有`SourceTerminalReconciler`触发一次启动核对；门从build开始覆盖live回调、hedge派发和Maker提前freeze/cancel/release；保留`recover_for_start`前已有HOLD原文。先只放行全部订单终态、最终义务满量且native/venue/业务一致的已结算类别，未决、中间腿、缺事实和外因HOLD继续暂停。两个project返回值不是ready。W6b/c、R01–R06及W6父项不在本包勾选。
+
 恢复分类：
 
 - 已结束订单、对冲义务均完成，venue 仓位和本地记录吻合：恢复原策略运行，保留现有仓位。
@@ -721,6 +729,7 @@ EA 改动额外执行现有 `tools/mt5_source_manifest.sh --lines`、MetaEditor 
     - [x] W6b1：MT5报告进入原生Engine前核验原订单/票据索引/已记成交；独立复核发现的量价舍入遗漏已窄修，修订全量2376项含真实Redis及独立复核通过。仅接受报告事实边界，不解除业务HOLD。
     - [x] W6b2：完整已知source成交的缺失suffix纯投影，单次原子发布BLOCKED义务，保留HOLD；修订冻结全量2429项含真实Redis及独立复核通过。仅接受source纯投影，尚未接普通启动或MT5对冲腿恢复。
     - [x] W6b3：已知MT5当前/旧对冲腿核对及当前缺失成交的暂停投影；原对冲成交发布前失败回滚已修复，冻结全量2514项含真实Redis及独立复核通过。仅接受held投影，不推进下一腿或接普通启动。
+    - [x] W6b4：Bitfinex已闭缓存的已返回订单/成交报告核验及mapper前身份守卫；冻结全量2553项含真实Redis及独立复核通过。仅接受该事实边界，不认证缺失历史、推断ID替换或普通启动解除暂停。
   - [ ] W6c 执行通道在线时drain、进程重启/停止矩阵R01–R06。
 - [ ] W7 同节点共账户。
 - [ ] W8 入口/安装/文档/原生运行边界。
@@ -1024,3 +1033,11 @@ EA 改动额外执行现有 `tools/mt5_source_manifest.sh --lines`、MetaEditor 
 - 同一冻结上主agent独立六文件定向 **275 passed / 1.90s**，全仓Ruff、Mypy95文件及diff-check通过。未参与实施的reviewer另加Maker迁移测试，**309 passed / 1.96s**，静态检查通过；仅在测试进程换回基线原方法，三个旧缺陷精确在内存回滚断言处RED，恢复冻结方法后四例GREEN。reviewer给出仅限W6b3的RECOMMEND-ACCEPT，临时probe目录已清理，四个源/测试SHA测前测后相同。
 - 主agent在冻结候选上使用全新临时Redis单次全量，**2514 passed / 129既有类别Pandas弃用警告 / 327.28s**，含两项真实backend且无skip；四SHA全量前后相同。临时容器`bdebd0852efe`已按完整ID停止，`--rm`清除仅用于测试的合成数据，列表复查为空；未动既有服务、镜像或真实账户。既有W6c停止/drain问题仍须对应生命周期验证，不由本次绿色代替。
 - 主agent结合本次全量与独立RECOMMEND-ACCEPT接受W6b3，按约定仅五个既定文件形成本地提交，不推送、部署或发单。W6b/c、R01–R06及W6父项仍未完成；下一步把已验证的source/hedge纯投影接入普通启动的完整事实核对，区分可继续与保持HOLD的状态，再验证下一机会及在线drain。不以投影返回数量直接放行，也不重发未决旧request。
+
+2026-09-06，W6b4 Bitfinex已闭报告核验：冻结全量及独立复核通过：
+
+- 基线`e826911`。主agent在真实LiveExecutionEngine中形成已闭BUY2/SELL2、native及venue净仓均0、adapter live表为空；改原价格、将两边报告成交改成3、保留venue ID但换无绑定CID三个反例，旧完整对账均错误返回True，正确对照通过。实施agent另固定单单/批量/mass的flags/price及缺失/未知TradeId共8个旧业务RED。夹具的队列启动和stub签名错误已分开修正，不计作产品缺陷。
+- 只在原Bitfinex执行模块复用逐笔比较、增加closed与mapper前身份守卫，生产净增77行，无新REST请求或状态schema。新增31项adapter测试和8项主agent原生组合；后者包含partial-canceled原委托4不变、已成交2却报3的净额抵消反例。首次paper最终费用补充、同轮opaque/已认证拒单、窄窗subset/empty、无返回历史语义保留；inferred UUID虽可完成费用核对，后续不同真实TradeId仍拒绝，不能据此自动恢复。
+- 主agent原生组合及既有投影 **14 passed / 1.01s**，runtime/两adapter连续策略/两纯投影回归 **341 passed / 4既有Pandas警告 / 265.12s**。未实施reviewer在冻结上独立四文件 **495 passed / 17.04s**，全仓Ruff、Mypy95文件和diff-check通过；仅测试进程关闭三个新增守卫时六个冲突精确RED、两个对照GREEN，恢复后八例全GREEN。三份生产/测试SHA前后相同，reviewer给出仅限W6b4的RECOMMEND-ACCEPT。
+- 同一冻结候选上主agent全量 **2553 passed / 129既有类别Pandas警告 / 327.68s**，包含两项真实Redis跨进程测试且无skip。三SHA保持`3a76748f5418`、`b1e58b2a2cc3`、`a43f30948efe`。临时容器`3f8ad99926e85`按完整ID停止，`--rm`清除合成测试数据，列表复查为空，未动既有服务或账户。全量出现MT5 pending报告拒绝日志，单独重跑既有`unknown-short-first-maker`反例 **1 passed / 5.50s**并复现相同拒绝，符合该例明确断言；另有停止fixture的队列取消/原生状态转换警告，W6c生命周期仍未认证，不由本次全绿替代。
+- 主agent接受W6b4并仅本地提交上述四文件，不推送、部署或发单。W6b/c、R01–R06及W6父项仍未完成；下一步回到普通启动接线：保持原HOLD来源、核对完整报告覆盖和业务义务，在既有Actor内放行可证明已结算类别，再验证下一机会；不再另造恢复框架。
