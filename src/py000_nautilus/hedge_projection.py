@@ -25,7 +25,7 @@ def _key(fill: OrderFilled) -> str:
 
 
 def _order_ids(intent: HedgeIntent, record: SourceOrderRecord) -> tuple[str, ...]:
-    ids, current = intent.hedge_order_ids, intent.hedge_client_order_id
+    ids, current = intent.hedge_leg_order_ids, intent.hedge_client_order_id
     binding = (intent.hedge_position_id, intent.hedge_position_quantity_ounces)
     if binding != (record.hedge_position_id, record.hedge_position_quantity_ounces):
         raise ValueError("hedge projection source/intent ticket binding differs")
@@ -156,6 +156,11 @@ def project_hedge_fills(
                 if cid in bindings:
                     raise ValueError("hedge projection order belongs to multiple intents")
                 bindings[cid] = (view, intent, record, index)
+            attempt = intent.rejected_attempt
+            if attempt is not None:
+                if attempt.client_order_id in bindings:
+                    raise ValueError("hedge projection rejected order belongs to multiple intents")
+                bindings[attempt.client_order_id] = (view, intent, record, attempt.leg_index)
     by_id = {order.client_order_id.value: order for order in orders}
     if sources & bindings.keys() or len(by_id) != len(orders) or set(by_id) != set(bindings):
         raise ValueError("hedge projection requires the exact complete hedge order set")
@@ -170,6 +175,12 @@ def project_hedge_fills(
         fills = _checked_fills(order, record, intent, index,
                                hedge_instrument_id=hedge_instrument_id,
                                trader_id=trader_id, strategy_id=strategy_id)
+        attempt = intent.rejected_attempt
+        if attempt is not None and cid == attempt.client_order_id:
+            if (order.status != OrderStatus.REJECTED or order.filled_qty != 0
+                    or fills or order.trade_ids):
+                raise ValueError("hedge projection archived rejection has conflicting native facts")
+            continue  # Its complete zero-fill evidence stays in the required CID set.
         keys = tuple(_key(fill) for fill in fills)
         for fill in fills:
             trade = (fill.account_id.value, fill.trade_id.value)

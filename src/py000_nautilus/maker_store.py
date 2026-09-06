@@ -121,6 +121,8 @@ class MakerStateStore:
     def _freeze_external(self, reason: str, views: tuple[JsonStateStore, ...]) -> None:
         if not reason:
             raise ValueError("freeze reason must not be empty")
+        for view in views:
+            view._revoke_restart_permission()
         changed = self._set_freezes(reason, views) or self._cycle_freeze_only
         self._cycle_freeze_only = False
         if changed:
@@ -262,7 +264,7 @@ class MakerStateStore:
 
     def _to_payload(self) -> dict[str, object]:
         payload: dict[str, object] = {
-            "schema_version": 5 if self._legacy_sources is None else 6,
+            "schema_version": 7 if self._legacy_sources is None else 8,
             "cycle_freeze_only": self._cycle_freeze_only,
             "kind": "maker", "source_instrument_id": self.source_instrument_id,
             "hedge_instrument_id": self.hedge_instrument_id,
@@ -286,12 +288,12 @@ class MakerStateStore:
             "schema_version", "kind", "source_instrument_id", "hedge_instrument_id", "directions",
             "allocations",
         }
-        if type(version) is int and version in {4, 6}:
+        if type(version) is int and version in {4, 6, 8}:
             fields.add("legacy_checkpoint")
-        if type(version) is int and version in {5, 6}:
+        if type(version) is int and version in {5, 6, 7, 8}:
             fields.add("cycle_freeze_only")
         if (not isinstance(raw, dict) or set(raw) != fields
-                or type(version) is not int or version not in {3, 4, 5, 6}):
+                or type(version) is not int or version not in {3, 4, 5, 6, 7, 8}):
             raise ValueError("unsupported Maker state schema; legacy state requires migration")
         self._cycle_freeze_only = raw.get("cycle_freeze_only", False)
         if type(self._cycle_freeze_only) is not bool:
@@ -306,10 +308,11 @@ class MakerStateStore:
         if not isinstance(directions, dict) or set(directions) != {"bid", "ask"}:
             raise ValueError("Maker state requires exactly both directions")
         if any(not isinstance(state, dict) or type(state.get("schema_version")) is not int
+               or state["schema_version"] != (2 if version in {7, 8} else 1)
                for state in directions.values()):
             raise ValueError("invalid Maker direction schema")
         try:
-            if raw["schema_version"] in {4, 6}:
+            if raw["schema_version"] in {4, 6, 8}:
                 self._legacy_sources, self._legacy_orders = _read_checkpoint(
                     raw["legacy_checkpoint"],
                 )

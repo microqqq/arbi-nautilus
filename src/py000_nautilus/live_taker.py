@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from decimal import Decimal
+from functools import partial
 from pathlib import Path
 from typing import cast
 
@@ -41,7 +42,9 @@ from py000_nautilus.mt5_v1_execution import (
     mt5_v1_execution_account_id,
 )
 from py000_nautilus.restart_recovery import (
+    StartupRecoveryOptions,
     capture_startup_receipt,
+    check_rejected_retry_execution,
     has_business_history,
     reconcile_startup,
 )
@@ -71,6 +74,7 @@ def build_live_taker_node(
     allowed_source_direction: SourceDirection | None = None,
     one_shot_expected_source_position: Decimal = Decimal(0),
     one_shot_close_existing: bool = False,
+    startup_recovery: StartupRecoveryOptions | None = None,
 ) -> tuple[TradingNode, TakerStrategy]:
     """Build without trading connections; an explicit cache database connects on construction."""
     if type(one_shot_close_existing) is not bool:
@@ -79,6 +83,8 @@ def build_live_taker_node(
         raise ValueError("one_shot_close_existing requires one_shot execution")
     if one_shot and cache_database is not None:
         raise ValueError("one_shot execution cannot use a native cache database")
+    if one_shot and startup_recovery is not None:
+        raise ValueError("startup recovery options require the ordinary entry")
     validate_stop_timeout(stop_timeout_seconds)
     _validate_composition(
         bitfinex_data_config,
@@ -207,11 +213,12 @@ def build_live_taker_node(
                 },
             )
         if not one_shot and (
-            native_history or node.cache.orders() or node.cache.positions()
+            startup_recovery is not None or native_history
+            or node.cache.orders() or node.cache.positions()
             or bitfinex_exec._cid_store.bindings
             or has_business_history(strategy.state_store)
         ):
-            receipt = capture_startup_receipt(strategy.state_store)
+            receipt = capture_startup_receipt(strategy.state_store, startup_recovery)
 
             async def recover_startup() -> None:
                 await reconcile_startup(
@@ -221,6 +228,10 @@ def build_live_taker_node(
                     source_instrument_id=strategy_config.source_instrument_id,
                     hedge_instrument_id=strategy_config.hedge_instrument_id,
                     receipt=receipt,
+                    rejected_retry_check=partial(
+                        check_rejected_retry_execution, node.cache, mt5_exec,
+                        config=strategy_config, data=mt5_data,
+                    ),
                 )
 
             reconciler.bind_restart_recovery(recover_startup)

@@ -38,6 +38,15 @@ def _begin(view: JsonStateStore, cid: str, side: BusinessOrderSide, **kwargs: An
     view.begin_source(cid, side, D(2), **route)
 
 
+def _v1_payload(view: JsonStateStore) -> dict[str, Any]:
+    """Create authentic old input, not the current writer's newer format."""
+    raw: dict[str, Any] = view._to_payload()
+    raw["schema_version"] = 1
+    for intent in raw["hedge_intents"].values():
+        assert intent.pop("rejected_attempt") is None
+    return raw
+
+
 def _legacy(
     prefix: Path, kind: str = "v2", quantities: tuple[str, ...] = ("0.1", "0.4"),
 ) -> dict[SourceDirection, JsonStateStore]:
@@ -50,6 +59,7 @@ def _legacy(
     views[LONG].confirm_source_reconciled("OLD")
     for view in views.values():
         view.freeze_source_submissions("legacy cycle")
+        view.path.write_text(json.dumps(_v1_payload(view)))
     if kind == "v2":
         _v2(prefix, views)
     return views
@@ -59,7 +69,7 @@ def _v2(prefix: Path, views: dict[SourceDirection, JsonStateStore]) -> None:
     maker_state_path(prefix).write_text(json.dumps({
         "schema_version": 2, "kind": "maker", "source_instrument_id": SOURCE,
         "hedge_instrument_id": HEDGE,
-        "directions": {direction.value: view._to_payload() for direction, view in views.items()},
+        "directions": {direction.value: _v1_payload(view) for direction, view in views.items()},
     }))
 
 
@@ -76,6 +86,8 @@ def test_checkpoint_origin_is_not_adopted_by_loading_or_later_fill(
     owner = _migrate(prefix, output)
     raw = owner._to_payload()
     raw["schema_version"] = version
+    raw["directions"] = {direction.value: _v1_payload(view)
+                         for direction, view in owner.stores.items()}
     if version == 4:
         raw.pop("cycle_freeze_only")
     owner.path.write_text(json.dumps(raw))
@@ -84,16 +96,23 @@ def test_checkpoint_origin_is_not_adopted_by_loading_or_later_fill(
     assert not loaded.cycle_freeze_only and loaded.path.read_bytes() == before
     _fill(loaded.stores[LONG], "OLD", BUY, "0.5", "LATE")
     updated = json.loads(loaded.path.read_text())
-    assert updated["schema_version"] == 6 and updated["cycle_freeze_only"] is False
+    assert updated["schema_version"] == 8 and updated["cycle_freeze_only"] is False
     assert updated["legacy_checkpoint"] == raw["legacy_checkpoint"]
 
 
+@pytest.mark.parametrize("version", [6, 8])
 @pytest.mark.parametrize("marker", [1, "false", None])
-def test_checkpoint_v6_also_requires_a_strict_boolean(tmp_path: Path, marker: object) -> None:
+def test_checkpoint_provenance_requires_a_strict_boolean(
+    tmp_path: Path, marker: object, version: int,
+) -> None:
     prefix, output = tmp_path / "legacy", tmp_path / "invalid"
     _legacy(prefix)
     owner = _migrate(prefix, output)
     raw = owner._to_payload()
+    raw["schema_version"] = version
+    if version == 6:
+        raw["directions"] = {direction.value: _v1_payload(view)
+                             for direction, view in owner.stores.items()}
     raw["cycle_freeze_only"] = marker
     owner.path.write_text(json.dumps(raw))
     with pytest.raises(ValueError, match="boolean"):
@@ -112,7 +131,7 @@ def test_migrate_explicit_checkpoint_without_fabricating_unknown_fill_sizes(
         MakerStateStore(prefix, SOURCE, HEDGE)
     owner = _migrate(prefix, tmp_path / "new")
     payload = json.loads(owner.path.read_text())
-    assert payload["schema_version"] == 6 and payload["allocations"] == []
+    assert payload["schema_version"] == 8 and payload["allocations"] == []
     assert payload["cycle_freeze_only"] is False
     checkpoint = payload["legacy_checkpoint"]
     assert checkpoint["projection"] == "bid_then_ask"

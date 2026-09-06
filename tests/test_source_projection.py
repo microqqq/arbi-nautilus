@@ -29,6 +29,7 @@ from nautilus_trader.model.objects import Money
 from nautilus_trader.model.orders import LimitOrder, Order
 from nautilus_trader.test_kit.stubs.events import TestEventStubs
 from nautilus_trader.test_kit.stubs.identifiers import TestIdStubs
+from test_maker_migration import _v1_payload
 
 import py000_nautilus.maker_store as maker_module
 import py000_nautilus.store as store_module
@@ -487,7 +488,10 @@ def test_v4_checkpoint_is_read_only_and_only_new_orders_can_gain_a_suffix(
     old = _order("OLD", ("0.4", "0.6") if legacy_candidate else ("1",), quantity="1")
     _begin(legacy, old)
     _record(legacy, old, 1)
-    JsonStateStore(maker_legacy_paths(prefix)[1]).freeze_source_submissions("legacy ask HOLD")
+    ask = JsonStateStore(maker_legacy_paths(prefix)[1])
+    ask.freeze_source_submissions("legacy ask HOLD")
+    for view in (legacy, ask):
+        view.path.write_text(json.dumps(_v1_payload(view)))
     owner = migrate_maker_state(prefix, tmp_path / "v4", SOURCE.value, HEDGE.value, stopped=True)
     checkpoint = deepcopy(owner._to_payload()["legacy_checkpoint"])
     if legacy_candidate:

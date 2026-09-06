@@ -23,6 +23,7 @@ from nautilus_trader.model.events import OrderModifyRejected
 from nautilus_trader.model.identifiers import ClientOrderId
 from nautilus_trader.model.orders import Order
 from test_bitfinex_v1_execution import _position_row
+from test_maker_migration import _v1_payload
 from test_mt5_v1_execution import _identity, _snapshot
 from test_strategy_continuity import _OrdinaryStrategy, _pump
 
@@ -350,13 +351,14 @@ def test_both_adapters_maker_hold_legacy_checkpoint_without_native_history(
         store.update_source_status(cid, "CANCELED")
         store.confirm_source_reconciled(cid)
         store.freeze_source_submissions("legacy matched source fills")
+        store.path.write_text(json.dumps(_v1_payload(store)))
         legacy[direction.value] = store
     if legacy_schema == 2:
         Path(f"{old_prefix}.maker.json").write_text(json.dumps({
             "schema_version": 2, "kind": "maker",
             "source_instrument_id": "XAUTUSDT-PERP.BITFINEX",
             "hedge_instrument_id": "XAUUSD.MT5",
-            "directions": {key: store._to_payload() for key, store in legacy.items()},
+            "directions": {key: _v1_payload(store) for key, store in legacy.items()},
         }))
     originals = {path: path.read_bytes() for path in tmp_path.glob("old-maker*.json")}
     migrated = migrate_maker_state(
@@ -390,7 +392,7 @@ def test_both_adapters_maker_hold_legacy_checkpoint_without_native_history(
                 assert store.source_freeze_reason == "legacy matched source fills"
                 assert restored._state == store._state
             payload = json.loads(h.store.path.read_text())
-            assert payload["schema_version"] == 6
+            assert payload["schema_version"] == 8
             assert payload["legacy_checkpoint"] == checkpoint
             assert not payload["allocations"]
             assert migrated.path.read_bytes() == migrated_bytes

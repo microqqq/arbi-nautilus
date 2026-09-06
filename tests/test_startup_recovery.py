@@ -568,6 +568,10 @@ def test_new_node_settles_actual_hedge_fill_with_lagging_business_callback(
                 payload = json.loads(first.store.path.read_text())
                 payload["schema_version"] = 3
                 payload.pop("cycle_freeze_only", None)
+                for direction in payload["directions"].values():
+                    direction["schema_version"] = 1
+                    for record in direction["hedge_intents"].values():
+                        assert record.pop("rejected_attempt") is None
                 first.store.path.write_text(json.dumps(payload))
             elif fault == "same-text-external":
                 assert old_freeze is not None

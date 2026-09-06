@@ -137,6 +137,21 @@ class HedgeLeg:
 
 
 @dataclass(frozen=True, slots=True)
+class RejectedHedgeAttempt:
+    """The sole archived zero-fill rejection; its native order remains evidence."""
+
+    client_order_id: str
+    leg_index: int
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.client_order_id, str) or not self.client_order_id
+                or "|" in self.client_order_id):
+            raise ValueError("rejected hedge attempt requires a non-empty order ID")
+        if type(self.leg_index) is not int or self.leg_index < 0:
+            raise ValueError("rejected hedge attempt requires an exact non-negative leg index")
+
+
+@dataclass(frozen=True, slots=True)
 class HedgeIntent:
     intent_id: str
     fill_key: str
@@ -155,6 +170,15 @@ class HedgeIntent:
     hedge_leg_index: int = 0
     hedge_leg_filled_ounces: Decimal = Decimal(0)
     hedge_order_ids: tuple[str, ...] = ()
+    rejected_attempt: RejectedHedgeAttempt | None = None
+
+    @property
+    def hedge_leg_order_ids(self) -> tuple[str, ...]:
+        """Retain one order per planned leg without discarding rejected history."""
+        if self.rejected_attempt is None:
+            return self.hedge_order_ids
+        return tuple(cid for cid in self.hedge_order_ids
+                     if cid != self.rejected_attempt.client_order_id)
 
     def __post_init__(self) -> None:
         # Schema-1 runtime history can contain an ID without the later quantity
@@ -193,6 +217,21 @@ class HedgeIntent:
             set(self.hedge_order_ids)
         ) != len(self.hedge_order_ids):
             raise ValueError("hedge order history must contain unique non-empty IDs")
+        attempt = self.rejected_attempt
+        if attempt is not None:
+            if (not isinstance(attempt, RejectedHedgeAttempt) or not self.hedge_plan
+                    or attempt.client_order_id not in self.hedge_order_ids
+                    or attempt.leg_index >= len(self.hedge_plan)
+                    or self.hedge_order_ids.index(attempt.client_order_id) != attempt.leg_index
+                    or attempt.leg_index > self.hedge_leg_index
+                    or self.hedge_client_order_id == attempt.client_order_id):
+                raise ValueError("rejected hedge attempt does not match its retained plan history")
+            ids = self.hedge_leg_order_ids
+            if (len(ids) != self.hedge_leg_index + (self.hedge_client_order_id is not None)
+                    or (self.hedge_client_order_id is not None and (
+                        self.hedge_leg_index == len(self.hedge_plan)
+                        or self.hedge_client_order_id != ids[self.hedge_leg_index]))):
+                raise ValueError("rejected hedge attempt has inconsistent subsequent leg history")
         if not self.hedge_plan:
             if self.hedge_leg_index != 0 or self.hedge_leg_filled_ounces != 0:
                 raise ValueError("unplanned hedge intent cannot have leg progress")

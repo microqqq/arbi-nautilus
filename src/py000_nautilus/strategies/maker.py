@@ -1541,7 +1541,9 @@ class MakerStrategy(Strategy):
             self._try_release_cycle()
             return
         for store in self._stores.values():
-            store.update_hedge_status(client_order_id, ObligationStatus.REJECTED)
+            store.update_hedge_status(
+                client_order_id, ObligationStatus.REJECTED, native_status=status,
+            )
 
     def _mark_source_unknown(self, client_order_id: str, reason: str) -> None:
         if _restart_blocked(self):

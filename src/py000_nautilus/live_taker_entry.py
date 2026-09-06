@@ -36,9 +36,11 @@ from py000_nautilus.live_taker import (
     MT5_CLIENT_ID,
     build_live_taker_node,
 )
-from py000_nautilus.maker_store import maker_legacy_paths, maker_state_path
+from py000_nautilus.maker_store import MakerStateStore, maker_legacy_paths, maker_state_path
 from py000_nautilus.mt5_v1_data import Mt5V1DataClientConfig
 from py000_nautilus.mt5_v1_execution import Mt5V1ExecClientConfig, Mt5V1ExecutionClient
+from py000_nautilus.restart_recovery import StartupRecoveryOptions, describe_business_recovery
+from py000_nautilus.store import JsonStateStore
 
 if TYPE_CHECKING:
     from py000_nautilus.live_lifecycle import DrainResult
@@ -106,6 +108,7 @@ class _LiveNodeBuilder(Protocol[_BuilderConfigT]):
         loop: asyncio.AbstractEventLoop | None,
         connection_timeout_seconds: float,
         stop_timeout_seconds: float,
+        startup_recovery: StartupRecoveryOptions | None = None,
     ) -> tuple[TradingNode, Strategy]: ...
 
 
@@ -141,6 +144,33 @@ def parse_live_maker_profile(raw: bytes | str) -> LiveMakerProfile:
 
 def load_live_maker_profile(path: Path) -> LiveMakerProfile:
     return parse_live_maker_profile(path.read_bytes())
+
+
+def inspect_profile_recovery(profile: LiveTakerProfile | LiveMakerProfile) -> dict[str, object]:
+    """Open only the existing business file, without building a node or reading secrets."""
+    config = profile.strategy_config
+    store: JsonStateStore | MakerStateStore
+    if isinstance(config, TakerStrategyConfig):
+        path = _required_path(config.store_path, "Taker state store")
+        if not path.is_file():
+            raise ValueError("no existing Taker state to inspect")
+        store = JsonStateStore(path)
+    else:
+        prefix = _required_path(config.store_path_prefix, "Maker state store prefix")
+        if not maker_state_path(prefix).is_file():
+            raise ValueError("no existing Maker state to inspect")
+        carry_route = None
+        if config.residual_mode == "bounded-carry":
+            source, hedge = config.source_accounts[0], config.hedge_accounts[0]
+            carry_route = (source.account_id.value,
+                           source.client_id.value if source.client_id is not None else None,
+                           hedge.account_id.value,
+                           hedge.client_id.value if hedge.client_id is not None else None)
+        store = MakerStateStore(
+            prefix, str(config.source_instrument_id), str(config.hedge_instrument_id),
+            residual_limit_ounces=config.residual_limit_ounces, carry_route=carry_route,
+        )
+    return describe_business_recovery(store)
 
 
 def validate_live_maker_profile(profile: LiveMakerProfile) -> None:
@@ -214,6 +244,8 @@ def run_live_taker_entry(
     *,
     rehearse: bool = False,
     run_paper: bool = False,
+    resume_held: bool = False,
+    retry_rejected_hedge: str | None = None,
     environment: Mapping[str, str] | None = None,
     env_file: Path | None = None,
     node_builder: LiveTakerNodeBuilder = build_live_taker_node,
@@ -224,6 +256,7 @@ def run_live_taker_entry(
         profile, strategy_config=profile.strategy_config, node_builder=node_builder,
         rehearse=rehearse, run_paper=run_paper, environment=environment,
         env_file=env_file, rehearsal_runner=rehearsal_runner,
+        resume_held=resume_held, retry_rejected_hedge=retry_rejected_hedge,
     )
 
 
@@ -232,6 +265,8 @@ def run_live_maker_entry(
     *,
     rehearse: bool = False,
     run_paper: bool = False,
+    resume_held: bool = False,
+    retry_rejected_hedge: str | None = None,
     environment: Mapping[str, str] | None = None,
     env_file: Path | None = None,
     node_builder: LiveMakerNodeBuilder = build_live_maker_node,
@@ -242,6 +277,7 @@ def run_live_maker_entry(
         profile, strategy_config=profile.strategy_config, node_builder=node_builder,
         rehearse=rehearse, run_paper=run_paper, environment=environment,
         env_file=env_file, rehearsal_runner=rehearsal_runner,
+        resume_held=resume_held, retry_rejected_hedge=retry_rejected_hedge,
     )
 
 
@@ -255,10 +291,15 @@ def _run_live_entry(
     environment: Mapping[str, str] | None,
     env_file: Path | None,
     rehearsal_runner: LiveTakerRehearsalRunner | None,
+    resume_held: bool,
+    retry_rejected_hedge: str | None,
 ) -> LiveTakerEntryResult:
     _validate_live_profile(profile, strategy_config)
     if rehearse and run_paper:
         raise ValueError("rehearse and run_paper are mutually exclusive")
+    recovery = StartupRecoveryOptions(resume_held, retry_rejected_hedge)
+    if (resume_held or retry_rejected_hedge is not None) and not run_paper:
+        raise ValueError("recovery choices require --run-paper")
     if run_paper:
         _validate_paper_binding(profile)
     if rehearsal_runner is None:
@@ -295,6 +336,7 @@ def _run_live_entry(
             loop=loop,
             connection_timeout_seconds=float(profile.connection_timeout_seconds),
             stop_timeout_seconds=float(profile.stop_timeout_seconds),
+            startup_recovery=recovery if resume_held else None,
         )
         if not rehearse and not run_paper:
             reason = (
@@ -638,9 +680,22 @@ def _main(
         action="store_true",
         help=f"run the ordinary {mode.title()} on its bound Bitfinex paper account",
     )
+    operation.add_argument("--inspect-recovery", action="store_true",
+                           help="inspect existing local business state without connections")
+    parser.add_argument("--resume-held", action="store_true",
+                        help="review old pauses for this run; reconciliation still required")
+    parser.add_argument("--retry-rejected-hedge", metavar="OLD_CLIENT_ORDER_ID",
+                        help="with --resume-held, qualify one zero-fill rejection for a new ID")
     parser.add_argument("--env-file", type=Path, default=Path(".env"))
     args = parser.parse_args(argv)
     try:
+        if args.inspect_recovery:
+            if args.resume_held or args.retry_rejected_hedge is not None:
+                raise ValueError("offline inspection cannot consume recovery choices")
+            profile = (load_live_taker_profile(args.profile) if mode == "taker"
+                       else load_live_maker_profile(args.profile))
+            print(json.dumps(inspect_profile_recovery(profile), default=str))
+            return 0
         if mode == "taker":
             result = run_live_taker_entry(
                 load_live_taker_profile(args.profile),
@@ -648,6 +703,7 @@ def _main(
                 environment=environment, env_file=args.env_file,
                 node_builder=cast(LiveTakerNodeBuilder, node_builder),
                 rehearsal_runner=rehearsal_runner,
+                resume_held=args.resume_held, retry_rejected_hedge=args.retry_rejected_hedge,
             )
         else:
             result = run_live_maker_entry(
@@ -656,6 +712,7 @@ def _main(
                 environment=environment, env_file=args.env_file,
                 node_builder=cast(LiveMakerNodeBuilder, node_builder),
                 rehearsal_runner=rehearsal_runner,
+                resume_held=args.resume_held, retry_rejected_hedge=args.retry_rejected_hedge,
             )
     except Exception as exc:
         print(

@@ -222,6 +222,8 @@ def test_pending_hedge_view_keeps_multileg_intent_ahead_of_other_direction(
 def test_pending_hedge_view_never_guesses_old_checkpoint_execution_order(
     tmp_path: Path, old_status: ObligationStatus,
 ) -> None:
+    from test_maker_migration import _v1_payload
+
     from py000_nautilus.maker_migration import migrate_maker_state
 
     old_prefix, new_prefix = tmp_path / "old", tmp_path / "new"
@@ -245,6 +247,8 @@ def test_pending_hedge_view_never_guesses_old_checkpoint_execution_order(
         else:
             legacy.update_hedge_status("OLD-HEDGE", old_status)
     JsonStateStore(maker_legacy_paths(old_prefix)[1]).freeze_source_submissions("old state")
+    for path in maker_legacy_paths(old_prefix):
+        path.write_text(json.dumps(_v1_payload(JsonStateStore(path))))
     owner = migrate_maker_state(
         old_prefix, new_prefix, "SOURCE.BITFINEX", "HEDGE.MT5", stopped=True,
     )
@@ -296,7 +300,7 @@ def test_fill_and_both_freezes_are_in_first_and_only_durable_snapshot(
     intent = _fill(owner, LONG)
     assert intent is not None and len(snapshots) == 1
     payload = snapshots[0]
-    assert payload["schema_version"] == 5 and payload["kind"] == "maker"
+    assert payload["schema_version"] == 7 and payload["kind"] == "maker"
     assert payload["cycle_freeze_only"] is (existing_freeze is None)
     assert payload["source_instrument_id"] == "SOURCE.BITFINEX"
     assert payload["hedge_instrument_id"] == "HEDGE.MT5"
@@ -402,6 +406,8 @@ def test_only_a_clean_atomic_fill_can_grant_or_retain_cycle_provenance(
 
 
 def test_old_v3_freeze_loads_without_writing_or_inventing_provenance(tmp_path: Path) -> None:
+    from test_maker_migration import _v1_payload
+
     prefix = tmp_path / "v3"
     owner = _owner(prefix)
     _begin(owner, LONG)
@@ -409,6 +415,8 @@ def test_old_v3_freeze_loads_without_writing_or_inventing_provenance(tmp_path: P
     payload = owner._to_payload()
     payload["schema_version"] = 3
     payload.pop("cycle_freeze_only")
+    payload["directions"] = {direction.value: _v1_payload(view)
+                             for direction, view in owner.stores.items()}
     owner.path.write_text(json.dumps(payload))
     before = owner.path.read_bytes()
     old = _owner(prefix)
@@ -418,7 +426,7 @@ def test_old_v3_freeze_loads_without_writing_or_inventing_provenance(tmp_path: P
         fill_key="S-bid|V-bid|LATE", client_order_id="S-bid", trade_id="LATE",
         source_side=BUY, fill_ounces=D(1),
     )
-    assert json.loads(old.path.read_text())["schema_version"] == 5
+    assert json.loads(old.path.read_text())["schema_version"] == 7
     assert not _owner(prefix).cycle_freeze_only
 
 

@@ -99,7 +99,9 @@ def bind_live_account_reader(
             ),
             ask=hedge_book.ask, ask_ts_ns=hedge_ts_ns,
             max_quote_age_ns=config.max_quote_age_ns,
-            ask_actionable=hedge_book.ask_size > 0,
+            # MT5 has no depth in its PUB protocol. Keep source depth admission
+            # above; hedge capacity is derived from fresh account/price facts.
+            ask_actionable=0 < hedge_book.bid <= hedge_book.ask,
         )
         source_observed = 0
         if source is not None:

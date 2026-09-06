@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 from decimal import Decimal
+from functools import partial
 from pathlib import Path
 from typing import Protocol, cast
 
@@ -45,7 +46,9 @@ from py000_nautilus.mt5_v1_execution import (
     mt5_v1_execution_account_id,
 )
 from py000_nautilus.restart_recovery import (
+    StartupRecoveryOptions,
     capture_startup_receipt,
+    check_rejected_retry_execution,
     has_business_history,
     reconcile_startup,
 )
@@ -88,9 +91,12 @@ def build_live_maker_node(
     connection_timeout_seconds: float = 10.0,
     stop_timeout_seconds: float = 10.0,
     strategy_factory: MakerStrategyFactory = MakerStrategy,
+    startup_recovery: StartupRecoveryOptions | None = None,
 ) -> tuple[TradingNode, MakerStrategy]:
     """Build without trading connections; an explicit cache database connects on construction."""
     validate_stop_timeout(stop_timeout_seconds)
+    if startup_recovery is not None and strategy_factory is not MakerStrategy:
+        raise ValueError("startup recovery options require the ordinary Maker")
     _validate_composition(
         bitfinex_data_config,
         bitfinex_exec_config,
@@ -193,11 +199,12 @@ def build_live_maker_node(
                 },
             )
         if (
-            native_history or node.cache.orders() or node.cache.positions()
+            startup_recovery is not None or native_history
+            or node.cache.orders() or node.cache.positions()
             or bitfinex_exec._cid_store.bindings
             or has_business_history(strategy._state_store)
         ):
-            receipt = capture_startup_receipt(strategy._state_store)
+            receipt = capture_startup_receipt(strategy._state_store, startup_recovery)
 
             async def recover_startup() -> None:
                 await reconcile_startup(
@@ -207,6 +214,10 @@ def build_live_maker_node(
                     source_instrument_id=strategy_config.source_instrument_id,
                     hedge_instrument_id=strategy_config.hedge_instrument_id,
                     receipt=receipt,
+                    rejected_retry_check=partial(
+                        check_rejected_retry_execution, node.cache, mt5_exec,
+                        config=strategy_config, data=mt5_data,
+                    ),
                 )
 
             reconciler.bind_restart_recovery(recover_startup)

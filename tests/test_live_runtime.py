@@ -38,11 +38,12 @@ from test_taker_events import (
 )
 
 from py000_nautilus import live_runtime
-from py000_nautilus.app import _maker_strategy_config
+from py000_nautilus.app import _hedge_instrument, _maker_strategy_config
 from py000_nautilus.bitfinex_v1_data import INSTRUMENT_ID as SOURCE_ID
 from py000_nautilus.live_runtime import SourceTerminalReconciler, get_source_terminal_reconciler
 from py000_nautilus.margin import LiveAccountReader
 from py000_nautilus.models import BookTop, SourceDirection
+from py000_nautilus.mt5_v1_data import quote_from_pub
 from py000_nautilus.strategies._source_terminal import SourceTerminalResult
 from py000_nautilus.strategies.maker import MakerStrategy
 
@@ -144,6 +145,42 @@ def test_live_account_reader_keeps_maintenance_separate_from_new_budget_and_curr
     assert probe.hedge.info["mt5_account_sample_valid"] is True
     assert probe.read(probe.book, probe.now, probe.book, probe.now, False) is None
     assert not probe.calls
+
+
+@pytest.mark.parametrize(
+    "failure", [None, "stale", "future", "zero", "crossed", "account", "source"],
+)
+def test_live_account_reader_accepts_mt5_unknown_depth_but_keeps_factual_gates(
+    tmp_path: Path, failure: str | None,
+) -> None:
+    probe = _account_reader_probe(tmp_path)
+    tick = quote_from_pub(
+        {"message_type": "tick", "event_time_ms": str(probe.now // 1_000_000),
+         "bid": "3999", "ask": "4000"},
+        _hedge_instrument(), reference_utc_ms=probe.now // 1_000_000,
+        now_utc_ms=probe.now // 1_000_000, timezone_name="UTC", ts_init=probe.now,
+        max_tick_age_ms=1000,
+    )
+    assert tick is not None and tick.bid_size == 0 and tick.ask_size == 0
+    hedge = BookTop(tick.bid_price.as_decimal(), tick.ask_price.as_decimal(),
+                    tick.bid_size.as_decimal(), tick.ask_size.as_decimal())
+    source, stamp = probe.book, tick.ts_event
+    if failure == "stale":
+        stamp -= probe.config.max_quote_age_ns + 1
+    elif failure == "future":
+        stamp += 1
+    elif failure == "zero":
+        hedge = BookTop(Decimal(0), hedge.ask, Decimal(0), Decimal(0))
+    elif failure == "crossed":
+        hedge = BookTop(hedge.ask + 1, hedge.ask, Decimal(0), Decimal(0))
+    elif failure == "account":
+        probe.hedge_client.sample_current = False
+    elif failure == "source":
+        # A flat Bitfinex account still needs a genuinely actionable source ask.
+        probe.source.info["bitfinex_margin"]["positions"]["position"] = None
+        source = BookTop(source.bid, source.ask, Decimal(0), Decimal(0))
+    result = probe.read(source, probe.now, hedge, stamp, True)
+    assert (result is not None) is (failure is None)
 
 
 class _Engine:

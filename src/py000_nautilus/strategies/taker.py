@@ -896,7 +896,9 @@ class TakerStrategy(Strategy):
         if self.state_store.knows_source_order(client_order_id):
             self.state_store.update_source_status(client_order_id, status)
         else:
-            self.state_store.update_hedge_status(client_order_id, ObligationStatus.REJECTED)
+            self.state_store.update_hedge_status(
+                client_order_id, ObligationStatus.REJECTED, native_status=status,
+            )
 
     def _inputs_are_fresh(
         self,

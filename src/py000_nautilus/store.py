@@ -18,7 +18,13 @@ from py000_nautilus.durability import (
     replace_and_sync_parent,
 )
 from py000_nautilus.economics import round_hedge_ounces
-from py000_nautilus.models import BusinessOrderSide, HedgeIntent, HedgeLeg, ObligationStatus
+from py000_nautilus.models import (
+    BusinessOrderSide,
+    HedgeIntent,
+    HedgeLeg,
+    ObligationStatus,
+    RejectedHedgeAttempt,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,6 +59,12 @@ class JsonStateStore:
 
     _restart_halt_recorder: Callable[[str], None] | None = None
     _restart_failure_recorder: Callable[[], None] | None = None
+    _restart_pause_revoker: Callable[[], None] | None = None
+
+    def _revoke_restart_permission(self) -> None:
+        revoker = getattr(self, "_restart_pause_revoker", None)
+        if revoker is not None:
+            revoker()
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
@@ -122,6 +134,7 @@ class JsonStateStore:
         """Persist a Maker-wide hold without inventing an order terminal state."""
         if not reason:
             raise ValueError("freeze reason must not be empty")
+        self._revoke_restart_permission()
         if self._state.source_freeze_reason is not None:
             return
         self._state.source_freeze_reason = reason
@@ -252,6 +265,8 @@ class JsonStateStore:
         record = self._state.source_orders.get(client_order_id)
         if record is None:
             return
+        if status in {"UNKNOWN", "DENIED", "REJECTED", "CANCELED", "EXPIRED"}:
+            self._revoke_restart_permission()
         self._state.source_orders[client_order_id] = replace(record, status=status)
         if (
             status in {"DENIED", "FILLED", "REJECTED"}
@@ -281,6 +296,7 @@ class JsonStateStore:
             raise
 
     def mark_source_unknown(self, client_order_id: str, reason: str) -> None:
+        self._revoke_restart_permission()
         record = self._state.source_orders.get(client_order_id)
         if record is not None:
             self._state.source_orders[client_order_id] = replace(record, status="UNKNOWN")
@@ -434,6 +450,7 @@ class JsonStateStore:
             raise ValueError("completed hedge intent cannot be blocked")
         if not reason:
             raise ValueError("hedge block reason must not be empty")
+        self._revoke_restart_permission()
         self._state.hedge_intents[intent_id] = replace(
             intent,
             status=ObligationStatus.BLOCKED,
@@ -441,10 +458,22 @@ class JsonStateStore:
         self._state.halt_reason = f"hedge {intent_id} blocked: {reason}"
         self._persist()
 
-    def update_hedge_status(self, client_order_id: str, status: ObligationStatus) -> None:
+    def update_hedge_status(
+        self, client_order_id: str, status: ObligationStatus, *, native_status: str | None = None,
+    ) -> None:
         intent = self._intent_for_hedge_order(client_order_id)
         if intent is None:
             return
+        if _is_rejected_attempt(intent, client_order_id):
+            if ((status is not ObligationStatus.REJECTED
+                 or native_status not in {None, "REJECTED"})
+                    and self._hold_rejected_attempt(intent, client_order_id, "terminal status")):
+                self._persist()
+            return
+        if status in {
+            ObligationStatus.BLOCKED, ObligationStatus.REJECTED, ObligationStatus.UNKNOWN,
+        }:
+            self._revoke_restart_permission()
         if intent.status in {
             ObligationStatus.BLOCKED,
             ObligationStatus.REJECTED,
@@ -493,6 +522,8 @@ class JsonStateStore:
         intent = self._intent_for_hedge_order(client_order_id)
         if intent is None:
             return False
+        if _is_rejected_attempt(intent, client_order_id):
+            return self._hold_rejected_attempt(intent, client_order_id, "late fill")
         if fill_ounces <= 0:
             raise ValueError("hedge fill quantity must be positive")
         self._state.seen_hedge_fills.add(fill_key)
@@ -512,6 +543,7 @@ class JsonStateStore:
                 status=ObligationStatus.BLOCKED,
             )
             if blocked_reason is None:
+                self._revoke_restart_permission()
                 self._state.halt_reason = (
                     f"hedge {client_order_id} filled after unresolved status "
                     f"{intent.status.value}"
@@ -521,6 +553,7 @@ class JsonStateStore:
             return True
         if intent.hedge_plan:
             if intent.hedge_leg_index >= len(intent.hedge_plan):
+                self._revoke_restart_permission()
                 self._state.hedge_intents[intent.intent_id] = replace(
                     intent,
                     hedge_filled_ounces=filled,
@@ -533,6 +566,7 @@ class JsonStateStore:
             leg = intent.hedge_plan[intent.hedge_leg_index]
             expected = leg.quantity_ounces - intent.hedge_leg_filled_ounces
             if fill_ounces != expected:
+                self._revoke_restart_permission()
                 self._state.hedge_intents[intent.intent_id] = replace(
                     intent,
                     hedge_filled_ounces=filled,
@@ -582,12 +616,23 @@ class JsonStateStore:
     def intents(self) -> tuple[HedgeIntent, ...]:
         return tuple(self._state.hedge_intents.values())
 
+    def _hold_rejected_attempt(self, intent: HedgeIntent, client_order_id: str, fact: str) -> bool:
+        """Keep contradictory old evidence out of the current leg's quantity/seen set."""
+        self._revoke_restart_permission()
+        blocked = replace(intent, status=ObligationStatus.BLOCKED)
+        reason = f"archived rejected hedge {client_order_id} has conflicting {fact}"
+        changed = blocked != intent or self._state.halt_reason != reason
+        self._state.hedge_intents[intent.intent_id] = blocked
+        self._state.halt_reason = reason
+        return changed
+
     def _intent_for_hedge_order(self, client_order_id: str) -> HedgeIntent | None:
         return next(
             (
                 intent
                 for intent in self._state.hedge_intents.values()
                 if intent.hedge_client_order_id == client_order_id
+                or _is_rejected_attempt(intent, client_order_id)
             ),
             None,
         )
@@ -606,7 +651,7 @@ class JsonStateStore:
 
     def _to_payload(self) -> dict[str, object]:
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "source_orders": {
                 key: _decimal_strings(asdict(record))
                 for key, record in self._state.source_orders.items()
@@ -629,10 +674,15 @@ class JsonStateStore:
 
     @staticmethod
     def _from_payload(raw: dict[str, object]) -> StoreState:
-        if raw.get("schema_version") != 1:
+        version = raw.get("schema_version")
+        if type(version) is not int or version not in {1, 2}:
             raise ValueError("unsupported state schema")
         source_raw = cast(dict[str, dict[str, object]], raw["source_orders"])
         intents_raw = cast(dict[str, dict[str, object]], raw["hedge_intents"])
+        if any((version == 1 and value.get("rejected_attempt") is not None)
+               or (version == 2 and "rejected_attempt" not in value)
+               for value in intents_raw.values()):
+            raise ValueError("rejected hedge attempt does not match state schema")
         source_orders = {
             key: SourceOrderRecord(
                 client_order_id=str(value["client_order_id"]),
@@ -683,10 +733,11 @@ class JsonStateStore:
                 hedge_order_ids=tuple(
                     str(item) for item in cast(list[object], value.get("hedge_order_ids", []))
                 ),
+                rejected_attempt=_rejected_attempt_from_payload(value.get("rejected_attempt")),
             )
             for key, value in intents_raw.items()
         }
-        return StoreState(
+        state = StoreState(
             source_orders=source_orders,
             active_source_order_id=_optional_string(raw["active_source_order_id"]),
             seen_source_fills=set(cast(list[str], raw["seen_source_fills"])),
@@ -696,6 +747,12 @@ class JsonStateStore:
             halt_reason=_optional_string(raw["halt_reason"]),
             source_freeze_reason=_optional_string(raw.get("source_freeze_reason")),
         )
+        if any(intent.rejected_attempt is not None and any(
+            key.split("|")[0] == intent.rejected_attempt.client_order_id
+            for key in state.seen_hedge_fills
+        ) for intent in hedge_intents.values()):
+            raise ValueError("archived rejected hedge attempt cannot have recorded fills")
+        return state
 
 
 def _persist_payload(
@@ -728,6 +785,20 @@ def _persist_payload(
 
 def _optional_string(value: object) -> str | None:
     return None if value is None else str(value)
+
+
+def _is_rejected_attempt(intent: HedgeIntent, client_order_id: str) -> bool:
+    return (intent.rejected_attempt is not None
+            and intent.rejected_attempt.client_order_id == client_order_id)
+
+
+def _rejected_attempt_from_payload(value: object) -> RejectedHedgeAttempt | None:
+    if value is None:
+        return None
+    if (not isinstance(value, dict) or set(value) != {"client_order_id", "leg_index"}
+            or not isinstance(value["client_order_id"], str)):
+        raise ValueError("invalid rejected hedge attempt record")
+    return RejectedHedgeAttempt(value["client_order_id"], _exact_int(value["leg_index"]))
 
 
 def _exact_int(value: object) -> int:

@@ -27,11 +27,13 @@ states remain for diagnosis, never deletion of state to unlock trading.
 
 ## Explicit Maker state migration (offline)
 
-Fresh Maker states use schema 5. Existing schema 3/4 files remain readable and
+Fresh Maker states use schema 7. Existing schema 3–6 files remain readable and
 upgrade on their next write, without inferring the cause of old freezes. New
 files record whether a freeze came only from a normal fill cycle; this alone
 does not authorize recovery without complete native and venue evidence.
-Older binaries cannot read schema 5/6; do not downgrade them against upgraded
+Taker states now write schema 2 and still read schema 1. The new formats retain
+the original zero-fill rejected hedge ID alongside its single permitted replacement.
+Older binaries cannot read schema 7/8 (Maker) or 2 (Taker); do not downgrade them against upgraded
 active state or restore stale state to bypass that check.
 To convert an old single-file schema 2 state or
 both schema 1 direction files, stop the old strategy and write to a **different**
@@ -53,7 +55,7 @@ files must be present for schema 1, including a valid empty file if one directio
 never traded. Its instrument IDs are operator-supplied bindings because schema 1
 has no instrument header; schema 2 must match its existing header.
 
-The new schema 6 file preserves old orders, fill identities, hedge plans and
+The new schema 8 file preserves old orders, fill identities, hedge plans and
 UNKNOWN/HOLD states. A labeled legacy checkpoint retains known historical totals
 without inventing missing individual fill quantities or replaying old hedges.
 Only subsequent real fills enter the new per-fill allocation ledger. The old
@@ -209,6 +211,30 @@ The typed profile accepts optional `cache_database` (native Redis `DatabaseConfi
 cross-process native history. Validation deliberately does not test the configured Redis backend.
 Ordinary startup uses the existing evidenced recovery rules, not a blanket clear-HOLD operation.
 
+Inspect an existing business file offline, without credentials, Redis, or venue access:
+
+```bash
+uv run py000-taker-live --profile /path/to/taker-profile.json --inspect-recovery
+uv run py000-maker-live --profile /path/to/maker-profile.json --inspect-recovery
+```
+
+Inspection reports local pauses and unfinished obligations; it cannot certify remote execution.
+After reviewing the cause, `--run-paper --resume-held` explicitly requests full reconciliation of
+an old pause **for this startup only**. Missing history, uncertain requests, conflicting positions
+or fees still block recovery. A new pause/failure during this startup revokes that review.
+For an explicitly planned hedge whose original order and complete EA journal both prove a
+zero-fill rejection, add `--retry-rejected-hedge OLD_CLIENT_ORDER_ID`. This retains the old ID,
+consumes at most one replacement per obligation, and lets the original dispatcher generate a
+new ID for that same leg. Current session, ticket, lot, quote and account capacity must qualify
+within 30 seconds of startup capture. This is a qualification deadline, not a fill guarantee;
+waiting for the first MT5 PUB also respects the configured reconciliation-round timeout.
+MT5's protocol has no depth: zero native quote sizes mean unknown, not fabricated liquidity.
+Fresh valid prices and current account/permission/plan facts are still required.
+The resulting confirmed obligation uses the normal pending/drain lifecycle. A second rejection
+remains held. Unknown or partially filled requests are never classified as zero-fill rejection.
+These temporary choices are not profile settings, do not raise order/account budgets, and do
+not apply to canaries. Never edit/delete custody files to manufacture a clean start.
+
 Normal node/signal stop first closes new source/modify admission while keeping execution and
 fill/terminal callbacks online. It requests each known source cancel at most once and progresses
 only existing confirmed hedge obligations, then calls native stop. It does not flatten an already
@@ -217,8 +243,11 @@ hedged position. `drain_complete` reports that execution result separately from 
 `PAPER_INCOMPLETE` exits nonzero with pending IDs/reasons and residuals.
 A timeout, old external HOLD or failed pause publication
 cannot be reported as success. Keep retained state for diagnosis; don't rerun blindly or delete it.
-Current-code finite DEMO, the remaining startup recovery cases and abrupt-process boundaries
-are still pending qualification. No automatic canary is enabled by installing the command.
+The in-tree ordinary process matrix covers 22 Maker/Taker cases using real SIGKILL/SIGTERM and
+disposable Redis, with synthetic venue I/O. It retains UNKNOWN/old HOLD and reports incomplete
+accounting when old native NETTING snapshots are unavailable. This is not installed-artifact,
+real-EA/network, power-loss or finite-DEMO qualification. Those remaining release boundaries
+are tracked in the implementation plan; installing a command does not enable an automatic canary.
 
 ### Realized trading PnL and commission at exit
 

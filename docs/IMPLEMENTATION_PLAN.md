@@ -572,9 +572,19 @@ carry 是同 route 的唯一 signed residual；下一 fill 先与它合并再分
 
 旧暂停/明确拒单的实施出口（2026-09-06，编码前固定）：复用普通入口，不新增恢复服务或订单账。`--inspect-recovery` 仅从原业务文件列出暂停、原订单/义务与精确所需证据；不读取凭据、构造数据库或宣称本地文件已证明 venue 终态。`--resume-held` 是本次普通 paper 运行中操作员审阅旧暂停后的显式恢复选择，不写进长期 profile，也不靠旧 reason 文案授权；随后仍需完整 native/venue/CID/票据/费用核验，缺历史或只查不到订单仍不放行。仅明确拒单另可指定 `--retry-rejected-hedge <旧CID>`，要求同时选择恢复旧暂停、原计划存在、旧 native+EA 请求明确 REJECTED 且成交0、执行前提健康；在原义务保留全部旧IDs和一条有界失败尝试记录，由原 dispatcher 创建新ID。每义务最多一次额外尝试，启动恢复资格限定30秒；失败后不形成重试循环，UNKNOWN请求从不重发。发布前失败整包回滚，发布后同步失败仍废弃当前资格。正常 live 报告/下单的 current snapshot、精确计划与账户限制不因该操作出口放宽；不自动增加账户、单量、净额或 DEMO 预算。
 
+真实行情接线修订（2026-09-07）：MT5 PUB 不提供深度，原 `quote_from_pub` 的 native bid/ask size=0 表示未知，不是无可交易报价。独立复核用真实 mapper 替换第二普通节点的全部 MT5 报价，精确复现拒单恢复被错误挡住。恢复与普通账户 reader 改用正且未交叉的 bid/ask、报价时效、当前权限、实际票据计划与账户容量；不伪造 MT5 深度，不放宽 Bitfinex 深度。真实新进程另复现首条 PUB 延迟300ms时已耗尽两次恢复轮次、报价到达后仍 HOLD。仅对原生明确REJECTED0且未消费替代尝试的原义务，在全部事实采集之前等待首条报价，受原30秒资格及Actor单轮timeout共同约束，等待中新暂停撤销资格、取消向上传播。已有但失效的报价仍由原完整检查拒绝；超时无报价继续HOLD/零派发，不重试状态发布或下单，不把连接成功当作行情已就绪。
+
 drain 必须发生在 node/执行客户端仍运行时，完成或到预算后才调用最终 stop/dispose；不能在框架已断开执行通道后才尝试完成 hedge。信号退出与显式停止使用同一生命周期，Q6覆盖这个消息顺序。
 
 验收：R01–R06，覆盖持久化/发单/成交/对冲边界的进程重启。没有原生 cache/order 归属探针结果前，不照搬 close canary 的 `generate_missing_orders=True`。
+
+2026-09-07，R04b 与本地真实进程恢复验证完成：
+
+- 在 `e2035a6` 上补齐普通入口的只读诊断、本次旧HOLD审阅、每义务最多一次明确零成交拒单替代；原计划、旧CID、已成交前缀及seen历史保留。Taker新写schema2，Maker新写7/8，旧格式可读但不伪造重试资格。新外因即使旧文案不变也撤销本次资格；发布前整包回滚，发布后同步失败不再开门。
+- 独立复核实际发现并修复 MT5 原mapper未知depth=0被错误拒绝，以及300ms首PUB晚到后两轮已失败的启动时序问题；修复范围见上文。其余权限、价格时效、账户容量、票据/lot、完整native/venue/CID/费用检查保留。175项针对性检查通过；旧迁移夹具两例改为真实schema1输入，未放宽生产迁移reader。
+- 冻结源码aggregate SHA `fb00084d48b9b2d93f44efe32414316d935be2eeb01a482f3298bd9c91288e63` 上全量 **2995 passed / 130既有Pandas警告 / 489.80s**（分离进程文件，含原两项实际Redis且无skip）。独立进程矩阵同冻结 **22 passed / 352.49s**：11个截点/场景×Maker/Taker，真实普通entry/node、SIGKILL、全新进程native Redis恢复和真实SIGTERM，无原生历史seed；原source/hedge事件落盘、已结算、腿间、未决request、旧HOLD、恢复中再次被杀、显式拒单、默认保留和无PUB均覆盖。替代完成后仍由普通策略响应下一机会；Maker完成后合法的零成交被动quote不是重复义务。
+- 进程证据 `/tmp/py000-r-final22-AqUfvL`，46个worker PID及78份快照的生产字典一致，manifest SHA `3f22cf3226f770d23adb67bef7c09ef5500fb4e75943ebb30f17541cf536d027`。主agent核对测试断言及当前源码，reviewer给固定范围RECOMMEND-ACCEPT；全仓Ruff、Mypy112文件、diff-check通过。主agent全量临时Redis及22个进程测试容器全部按完整ID停止并复查不存在，仅合成数据随`--rm`清除。先前失败轮保留，不混入通过次数。
+- 主agent接受上述源码/本地进程范围并本地提交，不推送、部署或交易。安装产物的普通进程认证、P05和当前EA匹配、W7共账户、W9有限DEMO仍未完成。腿间场景因原生旧NETTING snapshots未恢复，A07如实返回`PENDING/native_position_history_incomplete`，不把执行drain完成当成最终费用/PnL齐全。下一步立即进入既定W7接线，不能据单策略绿色宣布完整收尾。
 
 ### W7：单节点 Maker/Taker 共账户
 
@@ -592,6 +602,12 @@ Q4（2026-09-06）五个离线原生实验已通过：两个 StrategyId 的 +2/-
 
 验收：J01–J05。两策略必须各能真实参与，而不是长期阻塞其中一个；两边 Maker 工作单与 Taker 在途订单的最坏成交也不能超共享上限。
 
+W7 具体接线（2026-09-07，编码前固定）：复用一个 Maker 原子 owner 的既有 allocation，shared 模式增加一个可双向的 Taker view；原 Maker `.stores` 仍只有 bid/ask 两个 view，新增明确 `all_views()`/`taker_store` 供共同核验。共享文件必须绑定三个 view 的 StrategyId，使用独立路径/显式格式；不自动合并旧运行文件、不猜旧 fill 顺序。所有持久化、回滚、fill 唯一性、残差和暂停来源覆盖整个 owner；Taker 通过注入 view 复用 reducer，不另建 residual 或请求账。共同准入从当前账户净量及全部可成交 source leaves/reservation 计算 BUY/SELL 最坏值，不提前抵消反向挂单；pending cancel/update 保留保守占用。MT5 lane 沿同一 allocation 顺序，整个 intent 的 close/remaining-open 计划完成后才换 owner，腿间 currentCID 为空不等于 lane 空闲。两策略都须通过普通回调参与后续机会，不以固定优先级永久饿死一方。
+
+跨 owner 票据探针已实际核实：真实 MT5 mass 经原生 Engine 两次对账，Taker 的 reduce-only close Order/fill 可精确指向 Maker 开的 ticket，Position 仍保留 Maker 归属且事件包含两个真实 owner；重复对账 UUID 不变，native integrity=True。共享核验因此按每个 CID 的业务 view 验 Order/fill owner，不转移 Position owner、不修改 PID。单策略默认边界仍严格。启动只收一组完整报告、联合投影/发布/放行，不逐策略各解锁；停止先同时封新源、共用一次预算排空两策略再停原生节点。A07 shared 输出明确的双 owner **native 虚拟交易合计**口径：跨策略相反 NETTING 虚拟仓尚未关闭时，该值可能不同于 venue 已实现流水，不能称账户实收净利润，也不强行按开仓 Position owner 分摊另一策略的 close 费用。实际账户流水口径不在本次另造。
+
+W7 生产写集限定既有 owner/store/hedge、两策略、cache/projectors/recovery、公共生命周期/报告和一个薄 both composition/入口；独立 reviewer 负责真实 native cross-owner 和 J01–J05 普通双策略测试。先完成当前拒单恢复及真实进程候选的统一验证/本地提交，再开始这些共享生产改动，避免跨版本恢复证据混用。旧 standalone/canary 默认不改变，EA/账号/仓位预算不由 W7 扩大。
+
 ### W8：入口、发布和运行边界
 
 范围：live entry、builder、公用运行函数、canary/smoke、`pyproject.toml`、README/协议、必要的脱敏示例与测试。
@@ -606,6 +622,8 @@ Q4（2026-09-06）五个离线原生实验已通过：两个 StrategyId 的 +2/-
 6. 在 protocol 64KiB 内制定容量 envelope：按最大合法字段长度验证允许票数，预留帧开销；准入覆盖拟新增票，在完整snapshot仍可读取的范围内停止新增、允许减仓。数值依据测量填入profile，不把样本220当通用上限。若已经超包上限，close前snapshot也可能失败，此时有界HOLD并定位恢复，不能承诺自动减仓；必要时协同提升已测算的Python/EA/ZMQ固定上限，不优先新建分页协议。禁止截断。
 
 验收：P01–P06。可先完成构建/文档部分；不等这些维护项全完才开始 W1 修错。
+
+P03 原生互斥实测（2026-09-07）：`runtime/mt5-native-w8-p03-qbojrL` 的四个独立 portable 终端运行当前 EA 逐字提取的 owner helpers（主文件 SHA `d4712049f4a7f866988e786d6dfc42d6a480aafacb49fdd1b2cba2020fcc7f6f`，helper SHA `f30fa408752ba24c079b31bdf7588499cd21913e0d71d13da739cb3c43bc2fe7`）。同一个真实 FILE_COMMON 目录中新合成 namespace 争锁失败、不同 namespace 成功；正常释放及持锁进程异常退出后均可接管，完成角色9/12/12项检查均0失败。四个 EX5 编译均0错误/0警告，native终端build6182；只有新建CrashA PID10028被按完整路径/启动时间精确结束，其余自行退出。既有终端10072的PID/path/启动时间前后不变，交易/DLL权限全部0。首轮`HikItd`因隔离ini前置权限不符在调用锁前退出，保留为夹具失败，不计锁反例。该证据只认证原生句柄互斥，不冒充正式EA账户身份/初始化/部署、journal容量或真实REP延迟；P05继续实测。
 
 ### W9：有限 DEMO 连续验收
 
