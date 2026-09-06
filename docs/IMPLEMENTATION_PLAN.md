@@ -490,6 +490,15 @@ carry 是同 route 的唯一 signed residual；下一 fill 先与它合并再分
 - 写集：`mt5_v1_execution.py`及现有adapter测试由实施agent负责；紧凑`tests/test_restart_reconciliation.py`由主agent固定真实native反例、无事件污染及正常对照；本文记录边界/证据，未实施agent独立复核。先在旧实现获得业务RED，再修复、全量回归后单独本地提交。此包不接业务HOLD释放、不改两个builder、策略、store、profile、EA或canary，不访问真实账户，不推送/部署/发单。
 - 后续W6b2复用原source去重/intent及Maker原子allocation，不能调用会发hedge/cancel的策略fill回调当纯投影。Maker跨源单事件只有每单保序，不能把cache遍历或venue时间排序假装原全局分配次序；多单缺失且顺序不明继续HOLD。MT5旧腿IDs须逐腿核对，不把旧腿成交计到当前腿；持久写失败不得留下仅内存已seen的假幂等。先交付事实可证明的恢复类别，再扩矩阵，不为不明历史另造平行账。
 
+**W6b2 source缺失成交的纯义务投影（2026-09-06，实施前固定）：** 基线`479a63a`。本包只补完整已知source成交的业务义务，不接普通启动、不恢复MT5旧腿、不解除HOLD。两个策略的hedge调度并不检查`halt_reason`，因此补出的intent必须在首次原子发布时就是BLOCKED，不能先写PENDING再补写暂停。
+
+- 一个短`source_projection.py`入口`project_source_fills(store, orders, *, source_instrument_id, trader_id, strategy_id, reason) -> int`，输入为本组合全部已知source原生Order及其完整事件，不是仅累计数量或调用者筛出的差量。调用前仍须完成原生cache身份/路由与venue完整事实核对，本入口不认证持久后端、native client索引或venue历史完整性；返回新增投影fill数，不是ready。核对准确CID集合、显式trader/strategy/instrument、已有account/side/原始quantity、native事件的订单/成交身份与数量、TradeId唯一性及native filled总量；业务seen必须是事件序列连续前缀，前缀量等于已存filled，可取得的intent/逐fill allocation数量须逐项一致。业务store未保存的price/fee不补造第二份账。
+- 整体只读预检后至多允许一个CID有缺失suffix，禁止前缀孔洞、同总量换TradeId、多CID缺失或静默忽略缺失订单。Taker须先核对原残差=全部已记source signed量−全部已存intent signed分配量（hedge SELL为正/BUY为负，使用hedge_quantity而非hedge_filled），不重算覆盖矛盾状态。多历史订单时只补当前active CID，其他源单必须在业务记录及native Order两处均为对应全成交或零成交拒绝终态，且其对冲各自COMPLETED并filled=quantity、合计残差为零；不能用业务REJECTED覆盖仍ACCEPTED的原生旧单。旧partial cancel/late-fill与不明跨单顺序暂不恢复。单CID场景保留已存分配，只追加完整缺失suffix。
+- Maker用整个owner的两view一起预检，复用v3逐笔allocation与v4固定checkpoint。每个CID的post-checkpoint allocation子序列必须等于其native已见前缀去掉checkpoint keys，不能以seen集合/同总量掩盖同CID倒序。缺失CID的已记前缀末端须可锚定allocation尾部，不能越过其他CID；无已见前缀时只接受无既有post-checkpoint allocation的尾部。v4 checkpoint历史只核对可得事实，不强猜其旧顺序；缺失候选不得属于checkpoint，禁止为旧fill猜数量/重分配；多个缺失CID或无证据顺序继续HOLD并零写。
+- 复用原source-fill reducer和原子文件写，不建新状态机/schema/日志。一个suffix含多笔fill也只发布一次完整候选：保留既有halt/freeze文本、新义务全为BLOCKED；没有既有暂停时持久记录本次恢复reason，Maker两方向同一次发布暂停。保持原live单fill行为；空差量零写且不改状态。发布前失败回滚全部内存（Maker含两view/allocations），发布后父目录同步失败保留已发布候选并抛错，重新加载再投影不能双计。
+- 写集：实施agent负责`source_projection.py`、`store.py`、`maker_store.py`和`tests/test_source_projection.py`；主agent在`tests/test_restart_reconciliation.py`补真实native事件到业务store的组合验证及本文；另一个未实施agent独立复核。先固定反例/新功能缺口，再实现、全量含现有真实Redis回归后单独本地提交。测试需覆盖幂等零写、完整多fill单次发布、身份/前缀/已记事实冲突、Maker顺序及v4边界、原子失败前后reload，以及恢复义务不能进入现有hedge派发。
+- 本包不改adapter、builder、策略、EA、profile、CLI或canary，不调用策略成交回调、不连接真实账户，不推送/部署/发单。`apply_hedge_fill`发布前失败可能留下仅内存seen的已知遗漏随下一MT5义务投影切口修复；不把该遗漏或旧腿身份核对悄悄算作本包已完成。W6b父项和R01–R06保持未完成。
+
 恢复分类：
 
 - 已结束订单、对冲义务均完成，venue 仓位和本地记录吻合：恢复原策略运行，保留现有仓位。
@@ -701,6 +710,7 @@ EA 改动额外执行现有 `tools/mt5_source_manifest.sh --lines`、MetaEditor 
     - [x] W6a1：可选Redis薄接线、加载组合身份核验及历史source准入暂停；独立复核发现的MT5未成交exact-close缺索引遗漏已窄修，修订全量2340项含真实Redis及独立复核通过。只认证干净退出后的原生load；突崩/存储滞后与义务一致性随W6b/c验收。
   - [ ] W6b 完整事实核对、既有义务幂等恢复及普通策略解除HOLD。
     - [x] W6b1：MT5报告进入原生Engine前核验原订单/票据索引/已记成交；独立复核发现的量价舍入遗漏已窄修，修订全量2376项含真实Redis及独立复核通过。仅接受报告事实边界，不解除业务HOLD。
+    - [x] W6b2：完整已知source成交的缺失suffix纯投影，单次原子发布BLOCKED义务，保留HOLD；修订冻结全量2429项含真实Redis及独立复核通过。仅接受source纯投影，尚未接普通启动或MT5对冲腿恢复。
   - [ ] W6c 执行通道在线时drain、进程重启/停止矩阵R01–R06。
 - [ ] W7 同节点共账户。
 - [ ] W8 入口/安装/文档/原生运行边界。
@@ -984,3 +994,14 @@ EA 改动额外执行现有 `tools/mt5_source_manifest.sh --lines`、MetaEditor 
 - 修订冻结上主agent定向 **251 passed / 6.82s**，全仓Ruff、Mypy90文件与diff-check通过。独立reviewer另跑 **251 passed / 6.62s**，静态检查及三SHA测前测后相同；四个量价精度反例逐一经完整mass拒绝、断连且不污染订单事件。费用正例`-1.254→1.25`、`-1.255→1.26`、`-1.245→1.24`、返佣`1.254→-1.25 USD`在四报告入口保留，空cache旧报告/正常FOK/拒单/已关闭票据/UNKNOWN行为通过；内存关闭helper让错票据例重新在拒绝断言处RED，恢复后两对照GREEN。reviewer给出仅限W6b1的RECOMMEND-ACCEPT，不外推业务恢复或停止矩阵。
 - 主agent在修订冻结上使用全新临时Redis单次全量，**2376 passed / 129既有类别Pandas弃用警告 / 327.40s**，包含两项真实backend且无skip；三SHA测前测后相同。该临时容器已按准确ID停止并由`--rm`清除合成数据，列表复查为空；未动既有服务、镜像或真实账户。全量退出阶段另有native BACKTESTER的RUNNING→DISPOSE/DISPOSE_COMPLETED日志：只读定位未修改的`tests/test_taker_events.py:337–362`共享BacktestEngine fixture直接dispose，Maker例如`test_maker_events.py:3236–3255`手动trader.start后未stop；安装的`common/component.pyx:2195–2197`捕获无效转换并仅记ERROR。该模拟venue路径不经过新增MT5 live报告guard，不由本步修复；本步不以pytest通过替代W6c生命周期验收。
 - 主agent结合修订全量和独立RECOMMEND-ACCEPT接受W6b1，按约定单独本地提交，仅四个既定文件；不推送、部署或发单。W6b/c、R01–R06及W6父项仍未完成。下一步复用原store做完整已知事实与既有义务的幂等投影，先保留HOLD，不能重放会发单的策略回调或猜测Maker跨源单分配次序。
+
+2026-09-06，W6b2 source纯投影：草案反例修订后冻结，全量与独立复核通过：
+
+- 基线`479a63a`。实施前只读验证：普通live入口按0.4/0.6依次补一个CANCELED源单会发布两次、填满后清除特定terminal HOLD、新intent为PENDING；同fill_key换数量仍按普通去重返回None。因此原live回调不能直接充当恢复入口，这不是声称正常live语义本身违约。新API缺失导致的ModuleNotFoundError只记为新功能缺口，不冒充业务RED。
+- 独立设计复核补足Taker守恒：已记BUY0.4、无intent、待补0.2，真实residual0.4会分配1并剩−0.4；错误已存residual0.1却会分配0并剩0.3。新入口先对照已有source/intent的有符号守恒，矛盾零写拒绝而不修旧状态；历史COMPLETED还须逐义务filled=quantity。
+- 主agent四个新组合以真实native Engine处理0.4/0.7/0.9成交形成2oz Position，Maker/Taker业务分别缺全部或后两笔；完整cache身份核验后补义务，native订单/Position/事件不变，新intent全BLOCKED、原HOLD保留，同对象/重载再投影零增量，现有两策略hedge派发方法不进入下单分支。和原W6b1两例共 **6 passed / 0.90s**；先前测试stub的TraderId与Order不一致已仅修fixture，不计生产RED。另50组纯内存BUY/SELL、拆分和prefix位置对照与原live reducer经济结果一致，有差量单写、无差量/重复零写；该数不相加为pytest全量，也不证明venue或进程恢复。
+- 草案阶段出现五个真实缺失拒绝：intent重复claim/字典ID不符两例，source字典key/active身份不符两例，Maker同CID的allocation倒序一例。后者native为A0.4→B0.2→C0.4，业务却按B→A分配；同seen集合与总量虽通过旧owner校验，不能据此追加C。另将历史业务REJECTED却native仍ACCEPTED的错误正例拆开，正例使用实际OrderRejected，矛盾例须零写拒绝。修订只增加这些已记事实前检，不重排或修写历史；早期spy导入路径/非法native fixture导致的测试失败不计业务RED。
+- 冻结实现为233行`source_projection.py`、原store的无I/O reducer窄抽取和Maker尾部核验；无新schema或订单日志。新增单测49项，主agent独立重跑source/native组合及两store共 **190 passed / 2.10s**，全仓Ruff、Mypy92文件、diff-check通过。五个源/测试文件SHA在全量前后保持冻结值。
+- 未参与实施的reviewer独立运行上述四文件及Maker迁移测试，**224 passed / 1.71s**，全仓Ruff、Mypy92文件及diff-check通过，五SHA前后相同，给出仅限W6b2的RECOMMEND-ACCEPT。额外两项临时路径探针在第二次reducer已修改候选后抛RuntimeError，Taker及Maker两view/allocation/已提交快照均完整回滚且零发布，恢复后补2、reload再投影0；临时探针目录已清理。这两项不计入pytest总数。
+- 主agent在同一冻结候选上使用全新临时Redis单次全量，**2429 passed / 129既有类别Pandas弃用警告 / 329.63s**，包含两项真实backend且无skip。仍见上一步已归因的native模拟fixture RUNNING→DISPOSE/DISPOSE_COMPLETED日志，本包不宣称生命周期已修好。临时容器`62fef4306c3b`已按完整ID停止，`--rm`清除仅用于测试的合成数据，列表复查为空；未操作既有服务、镜像或账户。
+- 主agent结合本次全量和独立RECOMMEND-ACCEPT接受W6b2，按约定仅六个既定文件形成本地提交，不推送、部署或发单。W6b/c、R01–R06及W6父项仍未完成；下一切口核对MT5当前/旧对冲腿的已知成交，并修复`apply_hedge_fill`发布前失败的内存回滚，再接普通启动与HOLD释放。不能把本入口的返回值当作ready，也不能在未知历史上自动续单。

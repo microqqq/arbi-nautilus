@@ -163,6 +163,19 @@ class MakerStateStore:
             return None
         return None
 
+    def _validate_source_projection_tail(self, cid: str, prefix: tuple[str, ...]) -> None:
+        if any(item.client_order_id == cid for item in self._legacy_orders):
+            raise ValueError("source projection cannot append to a legacy Maker checkpoint order")
+        if not prefix:
+            if self._allocations:
+                raise ValueError("source projection Maker suffix has no allocation anchor")
+            return
+        index = next((index for index, item in enumerate(self._allocations)
+                      if item.fill_key == prefix[-1]), None)
+        if index is None or any(item.fill_key.split("|")[0] != cid
+                                for item in self._allocations[index + 1:]):
+            raise ValueError("source projection Maker suffix crosses another source allocation")
+
     def _route_balances(self) -> dict[_Route, tuple[Decimal, SourceDirection]]:
         directions = {key: direction for direction, view in self.stores.items()
                       for key in view._state.seen_source_fills}

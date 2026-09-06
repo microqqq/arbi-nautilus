@@ -281,6 +281,26 @@ class JsonStateStore:
         fill_ounces: Decimal,
     ) -> HedgeIntent | None:
         """Record one actual fill and, when integer ounces accrue, one intent."""
+        if self.has_seen_source_fill(fill_key) or not self.knows_source_order(client_order_id):
+            return None
+        previous_state = deepcopy(self._state)
+        try:
+            intent = self._reserve_source_fill(
+                fill_key=fill_key, client_order_id=client_order_id, trade_id=trade_id,
+                source_side=source_side, fill_ounces=fill_ounces,
+            )
+        except Exception:
+            self._state = previous_state
+            raise
+        self._persist_source_reservation(previous_state)
+        return intent
+
+    def _reserve_source_fill(
+        self, *, fill_key: str, client_order_id: str, trade_id: str,
+        source_side: BusinessOrderSide, fill_ounces: Decimal,
+        blocked_reason: str | None = None,
+    ) -> HedgeIntent | None:
+        """Apply the existing allocation without I/O; callers own atomic publication."""
         if fill_key in self._state.seen_source_fills:
             return None
         record = self._state.source_orders.get(client_order_id)
@@ -291,7 +311,6 @@ class JsonStateStore:
         if fill_ounces <= 0:
             raise ValueError("fill quantity must be positive")
 
-        previous_state = deepcopy(self._state)
         self._state.seen_source_fills.add(fill_key)
         filled = record.filled_ounces + fill_ounces
         status = "FILLED" if filled >= record.quantity_ounces else "PARTIALLY_FILLED"
@@ -302,13 +321,13 @@ class JsonStateStore:
         )
         if status == "FILLED" and self._state.active_source_order_id == client_order_id:
             self._state.active_source_order_id = None
-            if self._state.halt_reason == _source_reconcile_reason(client_order_id):
+            if (blocked_reason is None
+                    and self._state.halt_reason == _source_reconcile_reason(client_order_id)):
                 self._state.halt_reason = None
 
         signed_fill = fill_ounces if source_side is BusinessOrderSide.BUY else -fill_ounces
         rounded_ounces = self._allocate_source_fill(record, fill_key, signed_fill)
         if rounded_ounces == 0:
-            self._persist_source_reservation(previous_state)
             return None
 
         digest = sha256(fill_key.encode()).hexdigest()[:24]
@@ -327,10 +346,10 @@ class JsonStateStore:
             hedge_quantity_ounces=hedge_ounces,
             hedge_position_id=record.hedge_position_id,
             hedge_position_quantity_ounces=record.hedge_position_quantity_ounces,
-            status=ObligationStatus.PENDING,
+            status=(ObligationStatus.BLOCKED if blocked_reason is not None
+                    else ObligationStatus.PENDING),
         )
         self._state.hedge_intents[intent.intent_id] = intent
-        self._persist_source_reservation(previous_state)
         return intent
 
     def _allocate_source_fill(
