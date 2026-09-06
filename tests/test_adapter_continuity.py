@@ -314,6 +314,88 @@ async def _assert_reports(
         assert native[0].avg_px_open == pytest.approx(float(source.average_price), abs=1e-7)
 
 
+@pytest.mark.parametrize("first_sign", [1, -1], ids=["bid-first", "ask-first"])
+@pytest.mark.parametrize("second_quantity", [D("0.5"), D("0.6")], ids=["net-zero", "dust"])
+def test_both_adapters_maker_net_actual_dual_fills_then_obey_strict_next_cycle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    first_sign: int, second_quantity: Decimal,
+) -> None:
+    async def run() -> None:
+        async with _continuous(
+            tmp_path, monkeypatch, maker=True, long_quantity=2, short_quantity=2,
+        ) as (h, source, wire):
+            def accepted() -> dict[OrderSide, int]:
+                return {source.order(cid).side: cid for cid, row in source.rows.items()
+                        if source._active(row)
+                        and source.order(cid).status == OrderStatus.ACCEPTED}
+
+            # Ordinary economics and both actual adapters admit the original pair.
+            # No direct begin_source, private reserve call, or canary subclass.
+            await _drive(h, wire, lambda: len(accepted()) == 2, direction=0)
+            pair = accepted()
+            first = pair[OrderSide.BUY if first_sign > 0 else OrderSide.SELL]
+            second = pair[OrderSide.SELL if first_sign > 0 else OrderSide.BUY]
+            original_ids = set(source.rows)
+            assert len(original_ids) == 2
+            initial_journal = deepcopy(wire.journal)
+            assert [item["event_type"] for item in initial_journal] == ["stream_started"]
+            # The venue fills both already-live orders before protective cancels
+            # arrive; enqueue the actual WS facts without yielding between fills.
+            source.fill(first, D("0.5"))
+            source.fill(second, second_quantity)
+            owner = get_source_terminal_reconciler(h.node)
+            stores = _stores(h)
+
+            def reconciled() -> bool:
+                return (not owner.busy and all(source.order(cid).is_closed for cid in pair.values())
+                        and all(store.active_source_order_id not in {
+                            source.order(cid).client_order_id.value for cid in pair.values()
+                        } and store.halt_reason is None for store in stores))
+
+            await _drive(h, wire, reconciled, direction=0)
+            expected = (D("0.5") - second_quantity) * first_sign
+            assert source.net == h.node.portfolio.net_position(h.source_instrument.id) == expected
+            assert h.node.portfolio.net_position(h.hedge_instrument.id) == 0
+            assert wire.journal == initial_journal and all(not store.intents() for store in stores)
+            assert sum((store.rounding_residual_ounces for store in stores), D(0)) == expected
+            assert h.strategy._state_store.has_residuals() is (expected != 0)
+            assert owner.last_failure is None
+            assert {cid.value for cid in h.source_cancel_commands} == {
+                source.order(cid).client_order_id.value for cid in original_ids
+            }
+            assert len(h.source_cancel_commands) == 2
+            for store, restored in zip(stores, h.reload_stores(), strict=True):
+                assert restored.rounding_residual_ounces == store.rounding_residual_ounces
+                assert restored.source_freeze_reason == store.source_freeze_reason
+
+            if expected:
+                # Valid future market events still cannot admit a strict dust cycle.
+                for direction in (1, -1):
+                    await _market(h, wire, direction)
+                assert set(source.rows) == original_ids
+                assert h.strategy._global_obligation_block()
+                assert all(not store.can_submit_source() for store in stores)
+            else:
+                # A genuinely new economic source order proceeds through the
+                # unmodified strategy, native events, planner and MT5 journal.
+                cid = await _accepted_source(h, source, wire, first_sign)
+                assert cid not in original_ids
+                order = source.order(cid)
+                assert order.quantity.as_decimal() == 2 and order.is_post_only
+                source.fill(cid, D(2))
+                await _settle_cycle(h, source, wire, cid=cid, expected=1)
+                assert source.net == h.node.portfolio.net_position(h.source_instrument.id) == (
+                    D(2) * first_sign
+                )
+                assert h.node.portfolio.net_position(h.hedge_instrument.id) == -D(2) * first_sign
+                assert [item["event_type"] for item in wire.journal[len(initial_journal):]] == [
+                    "submission_reserved", "order_filled",
+                ]
+                assert all(store.rounding_residual_ounces == 0 for store in stores)
+
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize("maker", [False, True], ids=["taker", "maker"])
 @pytest.mark.parametrize("sign", [1, -1], ids=["long-first", "short-first"])
 @pytest.mark.parametrize("deltas", [(2, 2, -2, -1, -2), (1, 2, -4)],

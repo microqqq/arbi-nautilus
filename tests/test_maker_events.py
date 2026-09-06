@@ -33,6 +33,7 @@ from nautilus_trader.model.identifiers import (
     TradeId,
     VenueOrderId,
 )
+from nautilus_trader.model.instruments import CryptoPerpetual
 from nautilus_trader.model.objects import Money, Quantity
 from nautilus_trader.test_kit.stubs.component import TestComponentStubs
 from nautilus_trader.test_kit.stubs.events import TestEventStubs
@@ -170,11 +171,12 @@ def _seed_native_working_quotes(
     native_status: OrderStatus = OrderStatus.ACCEPTED,
 ) -> list[Any]:
     orders: list[Any] = []
+    instrument = strategy.cache.instrument(_source_instrument().id)
     for direction in directions:
         side = OrderSide.BUY if direction is SourceDirection.LONG else OrderSide.SELL
         order = strategy.order_factory.limit(
             instrument_id=_source_instrument().id, order_side=side,
-            quantity=_source_instrument().make_qty(2), price=_source_instrument().make_price(2400),
+            quantity=instrument.make_qty(2), price=instrument.make_price(2400),
             time_in_force=TimeInForce.GTC, post_only=True,
         )
         account_id = AccountId("BITFINEX-001")
@@ -1118,14 +1120,62 @@ def _modify_rejected(order: Any, **overrides: Any) -> OrderModifyRejected:
 
 
 def _fill_maker_source(
-    engine: Any, order: Any, quantity: int, *, trade_id: str = "S-ACTUAL", ts_event: int = 5,
+    engine: Any, order: Any, quantity: int | Decimal, *,
+    trade_id: str = "S-ACTUAL", ts_event: int = 5,
 ) -> None:
-    instrument = _source_instrument()
+    instrument = engine.cache.instrument(_source_instrument().id)
     engine.kernel.exec_engine.process(TestEventStubs.order_filled(
         order=order, instrument=instrument, last_qty=instrument.make_qty(quantity),
         last_px=instrument.make_price(2400), trade_id=TradeId(trade_id),
         commission=Money(0, instrument.quote_currency), ts_event=ts_event,
     ))
+
+
+@pytest.mark.parametrize("first_direction", [SourceDirection.LONG, SourceDirection.SHORT])
+@pytest.mark.parametrize("second_quantity", [D("0.5"), D("0.6")])
+def test_native_maker_net_residual_before_allocating_new_hedge(
+    tmp_path: Path, first_direction: SourceDirection, second_quantity: Decimal,
+) -> None:
+    completions: list[SourceTerminalResult] = []
+    strategy = RecordingMakerStrategy(
+        tmp_path / "native-netting",
+        source_terminal_query=lambda _cid, _vid, complete: completions.append(complete),
+    )
+    with _event_engine(cast(Any, strategy)) as engine:
+        values = CryptoPerpetual.to_dict(_source_instrument())
+        values.update(size_precision=1, size_increment="0.1", lot_size="0.1")
+        engine.add_instrument(CryptoPerpetual.from_dict(values))
+        engine.trader.start()
+        orders = _seed_native_working_quotes(cast(Any, strategy), exact_route=True)
+        if first_direction is SourceDirection.SHORT:
+            orders.reverse()
+        # Both original orders were already live before either fill. No new source
+        # is admitted after the first fill has frozen the strategy.
+        _fill_maker_source(engine, orders[0], D("0.5"), trade_id="NET-FIRST")
+        assert strategy._global_obligation_block()
+        _fill_maker_source(engine, orders[1], second_quantity, trade_id="NET-SECOND")
+        assert all(store.intents() == () for store in strategy._stores.values()), (
+            "same-route unallocated fills must be netted before rounding a new hedge"
+        )
+        expected = (D("0.5") - second_quantity) * (
+            1 if first_direction is SourceDirection.LONG else -1
+        )
+        residuals = [store.rounding_residual_ounces for store in strategy._stores.values()]
+        assert sorted(residuals) == sorted([D(0), expected])
+        assert strategy.recorded == []
+        assert not strategy._try_release_cycle(), "a zero residual is not source terminal proof"
+        for index, order in enumerate(orders):
+            _process_source_terminal(engine, order)
+            assert len(completions) == index + 1
+            assert completions[index](_terminal_report(order)) is True
+            if index == 0:
+                assert strategy._global_obligation_block()
+        assert strategy._global_obligation_block() is (expected != 0)
+        for direction, store in strategy._stores.items():
+            assert store.can_submit_source() is (expected == 0)
+            reloaded = _reload_maker_store(strategy, direction)
+            assert reloaded.rounding_residual_ounces == store.rounding_residual_ounces
+            assert reloaded.can_submit_source() is (expected == 0)
 
 
 @pytest.mark.parametrize("completion", ["partial", "rejected", "canceled"])
@@ -1361,20 +1411,23 @@ def test_native_partial_modify_rejection_without_exact_protection_keeps_hold(
         rejection = (_cancel_rejected if fault == "cancel_event" else _modify_rejected)(
             order, **overrides,
         )
-        if fault == "unseen_fill":
-            # Corrupting the private ledger now also violates the persisted
-            # intent-to-fill identity. The proof must reject it, and the owner
-            # must refuse that snapshot, retaining the known obligation.
+        invalid_state = fault in {"unseen_fill", "filled", "route"}
+        if invalid_state:
+            # Private corruption conflicts with the actual allocation history.
+            # The proof and the atomic owner must both reject it, retaining the
+            # last-good facts and known obligation instead of writing bad state.
             assert not strategy._source_action_is_obsolete(rejection)
-            with pytest.raises(ValueError, match="Maker intent source fill identity"):
+            with pytest.raises(ValueError, match="Maker"):
                 engine.kernel.exec_engine.process(rejection)
             assert store.has_seen_source_fill(store.intents()[0].fill_key)
-            assert _reload_maker_store(strategy).has_unresolved_hedges()
+            restored = _reload_maker_store(strategy)
+            assert restored.source_order(order.client_order_id.value) == record
+            assert restored.has_unresolved_hedges() and not restored.can_submit_source()
         else:
             engine.kernel.exec_engine.process(rejection)
         updated = store.source_order(order.client_order_id.value)
         assert updated is not None
-        if fault != "unseen_fill":
+        if not invalid_state:
             assert updated.status == "UNKNOWN" and store.halt_reason is not None
         assert strategy._source_hold
         assert not store.can_submit_source()
@@ -1489,7 +1542,10 @@ def test_native_cancel_rejection_without_exact_terminal_proof_keeps_hold(
         rejection = (_modify_rejected if action == "modify" else _cancel_rejected)(
             order, **overrides,
         )
-        invalid_state = fault in {"record_id", "side", "unseen_fill"}
+        invalid_state = fault in {
+            "record_id", "side", "unseen_fill", "filled", "source_account", "source_client",
+            "hedge_account", "hedge_client",
+        }
         if invalid_state:
             assert not strategy._source_action_is_obsolete(rejection)
             with pytest.raises(ValueError, match="Maker"):

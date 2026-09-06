@@ -72,10 +72,10 @@ class JsonStateStore:
 
     @property
     def net_unhedged_ounces(self) -> Decimal:
-        outstanding = self._state.net_unhedged_ounces
+        outstanding = self.rounding_residual_ounces
         for intent in self._state.hedge_intents.values():
             remaining = intent.hedge_quantity_ounces - intent.hedge_filled_ounces
-            sign = Decimal(1) if intent.source_side is BusinessOrderSide.BUY else Decimal(-1)
+            sign = Decimal(1) if intent.hedge_side is BusinessOrderSide.SELL else Decimal(-1)
             outstanding += sign * remaining
         return outstanding
 
@@ -299,13 +299,11 @@ class JsonStateStore:
                 self._state.halt_reason = None
 
         signed_fill = fill_ounces if source_side is BusinessOrderSide.BUY else -fill_ounces
-        self._state.net_unhedged_ounces += signed_fill
-        rounded_ounces = round_hedge_ounces(self._state.net_unhedged_ounces)
+        rounded_ounces = self._allocate_source_fill(record, fill_key, signed_fill)
         if rounded_ounces == 0:
             self._persist_source_reservation(previous_state)
             return None
 
-        self._state.net_unhedged_ounces -= Decimal(rounded_ounces)
         digest = sha256(fill_key.encode()).hexdigest()[:24]
         hedge_side = (
             BusinessOrderSide.SELL if rounded_ounces > 0 else BusinessOrderSide.BUY
@@ -327,6 +325,14 @@ class JsonStateStore:
         self._state.hedge_intents[intent.intent_id] = intent
         self._persist_source_reservation(previous_state)
         return intent
+
+    def _allocate_source_fill(
+        self, record: SourceOrderRecord, fill_key: str, signed_fill: Decimal,
+    ) -> int:
+        self._state.net_unhedged_ounces += signed_fill
+        rounded = round_hedge_ounces(self._state.net_unhedged_ounces)
+        self._state.net_unhedged_ounces -= Decimal(rounded)
+        return rounded
 
     def bind_hedge_order(self, intent_id: str, client_order_id: str) -> None:
         intent = self._state.hedge_intents[intent_id]

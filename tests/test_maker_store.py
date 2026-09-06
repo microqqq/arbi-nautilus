@@ -31,11 +31,18 @@ def _owner(prefix: Path) -> MakerStateStore:
     return MakerStateStore(prefix, "SOURCE.BITFINEX", "HEDGE.MT5")
 
 
-def _begin(owner: MakerStateStore, direction: SourceDirection, quantity: str = "2") -> None:
-    owner.stores[direction].begin_source(
-        f"S-{direction.value}", BUY if direction is LONG else SELL, D(quantity),
+def _begin(
+    owner: MakerStateStore, direction: SourceDirection, quantity: str = "2",
+    **route: Any,
+) -> None:
+    attributes: dict[str, Any] = dict(
         source_account_id="BITFINEX-001", source_client_id="BITFINEX",
         hedge_account_id="MT5-001", hedge_client_id="MT5",
+    )
+    attributes.update(route)
+    owner.stores[direction].begin_source(
+        f"S-{direction.value}", BUY if direction is LONG else SELL, D(quantity),
+        **attributes,
     )
 
 
@@ -47,8 +54,8 @@ def _fill(owner: MakerStateStore, direction: SourceDirection, quantity: str = "2
     )
 
 
-def _memory(owner: MakerStateStore) -> dict[SourceDirection, object]:
-    return {direction: deepcopy(view._state) for direction, view in owner.stores.items()}
+def _memory(owner: MakerStateStore) -> object:
+    return deepcopy(owner._snapshot())
 
 
 def test_paths_and_new_empty_owner_do_not_create_or_read_legacy_files(tmp_path: Path) -> None:
@@ -83,9 +90,13 @@ def test_fill_and_both_freezes_are_in_first_and_only_durable_snapshot(
     intent = _fill(owner, LONG)
     assert intent is not None and len(snapshots) == 1
     payload = snapshots[0]
-    assert payload["schema_version"] == 2 and payload["kind"] == "maker"
+    assert payload["schema_version"] == 3 and payload["kind"] == "maker"
     assert payload["source_instrument_id"] == "SOURCE.BITFINEX"
     assert payload["hedge_instrument_id"] == "HEDGE.MT5"
+    assert len(payload["allocations"]) == 1
+    assert payload["allocations"][0]["fill_key"] == "S-bid|V-bid|T-bid"
+    assert payload["allocations"][0]["signed_fill_ounces"] == "2"
+    assert payload["allocations"][0]["allocated_ounces"] == "2"
     bid, ask = payload["directions"]["bid"], payload["directions"]["ask"]
     assert bid["seen_source_fills"] == ["S-bid|V-bid|T-bid"]
     assert len(bid["hedge_intents"]) == 1
@@ -214,13 +225,13 @@ def test_atomic_release_requires_all_evidence_and_unique_existing_reason(
 
 
 @pytest.mark.parametrize("dust", ["0.4", "0.5"])
-def test_opposing_dust_is_preserved_separately_and_does_not_unlock(
+def test_cross_route_opposing_dust_is_preserved_separately_and_does_not_unlock(
     tmp_path: Path, dust: str,
 ) -> None:
     prefix = tmp_path / "strict-dust"
     owner = _owner(prefix)
-    for direction in (LONG, SHORT):
-        _begin(owner, direction, "1")
+    _begin(owner, LONG, "1")
+    _begin(owner, SHORT, "1", hedge_client_id="OTHER")
     for direction in (LONG, SHORT):
         assert _fill(owner, direction, dust) is None
         view = owner.stores[direction]
@@ -374,3 +385,314 @@ def test_same_venue_fill_cannot_be_claimed_by_different_direction_order_ids(
         action()
     assert _memory(owner) == before
     assert owner.path.read_bytes() == disk_before
+
+
+@pytest.mark.parametrize("first", [LONG, SHORT])
+@pytest.mark.parametrize("dust", ["0.4", "0.5"])
+def test_same_route_opposing_actual_dust_nets_before_next_normal_cycle(
+    tmp_path: Path, first: SourceDirection, dust: str,
+) -> None:
+    prefix = tmp_path / "strict-net"
+    owner = _owner(prefix)
+    second = SHORT if first is LONG else LONG
+    for direction in (first, second):
+        _begin(owner, direction, "1")
+    assert _fill(owner, first, dust) is None
+    assert _fill(owner, second, dust) is None
+    for direction in (first, second):
+        view = owner.stores[direction]
+        view.update_source_status(f"S-{direction.value}", "CANCELED")
+        view.confirm_source_reconciled(f"S-{direction.value}")
+    assert all(view.rounding_residual_ounces == 0 for view in owner.stores.values())
+    assert not owner.has_residuals()
+    assert owner.clear_source_freezes()
+    reloaded = _owner(prefix)
+    assert all(view.can_submit_source() for view in reloaded.stores.values())
+    view = reloaded.stores[LONG]
+    view.begin_source(
+        "NEXT", BUY, D(1), source_account_id="BITFINEX-001", source_client_id="BITFINEX",
+        hedge_account_id="MT5-001", hedge_client_id="MT5",
+    )
+    intent = view.reserve_source_fill(
+        fill_key="NEXT|NEXT-VENUE|NEXT-TRADE", client_order_id="NEXT", trade_id="NEXT-TRADE",
+        source_side=BUY, fill_ounces=D(1),
+    )
+    assert intent is not None and intent.hedge_quantity_ounces == 1
+    assert intent.hedge_side is SELL
+
+
+@pytest.mark.parametrize("first", [LONG, SHORT])
+def test_shared_dust_is_combined_before_rounding_the_next_fill(
+    tmp_path: Path, first: SourceDirection,
+) -> None:
+    prefix = tmp_path / "combine-first"
+    owner = _owner(prefix)
+    second = SHORT if first is LONG else LONG
+    for direction in (first, second):
+        _begin(owner, direction)
+    assert _fill(owner, first, "0.5") is None
+    assert _fill(owner, second, "0.6") is None
+    expected = D("-0.1") if first is LONG else D("0.1")
+    assert owner.stores[first].rounding_residual_ounces == 0
+    assert owner.stores[second].rounding_residual_ounces == expected
+    assert owner.has_residuals()
+    assert not owner.clear_source_freezes()
+    payload = json.loads(owner.path.read_text())
+    assert [item["allocated_ounces"] for item in payload["allocations"]] == ["0", "0"]
+    assert _memory(_owner(prefix)) == _memory(owner)
+
+
+@pytest.mark.parametrize("first", [LONG, SHORT])
+@pytest.mark.parametrize("status", [ObligationStatus.PENDING, ObligationStatus.SUBMITTED])
+def test_already_allocated_pending_obligation_cannot_be_netted_away(
+    tmp_path: Path, first: SourceDirection, status: ObligationStatus,
+) -> None:
+    owner = _owner(tmp_path / "allocated-not-residual")
+    second = SHORT if first is LONG else LONG
+    for direction in (first, second):
+        _begin(owner, direction)
+    first_intent = _fill(owner, first, "0.6")
+    assert first_intent is not None and first_intent.hedge_quantity_ounces == 1
+    assert owner.stores[first].rounding_residual_ounces == (
+        D("-0.4") if first is LONG else D("0.4")
+    )
+    if status is ObligationStatus.SUBMITTED:
+        owner.stores[first].bind_hedge_order(first_intent.intent_id, "H-INFLIGHT")
+        owner.stores[first].update_hedge_status("H-INFLIGHT", status)
+    original_intent = owner.stores[first].intent(first_intent.intent_id)
+    second_intent = _fill(owner, second, "0.6")
+    assert second_intent is not None and second_intent.hedge_quantity_ounces == 1
+    assert all(view.rounding_residual_ounces == 0 for view in owner.stores.values())
+    assert owner.stores[first].intent(first_intent.intent_id) == original_intent
+    assert owner.stores[first].intent(first_intent.intent_id).status is status
+    assert owner.stores[second].intent(second_intent.intent_id).status is ObligationStatus.PENDING
+    assert not owner.clear_source_freezes()
+    assert all(not view.can_submit_source() for view in owner.stores.values())
+
+
+@pytest.mark.parametrize("direction", [LONG, SHORT])
+def test_same_direction_point_four_removes_rounding_residual_but_not_pending_hedge(
+    tmp_path: Path, direction: SourceDirection,
+) -> None:
+    owner = _owner(tmp_path / "same-direction-remainder")
+    _begin(owner, direction)
+    view = owner.stores[direction]
+    intent = _fill(owner, direction, "0.6")
+    assert intent is not None
+    assert view.reserve_source_fill(
+        fill_key=f"S-{direction.value}|V-{direction.value}|SECOND",
+        client_order_id=f"S-{direction.value}", trade_id="SECOND",
+        source_side=BUY if direction is LONG else SELL, fill_ounces=D("0.4"),
+    ) is None
+    assert view.intent(intent.intent_id) == intent
+    view.update_source_status(f"S-{direction.value}", "CANCELED")
+    view.confirm_source_reconciled(f"S-{direction.value}")
+    assert not owner.has_residuals()
+    assert all(item.rounding_residual_ounces == 0 and item.active_source_order_id is None
+               for item in owner.stores.values())
+    assert not owner.clear_source_freezes()
+    assert not view.cycle_evidence_complete() and not view.can_submit_source()
+
+
+@pytest.mark.parametrize("change", [
+    "source_account_id", "source_client_id", "hedge_account_id", "hedge_client_id",
+    "source_client_none", "hedge_client_none", "missing_source", "missing_hedge", "ticket",
+])
+def test_route_mismatch_unknown_account_and_exact_ticket_never_cross_net(
+    tmp_path: Path, change: str,
+) -> None:
+    prefix = tmp_path / "route-isolation"
+    owner = _owner(prefix)
+    first: dict[str, Any] = {}
+    second: dict[str, Any] = {}
+    if change in {"missing_source", "missing_hedge"}:
+        field = "source_account_id" if change == "missing_source" else "hedge_account_id"
+        first[field] = second[field] = None
+    elif change == "ticket":
+        first = second = {
+            "hedge_position_id": "same-ticket", "hedge_position_quantity_ounces": D(1),
+        }
+    elif change.endswith("_none"):
+        second[change.removesuffix("_none") + "_id"] = None
+    else:
+        second[change] = "OTHER"
+    _begin(owner, LONG, "1", **first)
+    _begin(owner, SHORT, "1", **second)
+    assert _fill(owner, LONG, "0.5") is None
+    assert _fill(owner, SHORT, "0.5") is None
+    for direction in (LONG, SHORT):
+        view = owner.stores[direction]
+        view.update_source_status(f"S-{direction.value}", "CANCELED")
+        view.confirm_source_reconciled(f"S-{direction.value}")
+    assert sum((view.rounding_residual_ounces for view in owner.stores.values()), D(0)) == 0
+    assert owner.has_residuals()
+    assert not owner.clear_source_freezes()
+    assert all(not view.can_submit_source() and not view.cycle_evidence_complete()
+               for view in owner.stores.values())
+    assert _memory(_owner(prefix)) == _memory(owner)
+
+
+def test_none_clients_match_only_exact_none_clients_for_known_accounts(tmp_path: Path) -> None:
+    owner = _owner(tmp_path / "none-clients")
+    for direction in (LONG, SHORT):
+        _begin(owner, direction, "1", source_client_id=None, hedge_client_id=None)
+    assert _fill(owner, LONG, "0.5") is None
+    assert _fill(owner, SHORT, "0.5") is None
+    assert not owner.has_residuals()
+    assert all(view.rounding_residual_ounces == 0 for view in owner.stores.values())
+
+
+@pytest.mark.parametrize("after_replace", [False, True])
+def test_second_direction_fill_rolls_back_or_retains_ledger_and_both_views_together(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, after_replace: bool,
+) -> None:
+    prefix = tmp_path / "net-fault"
+    owner = _owner(prefix)
+    for direction in (LONG, SHORT):
+        _begin(owner, direction)
+    assert _fill(owner, LONG, "0.5") is None
+    previous = _memory(owner)
+    disk_before = owner.path.read_bytes()
+
+    def fail(source: Path, destination: Path) -> None:
+        if after_replace:
+            os.replace(source, destination)
+            raise ParentDirectorySyncError("post-replace")
+        raise OSError("pre-replace")
+
+    monkeypatch.setattr(store_module, "replace_and_sync_parent", fail)
+    with pytest.raises(ParentDirectorySyncError if after_replace else OSError):
+        _fill(owner, SHORT, "0.5")
+    reloaded = _owner(prefix)
+    assert _memory(owner) == _memory(reloaded)
+    assert (_memory(owner) != previous) is after_replace
+    assert (owner.path.read_bytes() != disk_before) is after_replace
+    payload = json.loads(owner.path.read_text())
+    assert len(payload["allocations"]) == (2 if after_replace else 1)
+    assert owner.has_residuals() is not after_replace
+    monkeypatch.setattr(store_module, "replace_and_sync_parent", replace_and_sync_parent)
+    assert _fill(reloaded, SHORT, "0.5") is None
+    assert len(json.loads(reloaded.path.read_text())["allocations"]) == 2
+    assert not reloaded.has_residuals()
+
+
+def test_v3_rejects_v2_without_overwriting_or_guessing_fill_history(tmp_path: Path) -> None:
+    prefix = tmp_path / "no-fabrication"
+    owner = _owner(prefix)
+    _begin(owner, LONG)
+    _fill(owner, LONG, "0.4")
+    payload = json.loads(owner.path.read_text())
+    payload["schema_version"] = 2
+    payload.pop("allocations", None)
+    owner.path.write_text(json.dumps(payload))
+    before = owner.path.read_bytes()
+    with pytest.raises(ValueError, match="schema|migration"):
+        _owner(prefix)
+    assert owner.path.read_bytes() == before
+
+
+@pytest.mark.parametrize("fault", [
+    "missing_allocation", "duplicate_allocation", "reordered", "signed_quantity", "nonfinite",
+    "allocated_quantity", "route", "missing_route", "raw_residual", "source_cumulative",
+    "missing_intent", "intent_quantity", "intent_source_fill",
+])
+def test_allocation_history_must_match_processing_order_route_and_original_facts(
+    tmp_path: Path, fault: str,
+) -> None:
+    prefix = tmp_path / "invalid-allocation"
+    owner = _owner(prefix)
+    for direction in (LONG, SHORT):
+        _begin(owner, direction)
+    assert _fill(owner, LONG, "0.5") is None
+    assert _fill(owner, SHORT, "0.6") is None
+    intent = owner.stores[SHORT].reserve_source_fill(
+        fill_key="S-ask|V-ask|SECOND-ASK", client_order_id="S-ask", trade_id="SECOND-ASK",
+        source_side=SELL, fill_ounces=D("0.6"),
+    )
+    assert intent is not None
+    payload = json.loads(owner.path.read_text())
+    allocations = payload["allocations"]
+    bid, ask = payload["directions"]["bid"], payload["directions"]["ask"]
+    if fault == "missing_allocation":
+        allocations.pop(0)
+    elif fault == "duplicate_allocation":
+        allocations.append(allocations[0])
+    elif fault == "reordered":
+        allocations[0], allocations[1] = allocations[1], allocations[0]
+    elif fault == "signed_quantity":
+        allocations[0]["signed_fill_ounces"] = "0.4"
+    elif fault == "nonfinite":
+        allocations[0]["signed_fill_ounces"] = "NaN"
+    elif fault == "allocated_quantity":
+        allocations[2]["allocated_ounces"] = "0"
+    elif fault == "route":
+        allocations[0]["route"]["hedge_account_id"] = "OTHER"
+    elif fault == "missing_route":
+        del allocations[0]["route"]["source_client_id"]
+    elif fault == "raw_residual":
+        bid["net_unhedged_ounces"] = "0.5"
+    elif fault == "source_cumulative":
+        bid["source_orders"]["S-bid"]["filled_ounces"] = "0.4"
+    elif fault == "missing_intent":
+        ask["hedge_intents"].clear()
+    else:
+        field = "hedge_quantity_ounces" if fault == "intent_quantity" else "source_fill_ounces"
+        ask["hedge_intents"][intent.intent_id][field] = "2"
+    owner.path.write_text(json.dumps(payload))
+    before = owner.path.read_bytes()
+    with pytest.raises(ValueError):
+        _owner(prefix)
+    assert owner.path.read_bytes() == before
+
+
+def test_actual_per_fill_history_is_not_replaced_by_equal_legacy_totals(tmp_path: Path) -> None:
+    payloads: list[dict[str, Any]] = []
+    for index, quantities in enumerate((("0.1", "0.4"), ("0.2", "0.3"))):
+        prefix = tmp_path / f"history-{index}"
+        owner = _owner(prefix)
+        _begin(owner, LONG)
+        for sequence, quantity in enumerate(quantities):
+            assert owner.stores[LONG].reserve_source_fill(
+                fill_key=f"S-bid|V|T{sequence}", client_order_id="S-bid",
+                trade_id=f"T{sequence}", source_side=BUY, fill_ounces=D(quantity),
+            ) is None
+        assert _memory(_owner(prefix)) == _memory(owner)
+        payloads.append(json.loads(owner.path.read_text()))
+    assert payloads[0]["directions"] == payloads[1]["directions"]
+    assert payloads[0]["allocations"] != payloads[1]["allocations"]
+    assert [row["signed_fill_ounces"] for row in payloads[0]["allocations"]] == ["0.1", "0.4"]
+    assert [row["signed_fill_ounces"] for row in payloads[1]["allocations"]] == ["0.2", "0.3"]
+
+
+def test_zero_view_projection_cannot_hide_two_nonzero_route_residuals(tmp_path: Path) -> None:
+    prefix = tmp_path / "zero-projection"
+    owner = _owner(prefix)
+    view = owner.stores[LONG]
+    for cid, hedge_account in (("A", "MT5-001"), ("B", "MT5-002")):
+        view.begin_source(cid, BUY, D(1), source_account_id="BITFINEX-001",
+                          source_client_id="BITFINEX", hedge_account_id=hedge_account)
+        view.update_source_status(cid, "CANCELED")
+        view.confirm_source_reconciled(cid)
+    assert view.reserve_source_fill(
+        fill_key="A|VA|TA", client_order_id="A", trade_id="TA", source_side=BUY,
+        fill_ounces=D("0.4"),
+    ) is None
+    intent = view.reserve_source_fill(
+        fill_key="B|VB|TB", client_order_id="B", trade_id="TB", source_side=BUY,
+        fill_ounces=D("0.6"),
+    )
+    assert intent is not None and intent.hedge_quantity_ounces == 1
+    view.bind_hedge_order(intent.intent_id, "HB")
+    assert view.apply_hedge_fill(client_order_id="HB", trade_id="HBT", fill_ounces=D(1))
+    for cid in ("A", "B"):
+        view.update_source_status(cid, "CANCELED")
+        view.confirm_source_reconciled(cid)
+    assert all(item.rounding_residual_ounces == item.net_unhedged_ounces == 0
+               for item in owner.stores.values())
+    assert all(item.active_source_order_id is None and not item.has_unresolved_hedges()
+               and item.halt_reason is None for item in owner.stores.values())
+    assert owner.has_residuals()
+    assert not owner.clear_source_freezes()
+    assert all(not item.can_submit_source() and not item.cycle_evidence_complete()
+               for item in owner.stores.values())
+    assert _owner(prefix).has_residuals()

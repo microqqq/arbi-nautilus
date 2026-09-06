@@ -1200,7 +1200,7 @@ class MakerStrategy(Strategy):
         )
 
     def _global_obligation_block(self) -> bool:
-        return self._source_hold or any(
+        return self._source_hold or self._state_store.has_residuals() or any(
             store.halt_reason is not None
             or store.source_freeze_reason is not None
             or store.has_unresolved_hedges()

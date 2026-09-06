@@ -4,14 +4,47 @@ from __future__ import annotations
 
 import json
 from copy import deepcopy
+from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
+from typing import cast
 
 from py000_nautilus.durability import ParentDirectorySyncError
+from py000_nautilus.economics import round_hedge_ounces
 from py000_nautilus.models import BusinessOrderSide, HedgeIntent, SourceDirection
-from py000_nautilus.store import JsonStateStore, StoreState, _persist_payload
+from py000_nautilus.store import JsonStateStore, SourceOrderRecord, StoreState, _persist_payload
 
 _DIRECTIONS = {SourceDirection.LONG: "bid", SourceDirection.SHORT: "ask"}
+_ROUTE_FIELDS = (
+    "source_account_id", "source_client_id", "hedge_account_id", "hedge_client_id",
+    "isolated_source_order_id",
+)
+_Route = tuple[str | None, str | None, str | None, str | None, str | None]
+
+
+@dataclass(frozen=True, slots=True)
+class _Allocation:
+    fill_key: str
+    route: _Route
+    signed_fill_ounces: Decimal
+    allocated_ounces: Decimal
+
+    def payload(self) -> dict[str, object]:
+        return {
+            "fill_key": self.fill_key, "route": dict(zip(_ROUTE_FIELDS, self.route, strict=True)),
+            "signed_fill_ounces": str(self.signed_fill_ounces),
+            "allocated_ounces": str(self.allocated_ounces),
+        }
+
+
+_Snapshot = tuple[dict[SourceDirection, StoreState], list[_Allocation]]
+
+
+def _route(record: SourceOrderRecord) -> _Route:
+    isolated = (record.client_order_id if not record.source_account_id
+                or not record.hedge_account_id or record.hedge_position_id is not None else None)
+    return (record.source_account_id, record.source_client_id, record.hedge_account_id,
+            record.hedge_client_id, isolated)
 
 
 def maker_state_path(prefix: str | Path) -> Path:
@@ -23,7 +56,7 @@ def maker_legacy_paths(prefix: str | Path) -> tuple[Path, Path]:
 
 
 class MakerStateStore:
-    """Persist both direction views together; residual allocation remains unchanged."""
+    """Allocate each actual fill against its route's unallocated strict residual."""
 
     def __init__(
         self, prefix: str | Path, source_instrument_id: str, hedge_instrument_id: str,
@@ -33,6 +66,7 @@ class MakerStateStore:
         self.path = maker_state_path(prefix)
         self.source_instrument_id = source_instrument_id
         self.hedge_instrument_id = hedge_instrument_id
+        self._allocations: list[_Allocation] = []
         if not self.path.exists() and any(path.exists() for path in maker_legacy_paths(prefix)):
             raise ValueError("legacy Maker state requires explicit migration before startup")
         states = self._load() if self.path.exists() else {
@@ -53,7 +87,7 @@ class MakerStateStore:
     def clear_source_freezes(self) -> bool:
         reasons = {view.source_freeze_reason for view in self.stores.values()
                    if view.source_freeze_reason is not None}
-        if len(reasons) != 1 or not all(
+        if self.has_residuals() or len(reasons) != 1 or not all(
             view.cycle_evidence_complete() for view in self.stores.values()
         ):
             return False
@@ -61,6 +95,29 @@ class MakerStateStore:
             view._state.source_freeze_reason = None
         self._persist()
         return True
+
+    def has_residuals(self) -> bool:
+        return any(balance != 0 for balance, _direction in self._route_balances().values())
+
+    def _route_balances(self) -> dict[_Route, tuple[Decimal, SourceDirection]]:
+        directions = {key: direction for direction, view in self.stores.items()
+                      for key in view._state.seen_source_fills}
+        balances: dict[_Route, tuple[Decimal, SourceDirection]] = {}
+        for item in self._allocations:
+            previous = balances.get(item.route, (Decimal(0), directions[item.fill_key]))[0]
+            balances[item.route] = (
+                previous + item.signed_fill_ounces - item.allocated_ounces,
+                directions[item.fill_key],
+            )
+        return balances
+
+    def _allocate(self, record: SourceOrderRecord, fill_key: str, signed_fill: Decimal) -> int:
+        route = _route(record)
+        current = self._route_balances().get(route)
+        combined = (current[0] if current is not None else Decimal(0)) + signed_fill
+        allocated = round_hedge_ounces(combined)
+        self._allocations.append(_Allocation(fill_key, route, signed_fill, Decimal(allocated)))
+        return allocated
 
     def _set_freezes(self, reason: str) -> bool:
         changed = False
@@ -70,22 +127,25 @@ class MakerStateStore:
                 changed = True
         return changed
 
-    def _snapshot(self) -> dict[SourceDirection, StoreState]:
-        return {direction: deepcopy(view._state) for direction, view in self.stores.items()}
+    def _snapshot(self) -> _Snapshot:
+        return ({direction: deepcopy(view._state) for direction, view in self.stores.items()},
+                self._allocations.copy())
 
-    def _restore(self, states: dict[SourceDirection, StoreState]) -> None:
-        for direction, state in states.items():
+    def _restore(self, snapshot: _Snapshot) -> None:
+        for direction, state in snapshot[0].items():
             self.stores[direction]._state = deepcopy(state)
+        self._allocations = snapshot[1].copy()
 
     def _persist(self) -> None:
         candidate = self._snapshot()
         try:
             self._validate()
             _persist_payload(self.path, {
-                "schema_version": 2,
+                "schema_version": 3,
                 "kind": "maker",
                 "source_instrument_id": self.source_instrument_id,
                 "hedge_instrument_id": self.hedge_instrument_id,
+                "allocations": [item.payload() for item in self._allocations],
                 "directions": {
                     key: self.stores[direction]._to_payload()
                     for direction, key in _DIRECTIONS.items()
@@ -103,8 +163,9 @@ class MakerStateStore:
         raw = json.loads(self.path.read_text(encoding="utf-8"))
         if not isinstance(raw, dict) or set(raw) != {
             "schema_version", "kind", "source_instrument_id", "hedge_instrument_id", "directions",
-        } or type(raw["schema_version"]) is not int or raw["schema_version"] != 2:
-            raise ValueError("unsupported Maker state schema")
+            "allocations",
+        } or type(raw["schema_version"]) is not int or raw["schema_version"] != 3:
+            raise ValueError("unsupported Maker state schema; legacy state requires migration")
         if (
             raw["kind"] != "maker"
             or raw["source_instrument_id"] != self.source_instrument_id
@@ -118,6 +179,7 @@ class MakerStateStore:
                for state in directions.values()):
             raise ValueError("invalid Maker direction schema")
         try:
+            self._allocations = _read_allocations(raw["allocations"])
             return {
                 direction: JsonStateStore._from_payload(directions[key])
                 for direction, key in _DIRECTIONS.items()
@@ -141,8 +203,8 @@ class MakerStateStore:
                 state.active_source_order_id not in state.source_orders
             ):
                 raise ValueError("Maker active source identity is missing")
-            if not state.net_unhedged_ounces.is_finite():
-                raise ValueError("Maker residual must be finite")
+            if not state.net_unhedged_ounces.is_finite() or state.net_unhedged_ounces != 0:
+                raise ValueError("Maker view residual must be zero; allocations own the balance")
             for key, record in state.source_orders.items():
                 if key != record.client_order_id or not key or key in source_ids:
                     raise ValueError("conflicting Maker source identity")
@@ -165,7 +227,7 @@ class MakerStateStore:
             for key, intent in state.hedge_intents.items():
                 if key != intent.intent_id or key in intent_ids:
                     raise ValueError("conflicting Maker intent identity")
-                if intent.source_side is not side or intent.hedge_side is side:
+                if intent.source_side is not side:
                     raise ValueError("Maker intent direction differs from its view")
                 if (intent.source_client_order_id not in state.source_orders
                         or intent.fill_key not in state.seen_source_fills):
@@ -192,6 +254,52 @@ class MakerStateStore:
                 hedge_trades.add((hedge_account, parts[1]))
         if source_ids & hedge_ids:
             raise ValueError("conflicting Maker source/hedge order identity")
+        self._validate_allocations()
+
+    def _validate_allocations(self) -> None:
+        records = {key: record for view in self.stores.values()
+                   for key, record in view._state.source_orders.items()}
+        seen = set().union(*(view._state.seen_source_fills for view in self.stores.values()))
+        intents = {intent.fill_key: intent for view in self.stores.values()
+                   for intent in view.intents()}
+        if len(intents) != sum(len(view.intents()) for view in self.stores.values()):
+            raise ValueError("multiple Maker intents claim the same allocation")
+        allocated_fills: set[str] = set()
+        source_totals: dict[str, Decimal] = {}
+        balances: dict[_Route, Decimal] = {}
+        for item in self._allocations:
+            if item.fill_key not in seen or item.fill_key in allocated_fills:
+                raise ValueError("Maker allocation fill identity is missing or duplicated")
+            allocated_fills.add(item.fill_key)
+            client_order_id = item.fill_key.split("|")[0]
+            record = records[client_order_id]
+            signed = item.signed_fill_ounces
+            if (not signed.is_finite() or signed == 0 or not item.allocated_ounces.is_finite()
+                    or (signed > 0) != (record.side is BusinessOrderSide.BUY)
+                    or item.route != _route(record)):
+                raise ValueError("Maker allocation direction, quantity or route differs")
+            combined = balances.get(item.route, Decimal(0)) + signed
+            if item.allocated_ounces != round_hedge_ounces(combined):
+                raise ValueError("Maker allocation does not match ordered route residual")
+            balances[item.route] = combined - item.allocated_ounces
+            source_totals[client_order_id] = (
+                source_totals.get(client_order_id, Decimal(0)) + abs(signed)
+            )
+            intent = intents.pop(item.fill_key, None)
+            if item.allocated_ounces == 0:
+                if intent is not None:
+                    raise ValueError("unallocated Maker fill cannot own a hedge intent")
+            elif (
+                intent is None or intent.hedge_quantity_ounces != abs(item.allocated_ounces)
+                or intent.source_fill_ounces != abs(signed)
+                or (intent.hedge_side is BusinessOrderSide.SELL) != (item.allocated_ounces > 0)
+            ):
+                raise ValueError("Maker allocated quantity does not match its hedge intent")
+        if allocated_fills != seen or intents or any(
+            source_totals.get(key, Decimal(0)) != record.filled_ounces
+            for key, record in records.items()
+        ):
+            raise ValueError("Maker allocation history differs from source/intent facts")
 
 
 class _MakerDirectionStore(JsonStateStore):
@@ -202,6 +310,23 @@ class _MakerDirectionStore(JsonStateStore):
 
     def _persist(self) -> None:
         self._owner._persist()
+
+    @property
+    def rounding_residual_ounces(self) -> Decimal:
+        direction = next(key for key, view in self._owner.stores.items() if view is self)
+        return sum((balance for balance, last_direction in self._owner._route_balances().values()
+                    if last_direction is direction), Decimal(0))
+
+    def can_submit_source(self) -> bool:
+        return not self._owner.has_residuals() and super().can_submit_source()
+
+    def cycle_evidence_complete(self) -> bool:
+        return not self._owner.has_residuals() and super().cycle_evidence_complete()
+
+    def _allocate_source_fill(
+        self, record: SourceOrderRecord, fill_key: str, signed_fill: Decimal,
+    ) -> int:
+        return self._owner._allocate(record, fill_key, signed_fill)
 
     def reserve_source_fill(
         self, *, fill_key: str, client_order_id: str, trade_id: str,
@@ -230,3 +355,28 @@ class _MakerDirectionStore(JsonStateStore):
             view.source_freeze_reason is not None for view in self._owner.stores.values()
         ):
             raise RuntimeError("Maker cycle evidence is incomplete")
+
+
+def _read_allocations(raw: object) -> list[_Allocation]:
+    if not isinstance(raw, list):
+        raise ValueError("Maker allocations must be an ordered list")
+    result: list[_Allocation] = []
+    for item in raw:
+        if not isinstance(item, dict) or set(item) != {
+            "fill_key", "route", "signed_fill_ounces", "allocated_ounces",
+        } or not isinstance(item["fill_key"], str):
+            raise ValueError("invalid Maker allocation record")
+        route = item["route"]
+        if not isinstance(route, dict) or set(route) != set(_ROUTE_FIELDS) or any(
+            value is not None and not isinstance(value, str) for value in route.values()
+        ):
+            raise ValueError("invalid Maker allocation route snapshot")
+        try:
+            signed = Decimal(item["signed_fill_ounces"])
+            allocated = Decimal(item["allocated_ounces"])
+        except (ArithmeticError, TypeError, ValueError) as exc:
+            raise ValueError("invalid Maker allocation quantity") from exc
+        result.append(_Allocation(item["fill_key"], cast(_Route, tuple(
+            route[key] for key in _ROUTE_FIELDS
+        )), signed, allocated))
+    return result
