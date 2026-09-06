@@ -6,6 +6,7 @@ import asyncio
 from collections.abc import Mapping
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
@@ -14,9 +15,10 @@ import test_live_taker as taker
 from msgspec.structs import replace as struct_replace
 from nautilus_trader.cache.cache import Cache
 from nautilus_trader.config import DatabaseConfig, TradingNodeConfig
+from nautilus_trader.execution.engine import ExecutionEngine
 from nautilus_trader.live.node import TradingNode
 from nautilus_trader.model.currencies import USD
-from nautilus_trader.model.enums import OmsType
+from nautilus_trader.model.enums import AccountType, OmsType, OrderSide
 from nautilus_trader.model.events import OrderFilled
 from nautilus_trader.model.identifiers import (
     AccountId,
@@ -25,6 +27,7 @@ from nautilus_trader.model.identifiers import (
     InstrumentId,
     PositionId,
     StrategyId,
+    TradeId,
     TraderId,
     VenueOrderId,
 )
@@ -32,7 +35,9 @@ from nautilus_trader.model.instruments import Instrument
 from nautilus_trader.model.objects import Money
 from nautilus_trader.model.orders import Order
 from nautilus_trader.model.position import Position
+from nautilus_trader.test_kit.mocks.exec_clients import MockExecutionClient
 from nautilus_trader.test_kit.providers import TestInstrumentProvider
+from nautilus_trader.test_kit.stubs.component import TestComponentStubs
 from nautilus_trader.test_kit.stubs.events import TestEventStubs
 from nautilus_trader.test_kit.stubs.execution import TestExecStubs
 
@@ -41,7 +46,11 @@ from py000_nautilus.app import _hedge_instrument, _source_instrument
 from py000_nautilus.bitfinex_v1_cids import BitfinexV1CidStore
 from py000_nautilus.bitfinex_v1_data import BitfinexV1DataClient
 from py000_nautilus.bitfinex_v1_execution import BitfinexV1ExecutionClient
-from py000_nautilus.live_cache import native_cache_config, validate_native_cache
+from py000_nautilus.live_cache import (
+    _filled_bitfinex_position_id,
+    native_cache_config,
+    validate_native_cache,
+)
 from py000_nautilus.live_runtime import SourceTerminalReconciler
 from py000_nautilus.maker_store import MakerStateStore
 from py000_nautilus.models import BusinessOrderSide, SourceDirection
@@ -251,6 +260,215 @@ def test_conflicting_position_index_fails_without_mutating_cache() -> None:
     with pytest.raises(ValueError, match="position index mismatch"):
         _validate(cache)
     assert cache.position_id(order.client_order_id) == other.id
+
+
+def _netting_history(count: int) -> tuple[Cache, list[Order]]:
+    """Run real native NETTING fills; no venue transport or synthetic index repair."""
+    cache = _cache()
+    instrument = _source_instrument()
+    clock, msgbus = TestComponentStubs.clock(), TestComponentStubs.msgbus()
+    engine = ExecutionEngine(msgbus=msgbus, cache=cache, clock=clock)
+    client = MockExecutionClient(
+        client_id=taker.BITFINEX_ID, venue=instrument.id.venue,
+        account_type=AccountType.MARGIN, base_currency=USD,
+        msgbus=msgbus, cache=cache, clock=clock, oms_type=OmsType.NETTING,
+    )
+    engine.register_client(client)
+    orders = []
+    sequence = [(OrderSide.BUY, 2), (OrderSide.BUY, 2),
+                (OrderSide.SELL, 4), (OrderSide.BUY, 2)]
+    try:
+        for index, (side, quantity) in enumerate(sequence[:count]):
+            order = TestExecStubs.limit_order(
+                instrument=instrument, strategy_id=_OWNER, trader_id=_TRADER,
+                client_order_id=ClientOrderId(f"NETTING-{index}"), order_side=side,
+                quantity=instrument.make_qty(quantity),
+            )
+            cache.add_order(order, client_id=taker.BITFINEX_ID)
+            engine.process(TestEventStubs.order_submitted(order, _SOURCE_ACCOUNT))
+            engine.process(TestEventStubs.order_accepted(
+                order, _SOURCE_ACCOUNT, VenueOrderId(order.client_order_id.value),
+            ))
+            fill = TestEventStubs.order_filled(
+                order, instrument, account_id=_SOURCE_ACCOUNT, commission=Money(0, USD),
+            )
+            assert fill.position_id is None  # The NETTING engine determines the native PID.
+            engine.process(fill)
+            assert order.filled_qty == order.quantity and cache.check_integrity()
+            orders.append(order)
+        assert not client.commands and not client.is_connected
+    finally:
+        engine.dispose()
+    return cache, orders
+
+
+@pytest.mark.parametrize("count", [2, 3, 4], ids=["same-side", "flat", "reopened"])
+def test_native_netting_optional_indexes_are_valid_without_cache_mutation(count: int) -> None:
+    cache, orders = _netting_history(count)
+    pid = PositionId(f"{taker.SOURCE_ID}-{_OWNER}")
+    expected = [pid, None, None, pid][:count]
+    assert [order.position_id for order in orders] == [pid] * count
+    assert [cache.position_id(order.client_order_id) for order in orders] == expected
+    position = cache.position(pid)
+    assert position is not None
+    assert position.signed_decimal_qty() == [Decimal(4), Decimal(0), Decimal(2)][count - 2]
+    assert len(position.events) == [2, 3, 1][count - 2]
+    if count == 4:
+        assert orders[0].last_trade_id not in position.trade_ids
+    events = [tuple(order.events) for order in orders]
+    before = Position.to_dict(position)
+
+    assert _validate(cache) is True
+
+    assert [tuple(order.events) for order in orders] == events
+    assert Position.to_dict(position) == before
+    assert [cache.position_id(order.client_order_id) for order in orders] == expected
+
+
+def test_filled_source_without_native_position_id_is_not_certified_by_integrity() -> None:
+    cache = _cache()
+    order = _order()
+    order.apply(TestEventStubs.order_submitted(order, _SOURCE_ACCOUNT))
+    order.apply(TestEventStubs.order_accepted(order, _SOURCE_ACCOUNT))
+    fill = TestEventStubs.order_filled(
+        order, _source_instrument(), account_id=_SOURCE_ACCOUNT, commission=Money(0, USD),
+    )
+    order.apply(fill)
+    cache.add_order(order, client_id=taker.BITFINEX_ID)
+    cache.update_order(order)
+    assert order.filled_qty.as_decimal() > 0
+    assert order.position_id is None and cache.position_id(order.client_order_id) is None
+    assert cache.check_integrity()
+    with pytest.raises(ValueError, match="native cache.*position"):
+        _validate(cache)
+
+
+def _source_fill_cache(
+    first_changes: dict[str, str] | None = None,
+    *,
+    position_changes: dict[str, str] | None = None,
+    native_pid: str | None = None,
+    add_position: bool = True,
+) -> tuple[Cache, Order]:
+    """Build native objects, including deliberately conflicting historical facts."""
+    cache, instrument = _cache(), _source_instrument()
+    order = _order()
+    order.apply(TestEventStubs.order_submitted(order, _SOURCE_ACCOUNT))
+    order.apply(TestEventStubs.order_accepted(order, _SOURCE_ACCOUNT))
+    fills = []
+    for index in range(2):
+        fill = TestEventStubs.order_filled(
+            order, instrument, strategy_id=_OWNER,
+            account_id=_SOURCE_ACCOUNT, commission=Money(0, USD),
+            position_id=PositionId(native_pid or f"{instrument.id}-{_OWNER}"),
+            trade_id=TradeId(f"SOURCE-{index}"), last_qty=instrument.make_qty(50),
+        )
+        fills.append(fill)
+        values = OrderFilled.to_dict(fill)
+        if index == 0:
+            values.update(first_changes or {})
+        order.apply(OrderFilled.from_dict(values))
+    cache.add_order(order, client_id=taker.BITFINEX_ID)
+    cache.update_order(order)
+    if add_position:
+        values = OrderFilled.to_dict(fills[0])
+        values.update(position_changes or {})
+        position_instrument = cache.instrument(InstrumentId.from_str(values["instrument_id"]))
+        position = Position(position_instrument, OrderFilled.from_dict(values))
+        if not position_changes:
+            position.apply(fills[1])
+        cache.add_position(position, OmsType.NETTING)
+    return cache, order
+
+
+@pytest.mark.parametrize("field,value", [
+    ("trader_id", "OTHER-001"), ("strategy_id", "OTHER-001"),
+    ("instrument_id", str(taker.HEDGE_ID)), ("account_id", str(_HEDGE_ACCOUNT)),
+    ("position_id", "WRONG-POSITION"), ("order_side", "SELL"),
+])
+def test_earlier_fill_identity_cannot_hide_behind_latest_order_fields(
+    field: str, value: str,
+) -> None:
+    cache, order = _source_fill_cache({field: value})
+    assert cache.check_integrity()
+    assert order.position_id == PositionId(f"{taker.SOURCE_ID}-{_OWNER}")
+    assert order.strategy_id == _OWNER and order.account_id == _SOURCE_ACCOUNT
+    events = tuple(order.events)
+    with pytest.raises(ValueError, match="filled order facts mismatch"):
+        _validate(cache)
+    assert tuple(order.events) == events
+
+
+def test_noncanonical_source_pid_is_rejected_even_with_matching_index_and_position() -> None:
+    cache, order = _source_fill_cache(native_pid="WRONG-POSITION")
+    assert cache.check_integrity()
+    assert cache.position_id(order.client_order_id) == order.position_id
+    with pytest.raises(ValueError, match="filled order position mismatch"):
+        _validate(cache)
+
+
+def test_optional_source_index_does_not_excuse_missing_actual_position() -> None:
+    cache, order = _source_fill_cache(add_position=False)
+    assert cache.check_integrity()
+    assert cache.position_id(order.client_order_id) is None and order.position_id is not None
+    with pytest.raises(ValueError, match="order position missing"):
+        _validate(cache)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("trader_id", "OTHER-001"), ("strategy_id", "OTHER-001"),
+    ("account_id", str(_HEDGE_ACCOUNT)),
+])
+def test_source_actual_position_must_still_match_route_and_owner(field: str, value: str) -> None:
+    cache, _ = _source_fill_cache(position_changes={field: value})
+    assert cache.check_integrity()
+    with pytest.raises(ValueError, match="native cache.*position.*mismatch"):
+        _validate(cache)
+
+
+def test_native_integrity_already_rejects_source_position_index_on_wrong_instrument() -> None:
+    cache, _ = _source_fill_cache(position_changes={"instrument_id": str(taker.HEDGE_ID)})
+    assert not cache.check_integrity()
+    with pytest.raises(ValueError, match="integrity check failed"):
+        _validate(cache)
+
+
+def test_nonempty_conflicting_source_index_is_never_replaced_by_native_pid() -> None:
+    cache, order = _source_fill_cache()
+    _, hedge_position = _add_position(cache, cid="HEDGE-OTHER")
+    cache.add_position_id(hedge_position.id, taker.SOURCE_ID.venue, order.client_order_id, _OWNER)
+    assert cache.check_integrity()
+    with pytest.raises(ValueError, match="position index mismatch"):
+        _validate(cache)
+    assert cache.position_id(order.client_order_id) == hedge_position.id
+
+
+@pytest.mark.parametrize("mismatch", ["no-fills", "trade-order", "duplicate", "quantity",
+                                     "client_order_id", "venue_order_id"])
+def test_source_fill_proof_requires_complete_order_evidence(mismatch: str) -> None:
+    # Predicate-only views exercise inconsistencies normal native Order.apply prevents.
+    # They are not represented as states proven loadable from a backend.
+    _, order = _source_fill_cache()
+    values = {field: getattr(order, field) for field in (
+        "trader_id", "strategy_id", "instrument_id", "client_order_id", "account_id",
+        "venue_order_id", "position_id", "side", "filled_qty", "events", "trade_ids",
+    )}
+    if mismatch == "no-fills":
+        values["events"] = order.events[:3]
+    elif mismatch == "trade-order":
+        values["trade_ids"] = order.trade_ids[::-1]
+    elif mismatch == "duplicate":
+        values["events"] = [*order.events, order.events[-1]]
+        values["trade_ids"] = [*order.trade_ids, order.trade_ids[-1]]
+    elif mismatch == "quantity":
+        values["filled_qty"] = _source_instrument().make_qty(101)
+    else:
+        fill = OrderFilled.to_dict(order.events[-1])
+        fill[mismatch] = "WRONG-ID"
+        values["events"] = [*order.events[:-1], OrderFilled.from_dict(fill)]
+    view = cast(Order, SimpleNamespace(**values))
+    with pytest.raises(ValueError, match="filled order facts mismatch"):
+        _filled_bitfinex_position_id(view)
 
 
 def _ready_dependencies(monkeypatch: pytest.MonkeyPatch) -> None:

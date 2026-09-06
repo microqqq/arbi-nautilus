@@ -17,7 +17,7 @@ from typing import cast
 
 from nautilus_trader.cache.cache import Cache
 from nautilus_trader.execution.reports import ExecutionMassStatus, PositionStatusReport
-from nautilus_trader.model.enums import OrderStatus
+from nautilus_trader.model.enums import OrderStatus, PositionSide
 from nautilus_trader.model.events import OrderFilled
 from nautilus_trader.model.identifiers import InstrumentId, StrategyId, TraderId
 from nautilus_trader.model.orders import Order
@@ -176,8 +176,12 @@ def _positions(cache: Cache, mass: ExecutionMassStatus, instrument_id: Instrumen
             raise ValueError("startup position average price differs")
 
     if netting:
-        if (len(reports) != int(total != 0)
-                or sum((report.signed_decimal_qty for report in reports), Decimal(0)) != total):
+        side = (PositionSide.LONG if total > 0 else
+                PositionSide.SHORT if total < 0 else PositionSide.FLAT)
+        # The BFX mapper emits one explicit FLAT report even for an empty REST result.
+        if (len(reports) != 1 or reports[0].position_side != side
+                or reports[0].quantity.as_decimal() != abs(total)
+                or reports[0].signed_decimal_qty != total):
             raise ValueError("startup NETTING position differs")
         if total:
             weight = sum((abs(position.signed_decimal_qty()) for position in positions), Decimal(0))

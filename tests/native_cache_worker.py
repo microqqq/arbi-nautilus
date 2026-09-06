@@ -43,7 +43,7 @@ from restart_replay_worker import _summary
 from py000_nautilus.app import _hedge_instrument
 from py000_nautilus.bitfinex_v1_data import instrument_from_config
 from py000_nautilus.bitfinex_v1_transport import BitfinexV1Transport
-from py000_nautilus.live_cache import native_cache_config
+from py000_nautilus.live_cache import native_cache_config, validate_native_cache
 from py000_nautilus.live_maker import build_live_maker_node
 from py000_nautilus.live_taker import build_live_taker_node
 from py000_nautilus.mt5_v1_transport import Mt5V1Transport
@@ -121,6 +121,57 @@ async def _produce(node: Any, strategy: Any, configs: Any) -> None:
         await _process(engine, events)
 
 
+async def _netting_cycle(node: Any, strategy: Any, configs: Any) -> list[dict[str, Any]]:
+    """Close/reopen through native events only, without editing either position index."""
+    engine = node.kernel.exec_engine
+    engine.start()
+    instrument = node.cache.instrument(configs.strategy.source_instrument_id)
+    observations = []
+    for index, side in enumerate((OrderSide.SELL, OrderSide.BUY)):
+        cid = ClientOrderId("W6B7-NET-CLOSE" if index == 0 else "W6B7-NET-REOPEN")
+        order = LimitOrder(
+            trader_id=strategy.trader_id, strategy_id=strategy.id,
+            instrument_id=instrument.id, client_order_id=cid, order_side=side,
+            quantity=instrument.make_qty(1), price=instrument.make_price(2400),
+            time_in_force=TimeInForce.GTC, init_id=UUID4(), ts_init=300 + index * 10,
+        )
+        node.cache.add_order(order, client_id=ClientId("BITFINEX"))
+        venue = VenueOrderId(str(700000301 + index))
+        fill = TestEventStubs.order_filled(
+            order, instrument, account_id=configs.bitfinex_exec.account_id,
+            venue_order_id=venue, trade_id=TradeId(str(800000301 + index)),
+            position_id=None, last_qty=instrument.make_qty(1),
+            last_px=instrument.make_price(2400), commission=Money(0, USD),
+            ts_event=303 + index * 10,
+        )
+        values = OrderFilled.to_dict(fill)
+        values["trader_id"] = strategy.trader_id.value
+        await _process(engine, [
+            TestEventStubs.order_submitted(order, configs.bitfinex_exec.account_id,
+                                           ts_event=301 + index * 10),
+            TestEventStubs.order_accepted(order, configs.bitfinex_exec.account_id, venue,
+                                         ts_event=302 + index * 10),
+            OrderFilled.from_dict(values),
+        ])
+        indexes = {item.client_order_id: node.cache.position_id(item.client_order_id)
+                   for item in node.cache.orders()}
+        assert validate_native_cache(
+            node.cache, trader_id=strategy.trader_id, strategy_id=strategy.id, routes={
+                instrument.id: (configs.bitfinex_exec.account_id, ClientId("BITFINEX")),
+                _hedge_instrument().id: (AccountId("MT5-12345678"), ClientId("MT5")),
+            },
+        )
+        assert indexes == {item.client_order_id: node.cache.position_id(item.client_order_id)
+                           for item in node.cache.orders()}
+        position = node.cache.position(order.position_id)
+        observations.append({
+            "order_pid": order.position_id.value,
+            "index_pid": None if indexes[cid] is None else indexes[cid].value,
+            "net": str(position.signed_decimal_qty()), "opening": position.opening_order_id.value,
+        })
+    return observations
+
+
 async def _exercise_loaded(node: Any, new_trade: bool) -> None:
     engine = node.kernel.exec_engine
     engine.start()
@@ -139,8 +190,11 @@ async def _run(node: Any, strategy: Any, configs: Any, mode: str) -> dict[str, A
         clients = engine._clients
         assert clients[ClientId("BITFINEX")].oms_type is OmsType.NETTING
         assert clients[ClientId("MT5")].oms_type is OmsType.HEDGING
+        netting_observations: list[dict[str, Any]] = []
         if mode == "produce":
             await _produce(node, strategy, configs)
+        elif mode == "netting-cycle":
+            netting_observations = await _netting_cycle(node, strategy, configs)
         elif mode in {"duplicate", "new-trade"}:
             await _exercise_loaded(node, new_trade=mode == "new-trade")
         elif mode in {"omit-client", "omit-position"}:
@@ -185,6 +239,7 @@ async def _run(node: Any, strategy: Any, configs: Any, mode: str) -> dict[str, A
                                  for account in node.cache.accounts()},
             "source_ready": strategy._live_submission_ready(),
             "integrity": node.cache.check_integrity(), "event_count": engine.event_count,
+            "netting_observations": netting_observations,
         }
     finally:
         if engine.is_running:

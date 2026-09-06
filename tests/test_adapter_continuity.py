@@ -64,6 +64,14 @@ class _SourceWire:
             row = [*_position_row(
                 self.net, avg_px=self.average_price, raw_symbol=h.wire.raw_symbol,
             ), None, D(1000), D(200), None]
+            # A reopened venue position is a new lifecycle, not resurrection of
+            # the closed raw ID. Derive only from this fixture's executed trades.
+            balance, position_id = D(0), 43
+            for trade in self.trades:
+                if balance == 0:
+                    position_id += 1
+                balance += D(trade[4])
+            row[11] = position_id
             row[13] = h.node.kernel.clock.timestamp_ns() // 1_000_000
             h.rest.position_rows = [row]
         else:
@@ -307,7 +315,9 @@ async def _assert_reports(
                 (str(trade[3]), str(trade[0]), abs(trade[4]), trade[4] > 0)
                 for trade in source.trades}
     positions = [report for group in source_mass.position_reports.values() for report in group]
-    assert len(positions) == int(source.net != 0)
+    assert len(positions) == 1  # The actual mapper emits an explicit FLAT report.
+    if source.net == 0:
+        assert positions[0].position_side == PositionSide.FLAT
     assert sum((report.quantity.as_decimal()
                 * (1 if report.position_side == PositionSide.LONG else -1)
                 for report in positions), D(0)) == source.net

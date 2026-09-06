@@ -17,10 +17,12 @@ from typing import Any, cast
 
 import pytest
 from continuous_mt5_wire import ContinuousMt5Wire
-from nautilus_trader.execution.reports import ExecutionMassStatus
-from nautilus_trader.model.enums import OmsType, OrderSide, OrderStatus
+from nautilus_trader.cache.cache import Cache
+from nautilus_trader.core.uuid import UUID4
+from nautilus_trader.execution.reports import ExecutionMassStatus, PositionStatusReport
+from nautilus_trader.model.enums import OmsType, OrderSide, OrderStatus, PositionSide
 from nautilus_trader.model.events import OrderFilled
-from nautilus_trader.model.identifiers import ClientOrderId, VenueOrderId
+from nautilus_trader.model.identifiers import AccountId, ClientId, ClientOrderId, VenueOrderId
 from nautilus_trader.model.orders.unpacker import OrderUnpacker
 from nautilus_trader.model.position import Position
 from nautilus_trader.test_kit.stubs.events import TestEventStubs
@@ -35,11 +37,13 @@ from test_adapter_continuity import (
 from test_strategy_continuity import _OrdinaryStrategy, _pump
 
 from py000_nautilus import store as store_module
+from py000_nautilus.app import _source_instrument
+from py000_nautilus.bitfinex_v1_reports import map_position_status_reports
 from py000_nautilus.durability import ParentDirectorySyncError, replace_and_sync_parent
 from py000_nautilus.live_runtime import get_source_terminal_reconciler
 from py000_nautilus.models import ObligationStatus
 from py000_nautilus.mt5_v1_protocol import JsonObject
-from py000_nautilus.restart_recovery import reconcile_startup
+from py000_nautilus.restart_recovery import _positions, reconcile_startup
 
 
 async def _check(h: _OrdinaryStrategy) -> None:
@@ -51,16 +55,47 @@ async def _check(h: _OrdinaryStrategy) -> None:
     )
 
 
+@pytest.mark.parametrize("fault", [None, "missing", "duplicate", "nonzero", "wrong-side"])
+def test_startup_netting_requires_one_explicit_flat_report(fault: str | None) -> None:
+    instrument = _source_instrument()
+    account = AccountId("BITFINEX-269312")
+    mass = ExecutionMassStatus(
+        client_id=ClientId("BITFINEX"), account_id=account, venue=instrument.id.venue,
+        report_id=UUID4(), ts_init=1,
+    )
+    reports = map_position_status_reports(
+        rows=[], instrument=instrument, account_id=account, ts_init=1,
+    )
+    if fault == "missing":
+        reports = []
+    elif fault == "duplicate":
+        reports *= 2
+    elif fault in {"nonzero", "wrong-side"}:
+        reports = [PositionStatusReport(
+            account_id=account, instrument_id=instrument.id, position_side=PositionSide.LONG,
+            quantity=instrument.make_qty(1 if fault == "nonzero" else 0),
+            report_id=UUID4(), ts_last=1, ts_init=1,
+        )]
+    mass.add_position_reports(reports)
+    if fault is None:
+        assert _positions(Cache(), mass, instrument.id, netting=True) == 0
+    else:
+        with pytest.raises(ValueError, match="NETTING position differs"):
+            _positions(Cache(), mass, instrument.id, netting=True)
+
+
 @asynccontextmanager
 async def _settled(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, maker: bool,
+    deltas: tuple[int, ...] = (2,),
 ) -> AsyncIterator[tuple[_OrdinaryStrategy, _SourceWire, ContinuousMt5Wire]]:
     async with _continuous(
         tmp_path, monkeypatch, maker=maker, long_quantity=2, short_quantity=2,
     ) as (h, source, wire):
-        cid = await _accepted_source(h, source, wire, 2)
-        source.fill(cid, h.source_quantity)
-        await _settle_cycle(h, source, wire, cid=cid, expected=1)
+        for expected, delta in enumerate(deltas, 1):
+            cid = await _accepted_source(h, source, wire, delta)
+            source.fill(cid, h.source_quantity)
+            await _settle_cycle(h, source, wire, cid=cid, expected=expected)
         assert await h.node.kernel.exec_engine.reconcile_execution_state(timeout_secs=2)
         h.source.confirm_terminal_reconciliation()
         yield h, source, wire
@@ -101,6 +136,10 @@ class _History:
                 position, OmsType.NETTING if instrument_id == second.source_instrument.id
                 else OmsType.HEDGING,
             )
+            # add_position initializes the open index. Restore the actual
+            # open/closed classification through the same native update API;
+            # this never fills a missing order-to-position secondary index.
+            second.node.cache.update_position(position)
         source = _SourceWire(second)
         source.rows, source.trades, source.net, source.average_price = deepcopy(self.source_facts)
         if fault == "missing-source":
@@ -120,6 +159,77 @@ def test_settled_ordinary_history_passes_complete_startup_check(
     async def scenario() -> None:
         async with _settled(tmp_path, monkeypatch, maker=maker) as (h, _, _):
             await _check(h)
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("maker", [False, True], ids=["taker", "maker"])
+@pytest.mark.parametrize("deltas", [(2, 2), (2, -2), (2, -2, 2), (2, -2, 2, -2)],
+                         ids=["same-way", "flat", "reopened", "flat-again"])
+def test_new_ordinary_node_resumes_native_netting_history_without_repairing_indexes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, maker: bool, deltas: tuple[int, ...],
+) -> None:
+    async def scenario() -> None:
+        async with _settled(tmp_path, monkeypatch, maker=maker, deltas=deltas) as (
+            first, source, wire,
+        ):
+            cache = first.node.cache
+            indexes = {order.client_order_id: cache.position_id(order.client_order_id)
+                       for order in cache.orders()}
+            assert cache.check_integrity()
+            assert any(order.position_id is not None and indexes[order.client_order_id] is None
+                       for order in cache.orders(instrument_id=first.source_instrument.id))
+            await _check(first)  # The original live-cache guard rejected the real close here.
+            assert indexes == {order.client_order_id: cache.position_id(order.client_order_id)
+                               for order in cache.orders()}
+            history = _History(first, source, wire)
+            business_store = first.strategy._state_store if maker else first.store
+            business = deepcopy(business_store._to_payload())
+            positions = {position.id: (position.signed_decimal_qty(),
+                                      tuple(event.id for event in position.events))
+                         for position in cache.positions()}
+        second = _OrdinaryStrategy(
+            tmp_path, monkeypatch, maker=maker, two_sided=maker,
+            native_mt5_transport=True, inject_mt5_io=False,
+        )
+        assert get_source_terminal_reconciler(second.node).restart_pending
+        owner = get_source_terminal_reconciler(second.node)
+        source2, wire2 = history.restore(second)
+        try:
+            second.hedge.connect()
+            async with asyncio.timeout(2):
+                while second.hedge._poll_task is None:
+                    await asyncio.sleep(.005)
+            await second.start(initial_reconciliation=True)
+            await _drive(second, wire2, lambda: not owner.busy and (
+                not owner.restart_pending or owner.last_failure is not None
+            ), direction=0)
+            assert not owner.restart_pending, owner.last_failure
+            business_store = second.strategy._state_store if maker else second.store
+            assert business_store._to_payload() == business
+            assert indexes == {
+                order.client_order_id: second.node.cache.position_id(order.client_order_id)
+                for order in second.node.cache.orders()
+            }
+            assert positions == {
+                position.id: (position.signed_decimal_qty(),
+                              tuple(event.id for event in position.events))
+                for position in second.node.cache.positions()
+            }
+            assert {order.client_order_id: tuple(event.id for event in order.events)
+                    for order in second.node.cache.orders()} == {
+                events[0].client_order_id: tuple(event.id for event in events)
+                for events, _, _ in history.orders
+            }
+            assert not wire2.submit_calls and not wire2.close_calls
+            assert not second.source_cancel_commands
+            cid = await _accepted_source(second, source2, wire2, 2)
+            assert cid not in history.source_facts[0]
+            source2.fill(cid, second.source_quantity)
+            await _settle_cycle(second, source2, wire2, cid=cid, expected=len(deltas) + 1)
+            assert len(wire2.submit_calls) == 1 and not wire2.close_calls
+        finally:
+            await second.hedge._disconnect()
+            await second.close()
     asyncio.run(scenario())
 
 

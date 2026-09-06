@@ -89,6 +89,21 @@ def test_ordinary_builder_native_redis_survives_a_fresh_process(
     reloaded = _result(_worker(kind, "load", port, tmp_path))
     assert reloaded["snapshot"] == increment["snapshot"]  # The new native update also persisted.
 
+    cycle = _result(_worker(kind, "netting-cycle", port, tmp_path))
+    closed, reopened = cycle["netting_observations"]
+    canonical = f"{orders['W6A-SOURCE']['instrument']}-{restored['strategy_id']}"
+    assert closed["order_pid"] == reopened["order_pid"] == canonical
+    assert closed["index_pid"] is None and reopened["index_pid"] == canonical
+    assert Decimal(closed["net"]) == 0 and Decimal(reopened["net"]) == 1
+    assert reopened["opening"] == "W6B7-NET-REOPEN"
+    assert cycle["snapshot"]["orders"]["W6B7-NET-CLOSE"]["position_id"] is None
+    reloaded = _result(_worker(kind, "load", port, tmp_path))
+    # Native load builds this optional secondary index from the persisted Order.
+    # Only the expected summary is normalized; no cache/database index is edited.
+    cycle["snapshot"]["orders"]["W6B7-NET-CLOSE"]["position_id"] = canonical
+    assert reloaded["snapshot"] == cycle["snapshot"]
+    assert reloaded["event_count"] == 0 and reloaded["integrity"] is True
+
     wrong = _worker(kind, "wrong-account", port, tmp_path)
     assert wrong.returncode != 0
     assert "native cache contains an account outside" in wrong.stderr
