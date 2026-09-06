@@ -3,6 +3,7 @@
 import asyncio
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from copy import deepcopy
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, cast
@@ -25,7 +26,7 @@ from nautilus_trader.model.enums import (
     OrderStatus,
     TimeInForce,
 )
-from nautilus_trader.model.events import OrderExpired, OrderRejected
+from nautilus_trader.model.events import OrderDenied, OrderExpired, OrderRejected
 from nautilus_trader.model.identifiers import AccountId, ClientOrderId, TradeId, VenueOrderId
 from nautilus_trader.model.instruments import Cfd
 from nautilus_trader.model.objects import Money, Price, Quantity
@@ -307,6 +308,117 @@ def test_stop_missing_cached_order_marks_exact_active_unknown() -> None:
     assert harness.canceled == []
     assert harness.state_store.active_source_order_id == "O-B"
     assert harness.state_store.unknown[0][0] == "O-B"
+
+
+def test_restart_pending_stop_does_not_cancel_an_unverified_old_order() -> None:
+    harness = _StopHarness("OLD")
+    TakerStrategy.bind_restart_gate(cast(Any, harness), lambda: True)
+    TakerStrategy.on_stop(cast(Any, harness))
+    assert not harness.cache.requested and not harness.canceled
+    assert not harness.state_store.unknown
+    assert harness._source_terminal_stopped
+
+
+@pytest.mark.parametrize("kind", ["maker", "taker"])
+@pytest.mark.parametrize("leg", ["source", "hedge"])
+def test_restart_gate_skips_business_order_callbacks_until_released(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str, leg: str,
+) -> None:
+    strategy: Any = (
+        MakerStrategy(_maker_strategy_config(tmp_path / kind)) if kind == "maker"
+        else TakerStrategy(_strategy_config(tmp_path / kind))
+    )
+    view = strategy._stores[SourceDirection.LONG] if kind == "maker" else strategy.state_store
+    view.begin_source("OLD-SOURCE", BusinessOrderSide.BUY, Decimal(1),
+                      source_account_id="BITFINEX-001", hedge_account_id="MT5-001")
+    instrument = _source_instrument() if leg == "source" else _hedge_instrument()
+    client_order_id = "OLD-SOURCE"
+    if leg == "hedge":
+        intent = view.reserve_source_fill(
+            fill_key="OLD-SOURCE|SOURCE-V|SOURCE-T", client_order_id="OLD-SOURCE",
+            trade_id="SOURCE-T", source_side=BusinessOrderSide.BUY, fill_ounces=Decimal(1),
+        )
+        assert intent is not None
+        client_order_id = "OLD-HEDGE"
+        view.bind_hedge_order(intent.intent_id, client_order_id)
+    order = TestExecStubs.limit_order(
+        instrument=instrument, client_order_id=ClientOrderId(client_order_id),
+        order_side=OrderSide.BUY if leg == "source" else OrderSide.SELL,
+        quantity=instrument.make_qty(1), price=instrument.make_price(2400),
+    )
+    filled = TestEventStubs.order_filled(
+        order, instrument, venue_order_id=VenueOrderId("OLD-V"), trade_id=TradeId("OLD-T"),
+        last_qty=instrument.make_qty(1), commission=Money(0, instrument.quote_currency),
+    )
+    pending = True
+    strategy.bind_restart_gate(lambda: pending)
+    strategy._live_submission_ready = lambda: False
+    dispatched: list[object] = []
+    canceled: list[object] = []
+    monkeypatch.setattr(strategy, "_submit_hedge" if kind == "maker" else "_submit_hedge_intent",
+                        lambda *args: dispatched.append(args))
+    monkeypatch.setattr(strategy, "cancel_order", lambda *args, **kwargs: canceled.append(args))
+    before = deepcopy(view._to_payload())
+    file_before = view.path.read_bytes()
+    for callback, event in (
+        (strategy.on_order_submitted, TestEventStubs.order_submitted(order)),
+        (strategy.on_order_accepted, TestEventStubs.order_accepted(order)),
+        (strategy.on_order_denied, OrderDenied(
+            trader_id=order.trader_id, strategy_id=order.strategy_id,
+            instrument_id=order.instrument_id, client_order_id=order.client_order_id,
+            reason="risk denied", event_id=UUID4(), ts_init=0,
+        )),
+        (strategy.on_order_rejected, _rejected(order, "UNKNOWN")),
+        (strategy.on_order_rejected, _rejected(order, "venue rejected")),
+        (strategy.on_order_canceled, TestEventStubs.order_canceled(order)),
+        (strategy.on_order_expired, TestEventStubs.order_expired(order)),
+        (strategy.on_order_filled, filled),
+    ):
+        callback(event)
+        assert view._to_payload() == before and view.path.read_bytes() == file_before
+    strategy._submit_next_pending_hedge()
+    assert not dispatched and not canceled and not strategy._source_terminal_inflight
+    pending = False
+    strategy.on_order_filled(filled)
+    assert view._to_payload() != before
+    if leg == "source":
+        assert len(dispatched) == 1  # Source-health HOLD does not replace the restart gate.
+    else:
+        assert view.intents()[0].status is ObligationStatus.COMPLETED
+
+
+@pytest.mark.parametrize("kind", ["maker", "taker"])
+def test_restart_gate_blocks_an_otherwise_dispatchable_pending_hedge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str,
+) -> None:
+    strategy: Any = (
+        MakerStrategy(_maker_strategy_config(tmp_path / kind)) if kind == "maker"
+        else TakerStrategy(_strategy_config(tmp_path / kind))
+    )
+    view = strategy._stores[SourceDirection.LONG] if kind == "maker" else strategy.state_store
+    view.begin_source("OLD", BusinessOrderSide.BUY, Decimal(1),
+                      source_account_id="BITFINEX-001", hedge_account_id="MT5-001")
+    intent = view.reserve_source_fill(
+        fill_key="OLD|V|T", client_order_id="OLD", trade_id="T",
+        source_side=BusinessOrderSide.BUY, fill_ounces=Decimal(1),
+    )
+    assert intent is not None and intent.status is ObligationStatus.PENDING
+    pending = True
+    strategy.bind_restart_gate(lambda: pending)
+    dispatched: list[object] = []
+    monkeypatch.setattr(strategy, "_submit_hedge" if kind == "maker" else "_submit_hedge_intent",
+                        lambda *args: dispatched.append(args))
+    before = deepcopy(view._to_payload())
+    strategy._submit_next_pending_hedge()
+    if kind == "maker":
+        MakerStrategy._submit_hedge(strategy, SourceDirection.LONG, AccountId("MT5-001"),
+                                    None, intent)
+    else:
+        TakerStrategy._submit_hedge_intent(strategy, intent)
+    assert not dispatched and view._to_payload() == before
+    pending = False
+    strategy._submit_next_pending_hedge()
+    assert len(dispatched) == 1
 
 
 class _QuoteTriggeredTaker(TakerStrategy):
@@ -618,6 +730,37 @@ def test_native_expired_then_late_fill_requires_matching_native_quantity(tmp_pat
 
 
 @pytest.mark.parametrize("kind", ["maker", "taker"])
+def test_restart_gate_keeps_exact_terminal_completion_pending(
+    tmp_path: Path, kind: str,
+) -> None:
+    completions: list[Any] = []
+    def query(_cid: ClientOrderId, _vid: VenueOrderId, complete: SourceTerminalResult) -> None:
+        completions.append(complete)
+
+    strategy: Any = (
+        MakerStrategy(_maker_strategy_config(tmp_path / kind), source_terminal_query=query)
+        if kind == "maker"
+        else RecordingTakerStrategy(tmp_path / kind, source_terminal_query=query)
+    )
+    pending = False
+    strategy.bind_restart_gate(lambda: pending)
+    with _event_engine(strategy) as engine:
+        engine.trader.start()
+        order = _seed_terminal_source(engine, strategy, maker=kind == "maker")
+        _process_source_terminal(engine, order)
+        assert len(completions) == 1
+        view = strategy._stores[SourceDirection.LONG] if kind == "maker" else strategy.state_store
+        before = deepcopy(view._to_payload())
+        pending = True
+        assert completions[0](_terminal_report(order)) is False
+        assert view._to_payload() == before
+        assert strategy._source_terminal_inflight == {order.client_order_id.value}
+        pending = False
+        assert completions[0](_terminal_report(order)) is True
+        assert not strategy._source_terminal_inflight
+
+
+@pytest.mark.parametrize("kind", ["maker", "taker"])
 def test_old_terminal_callback_cannot_consume_a_new_strategy_generation(
     tmp_path: Path, kind: str,
 ) -> None:
@@ -636,6 +779,8 @@ def test_old_terminal_callback_cannot_consume_a_new_strategy_generation(
         order = _seed_terminal_source(engine, strategy, maker=kind == "maker")
         _process_source_terminal(engine, order)
         assert len(completions) == 1
+        store = strategy._stores[SourceDirection.LONG] if kind == "maker" else strategy.state_store
+        store.mark_source_unknown(order.client_order_id.value, "external HOLD before restart")
         strategy.stop()
         strategy.reset()
         strategy.start()
@@ -646,7 +791,7 @@ def test_old_terminal_callback_cannot_consume_a_new_strategy_generation(
         assert completions[1](_terminal_report(order)) is True
         assert strategy._source_terminal_inflight == set()
         store = strategy._stores[SourceDirection.LONG] if kind == "maker" else strategy.state_store
-        assert store.halt_reason is not None  # Generation isolation is not restart recovery.
+        assert store.halt_reason == "external HOLD before restart"
         assert not store.can_submit_source()
 
 

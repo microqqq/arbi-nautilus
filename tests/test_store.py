@@ -562,5 +562,28 @@ def test_restart_marks_inflight_source_unknown_and_blocks_second_source(tmp_path
         restarted.begin_source("O-2", BusinessOrderSide.SELL, D(1))
 
 
+@pytest.mark.parametrize("source_filled", [False, True])
+def test_restart_preserves_prior_hold_while_marking_inflight_unknown(
+    tmp_path: Path, source_filled: bool,
+) -> None:
+    path = _state_path(tmp_path)
+    store = JsonStateStore(path)
+    store.begin_source("OLD", BusinessOrderSide.BUY, D(2))
+    if source_filled:
+        store.reserve_source_fill(
+            fill_key="OLD|V|T", client_order_id="OLD", trade_id="T",
+            source_side=BusinessOrderSide.BUY, fill_ounces=D(2),
+        )
+    reason = "operator HOLD: unmatched account evidence"
+    store.mark_source_unknown("OLD", reason)
+    restarted = JsonStateStore(path)
+    assert restarted.recover_for_start() == reason
+    assert JsonStateStore(path).halt_reason == reason
+    record = restarted.source_order("OLD")
+    assert record is not None and record.status == "UNKNOWN"
+    if source_filled:
+        assert restarted.intents()[0].status is ObligationStatus.UNKNOWN
+
+
 def _state_path(tmp_path: Path) -> str:
     return str(tmp_path) + "/taker.state.json"

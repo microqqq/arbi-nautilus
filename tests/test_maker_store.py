@@ -59,6 +59,21 @@ def _memory(owner: MakerStateStore) -> object:
     return deepcopy(owner._snapshot())
 
 
+def test_restart_preserves_each_maker_views_original_hold(tmp_path: Path) -> None:
+    prefix = tmp_path / "restart-hold"
+    owner = _owner(prefix)
+    for direction in (LONG, SHORT):
+        _begin(owner, direction)
+        owner.stores[direction].mark_source_unknown(
+            f"S-{direction.value}", f"original {direction.value} account HOLD",
+        )
+    restarted = _owner(prefix)
+    for direction in (LONG, SHORT):
+        expected = f"original {direction.value} account HOLD"
+        assert restarted.stores[direction].recover_for_start() == expected
+        assert _owner(prefix).stores[direction].halt_reason == expected
+
+
 @pytest.mark.parametrize("first", [LONG, SHORT])
 @pytest.mark.parametrize(("limit", "amount", "allowed"), [
     ("0.5", "0.5", True), ("0.49", "0.5", False), ("0", "0.5", False),

@@ -238,6 +238,117 @@ def _report(harness: _Harness, cid: ClientOrderId, vid: VenueOrderId) -> OrderSt
     )
 
 
+def test_restart_binding_starts_idle_actor_once_and_holds_until_final_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        with _runtime(tmp_path, monkeypatch) as (runtime, harness, engine):
+            entered, release = asyncio.Event(), asyncio.Event()
+            next_turn: list[bool] = []
+
+            async def recover() -> None:
+                assert runtime.restart_pending and runtime.busy
+                assert engine.calls == engine.confirmations == 1
+                entered.set()
+                await release.wait()
+                asyncio.get_running_loop().call_soon(
+                    lambda: next_turn.append(runtime.restart_pending),
+                )
+
+            runtime.bind_restart_recovery(recover)
+            assert runtime.restart_pending and not harness.client._tasks
+            assert not bool(runtime.source_submission_ready) and not engine.required
+            runtime.start()
+            assert runtime.busy and runtime.restart_pending
+            await asyncio.wait_for(entered.wait(), timeout=0.2)
+            assert not bool(runtime.source_submission_ready)
+            assert not runtime.working_observation_in_progress
+            release.set()
+            assert runtime._root is not None and await runtime._root
+            assert runtime.source_submission_ready and not bool(runtime.restart_pending)
+            assert next_turn == [False]  # Final certification and release did not yield.
+            runtime._observe(None)
+            await asyncio.sleep(0)
+            assert engine.calls == 1
+            with pytest.raises(RuntimeError, match="before Actor start"):
+                runtime.bind_restart_recovery(recover)
+            await harness.client.cancel_pending_tasks()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("failure", ["error", "disconnect", "stop", "timeout", "cancel"])
+def test_restart_failure_keeps_gate_and_does_not_create_timer_retries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str,
+) -> None:
+    async def scenario() -> None:
+        with _runtime(tmp_path, monkeypatch) as (runtime, harness, engine):
+            entered = asyncio.Event()
+
+            async def recover() -> None:
+                entered.set()
+                if failure == "error":
+                    raise ValueError("unsettled business history")
+                if failure == "disconnect":
+                    engine.connected = False
+                elif failure == "stop":
+                    runtime.stop()
+                else:
+                    await asyncio.Event().wait()
+
+            runtime.bind_restart_recovery(recover)
+            runtime.start()
+            await asyncio.wait_for(entered.wait(), timeout=0.2)
+            root = runtime._root
+            assert root is not None
+            if failure == "cancel":
+                root.cancel()
+            if failure in {"stop", "cancel"}:
+                with pytest.raises(asyncio.CancelledError):
+                    await root
+            else:
+                assert not await root
+            assert runtime.restart_pending and not runtime.source_submission_ready
+            assert runtime.last_failure is not None
+            calls = engine.calls
+            assert calls == (2 if failure in {"error", "timeout"} else 1)
+            runtime._observe(None)
+            await asyncio.sleep(0)
+            assert engine.calls == calls
+            await harness.client.cancel_pending_tasks()
+    asyncio.run(scenario())
+
+
+def test_restart_check_follows_terminal_callbacks_with_gate_still_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        with _runtime(tmp_path, monkeypatch) as (runtime, harness, engine):
+            sequence: list[str] = []
+
+            def complete(_report: OrderStatusReport | None) -> bool:
+                assert runtime.restart_pending
+                sequence.append("terminal callback")
+                return True
+
+            async def report(command: Any) -> OrderStatusReport:
+                await asyncio.sleep(0)
+                return _report(harness, command.client_order_id, command.venue_order_id)
+
+            async def recover() -> None:
+                assert runtime.restart_pending and not runtime._requests
+                sequence.append("startup certification")
+
+            monkeypatch.setattr(harness.client, "generate_order_status_report", report)
+            runtime.bind_restart_recovery(recover)
+            runtime.start()
+            runtime.query_source_terminal(ClientOrderId("OLD"), VenueOrderId("V-OLD"), complete)
+            assert runtime._root is not None and await runtime._root
+            assert sequence == ["terminal callback", "startup certification"]
+            assert not runtime.restart_pending
+            await harness.client.cancel_pending_tasks()
+    asyncio.run(scenario())
+
+
 def test_native_actor_shares_root_and_covers_report_and_callback_with_busy_gate(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

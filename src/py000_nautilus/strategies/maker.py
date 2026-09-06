@@ -103,6 +103,7 @@ class MakerStrategy(Strategy):
         super().__init__(config)
         self._config = config
         self._live_submission_ready = live_submission_ready
+        self._restart_gate: Callable[[], bool] | None = None
         self._hedge_quantity_ready = hedge_quantity_ready
         self._live_costs_from_adapters = live_costs_from_adapters
         self._source_terminal_query = source_terminal_query
@@ -202,6 +203,10 @@ class MakerStrategy(Strategy):
             else:
                 self._reschedule_active_timers()
 
+    def bind_restart_gate(self, pending: Callable[[], bool]) -> None:
+        """Bind only the ordinary composition's startup HOLD, not general health."""
+        self._restart_gate = pending
+
     def bind_live_account_reader(self, reader: LiveAccountReader) -> None:
         """Bind the composition's current-account view before strategy start."""
         self._live_account_reader = reader
@@ -284,6 +289,8 @@ class MakerStrategy(Strategy):
             self.msgbus.unsubscribe(topic, self._on_account_update)
         self._account_topics = ()
         self._account_loop = None
+        if _restart_blocked(self):
+            return
         for direction in _DIRECTIONS:
             self._cancel_working(direction, reason="strategy stop")
         for route, residual in self._state_store.residuals().items():
@@ -302,6 +309,8 @@ class MakerStrategy(Strategy):
         self._evaluate_quotes()
 
     def _evaluate_quotes(self) -> None:
+        if _restart_blocked(self):
+            return
         source_tick = self.cache.quote_tick(self._config.source_instrument_id)
         hedge_tick = self.cache.quote_tick(self._config.hedge_instrument_id)
         if source_tick is None or hedge_tick is None:
@@ -405,6 +414,8 @@ class MakerStrategy(Strategy):
         self._finish_or_reject(event.client_order_id.value, "DENIED")
 
     def on_order_rejected(self, event: OrderRejected) -> None:
+        if _restart_blocked(self):
+            return
         if event.reason.strip().upper() == "UNKNOWN":
             client_order_id = event.client_order_id.value
             direction = self._direction_for_source_order(client_order_id)
@@ -511,6 +522,8 @@ class MakerStrategy(Strategy):
         )
 
     def on_order_filled(self, event: OrderFilled) -> None:
+        if _restart_blocked(self):
+            return
         if event.instrument_id == self._config.source_instrument_id:
             direction = self._direction_for_source_order(event.client_order_id.value)
             if direction is None:
@@ -792,6 +805,8 @@ class MakerStrategy(Strategy):
         return replace(quote, source_price_usdt=price)
 
     def _submit_source(self, quote: MakerQuote) -> None:
+        if _restart_blocked(self):
+            return
         instrument = self._required_source_instrument()
         side = OrderSide.BUY if quote.direction is SourceDirection.LONG else OrderSide.SELL
         source_quantity = instrument.make_qty(quote.quantity_ounces)
@@ -979,6 +994,8 @@ class MakerStrategy(Strategy):
         return True
 
     def _requote(self, order: Order, desired: MakerQuote) -> None:
+        if _restart_blocked(self):
+            return
         if cast(bool, order.is_pending_update) or cast(bool, order.is_pending_cancel):
             return
         instrument = self._required_source_instrument()
@@ -1004,6 +1021,8 @@ class MakerStrategy(Strategy):
 
     def _submit_next_pending_hedge(self) -> None:
         """Run one MT5 leg globally across both Maker directions."""
+        if _restart_blocked(self):
+            return
         queued = [
             (direction, intent)
             for direction in _DIRECTIONS
@@ -1048,6 +1067,8 @@ class MakerStrategy(Strategy):
         hedge_client_id: ClientId | None,
         intent: HedgeIntent,
     ) -> None:
+        if _restart_blocked(self):
+            return
         hedge_tick = self.cache.quote_tick(self._config.hedge_instrument_id)
         if hedge_tick is None or not self._quote_is_fresh(hedge_tick):
             self.log.error(f"Maker hedge quote unavailable for {intent.intent_id}")
@@ -1106,6 +1127,8 @@ class MakerStrategy(Strategy):
         expected_order_id: str | None = None,
         reason: str,
     ) -> None:
+        if _restart_blocked(self):
+            return
         store = self._stores[direction]
         active_id = store.active_source_order_id
         if active_id is None or (expected_order_id is not None and active_id != expected_order_id):
@@ -1182,6 +1205,8 @@ class MakerStrategy(Strategy):
         self._on_stale_timer(event)
 
     def _on_stale_timer(self, event: TimeEvent) -> None:
+        if _restart_blocked(self):
+            return
         target = _maker_timer_target(
             cast(str, event.name),
             self._stores[SourceDirection.LONG].active_source_order_id,
@@ -1352,6 +1377,8 @@ class MakerStrategy(Strategy):
         direction: SourceDirection,
         event: OrderCanceled | OrderExpired,
     ) -> None:
+        if _restart_blocked(self):
+            return
         query = self._source_terminal_query
         client_order_id = event.client_order_id.value
         venue_order_id = event.venue_order_id
@@ -1387,6 +1414,8 @@ class MakerStrategy(Strategy):
         event: OrderCanceled | OrderExpired,
         report: OrderStatusReport | None,
     ) -> bool:
+        if _restart_blocked(self):
+            return False
         client_order_id = event.client_order_id.value
         if self._source_terminal_stopped or client_order_id not in self._source_terminal_inflight:
             return False
@@ -1423,12 +1452,16 @@ class MakerStrategy(Strategy):
         )
 
     def _try_release_cycle(self) -> bool:
+        if _restart_blocked(self):
+            return False
         if not self._state_store.clear_source_freezes():
             return False
         self._source_hold = False
         return True
 
     def _freeze_and_cancel_all(self, reason: str) -> None:
+        if _restart_blocked(self):
+            return
         self._source_hold = True
         self._freeze_all_best_effort(reason)
         self._cancel_all_best_effort(reason)
@@ -1463,6 +1496,8 @@ class MakerStrategy(Strategy):
         )
 
     def _update_order_status(self, client_order_id: str, status: str) -> None:
+        if _restart_blocked(self):
+            return
         direction = self._direction_for_source_order(client_order_id)
         if direction is not None:
             self._stores[direction].update_source_status(client_order_id, status)
@@ -1475,6 +1510,8 @@ class MakerStrategy(Strategy):
             store.update_hedge_status(client_order_id, obligation_status)
 
     def _finish_or_reject(self, client_order_id: str, status: str) -> None:
+        if _restart_blocked(self):
+            return
         direction = self._direction_for_source_order(client_order_id)
         if direction is not None:
             self._stores[direction].update_source_status(client_order_id, status)
@@ -1485,6 +1522,8 @@ class MakerStrategy(Strategy):
             store.update_hedge_status(client_order_id, ObligationStatus.REJECTED)
 
     def _mark_source_unknown(self, client_order_id: str, reason: str) -> None:
+        if _restart_blocked(self):
+            return
         direction = self._direction_for_source_order(client_order_id)
         if direction is not None:
             self._source_hold = True
@@ -1540,6 +1579,11 @@ class MakerStrategy(Strategy):
         if self._hedge_instrument is None:
             raise RuntimeError("hedge instrument unavailable before Maker start")
         return self._hedge_instrument
+
+
+def _restart_blocked(strategy: object) -> bool:
+    gate = getattr(strategy, "_restart_gate", None)
+    return gate is not None and bool(gate())
 
 
 def _cancel_is_pending(order: Order) -> bool:

@@ -39,6 +39,7 @@ from py000_nautilus.mt5_v1_execution import (
     Mt5V1LiveExecClientFactory,
     mt5_v1_execution_account_id,
 )
+from py000_nautilus.restart_recovery import has_business_history, reconcile_startup
 from py000_nautilus.strategies.taker import TakerStrategy
 
 BITFINEX_CLIENT_NAME = "BITFINEX"
@@ -148,11 +149,10 @@ def build_live_taker_node(
             timeout_seconds=connection_timeout_seconds,
         )
         node.trader.add_actor(reconciler)
-        restart_pending = False
         strategy = TakerStrategy(
             runtime_strategy_config,
             live_submission_ready=lambda: (
-                not restart_pending
+                not reconciler.restart_pending
                 and bitfinex_data.is_connected
                 and bitfinex_data.book_is_actionable
                 and bitfinex_exec.execution_hold_reason is None
@@ -181,8 +181,10 @@ def build_live_taker_node(
             hedge_must_reduce_only=one_shot_close_existing,
         )
         node.trader.add_strategy(strategy)
+        strategy.bind_restart_gate(lambda: reconciler.restart_pending)
+        native_history = False
         if cache_database is not None:
-            restart_pending = validate_native_cache(
+            native_history = validate_native_cache(
                 node.cache,
                 trader_id=LIVE_TAKER_TRADER_ID,
                 strategy_id=strategy.id,
@@ -195,10 +197,22 @@ def build_live_taker_node(
                     ),
                 },
             )
-            if restart_pending:
-                node.kernel.logger.warning(
-                    "native cache restored; restart reconciliation is pending",
+        if not one_shot and (
+            native_history or node.cache.orders() or node.cache.positions()
+            or bitfinex_exec._cid_store.bindings
+            or has_business_history(strategy.state_store)
+        ):
+            async def recover_startup() -> None:
+                await reconcile_startup(
+                    node.cache, strategy.state_store,
+                    trader_id=LIVE_TAKER_TRADER_ID, strategy_id=strategy.id,
+                    source=bitfinex_exec, hedge=mt5_exec,
+                    source_instrument_id=strategy_config.source_instrument_id,
+                    hedge_instrument_id=strategy_config.hedge_instrument_id,
                 )
+
+            reconciler.bind_restart_recovery(recover_startup)
+            node.kernel.logger.warning("native or business history; restart reconciliation pending")
         bind_live_account_reader(
             strategy, config=runtime_strategy_config,
             source_data=bitfinex_data, source_client=bitfinex_exec,

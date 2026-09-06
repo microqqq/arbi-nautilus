@@ -4,6 +4,7 @@ import asyncio
 import json
 import threading
 from collections.abc import Callable
+from copy import deepcopy
 from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
@@ -148,6 +149,30 @@ def test_maker_releases_both_freezes_in_one_write(
     assert all(value["source_freeze_reason"] is None
                for value in snapshots[0]["directions"].values())
     assert not strategy._source_hold
+
+
+@pytest.mark.parametrize("frozen", [False, True])
+def test_restart_gate_prevents_maker_early_release_freeze_cancel_and_stop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, frozen: bool,
+) -> None:
+    strategy = MakerStrategy(_maker_strategy_config(tmp_path / "startup-gate"))
+    if frozen:
+        strategy._state_store.freeze_sources("original external HOLD")
+    strategy.bind_restart_gate(lambda: True)
+    canceled: list[object] = []
+    monkeypatch.setattr(strategy, "cancel_order", lambda *args, **kwargs: canceled.append(args))
+    before = deepcopy(strategy._state_store._snapshot())
+    with _event_engine(cast(Any, strategy)) as engine:
+        engine.trader.start()  # on_start must not release the old Maker freeze.
+        assert not strategy._try_release_cycle()
+        strategy._freeze_and_cancel_all("new stale observation")
+        strategy.update_cost_snapshot(strategy._carry, strategy._fx, 0)
+        strategy.update_hedge_session(False, strategy._session_ts_ns + 1)
+        strategy._evaluate_quotes()
+        strategy.stop()
+        assert strategy._state_store._snapshot() == before
+        assert not strategy._source_hold and not canceled
+        assert strategy._source_terminal_stopped
 
 
 class _InstrumentLifecycleMaker(MakerStrategy):

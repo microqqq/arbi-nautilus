@@ -96,6 +96,7 @@ class TakerStrategy(Strategy):
             raise ValueError("hedge_must_reduce_only requires one_shot execution")
         self._config = config
         self._live_submission_ready = live_submission_ready
+        self._restart_gate: Callable[[], bool] | None = None
         self._hedge_quantity_ready = hedge_quantity_ready
         self._live_costs_from_adapters = live_costs_from_adapters
         self._one_shot = one_shot
@@ -130,6 +131,10 @@ class TakerStrategy(Strategy):
         self._cost_recovery_after_ns = 0
         self._hedge_session_open = config.initial_hedge_session_open
         self._session_ts_ns = config.initial_session_ts_ns
+
+    def bind_restart_gate(self, pending: Callable[[], bool]) -> None:
+        """Bind only the ordinary composition's startup HOLD, not general health."""
+        self._restart_gate = pending
 
     def bind_live_account_reader(self, reader: LiveAccountReader) -> None:
         """Bind the composition's current-account view before strategy start."""
@@ -316,6 +321,8 @@ class TakerStrategy(Strategy):
             self.msgbus.unsubscribe(topic, self._on_account_update)
         self._account_topics = ()
         self._account_loop = None
+        if _restart_blocked(self):
+            return
         client_order_id = self.state_store.active_source_order_id
         if client_order_id is None:
             return
@@ -343,6 +350,9 @@ class TakerStrategy(Strategy):
         self._evaluate_and_submit()
 
     def _evaluate_and_submit(self) -> None:
+        if _restart_blocked(self):
+            self._last_decision_gate = "restart_pending"
+            return
         if not self.state_store.can_submit_source():
             self._last_decision_gate = "state_store_closed"
             return
@@ -482,6 +492,8 @@ class TakerStrategy(Strategy):
         self._finish_or_reject(event.client_order_id.value, "DENIED")
 
     def on_order_rejected(self, event: OrderRejected) -> None:
+        if _restart_blocked(self):
+            return
         if event.reason.strip().upper() == "UNKNOWN":
             client_order_id = event.client_order_id.value
             if self.state_store.knows_source_order(client_order_id):
@@ -506,6 +518,8 @@ class TakerStrategy(Strategy):
         self._request_source_terminal_query(event)
 
     def _request_source_terminal_query(self, event: OrderCanceled | OrderExpired) -> None:
+        if _restart_blocked(self):
+            return
         client_order_id = event.client_order_id.value
         query = self._source_terminal_query
         if (
@@ -532,6 +546,8 @@ class TakerStrategy(Strategy):
     def _complete_source_terminal_query(
         self, event: OrderCanceled | OrderExpired, report: OrderStatusReport | None,
     ) -> bool:
+        if _restart_blocked(self):
+            return False
         client_order_id = event.client_order_id.value
         if self._source_terminal_stopped or client_order_id not in self._source_terminal_inflight:
             return False
@@ -552,6 +568,8 @@ class TakerStrategy(Strategy):
         return True
 
     def on_order_filled(self, event: OrderFilled) -> None:
+        if _restart_blocked(self):
+            return
         if event.instrument_id == self._config.source_instrument_id:
             intent = self._hedges.on_source_filled(event)
             if intent is not None:
@@ -563,6 +581,8 @@ class TakerStrategy(Strategy):
                 self._submit_next_pending_hedge()
 
     def _submit_source(self, opportunity: Opportunity, *, market_ts_ns: int | None = None) -> bool:
+        if _restart_blocked(self):
+            return False
         if (
             self._allowed_source_direction is not None
             and opportunity.direction is not self._allowed_source_direction
@@ -716,6 +736,8 @@ class TakerStrategy(Strategy):
         return True
 
     def _submit_next_pending_hedge(self) -> None:
+        if _restart_blocked(self):
+            return
         intents = self.state_store.intents()
         failed_statuses = {
             ObligationStatus.BLOCKED,
@@ -744,6 +766,8 @@ class TakerStrategy(Strategy):
             self._submit_hedge_intent(pending)
 
     def _submit_hedge_intent(self, intent: HedgeIntent) -> None:
+        if _restart_blocked(self):
+            return
         source = self.state_store.source_order(intent.source_client_order_id)
         configured_client_id = (
             self._config.hedge_client_id.value
@@ -842,6 +866,8 @@ class TakerStrategy(Strategy):
         )
 
     def _update_order_status(self, client_order_id: str, status: str) -> None:
+        if _restart_blocked(self):
+            return
         if self.state_store.knows_source_order(client_order_id):
             self.state_store.update_source_status(client_order_id, status)
             return
@@ -852,6 +878,8 @@ class TakerStrategy(Strategy):
         self.state_store.update_hedge_status(client_order_id, obligation_status)
 
     def _finish_or_reject(self, client_order_id: str, status: str) -> None:
+        if _restart_blocked(self):
+            return
         if self.state_store.knows_source_order(client_order_id):
             self.state_store.update_source_status(client_order_id, status)
         else:
@@ -942,6 +970,11 @@ class TakerStrategy(Strategy):
         if self._hedge_instrument is None:
             raise RuntimeError("hedge instrument unavailable before strategy start")
         return self._hedge_instrument
+
+
+def _restart_blocked(strategy: object) -> bool:
+    gate = getattr(strategy, "_restart_gate", None)
+    return gate is not None and bool(gate())
 
 
 def _book_top(tick: QuoteTick) -> BookTop:

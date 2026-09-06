@@ -318,7 +318,7 @@ async def _assert_reports(
 
 
 @pytest.mark.parametrize("legacy_schema", [1, 2], ids=["dual-v1", "single-v2"])
-def test_both_adapters_maker_continue_from_explicit_legacy_checkpoint(
+def test_both_adapters_maker_hold_legacy_checkpoint_without_native_history(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, legacy_schema: int,
 ) -> None:
     from py000_nautilus.maker_migration import migrate_maker_state
@@ -353,6 +353,7 @@ def test_both_adapters_maker_continue_from_explicit_legacy_checkpoint(
         old_prefix, new_prefix, "XAUTUSDT-PERP.BITFINEX", "XAUUSD.MT5", stopped=True,
     )
     checkpoint = json.loads(migrated.path.read_text())["legacy_checkpoint"]
+    migrated_bytes = migrated.path.read_bytes()
     assert all(view.source_freeze_reason == "legacy matched source fills"
                for view in migrated.stores.values())
 
@@ -360,23 +361,29 @@ def test_both_adapters_maker_continue_from_explicit_legacy_checkpoint(
         async with _continuous(
             tmp_path, monkeypatch, maker=True, long_quantity=2, short_quantity=0,
         ) as (h, source, wire):
-            # Normal startup consumes the converted state; only the ordinary
-            # strategy's own gates may release the already-complete old cycle.
-            cid = await _accepted_source(h, source, wire, 2)
-            assert source.order(cid).client_order_id.value not in {"LEGACY-bid", "LEGACY-ask"}
-            source.fill(cid, D(2))
-            await _settle_cycle(h, source, wire, cid=cid, expected=1)
-            assert h.node.portfolio.net_position(h.source_instrument.id) == 2
-            assert h.node.portfolio.net_position(h.hedge_instrument.id) == -2
+            # Conversion preserves business facts, not missing native/venue
+            # history or authority to clear the original source freeze.
+            owner = get_source_terminal_reconciler(h.node)
+            await _drive(
+                h, wire, lambda: not owner.busy and owner.last_failure is not None, direction=1,
+            )
+            assert owner.restart_pending and not owner.source_submission_ready
+            assert not source.rows and not source.trades
+            assert not wire.submit_calls and not wire.close_calls
+            assert not h.source_cancel_commands
+            assert not h.node.cache.orders() and not h.node.cache.positions()
             for store, restored in zip(_stores(h), h.reload_stores(), strict=True):
                 old = next(record for record in restored.source_orders()
                            if record.client_order_id.startswith("LEGACY-"))
                 assert old.filled_ounces == D("0.5") and old.status == "CANCELED"
                 assert restored.rounding_residual_ounces == store.rounding_residual_ounces == 0
+                assert store.source_freeze_reason == "legacy matched source fills"
+                assert restored._state == store._state
             payload = json.loads(h.store.path.read_text())
             assert payload["schema_version"] == 4
             assert payload["legacy_checkpoint"] == checkpoint
-            assert len(payload["allocations"]) == 1  # Only the new real two-ounce fill.
+            assert not payload["allocations"]
+            assert migrated.path.read_bytes() == migrated_bytes
             assert all(path.read_bytes() == original for path, original in originals.items())
 
     asyncio.run(run())

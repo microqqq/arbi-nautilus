@@ -171,7 +171,8 @@ class JsonStateStore:
                         status=ObligationStatus.UNKNOWN,
                     )
             details.append(f"hedges={','.join(intent.intent_id for intent in unresolved)}")
-        self._state.halt_reason = "restart requires reconciliation: " + " ".join(details)
+        if self._state.halt_reason is None:
+            self._state.halt_reason = "restart requires reconciliation: " + " ".join(details)
         self._persist()
         return self._state.halt_reason
 
@@ -319,10 +320,10 @@ class JsonStateStore:
             filled_ounces=filled,
             status=status,
         )
-        if status == "FILLED" and self._state.active_source_order_id == client_order_id:
+        if (blocked_reason is None and status == "FILLED"
+                and self._state.active_source_order_id == client_order_id):
             self._state.active_source_order_id = None
-            if (blocked_reason is None
-                    and self._state.halt_reason == _source_reconcile_reason(client_order_id)):
+            if self._state.halt_reason == _source_reconcile_reason(client_order_id):
                 self._state.halt_reason = None
 
         signed_fill = fill_ounces if source_side is BusinessOrderSide.BUY else -fill_ounces

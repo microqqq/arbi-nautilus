@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, cast
 
@@ -167,6 +168,19 @@ class SourceTerminalReconciler(Actor):
         self._failed_requests: dict[tuple[str, str], _TerminalRequest] = {}
         self._last_failure: str | None = None
         self._phase = "idle"
+        self._restart_recovery: Callable[[], Awaitable[None]] | None = None
+        self._restart_pending = False
+
+    def bind_restart_recovery(self, callback: Callable[[], Awaitable[None]]) -> None:
+        """Hold strategy callbacks before start until this bounded recovery succeeds."""
+        if self._active:
+            raise RuntimeError("restart recovery must be bound before Actor start")
+        self._restart_recovery = callback
+        self._restart_pending = True
+
+    @property
+    def restart_pending(self) -> bool:
+        return self._restart_pending
 
     @property
     def busy(self) -> bool:
@@ -181,6 +195,7 @@ class SourceTerminalReconciler(Actor):
         return (
             self._active
             and not self._busy
+            and not self._restart_pending
             and self._last_failure is None
             and not self._source.terminal_reconciliation_required
         )
@@ -190,6 +205,7 @@ class SourceTerminalReconciler(Actor):
         return (
             self._active
             and self._busy
+            and not self._restart_pending
             and not self._mass_required
             and self._last_failure is None
             and not self._source.terminal_reconciliation_required
@@ -207,7 +223,10 @@ class SourceTerminalReconciler(Actor):
             stop_time_ns=0,
             callback=self._dispatch_observation,
         )
-        self._observe(None)
+        if self._restart_pending:
+            self._ensure_root()
+        else:
+            self._observe(None)
 
     def on_stop(self) -> None:
         self._active = False
@@ -291,7 +310,7 @@ class SourceTerminalReconciler(Actor):
         if self._root is None or self._root.done():
             # Gate before scheduling: native fill callbacks can synchronously create work.
             self._busy = True
-            self._mass_required = not working_check
+            self._mass_required = self._restart_pending or not working_check
             self._observed_required = self._source.terminal_reconciliation_required
             self._root = self._source.create_task(
                 self._run(),
@@ -374,6 +393,19 @@ class SourceTerminalReconciler(Actor):
         if self._source.terminal_reconciliation_required:
             raise RuntimeError("source adapter still requires terminal reconciliation")
         await self._drain_requests()
+        if self._restart_pending:
+            self._phase = "startup recovery"
+            if self._failed_requests:
+                raise RuntimeError("source terminal actions remain unresolved")
+            assert self._restart_recovery is not None
+            await self._restart_recovery()
+            if not self._active:
+                raise asyncio.CancelledError
+            if not self._engine.check_connected() or self._source.terminal_reconciliation_required:
+                raise RuntimeError("execution changed during startup recovery")
+            # The recovery callback's final checks and this release share one loop turn.
+            # No further await may intervene after facts are certified and before release.
+            self._restart_pending = False
 
     async def _drain_requests(self) -> None:
         while self._requests:

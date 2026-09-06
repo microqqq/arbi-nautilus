@@ -247,7 +247,7 @@ class _OrdinaryStrategy:
         self.wire.raw_symbol = configs.bitfinex_exec.raw_symbol
         self.wire.fee_currency = "USD"
 
-    async def start(self) -> None:
+    async def start(self, *, initial_reconciliation: bool = False) -> None:
         self.node.kernel.data_engine.start()
         self.node.kernel.risk_engine.start()
         self.node.kernel.exec_engine.start()
@@ -260,6 +260,9 @@ class _OrdinaryStrategy:
         await self.source._connect()
         self.source._set_connected(True)
         await _pump()
+        if initial_reconciliation:
+            # Match kernel.start_async: reconcile native facts before trader.start.
+            assert await self.node.kernel.exec_engine.reconcile_execution_state(timeout_secs=2)
         self.node.trader.start()
         await _pump()
         assert self.strategy.is_running

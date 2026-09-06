@@ -38,12 +38,16 @@ from nautilus_trader.test_kit.stubs.execution import TestExecStubs
 
 from py000_nautilus import live_maker, live_taker
 from py000_nautilus.app import _hedge_instrument, _source_instrument
+from py000_nautilus.bitfinex_v1_cids import BitfinexV1CidStore
 from py000_nautilus.bitfinex_v1_data import BitfinexV1DataClient
 from py000_nautilus.bitfinex_v1_execution import BitfinexV1ExecutionClient
 from py000_nautilus.live_cache import native_cache_config, validate_native_cache
 from py000_nautilus.live_runtime import SourceTerminalReconciler
+from py000_nautilus.maker_store import MakerStateStore
+from py000_nautilus.models import BusinessOrderSide, SourceDirection
 from py000_nautilus.mt5_v1_data import Mt5V1DataClient
 from py000_nautilus.mt5_v1_execution import Mt5V1ExecutionClient
+from py000_nautilus.store import JsonStateStore
 
 _TRADER = TraderId("TESTER-000")
 _OWNER = StrategyId("CACHE-001")
@@ -346,6 +350,100 @@ def test_default_builder_never_validates_or_connects_native_cache(
     else:
         node, _ = maker._build(maker._configs(tmp_path), loop=loop)
     node.dispose()
+    assert loop.is_closed()
+
+
+@pytest.mark.parametrize("kind", ["taker", "maker"])
+def test_orphan_source_cid_history_holds_empty_native_and_business_startup(
+    kind: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configs: Any = taker._configs(tmp_path) if kind == "taker" else maker._configs(tmp_path)
+    cids = BitfinexV1CidStore(
+        configs.bitfinex_exec.cid_store_path,
+        account_id=configs.bitfinex_exec.account_id.value,
+    )
+    cids.allocate("ORPHAN-OLD-CID", epoch_ms=1000)
+    before = cids.path.read_bytes()
+    loop = asyncio.new_event_loop()
+    node, strategy = (taker._build(configs, loop=loop) if kind == "taker"
+                      else maker._build(configs, loop=loop))
+    try:
+        runtime = next(actor for actor in node.trader.actors()
+                       if isinstance(actor, SourceTerminalReconciler))
+        assert not node.cache.orders() and not node.cache.positions()
+        _ready_dependencies(monkeypatch)
+        assert runtime.restart_pending
+        assert not strategy._live_submission_ready()
+        assert not runtime._source._tasks and runtime._root is None
+        assert cids.path.read_bytes() == before
+    finally:
+        node.dispose()
+    assert loop.is_closed()
+
+
+@pytest.mark.parametrize("kind", ["taker", "maker"])
+def test_business_history_with_empty_native_cache_binds_startup_gate_without_database(
+    kind: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module: Any = live_taker if kind == "taker" else live_maker
+    configs: Any = taker._configs(tmp_path) if kind == "taker" else maker._configs(tmp_path)
+    owner: JsonStateStore | MakerStateStore
+    if kind == "taker":
+        owner = JsonStateStore(configs.strategy.store_path)
+        view = owner
+    else:
+        owner = MakerStateStore(configs.strategy.store_path_prefix,
+                                str(taker.SOURCE_ID), str(taker.HEDGE_ID))
+        view = owner.stores[SourceDirection.LONG]
+    view.begin_source("OLD", BusinessOrderSide.BUY, Decimal(1))
+    view.update_source_status("OLD", "REJECTED")
+    assert view.can_submit_source()  # Business readiness cannot bypass missing native facts.
+    before = owner.path.read_bytes()
+    calls: list[tuple[Cache, object, dict[str, object]]] = []
+
+    async def recovery(cache: Cache, store: object, **kwargs: object) -> None:
+        calls.append((cache, store, kwargs))
+        raise ValueError("native history missing")
+
+    monkeypatch.setattr(module, "reconcile_startup", recovery)
+    loop = asyncio.new_event_loop()
+    builder = module.build_live_taker_node if kind == "taker" else module.build_live_maker_node
+    node, strategy = builder(
+        bitfinex_data_config=configs.bitfinex_data, bitfinex_exec_config=configs.bitfinex_exec,
+        mt5_data_config=configs.mt5_data, mt5_exec_config=configs.mt5_exec,
+        strategy_config=configs.strategy, connection_timeout_seconds=0.03, loop=loop,
+    )
+    runtime = next(actor for actor in node.trader.actors()
+                   if isinstance(actor, SourceTerminalReconciler))
+    try:
+        assert not node.cache.orders() and not node.cache.positions()
+        assert runtime.restart_pending and not calls
+        assert strategy._restart_gate() is True
+        _ready_dependencies(monkeypatch)
+        assert not strategy._live_submission_ready()
+        engine = node.kernel.exec_engine
+        monkeypatch.setattr(engine, "check_connected", lambda: True)
+
+        async def reconciled(*, timeout_secs: float) -> bool:
+            return True
+
+        monkeypatch.setattr(engine, "reconcile_execution_state", reconciled)
+
+        async def start() -> None:
+            runtime.start()
+            assert runtime._root is not None and not await runtime._root
+            assert runtime.restart_pending
+            assert len(calls) == 2  # Existing Actor attempt budget, not a new polling loop.
+            assert calls[0][0] is node.cache
+            store = strategy.state_store if kind == "taker" else strategy._state_store
+            assert calls[0][1] is store
+            assert calls[0][2]["strategy_id"] == strategy.id
+            assert owner.path.read_bytes() == before
+            runtime.stop()
+
+        loop.run_until_complete(start())
+    finally:
+        node.dispose()
     assert loop.is_closed()
 
 
