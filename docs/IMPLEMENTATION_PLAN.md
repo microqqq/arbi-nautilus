@@ -445,6 +445,33 @@ carry 是同 route 的唯一 signed residual；下一 fill 先与它合并再分
 
 范围：`store.py`、两个 execution 的报告/重连路径、live lifecycle、必要的原生 cache 配置和恢复测试。先执行 Q3。
 
+**Q3 实施切口（2026-09-06，实验前固定）：** 本小步只增加紧凑离线测试与本文结论，不改生产恢复规则、profile、schema或默认准入。复用安装的1.231.0和现有adapter测试夹具，不接真实账户、不启动持久服务。
+
+- 对照空cache只有原生reports、具备原`OrderInitialized`身份种子、完整原生事件三种前提。用两个StrategyId、同品种不同CID，逐项断言订单/position归属、MT5真实identifier、partial数量及TradeId，不以`reconcile_execution_state=True`单独证明成功；同品种双external claim明确测试是否支持。
+- 复用真实MT5 execution adapter的合成EA journal/snapshot，验证报告保留票据与CID不等于保留原StrategyId；Bitfinex普通cold非零仓仍应保留既有拒绝，不打开close canary专用冷仓豁免来得到绿色。没有完整trades的partial cancel或已closed但数量不同的报告，只记录原生接口真实限制，不放宽adapter既有完整性检查。
+- 将合成原生订单事件经原serializer交给全新Python进程，再由原生ExecutionEngine重放，核对两个owner、source部分成交、MT5票据及重复fill；同时检验仅`Order.apply`后`cache.add_order`是否重建Position。该实验只证明codec/原生重放前提，不冒充生产持久后端、掉电耐久、普通策略解除HOLD或R01–R06验收。
+- 写集仅`tests/test_restart_ownership.py`、独立进程测试helper及本文；具体native reports/MT5测试可委派，主agent负责新进程实验和方案，未实施agent独立复核。结果写回Q3/W6再选择最小原生持久化接线；不因Kernel只支持Redis配置就自动部署Redis，也不临时造第二套订单日志。通过后单独本地提交这个技术前置检查点，W6父项保持未完成。
+
+**Q3 观测结论与后续选择（2026-09-06，NT 1.231.0）：** 下表由`tests/test_restart_ownership.py`及`tests/restart_replay_worker.py`固定，14项离线测试已通过；完整集成和独立复核结果记入第10节。
+
+| 恢复输入/路径 | 实测结果 | W6设计约束 |
+| --- | --- | --- |
+| 真实MT5 adapter、合成EA journal/snapshot，空cache只收reports | CID、两个position identifier及TradeId均保留，但两个原owner均变成`EXTERNAL` | 不从CID猜StrategyId，不把布尔成功/总量吻合作为归属认证 |
+| 同上，先用原`OrderInitialized`及明确client/position索引seed | 保留两个StrategyId、两个identifier及完整成交量；重复对账不增加事件/成交 | 原生订单身份与索引须先恢复；不能对无证据的历史现场补造seed |
+| 同品种的两个external claims | 第二个被`InvalidConfiguration`拒绝 | 不用双claim代替Maker/Taker订单归属；普通cold豁免保持关闭 |
+| 原生CANCELED/EXPIRED报告有完整partial trades / 缺trades | 前者恢复1.25；后者可返回True但实际filled仍0 | 继续要求完整真实成交集合；EXPIRED只是native边界探针，不扩充BFX wire |
+| 已CANCELED的原生订单收到更大累计量及新TradeId | 可返回True但仍只记原1oz | 比较实际cache事件/数量；落后闭单不能直接套用同run terminal确认 |
+| 全新进程、原codec完整事件经ExecutionEngine重放，并恢复client/position索引 | 原事件UUID/TradeId、两owner、source部分成交、两个MT5 identifier、未成交exact-close绑定及TE来源标记保留；重复fill不改变状态 | 原生事件能承载所需语义；这不是持久后端、费用producer或普通重启验收 |
+| 全新进程仅`Order.apply`后add_order / 重放时省略两个索引 | 前者订单完整但positions为空；后者已成交票据能重建，但未成交exact-close目标与client路由丢失 | 必须恢复原生Position和显式索引，不只保存OrderInitialized或订单JSON |
+
+独立进程实验使用合成原生limit订单、BacktestEngine内核和NETTING Bitfinex/HEDGING MT5，不连接transport、不使用真实MT5下单路径。新进程预置同一合成Instrument/AccountState，只证明给定事件顺序的订单/仓位恢复，不证明账户/行情恢复、任意交错或netting翻仓。两个source策略仓位为+0.5/-1oz，是NT按策略的视图，不是Bitfinex账户出现两个venue仓位；共享净仓及交叉策略平仓语义仍由Q4/W7验证。跨进程临时文件只服务测试，不是生产恢复入口；普通Bitfinex adapter非零cold仓仍由真实adapter反例证明拒绝。
+
+据此，后续W6按以下三个小步实施，不把Q3继续扩成研究阶段：
+
+1. **W6a 原生cache接线与真实后端认证。** 优先使用框架现成持久化；安装源码`system/kernel.py:307–329`的配置入口只支持Redis，`cache/database.pyx`已有订单事件、Position和两个索引的读写，`ExecutionEngine.load_cache`会分别恢复它们。因此不新写JSON订单日志/Position重建器，不搬用测试worker做生产。后续先给现有builder接显式可选的原生cache配置；固定TraderId/namespace、`use_instance_id=False`、`flush_on_start=False`，与既有账户绑定核对，不能重启换namespace后假装空仓。真实后端连接、写入队列收束和跨进程load必须另行验证；本包没有安装/启动Redis或承诺掉电耐久，启用服务也不由测试通过自动授权。未接持久后端的原路径不冒称支持有仓续跑。
+2. **W6b 已知事实恢复与原store幂等投影。** 在普通新源准入打开前，先核对恢复的cache身份/索引、venue完整历史/持仓、CID/EA journal及既有业务义务。MT5映射冲突必须在事件交给Engine前识别，因为native会优先用cache索引覆盖report中的position ID。缺失/冲突保持原HOLD；已知成交的重放仍经原生事件，原业务store只补实际缺少的义务。未决旧request不重发，reconciliation布尔成功不能单独解除HOLD；最终fee来源沿现有CID v2核对。真实后端未认证前可先实现/验证这层纯核对，不模拟出生产可恢复结论。
+3. **W6c 在线drain与R01–R06。** 保持下列分类，按普通builder/策略在持久写入、submit、partial fill、hedge及stop边界重启，证明下一真实机会与不重复对冲；执行通道尚在线时drain，随后才最终stop。Q3的空引擎重放、stub报告、干净退出或现有canary均不能替代这些验收。
+
 恢复分类：
 
 - 已结束订单、对冲义务均完成，venue 仓位和本地记录吻合：恢复原策略运行，保留现有仓位。
@@ -574,7 +601,7 @@ drain 必须发生在 node/执行客户端仍运行时，完成或到预算后�
 | --- | --- | --- | --- |
 | Q1 费用后补 | 最小codec/真实Engine探针已复跑；普通入口无cache database，选择CID v2来源证据；恢复矩阵待W1b | 原生事件codec落临时文件/重放、TE→TU、inferred→retire→late TU已验证；deferred回调/写盘失败/实际重启随实现验证 | W1第二部分；字段已写回4.1，不阻塞已完成W1a |
 | Q2 动态Instrument | 原生DataEngine/Actor探针及主审复跑通过，接口/去重缺口已写入4.3 | subscribe_instrument/on_instrument；cache先替换，重复/倒序也回调，策略必须保留last-good | W3动态swap |
-| Q3 重启归属 | close canary的空cache对账不能直接外推 | 两个strategy ID订单、MT5真ticket、部分成交后重启；输出native归属/报告恢复支持矩阵 | W6 |
+| Q3 重启归属 | 14项native/真实adapter/独立进程实验已通过，支持矩阵和最小原生cache选择写入W6 | reports-only丢owner、双claim不支持；完整事件+显式索引可重建，订单对象独自不能恢复Position；真实后端和普通策略release仍未验收 | W6a–c；Q3不等于R01–R06 |
 | Q4 共账户NETTING | venue净仓和strategy视图可能不同 | 同node Maker/Taker相反fill，检查cache各视图、report reconciliation、共享lane | W7 |
 | Q5 动态margin映射 | 已认证原ZIP及两端callee，2,000组normalized向量通过；原BFX flat producer存在除零，迁移政策/venue字段接线待固定 | flat/反向持仓/接近margin目标三组输入；不以normalized flat冒充原脚本可空仓启动，只补现有只读查询所缺字段 | W5动态容量 |
 | Q6 普通终态补偿 | W4a–c已验证规定触发下的普通composition；Maker未发cancel且order/trade全丢的主动发现、完整启停仍待探针 | 复用原生open-order/query能力先验证；不新增轮询服务、不把native布尔值或组件停止当完整恢复证明 | W4/W6 |
@@ -651,6 +678,10 @@ EA 改动额外执行现有 `tools/mt5_source_manifest.sh --lines`、MetaEditor 
   - [x] W5c4b：单Maker明确route的bounded-carry预算、普通双侧跨cycle及带dust停止报告；独立复核及全量通过，仅接受规定的离线范围。
   - [x] W5d/E08：脱敏原 caller 与规范化 carry 对照、Maker tie 修复及已知差异归类；独立复核与全量通过。W5仅关闭上述规定范围，共账户预算与完整启停仍分别归W7/W6，不认证原始 wire/账户生产链或现场运行。
 - [ ] W6 重启/停止。
+  - [x] Q3 技术前置：原生/真实adapter与新进程重放14项、全量及独立复核通过；支持矩阵和W6a–c方案已固定，不计作R01–R06。
+  - [ ] W6a 原生持久cache接线与真实后端跨进程恢复认证。
+  - [ ] W6b 完整事实核对、既有义务幂等恢复及普通策略解除HOLD。
+  - [ ] W6c 执行通道在线时drain、进程重启/停止矩阵R01–R06。
 - [ ] W7 同节点共账户。
 - [ ] W8 入口/安装/文档/原生运行边界。
 - [ ] W9 有限 DEMO 连续验收。
@@ -903,3 +934,11 @@ EA 改动额外执行现有 `tools/mt5_source_manifest.sh --lines`、MetaEditor 
 - 新增101项测试。真实Bitfinex data parser→FundingRateUpdate→DataEngine→两策略回调覆盖方向、fee/FX、Instrument更新不刷新funding及独立过期/恢复；夏冬四例经真实quote回调使用决策日三倍而非旧quote日正常倍率。该Maker跨日场景显式源配置量0，只认证真实经济回调，不冒称原生发单验收；正常TTL未放宽，transport未连接。
 - 冻结五份源码/测试/fixture及两份本机probe上，主agent单次全量 **2292 passed / 129既有类别Pandas弃用警告 / 291.60s**，全仓Ruff、Mypy83文件与diff-check通过；七SHA测前测后不变。独立reviewer成本40项、caller/经济117项通过；仅在内存恢复旧source选择器使单端tie重新RED，仅改用quote时间使跨日成本从`-0.0000945`错为`-0.0000315`也重新RED，恢复后原样正常。其核验七SHA后RECOMMEND-ACCEPT；主agent据新全量与独立证据接受本包，子集不累加为全量数量。
 - W3/C07及W5/E08仅在上文规定的规范化/离线范围关闭。README已分开当前普通连续能力与2026-09-03一轮canary历史。按约定单独本地提交，不推送、部署、改EA/profile、访问真实账户或发单；W4跨重启、A07、W6–W9仍未验收。下一步先执行既定Q3原生cache/订单/MT5票据归属探针，再按证据实施W6恢复与仍在线的stop/drain，不能从close canary外推重启已可用。
+
+2026-09-06，Q3 重启归属技术前置完成；只接受原生接口/合成重放证据，不关闭W6父项或R01–R06：
+
+- 从干净`475fb6d`开始，先在W6固定离线实验写集和判断标准。实施agent写真实MT5 adapter/native reports边界测试，主agent写独立进程codec/ExecutionEngine worker和方案；生产源码、配置/profile、schema、EA均未改。
+- 11项native/adapter病例和3项新进程对照均通过。报告恢复能保留CID/identifier不等于保留原策略；完整原事件和显式索引能重建本组订单/仓位，orders-only无法重建Position，省略索引会丢未成交exact-close绑定。原生partial terminal/已闭单布尔成功的数量反例和普通BFX非零cold拒绝均固定，不把原生限制改成adapter豁免。
+- 主agent在两个冻结测试文件上运行单次全量：**2306 passed / 129既有类别Pandas弃用警告 / 298.40s**。全仓Ruff、Mypy85文件、diff-check通过；新14项单文件5.45s通过，子集不累加进全量数量，测前测后文件SHA相同。
+- 未实施reviewer独立14项通过，并做内存反事实：4个fill换UUID但保持TradeId不改变订单/仓位/事件；同一partial source换新TradeId后filled与Position由0.5增到1.0，排除无效事件/仅UUID去重的假绿色。其完整核对两个测试文件、W6/Q3新增方案和pinned原生cache源码后给出RECOMMEND-ACCEPT；主agent据上述独立证据及全量接受Q3。
+- 后续按W6a原生cache → W6b事实/义务恢复 → W6c在线drain推进；框架Redis接线有源码依据但真实后端、队列收束及普通策略继续运行尚未认证。不搬测试worker做生产，不新增订单日志。本包按约定单独本地提交，不推送、启动服务、部署或交易；W4跨重启、A07、W6–W9保持未完成。
