@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import json
 import tomllib
+from dataclasses import replace as dataclass_replace
+from decimal import Decimal
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import msgspec
 import pytest
@@ -17,6 +19,7 @@ from test_live_maker import _configs
 from test_live_taker_entry import USER_ID, _paper_profile, _UnreadableEnvironment
 
 import py000_nautilus.live_taker_entry as entry
+from py000_nautilus.accounting_report import build_run_accounting_report
 from py000_nautilus.bitfinex_v1_data import PAPER_RAW_SYMBOL
 from py000_nautilus.bitfinex_v1_transport import BitfinexV1Transport
 from py000_nautilus.live_lifecycle import DrainResult
@@ -228,11 +231,15 @@ def test_cli_requires_drain_and_preserves_diagnostics(
                  environment=_CREDENTIALS, node_builder=builder)
     assert status == (0 if complete is True else 1)
     output = json.loads(capsys.readouterr().out.splitlines()[-1])
+    report = output.pop("accounting")
+    assert report["status"] == "FINAL" and report["currencies"] == {}
+    assert report["final_realized_pnl_usdt"] == "0"
     assert output == {
         "outcome": "PAPER_STOPPED" if complete is True else "PAPER_INCOMPLETE",
         "reason": "drain_result_missing" if expected is None else expected.reason,
         "pending": [] if expected is None else list(expected.pending),
         "residuals": {} if expected is None else expected.residuals,
+        "drain_complete": complete,
     }
 
 
@@ -258,11 +265,90 @@ def test_runner_failure_keeps_drain_diagnostics_but_never_reports_success(
                environment=_CREDENTIALS, node_builder=builder) == 1
     captured = capsys.readouterr()
     assert "MUST-NOT-LEAK" not in captured.out + captured.err
-    assert json.loads(captured.out.splitlines()[-1]) == {
+    output = json.loads(captured.out.splitlines()[-1])
+    report = output.pop("accounting")
+    assert report["status"] == "FINAL" and report["currencies"] == {}
+    assert report["final_realized_pnl_usdt"] == "0"
+    assert output == {
         "outcome": "PAPER_INCOMPLETE",
         "reason": "paper_runner_error:RuntimeError; retained_drain_facts",
         "pending": ["HEDGE-OLD"], "residuals": {kind: "0.1"},
+        "drain_complete": complete,
     }
+
+
+@pytest.mark.parametrize("kind", ["taker", "maker"])
+@pytest.mark.parametrize("complete", [False, True])
+@pytest.mark.parametrize("report_state", ["FINAL", "PENDING", "error"])
+def test_report_runs_before_disposal_and_is_independent_of_drain(
+    kind: str, complete: bool, report_state: Literal["FINAL", "PENDING", "error"], tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    profile, _, builder = _case(kind, tmp_path)
+    path = tmp_path / "profile.json"
+    path.write_bytes(profile.json())
+    stages: list[str] = []
+    nodes: list[TradingNode] = []
+    report_builder, dispose = build_run_accounting_report, entry._dispose_node
+
+    def runner(node: TradingNode) -> None:
+        stages.append("run")
+        nodes.append(node)
+        cast(Any, node).drain_result = DrainResult(complete, "observed_drain", (), {})
+
+    def report(*args: Any, **kwargs: Any) -> Any:
+        stages.append("report")
+        assert args[0] is nodes[0].cache
+        assert kwargs["strategy_id"] == nodes[0].trader.strategies()[0].id
+        assert kwargs["fx"] == profile.strategy_config.economics.fx
+        if report_state == "error":
+            raise RuntimeError("DO-NOT-EXPOSE-REPORT-SECRET")
+        observed = report_builder(*args, **kwargs)
+        return dataclass_replace(
+            observed, status=report_state,
+            pending_reasons=("test_pending_fee",) if report_state == "PENDING" else (),
+            final_realized_pnl_usdt=None if report_state == "PENDING" else Decimal("1.235"),
+        )
+
+    def disposing(node: TradingNode) -> None:
+        stages.append("dispose")
+        dispose(node)
+
+    monkeypatch.setattr(entry, "run_paper_node", runner)
+    monkeypatch.setattr(entry, "build_run_accounting_report", report)
+    monkeypatch.setattr(entry, "_dispose_node", disposing)
+    cli: Any = maker_main if kind == "maker" else entry.main
+    status = cli(["--profile", str(path), "--run-paper"],
+                 environment=_CREDENTIALS, node_builder=builder)
+    captured = capsys.readouterr()
+    assert "DO-NOT-EXPOSE-REPORT-SECRET" not in captured.out + captured.err
+    output = json.loads(captured.out.splitlines()[-1])
+    assert status == (0 if complete and report_state == "FINAL" else 1)
+    assert output["drain_complete"] is complete and stages == ["run", "report", "dispose"]
+    if report_state == "error":
+        assert output["accounting"] is None
+        assert output["reason"] == "observed_drain; accounting_report_error:RuntimeError"
+    else:
+        assert output["accounting"]["status"] == report_state
+        assert output["accounting"]["final_realized_pnl_usdt"] == (
+            None if report_state == "PENDING" else "1.235"
+        )
+
+
+@pytest.mark.parametrize("kind", ["taker", "maker"])
+@pytest.mark.parametrize("rehearse", [False, True])
+def test_validate_and_rehearse_do_not_build_accounting_report(
+    kind: str, rehearse: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile, run, builder = _case(kind, tmp_path)
+
+    def forbidden(*_args: Any, **_kwargs: Any) -> Any:
+        pytest.fail("nontrading entry attempted accounting")
+
+    monkeypatch.setattr(entry, "build_run_accounting_report", forbidden)
+    result = run(profile, rehearse=rehearse, environment=_CREDENTIALS, node_builder=builder,
+                 rehearsal_runner=lambda *_args, **_kwargs: None)
+    assert result.accounting is None and result.drain_complete is None
 
 
 def test_maker_binding_and_secrets_fail_before_credentials_or_build(tmp_path: Path) -> None:

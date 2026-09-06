@@ -570,6 +570,8 @@ carry 是同 route 的唯一 signed residual；下一 fill 先与它合并再分
 - 仅“查不到订单”、历史不完整、身份不一致：仍 UNKNOWN；给出只读诊断和精确恢复条件，不删状态、不自动反向交易。
 - 正常 stop：先停新源准入，撤本节点未完成源单并核对，处理可确认的已有 hedge；到预算仍未决则持久保留并返回未完成状态，不将超时当平仓成功。
 
+旧暂停/明确拒单的实施出口（2026-09-06，编码前固定）：复用普通入口，不新增恢复服务或订单账。`--inspect-recovery` 仅从原业务文件列出暂停、原订单/义务与精确所需证据；不读取凭据、构造数据库或宣称本地文件已证明 venue 终态。`--resume-held` 是本次普通 paper 运行中操作员审阅旧暂停后的显式恢复选择，不写进长期 profile，也不靠旧 reason 文案授权；随后仍需完整 native/venue/CID/票据/费用核验，缺历史或只查不到订单仍不放行。仅明确拒单另可指定 `--retry-rejected-hedge <旧CID>`，要求同时选择恢复旧暂停、原计划存在、旧 native+EA 请求明确 REJECTED 且成交0、执行前提健康；在原义务保留全部旧IDs和一条有界失败尝试记录，由原 dispatcher 创建新ID。每义务最多一次额外尝试，启动恢复资格限定30秒；失败后不形成重试循环，UNKNOWN请求从不重发。发布前失败整包回滚，发布后同步失败仍废弃当前资格。正常 live 报告/下单的 current snapshot、精确计划与账户限制不因该操作出口放宽；不自动增加账户、单量、净额或 DEMO 预算。
+
 drain 必须发生在 node/执行客户端仍运行时，完成或到预算后才调用最终 stop/dispose；不能在框架已断开执行通道后才尝试完成 hedge。信号退出与显式停止使用同一生命周期，Q6覆盖这个消息顺序。
 
 验收：R01–R06，覆盖持久化/发单/成交/对冲边界的进程重启。没有原生 cache/order 归属探针结果前，不照搬 close canary 的 `generate_missing_orders=True`。
@@ -754,6 +756,12 @@ EA 改动额外执行现有 `tools/mt5_source_manifest.sh --lines`、MetaEditor 
 - 合格 Maker 未绑定余腿沿原全量核验恢复；pending 时保留 cycle-only 双侧冻结和 receipt，原 dispatcher 按 allocation 顺序完成后正常释放。未修改策略派单器或状态 schema。使用原 owner 的 signed route/carry 限额，strict、超预算及无法确定顺序的 legacy 未完义务仍保持原状态。
 - 先固定三个旧实现 TypeError 反例，再完成纯状态64项、普通双 adapter 四截点及旧HOLD/发布前后失败14项；恢复保留原订单/Position事件及IDs，只发尚未绑定的新腿，完成后下一机会通过。扩参初次漏传 Maker two-sided 配置，以及未先排空最后一次正常终态观测，均仅修测试准备，不改变原断言或生产时序守卫。相关六文件 **409 passed**；独立 reviewer 针对余腿/carry/legacy **34 passed / 57.34s**，未发现该约30行生产切片的具体 REWORK；Ruff、Mypy定向通过。
 - 本次只形成已验证 Maker 能力的本地提交；W6父项/真实进程全矩阵、拒单一次新ID与旧HOLD出口、A07、W7–W9继续实施，不据局部绿色关闭交付包。A07独立审查已实际复现“MT5 journal数量与native矛盾仍FINAL”，正复用原成交校验窄修，旧报告候选不接受；不得用本条中的恢复测试替代该费用修复及后续冻结全量。
+
+本轮 A07 实现与定向复核（尚待收尾候选统一全量）：
+
+- 新只读报告沿原 native Position/历史 snapshots 与 CID/EA 已保留费用，按原币桥接再显式FX；entry在dispose前报告，执行drain和会计分别输出。只有drain完成、报告FINAL且runner无异常才报PAPER_STOPPED，validate/rehearse不运行报告；不估算 funding/swap/其它费用/浮盈。
+- 报告35项使用真实native Engine/Position，覆盖已嵌入费用不得二扣、Paper TE补费、raw/量化/返佣、非1 FX、NETTING重开/翻仓及缺/重复snapshot、缺费用/未决/冲突；断连后的真实MT5 client配合成transport核查只读访问器不会回连或发单。root独立量冲突反例及venue/price/ticket/time共五类在首稿均错误FINAL；修订只给原cached-terminal guard可选canonical Instrument供退出只读核验，普通报告默认仍要求current snapshot。旧首稿不接受。另三类BFX fee metadata scope反例亦已修正。
+- 实施者最终报告/MT5/BFX报告定向 **265 passed / 1.47s**；root合并普通入口回归 **336 passed**，相关Ruff/Mypy通过。入口初接错取不存在的reconciler hedge字段已修为既有engine客户端映射，新增16项验证报告在dispose前、pending与执行结果独立、异常脱敏以及validate/rehearse零报告。现A07仅本地提交，无部署、账号连接或交易；冻结全量与新的安装产物仍随收尾包验证。
 
 三种结论必须区分：
 

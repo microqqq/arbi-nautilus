@@ -212,11 +212,31 @@ Ordinary startup uses the existing evidenced recovery rules, not a blanket clear
 Normal node/signal stop first closes new source/modify admission while keeping execution and
 fill/terminal callbacks online. It requests each known source cancel at most once and progresses
 only existing confirmed hedge obligations, then calls native stop. It does not flatten an already
-hedged position. `PAPER_STOPPED` requires a completed drain result; `PAPER_INCOMPLETE` exits nonzero
-with pending IDs/reasons and residuals. A timeout, old external HOLD or failed pause publication
+hedged position. `drain_complete` reports that execution result separately from accounting.
+`PAPER_STOPPED` requires a completed drain and a `FINAL` accounting report;
+`PAPER_INCOMPLETE` exits nonzero with pending IDs/reasons and residuals.
+A timeout, old external HOLD or failed pause publication
 cannot be reported as success. Keep retained state for diagnosis; don't rerun blindly or delete it.
 Current-code finite DEMO, the remaining startup recovery cases and abrupt-process boundaries
 are still pending qualification. No automatic canary is enabled by installing the command.
+
+### Realized trading PnL and commission at exit
+
+The ordinary paper entry reports retained native facts **before** disposing the cache.
+`accounting` separates native realized PnL, native booked and already-embedded commission,
+venue raw and quantized costs, rounding, and provisional correction by currency. The bridge is
+`native realized + embedded commission - venue raw cost`; this avoids charging MT5 fees twice
+or assuming a Bitfinex USD fee was already deducted from its USDT-settled Position.
+Only then does it value each currency's net amount in USDT using the profile's explicit
+USD/USDT bid for positive USD and ask for negative USD. This is valuation, not a real FX trade.
+
+`FINAL` applies only to owned cached realized trading PnL and trade commission. Funding,
+swap, other broker fees and unrealized PnL are excluded, not estimated as zero or taken from
+`CarryConfig`. It is **not** the account's complete net profit. Native Position snapshots are
+included; missing old NETTING cycles, incomplete fees, unresolved orders or conflicting facts
+produce `PENDING` with reasons and null final values. Observed subtotals remain visible.
+A successful execution drain does not override an incomplete report. Validate and rehearse
+do not generate this report; neither command executes business recovery.
 
 The attached cap-bound Taker-paper EA candidate defaults to build ID
 `py000-mt5-ea-v1-taker-paper` and `InpMaxOrderLots=0.02`. Its six-source manifest is

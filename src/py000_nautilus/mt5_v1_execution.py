@@ -350,6 +350,29 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
     def pending_client_order_ids(self) -> tuple[str, ...]:
         return tuple(self._pending)
 
+    def raw_commission_cashflows(self) -> dict[tuple[ClientOrderId, TradeId], Decimal]:
+        """Copy validated journal cash flows, including after ordinary disconnection.
+
+        This does not query the venue, publish fills, or certify other broker fees.
+        """
+        projection = _JournalProjection(self._reservations, self._terminal_events)
+        if self._pending or projection.hold_reason is not None:
+            raise Mt5V1ExecutionError("MT5 commission history has unresolved requests")
+        result: dict[tuple[ClientOrderId, TradeId], Decimal] = {}
+        for request_id, event in projection.terminals.items():
+            if event["event_type"] != "order_filled":
+                continue
+            instrument = self._cache.instrument(self._mt5_config.instrument_id)
+            if instrument is None or instrument.lot_size is None:
+                raise Mt5V1ExecutionError("canonical MT5 commission instrument is unavailable")
+            self._validate_cached_terminal(request_id, event, cached_instrument=instrument)
+            payload = cast(JsonObject, event["payload"])
+            amount = Decimal(cast(str, payload["commission"]))
+            if payload["client_request_id"] != request_id or not amount.is_finite():
+                raise Mt5V1ExecutionError("MT5 commission history has conflicting facts")
+            result[ClientOrderId(request_id), TradeId(cast(str, payload["venue_deal_id"]))] = amount
+        return result
+
     @property
     def last_failure(self) -> str | None:
         return self._last_failure
@@ -1355,7 +1378,9 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
         ).encode()
         return VenueOrderId(f"PY000_REJ_{hashlib.sha256(material).hexdigest()}")
 
-    def _validate_cached_terminal(self, request_id: str, event: JsonObject) -> None:
+    def _validate_cached_terminal(
+        self, request_id: str, event: JsonObject, *, cached_instrument: Instrument | None = None,
+    ) -> None:
         """Reject known native/journal conflicts before the engine can overwrite facts."""
         client_order_id = ClientOrderId(request_id)
         reserved = cast(JsonObject, self._reservations[request_id]["payload"])
@@ -1371,7 +1396,9 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
         order = self._cache.order(client_order_id)
         if order is None:
             return
-        instrument = self._report_instrument()
+        # Only retained-fee observation supplies the cached instrument after disconnect.
+        # Live report callers still require the complete current snapshot/contract check.
+        instrument = self._report_instrument() if cached_instrument is None else cached_instrument
         quantity = Decimal(cast(str, reserved["quantity_lots"])) * Decimal(str(instrument.lot_size))
         side = self._order_side(reserved)
         reduce_only = "position_identifier" in reserved

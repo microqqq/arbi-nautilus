@@ -21,6 +21,7 @@ from nautilus_trader.live.node import TradingNode
 from nautilus_trader.model.identifiers import ClientId
 from nautilus_trader.trading.strategy import Strategy
 
+from py000_nautilus.accounting_report import RunAccountingReport, build_run_accounting_report
 from py000_nautilus.bitfinex_v1_data import PAPER_RAW_SYMBOL, BitfinexV1DataClientConfig
 from py000_nautilus.bitfinex_v1_execution import (
     BitfinexV1ExecClientConfig,
@@ -77,6 +78,8 @@ class LiveTakerEntryResult:
     reason: str
     pending: tuple[str, ...] = ()
     residuals: dict[str, str] = field(default_factory=dict)
+    drain_complete: bool | None = None
+    accounting: RunAccountingReport | None = None
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -315,13 +318,41 @@ def _run_live_entry(
             if node.is_running():
                 raise LiveTakerEntryError("paper runner returned while the node was running")
             drain = cast("DrainResult | None", getattr(node, "drain_result", None))
+            # Reports read retained facts while the native cache still exists. They
+            # never reconnect, mutate Positions, or turn a pending drain into success.
+            accounting = None
+            accounting_failure = None
+            try:
+                clients = cast(
+                    dict[ClientId, LiveExecutionClient], node.kernel.exec_engine._clients,
+                )
+                source = clients[BITFINEX_CLIENT_ID]
+                hedge = clients[MT5_CLIENT_ID]
+                if (not isinstance(source, BitfinexV1ExecutionClient)
+                        or not isinstance(hedge, Mt5V1ExecutionClient)):
+                    raise LiveTakerEntryError("accounting requires configured execution clients")
+                accounting = build_run_accounting_report(
+                    node.cache, source, hedge,
+                    trader_id=node.trader.id, strategy_id=strategy.id,
+                    fx=strategy_config.economics.fx,
+                )
+            except Exception as exc:
+                accounting_failure = f"accounting_report_error:{type(exc).__name__}"
             if drain is None:
-                return LiveTakerEntryResult("PAPER_INCOMPLETE", "drain_result_missing")
+                return LiveTakerEntryResult(
+                    "PAPER_INCOMPLETE", "drain_result_missing", accounting=accounting,
+                )
+            reason = drain.reason if run_failure is None else f"{run_failure}; {drain.reason}"
+            if accounting_failure is not None:
+                reason += f"; {accounting_failure}"
+            elif accounting is not None and accounting.status != "FINAL":
+                reason += "; accounting_pending"
             return LiveTakerEntryResult(
                 "PAPER_STOPPED" if drain.complete is True and run_failure is None
+                and accounting is not None and accounting.status == "FINAL"
                 else "PAPER_INCOMPLETE",
-                drain.reason if run_failure is None else f"{run_failure}; {drain.reason}",
-                tuple(drain.pending), dict(drain.residuals),
+                reason, tuple(drain.pending), dict(drain.residuals),
+                drain_complete=drain.complete, accounting=accounting,
             )
 
         # Strategy callbacks and the bound startup Actor can mutate business state.
@@ -632,7 +663,7 @@ def _main(
             file=sys.stderr,
         )
         return 1
-    print(json.dumps(asdict(result)))
+    print(json.dumps(asdict(result), default=str))
     return 1 if result.outcome == "PAPER_INCOMPLETE" else 0
 
 
