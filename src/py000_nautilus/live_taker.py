@@ -1,4 +1,4 @@
-"""Offline-buildable live composition for the single PY000 Taker strategy."""
+"""Live Taker composition; building is offline unless a cache database is supplied."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import cast
 
 from msgspec.structs import replace as struct_replace
-from nautilus_trader.config import TradingNodeConfig
+from nautilus_trader.config import DatabaseConfig, TradingNodeConfig
 from nautilus_trader.live.config import LiveExecEngineConfig
 from nautilus_trader.live.execution_client import LiveExecutionClient
 from nautilus_trader.live.node import TradingNode
@@ -25,6 +25,7 @@ from py000_nautilus.bitfinex_v1_execution import (
     BitfinexV1LiveExecClientFactory,
 )
 from py000_nautilus.config import TakerStrategyConfig
+from py000_nautilus.live_cache import native_cache_config, validate_native_cache
 from py000_nautilus.live_runtime import SourceTerminalReconciler, bind_live_account_reader
 from py000_nautilus.models import SourceDirection
 from py000_nautilus.mt5_v1_data import (
@@ -56,6 +57,7 @@ def build_live_taker_node(
     mt5_data_config: Mt5V1DataClientConfig,
     mt5_exec_config: Mt5V1ExecClientConfig,
     strategy_config: TakerStrategyConfig,
+    cache_database: DatabaseConfig | None = None,
     loop: asyncio.AbstractEventLoop | None = None,
     connection_timeout_seconds: float = 10.0,
     one_shot: bool = False,
@@ -63,11 +65,13 @@ def build_live_taker_node(
     one_shot_expected_source_position: Decimal = Decimal(0),
     one_shot_close_existing: bool = False,
 ) -> tuple[TradingNode, TakerStrategy]:
-    """Build, but never connect or run, the exact two-leg live Taker node."""
+    """Build without trading connections; an explicit cache database connects on construction."""
     if type(one_shot_close_existing) is not bool:
         raise TypeError("one_shot_close_existing must be a bool")
     if one_shot_close_existing and not one_shot:
         raise ValueError("one_shot_close_existing requires one_shot execution")
+    if one_shot and cache_database is not None:
+        raise ValueError("one_shot execution cannot use a native cache database")
     _validate_composition(
         bitfinex_data_config,
         bitfinex_exec_config,
@@ -92,6 +96,7 @@ def build_live_taker_node(
     node = TradingNode(
         config=TradingNodeConfig(
             trader_id=LIVE_TAKER_TRADER_ID,
+            cache=native_cache_config(cache_database),
             data_clients={
                 BITFINEX_CLIENT_NAME: bitfinex_data_config,
                 MT5_CLIENT_NAME: mt5_data_config,
@@ -143,10 +148,12 @@ def build_live_taker_node(
             timeout_seconds=connection_timeout_seconds,
         )
         node.trader.add_actor(reconciler)
+        restart_pending = False
         strategy = TakerStrategy(
             runtime_strategy_config,
             live_submission_ready=lambda: (
-                bitfinex_data.is_connected
+                not restart_pending
+                and bitfinex_data.is_connected
                 and bitfinex_data.book_is_actionable
                 and bitfinex_exec.execution_hold_reason is None
                 and (one_shot_close_existing or bitfinex_exec.accounting_ready)
@@ -174,6 +181,24 @@ def build_live_taker_node(
             hedge_must_reduce_only=one_shot_close_existing,
         )
         node.trader.add_strategy(strategy)
+        if cache_database is not None:
+            restart_pending = validate_native_cache(
+                node.cache,
+                trader_id=LIVE_TAKER_TRADER_ID,
+                strategy_id=strategy.id,
+                routes={
+                    strategy_config.source_instrument_id: (
+                        strategy_config.source_accounts[0].account_id, BITFINEX_CLIENT_ID,
+                    ),
+                    strategy_config.hedge_instrument_id: (
+                        strategy_config.hedge_account_id, MT5_CLIENT_ID,
+                    ),
+                },
+            )
+            if restart_pending:
+                node.kernel.logger.warning(
+                    "native cache restored; restart reconciliation is pending",
+                )
         bind_live_account_reader(
             strategy, config=runtime_strategy_config,
             source_data=bitfinex_data, source_client=bitfinex_exec,

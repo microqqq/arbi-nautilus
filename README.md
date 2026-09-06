@@ -337,6 +337,31 @@ position for the Taker strategy. Paper and production
 must use separate account IDs, CID/state paths, and caches; the shared canonical instrument
 ID means the two profiles must never run concurrently in one node.
 
+Both ordinary Python builders now accept an optional native `cache_database: DatabaseConfig`.
+The default remains in-memory and builds without a network connection. Supplying Redis connects
+the cache during construction, but never opens trading transports. The existing TraderId stays
+fixed across runs; instance-specific keys and startup flushing are disabled. Use a dedicated
+cache for each account/mode: loaded accounts, instruments, owners and execution-client indexes
+must match the single-strategy composition, otherwise construction fails without clearing data.
+An unfilled MT5 reduce-only order must retain its exact-close position index; Bitfinex NETTING
+reduce-only orders do not require an MT5-style ticket index.
+The existing profile/CLI format does not expose this option yet.
+
+Native Redis writes and fresh-process loads have offline integration coverage, including
+partial fills, the MT5 identifier and pending exact-close index, fee provenance and duplicate
+TradeIds. This is **not** automatic strategy recovery: loading historical orders or positions
+keeps new-source admission closed with `restart reconciliation is pending`. Joining the venue
+facts and business obligations, abrupt-crash consistency and live stop/drain remain W6 work.
+No Redis service is installed or managed by this package.
+
+The opt-in integration test requires a **fresh disposable local Redis**, used only for synthetic
+test data. Set `PY000_NATIVE_CACHE_PORT` to its localhost port and run
+`.venv/bin/python -m pytest tests/test_native_cache.py`. Without the variable it is explicitly
+skipped, not certified. The missing-position test restores only its known synthetic fixture index
+before the independent missing-client test, which intentionally leaves an incomplete cache.
+Discard the disposable instance afterward instead of pointing another run at it. The test never
+starts a service, flushes a database or deletes an existing namespace.
+
 `py000-bitfinex-paper-canary` is the one bounded exception used to exercise this adapter.
 It reads `BFX_TEST_API_KEY`, `BFX_TEST_API_SECRET`, and `BFX_TEST_USER_ID` from the process
 environment or `.env`. Without `--execute` it performs authenticated REST preflight only:

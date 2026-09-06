@@ -472,6 +472,14 @@ carry 是同 route 的唯一 signed residual；下一 fill 先与它合并再分
 2. **W6b 已知事实恢复与原store幂等投影。** 在普通新源准入打开前，先核对恢复的cache身份/索引、venue完整历史/持仓、CID/EA journal及既有业务义务。MT5映射冲突必须在事件交给Engine前识别，因为native会优先用cache索引覆盖report中的position ID。缺失/冲突保持原HOLD；已知成交的重放仍经原生事件，原业务store只补实际缺少的义务。未决旧request不重发，reconciliation布尔成功不能单独解除HOLD；最终fee来源沿现有CID v2核对。真实后端未认证前可先实现/验证这层纯核对，不模拟出生产可恢复结论。
 3. **W6c 在线drain与R01–R06。** 保持下列分类，按普通builder/策略在持久写入、submit、partial fill、hedge及stop边界重启，证明下一真实机会与不重复对冲；执行通道尚在线时drain，随后才最终stop。Q3的空引擎重放、stub报告、干净退出或现有canary均不能替代这些验收。
 
+**W6a1 实施切口（2026-09-06，实施前固定）：** Q3后先交付普通builder的可选原生持久化接线和真实后端干净退出/新进程加载，不同时实现W6b的义务恢复或W6c的崩溃/drain矩阵。
+
+- 两个builder只增加可选原生`DatabaseConfig`参数；复用原生`CacheConfig`固定`use_instance_id=False`、`flush_on_start=False`和既有TraderId。默认不配数据库保持原离线build行为；显式配置会在构造时连接缓存，但不连接交易transport。拒绝不支持的后端，不静默回退空cache；close/one-shot canary不接受此新参数，避免混用冷仓claim与历史cache。暂不修改profile格式/CLI，不新增凭据载体、订单日志、服务管理器或缓存后端实现。
+- 一份短共享函数核对加载cache的完整性及已知账户/品种/策略/client路由是否属于当前单策略组合；冲突显式失败，保留后端内容。原生cache已加载订单或仓位时，普通新源准入保持关闭并明确日志原因，不因本包接线消除现有业务HOLD；W6b再以真实事实和义务核对替换这个临时准入停点。该检查只证明组合身份，不代替venue状态/fee/未决request认证。
+- 复用本机现有Redis 7.4镜像，在Docker Desktop上创建任务专用临时容器，仅绑定127.0.0.1随机端口、无宿主数据挂载/volume；不用既有Redis实例、不清现有namespace、不拉镜像、不安装常驻服务。测试只写合成账户/订单；测试结束停止并删除该临时容器。普通全量测试不自动要求Docker；真实后端测试显式选择，缺前提必须报告未运行而不是算作通过。
+- 两个普通builder分别做真实Native LiveExecutionEngine事件入队→原生cache后台写入→dispose→全新Python进程native load。消费者不能重放生产者事件或重新seed账户/订单；只从数据库读回账号、原始OrderInitialized/事件UUID/TradeId、partial数量、Position、MT5 identifier、未成交exact-close索引及TE来源。追加重复TradeId须不增量、新TradeId阳性须增量；账户不符、缺索引/不完整载入和服务不可用失败且不能触发交易。不在这里声称突然断电、Redis自身重启耐久、netting翻仓、同节点双策略或下一机会已认证。
+- 写集：两个live builder、一份短`live_cache.py`、对应纯接线测试、紧凑独立进程helper/显式Redis集成测试、本文及必要README说明。实施agent负责生产薄接线与单元反例，主agent负责独立进程/真实后端和集成，未实施agent独立复核。通过后单独本地提交W6a1；W6a完整异常边界、W6b/c及W6父项不提前勾选。
+
 恢复分类：
 
 - 已结束订单、对冲义务均完成，venue 仓位和本地记录吻合：恢复原策略运行，保留现有仓位。
@@ -680,6 +688,7 @@ EA 改动额外执行现有 `tools/mt5_source_manifest.sh --lines`、MetaEditor 
 - [ ] W6 重启/停止。
   - [x] Q3 技术前置：原生/真实adapter与新进程重放14项、全量及独立复核通过；支持矩阵和W6a–c方案已固定，不计作R01–R06。
   - [ ] W6a 原生持久cache接线与真实后端跨进程恢复认证。
+    - [x] W6a1：可选Redis薄接线、加载组合身份核验及历史source准入暂停；独立复核发现的MT5未成交exact-close缺索引遗漏已窄修，修订全量2340项含真实Redis及独立复核通过。只认证干净退出后的原生load；突崩/存储滞后与义务一致性随W6b/c验收。
   - [ ] W6b 完整事实核对、既有义务幂等恢复及普通策略解除HOLD。
   - [ ] W6c 执行通道在线时drain、进程重启/停止矩阵R01–R06。
 - [ ] W7 同节点共账户。
@@ -942,3 +951,14 @@ EA 改动额外执行现有 `tools/mt5_source_manifest.sh --lines`、MetaEditor 
 - 主agent在两个冻结测试文件上运行单次全量：**2306 passed / 129既有类别Pandas弃用警告 / 298.40s**。全仓Ruff、Mypy85文件、diff-check通过；新14项单文件5.45s通过，子集不累加进全量数量，测前测后文件SHA相同。
 - 未实施reviewer独立14项通过，并做内存反事实：4个fill换UUID但保持TradeId不改变订单/仓位/事件；同一partial source换新TradeId后filled与Position由0.5增到1.0，排除无效事件/仅UUID去重的假绿色。其完整核对两个测试文件、W6/Q3新增方案和pinned原生cache源码后给出RECOMMEND-ACCEPT；主agent据上述独立证据及全量接受Q3。
 - 后续按W6a原生cache → W6b事实/义务恢复 → W6c在线drain推进；框架Redis接线有源码依据但真实后端、队列收束及普通策略继续运行尚未认证。不搬测试worker做生产，不新增订单日志。本包按约定单独本地提交，不推送、启动服务、部署或交易；W4跨重启、A07、W6–W9保持未完成。
+
+2026-09-06，W6a1 可选原生cache接线完成并接受；仅认证干净退出/新进程加载：
+
+- 基线`90da14e`。两普通builder新增可选原生`DatabaseConfig`，一份96行共享函数使用原生CacheConfig和只读组合身份/索引检查；沿用固定TraderId与原生DB，不建订单日志、缓存后端或业务状态格式。默认无DB继续离线，显式配置会连接缓存但不连接交易通道；one-shot与持久cache组合拒绝。
+- 原生`check_integrity=True`仍可能遗漏client索引、依赖account/instrument和order/Position索引冲突，32项新增单元反例固定补充核验。历史pending仅关闭新的source准入；测试将其它就绪条件全部置为真，以empty-ready对照history-pending，并核对原MT5 hedge回调未替换。既有业务HOLD不清除，未知request不重发。
+- 两普通builder分别通过真正的原生Redis写入、无延迟等待的正常dispose、全新Python进程load。消费者事件处理计数0、未seed账户/订单，恢复账号/余额、原事件UUID/TradeId、partial source、MT5 identifier、未成交exact-close和TE pending来源；同TradeId换UUID不增量，新TradeId增量且再重启仍保留。账户不符及缺client索引在已加载真实数据上明确拒绝，错误账户检查不改旧数据；不可用本地端口在native cache构造处失败，不回退为空。
+- 实验只向已停止策略的原生LiveExecutionEngine队列投合成limit订单事件，不经过交易adapter发单、不认证其wire/TIF政策；客户端OMS仍是Bitfinex NETTING、MT5 HEDGING。采用本机已有Redis7.4镜像的任务专用临时实例，127.0.0.1随机端口、无宿主数据挂载、仅tmpfs；Redis自身无持久化，本项只验证Python进程边界，不认证Redis重启/断电、完整node生命周期或业务策略续跑。首轮fixture缺`ts_init`及asyncio.run内dispose停止loop的问题只修测试调用方式，未当成生产RED或修改native框架。
+- 首轮冻结主agent全量 **2336 passed / 129既有类别Pandas弃用警告 / 317.32s**，包含两项真实Redis且无skip；独立复核随后给出确切REWORK，不能以该全量替代修订验收。MT5未成交exact-close的`order.position_id=None`是原生正常事实，但显式cache目标索引也缺失时原检查漏拒；两种普通builder真实Redis新进程反事实均能重现。修复只约束MT5 reduce-only必须有明确目标索引，不猜票据、不修数据；MT5 INITIALIZED/ACCEPTED两例先RED后GREEN，对应Bitfinex NETTING无索引两例仍通过。
+- 主agent把该反例加入原backend矩阵：合法owner/account/client的未成交MT5 close唯一缺目标索引，native integrity仍为真而普通新进程必须拒绝；仅测试fixture用原生数据库索引接口补回其已知合成目标，再以未修改的普通builder重新load核对只有该索引变化，随后独立验证缺client拒绝。这不是生产恢复入口，不绕过消费者校验。修订定向 **61 passed / 31.30s**（含两项真实Redis）。
+- 最终六份冻结源码/测试上，主agent显式选择全新临时Redis运行单次全量：**2340 passed / 129既有类别Pandas弃用警告 / 327.26s**，包含两项真实backend，无skip。全仓Ruff、Mypy89文件与diff-check通过；六SHA测前测后不变。独立reviewer在其另一个全新临时实例上 **61 passed / 30.58s**，复验原MT5反例、Bitfinex阳性、fixture精确恢复及其余失败边界，静态检查和六SHA一致，给出RECOMMEND-ACCEPT；主agent据修订全量与独立证据接受本小步。各子集不相加为全量数量。
+- 主agent与独立reviewer创建的临时容器均已按准确ID停止，`--rm`删除仅用于测试的合成数据；最终列表确认主agent容器不存在，未操作既有服务、镜像、volume或真实账户。按约定单独本地提交，不推送、部署或交易；W6b/c、R01–R06和W6父项保持未完成。下一步将已恢复cache与venue事实、原业务义务接起来，确认既有成交只投影一次后再开放正常续跑，不重复造持久化系统。
