@@ -37,6 +37,25 @@ class _Allocation:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class _LegacyOrder:
+    client_order_id: str
+    direction: SourceDirection
+    route: _Route
+    filled_ounces: Decimal
+    fill_keys: tuple[str, ...]
+    intent_ids: tuple[str, ...]
+    allocated_ounces: Decimal
+
+    def payload(self) -> dict[str, object]:
+        return {
+            "client_order_id": self.client_order_id, "direction": self.direction.value,
+            "route": dict(zip(_ROUTE_FIELDS, self.route, strict=True)),
+            "filled_ounces": str(self.filled_ounces), "fill_keys": list(self.fill_keys),
+            "intent_ids": list(self.intent_ids), "allocated_ounces": str(self.allocated_ounces),
+        }
+
+
 _Snapshot = tuple[dict[SourceDirection, StoreState], list[_Allocation]]
 
 
@@ -67,6 +86,8 @@ class MakerStateStore:
         self.source_instrument_id = source_instrument_id
         self.hedge_instrument_id = hedge_instrument_id
         self._allocations: list[_Allocation] = []
+        self._legacy_sources: tuple[tuple[str, str], ...] | None = None
+        self._legacy_orders: tuple[_LegacyOrder, ...] = ()
         if not self.path.exists() and any(path.exists() for path in maker_legacy_paths(prefix)):
             raise ValueError("legacy Maker state requires explicit migration before startup")
         states = self._load() if self.path.exists() else {
@@ -102,13 +123,26 @@ class MakerStateStore:
     def _route_balances(self) -> dict[_Route, tuple[Decimal, SourceDirection]]:
         directions = {key: direction for direction, view in self.stores.items()
                       for key in view._state.seen_source_fills}
-        balances: dict[_Route, tuple[Decimal, SourceDirection]] = {}
+        balances = self._checkpoint_balances()
         for item in self._allocations:
             previous = balances.get(item.route, (Decimal(0), directions[item.fill_key]))[0]
             balances[item.route] = (
                 previous + item.signed_fill_ounces - item.allocated_ounces,
                 directions[item.fill_key],
             )
+        return balances
+
+    def _checkpoint_balances(self) -> dict[_Route, tuple[Decimal, SourceDirection]]:
+        balances: dict[_Route, tuple[Decimal, SourceDirection]] = {}
+        # This is a fixed historical display projection, not reconstructed fill order.
+        for item in sorted(self._legacy_orders, key=lambda item: (
+            item.direction is SourceDirection.SHORT, item.client_order_id,
+        )):
+            if item.filled_ounces == item.allocated_ounces == 0:
+                continue
+            previous = balances.get(item.route, (Decimal(0), item.direction))[0]
+            signed = item.filled_ounces * (1 if item.direction is SourceDirection.LONG else -1)
+            balances[item.route] = (previous + signed - item.allocated_ounces, item.direction)
         return balances
 
     def _allocate(self, record: SourceOrderRecord, fill_key: str, signed_fill: Decimal) -> int:
@@ -140,17 +174,7 @@ class MakerStateStore:
         candidate = self._snapshot()
         try:
             self._validate()
-            _persist_payload(self.path, {
-                "schema_version": 3,
-                "kind": "maker",
-                "source_instrument_id": self.source_instrument_id,
-                "hedge_instrument_id": self.hedge_instrument_id,
-                "allocations": [item.payload() for item in self._allocations],
-                "directions": {
-                    key: self.stores[direction]._to_payload()
-                    for direction, key in _DIRECTIONS.items()
-                },
-            })
+            _persist_payload(self.path, self._to_payload())
         except ParentDirectorySyncError:
             self._committed = candidate
             raise
@@ -159,12 +183,34 @@ class MakerStateStore:
             raise
         self._committed = candidate
 
+    def _to_payload(self) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "schema_version": 3 if self._legacy_sources is None else 4,
+            "kind": "maker", "source_instrument_id": self.source_instrument_id,
+            "hedge_instrument_id": self.hedge_instrument_id,
+            "allocations": [item.payload() for item in self._allocations],
+            "directions": {key: self.stores[direction]._to_payload()
+                           for direction, key in _DIRECTIONS.items()},
+        }
+        if self._legacy_sources is not None:
+            payload["legacy_checkpoint"] = {
+                "projection": "bid_then_ask",
+                "sources": [{"path": path, "sha256": digest}
+                            for path, digest in self._legacy_sources],
+                "orders": [item.payload() for item in self._legacy_orders],
+            }
+        return payload
+
     def _load(self) -> dict[SourceDirection, StoreState]:
         raw = json.loads(self.path.read_text(encoding="utf-8"))
-        if not isinstance(raw, dict) or set(raw) != {
+        fields = {
             "schema_version", "kind", "source_instrument_id", "hedge_instrument_id", "directions",
             "allocations",
-        } or type(raw["schema_version"]) is not int or raw["schema_version"] != 3:
+        }
+        if isinstance(raw, dict) and raw.get("schema_version") == 4:
+            fields.add("legacy_checkpoint")
+        if (not isinstance(raw, dict) or set(raw) != fields
+                or type(raw["schema_version"]) is not int or raw["schema_version"] not in {3, 4}):
             raise ValueError("unsupported Maker state schema; legacy state requires migration")
         if (
             raw["kind"] != "maker"
@@ -179,6 +225,10 @@ class MakerStateStore:
                for state in directions.values()):
             raise ValueError("invalid Maker direction schema")
         try:
+            if raw["schema_version"] == 4:
+                self._legacy_sources, self._legacy_orders = _read_checkpoint(
+                    raw["legacy_checkpoint"],
+                )
             self._allocations = _read_allocations(raw["allocations"])
             return {
                 direction: JsonStateStore._from_payload(directions[key])
@@ -264,9 +314,8 @@ class MakerStateStore:
                    for intent in view.intents()}
         if len(intents) != sum(len(view.intents()) for view in self.stores.values()):
             raise ValueError("multiple Maker intents claim the same allocation")
-        allocated_fills: set[str] = set()
-        source_totals: dict[str, Decimal] = {}
-        balances: dict[_Route, Decimal] = {}
+        allocated_fills, source_totals = self._validate_checkpoint(records, intents)
+        balances = {route: balance for route, (balance, _) in self._checkpoint_balances().items()}
         for item in self._allocations:
             if item.fill_key not in seen or item.fill_key in allocated_fills:
                 raise ValueError("Maker allocation fill identity is missing or duplicated")
@@ -300,6 +349,49 @@ class MakerStateStore:
             for key, record in records.items()
         ):
             raise ValueError("Maker allocation history differs from source/intent facts")
+
+    def _validate_checkpoint(
+        self, records: dict[str, SourceOrderRecord], intents: dict[str, HedgeIntent],
+    ) -> tuple[set[str], dict[str, Decimal]]:
+        keys: set[str] = set()
+        totals: dict[str, Decimal] = {}
+        directions = {cid: direction for direction, view in self.stores.items()
+                      for cid in view._state.source_orders}
+        by_id = {intent.intent_id: intent for intent in intents.values()}
+        for item in self._legacy_orders:
+            cid = item.client_order_id
+            if (cid not in records or cid in totals or item.direction is not directions[cid]
+                    or item.route != _route(records[cid]) or not item.filled_ounces.is_finite()
+                    or item.filled_ounces < 0 or not item.allocated_ounces.is_finite()):
+                raise ValueError("legacy checkpoint source binding or quantity differs")
+            if (len(set(item.fill_keys)) != len(item.fill_keys)
+                    or keys.intersection(item.fill_keys)
+                    or any(key.split("|")[0] != cid for key in item.fill_keys)
+                    or bool(item.fill_keys) != (item.filled_ounces > 0)
+                    or len(set(item.intent_ids)) != len(item.intent_ids)):
+                raise ValueError("legacy checkpoint fill identities differ")
+            known = Decimal(0)
+            allocated = Decimal(0)
+            for intent_id in item.intent_ids:
+                intent = by_id.get(intent_id)
+                if (intent is None or intent.source_client_order_id != cid
+                        or intent.fill_key not in item.fill_keys
+                        or not intent.source_fill_ounces.is_finite()
+                        or intent.source_fill_ounces <= 0
+                        or intents.pop(intent.fill_key, None) is None):
+                    raise ValueError("legacy checkpoint intent identity differs")
+                known += intent.source_fill_ounces
+                allocated += intent.hedge_quantity_ounces * (
+                    1 if intent.hedge_side is BusinessOrderSide.SELL else -1
+                )
+            unknown = len(item.fill_keys) - len(item.intent_ids)
+            if (allocated != item.allocated_ounces or known > item.filled_ounces
+                    or (unknown == 0 and known != item.filled_ounces)
+                    or (unknown > 0 and known >= item.filled_ounces)):
+                raise ValueError("legacy checkpoint cumulative or fixed allocation differs")
+            keys.update(item.fill_keys)
+            totals[cid] = item.filled_ounces
+        return keys, totals
 
 
 class _MakerDirectionStore(JsonStateStore):
@@ -380,3 +472,44 @@ def _read_allocations(raw: object) -> list[_Allocation]:
             route[key] for key in _ROUTE_FIELDS
         )), signed, allocated))
     return result
+
+
+def _read_checkpoint(raw: object) -> tuple[tuple[tuple[str, str], ...], tuple[_LegacyOrder, ...]]:
+    if not isinstance(raw, dict) or set(raw) != {"projection", "sources", "orders"} or (
+        raw["projection"] != "bid_then_ask" or not isinstance(raw["sources"], list)
+        or len(raw["sources"]) not in {1, 2} or not isinstance(raw["orders"], list)
+    ):
+        raise ValueError("invalid legacy checkpoint")
+    sources: list[tuple[str, str]] = []
+    for source in raw["sources"]:
+        if (not isinstance(source, dict) or set(source) != {"path", "sha256"}
+                or not isinstance(source["path"], str) or not source["path"]
+                or not isinstance(source["sha256"], str) or len(source["sha256"]) != 64
+                or any(char not in "0123456789abcdef" for char in source["sha256"])):
+            raise ValueError("invalid legacy checkpoint source metadata")
+        sources.append((source["path"], source["sha256"]))
+    if len({path for path, _ in sources}) != len(sources):
+        raise ValueError("duplicate legacy checkpoint source")
+    orders: list[_LegacyOrder] = []
+    for item in raw["orders"]:
+        if not isinstance(item, dict) or set(item) != {
+            "client_order_id", "direction", "route", "filled_ounces", "fill_keys", "intent_ids",
+            "allocated_ounces",
+        } or not isinstance(item["client_order_id"], str):
+            raise ValueError("invalid legacy checkpoint order")
+        route = item["route"]
+        if not isinstance(route, dict) or set(route) != set(_ROUTE_FIELDS) or any(
+            value is not None and not isinstance(value, str) for value in route.values()
+        ) or any(not isinstance(item[key], list) or any(not isinstance(value, str)
+                   for value in item[key]) for key in ("fill_keys", "intent_ids")):
+            raise ValueError("invalid legacy checkpoint route or identities")
+        try:
+            orders.append(_LegacyOrder(
+                item["client_order_id"], SourceDirection(item["direction"]),
+                cast(_Route, tuple(route[key] for key in _ROUTE_FIELDS)),
+                Decimal(item["filled_ounces"]), tuple(item["fill_keys"]), tuple(item["intent_ids"]),
+                Decimal(item["allocated_ounces"]),
+            ))
+        except (ArithmeticError, TypeError, ValueError) as exc:
+            raise ValueError("invalid legacy checkpoint quantity or direction") from exc
+    return tuple(sources), tuple(orders)

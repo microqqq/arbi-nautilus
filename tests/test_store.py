@@ -2,6 +2,7 @@
 
 import json
 import os
+import stat
 from decimal import Decimal
 from pathlib import Path
 
@@ -13,6 +14,59 @@ from py000_nautilus.models import BusinessOrderSide, HedgeLeg, ObligationStatus
 from py000_nautilus.store import JsonStateStore
 
 D = Decimal
+
+
+def test_create_only_payload_never_overwrites_an_existing_file(tmp_path: Path) -> None:
+    target = tmp_path / "checkpoint.json"
+    payload: dict[str, object] = {"schema_version": 4, "complete": True}
+    store_module._persist_payload(target, payload, overwrite=False)
+    assert json.loads(target.read_text()) == payload
+    with pytest.raises(FileExistsError):
+        store_module._persist_payload(target, {"different": True}, overwrite=False)
+    assert json.loads(target.read_text()) == payload
+
+
+def test_create_only_payload_keeps_the_winner_of_a_publish_race(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from py000_nautilus.durability import create_and_sync_parent
+
+    target = tmp_path / "checkpoint.json"
+
+    def other_writer_wins(source: Path, destination: Path) -> None:
+        destination.write_bytes(b"other complete result")
+        create_and_sync_parent(source, destination)
+
+    monkeypatch.setattr(store_module, "create_and_sync_parent", other_writer_wins)
+    with pytest.raises(FileExistsError):
+        store_module._persist_payload(target, {"candidate": True}, overwrite=False)
+    assert target.read_bytes() == b"other complete result"
+
+
+@pytest.mark.parametrize("directory", [
+    pytest.param(False, id="file-sync"),
+    pytest.param(True, id="parent-sync", marks=pytest.mark.skipif(
+        os.name != "posix", reason="requires a real POSIX directory descriptor",
+    )),
+])
+def test_create_only_payload_distinguishes_pre_and_post_publication_sync_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, directory: bool,
+) -> None:
+    target = tmp_path / "checkpoint.json"
+    payload: dict[str, object] = {"complete": True}
+    original_sync = os.fsync
+
+    def fail_selected_sync(descriptor: int) -> None:
+        if stat.S_ISDIR(os.fstat(descriptor).st_mode) is directory:
+            raise OSError("injected sync failure")
+        original_sync(descriptor)
+
+    monkeypatch.setattr(os, "fsync", fail_selected_sync)
+    with pytest.raises(ParentDirectorySyncError if directory else OSError):
+        store_module._persist_payload(target, payload, overwrite=False)
+    assert target.exists() is directory
+    if directory:
+        assert json.loads(target.read_text()) == payload
 
 
 def test_partial_final_and_duplicate_fills_create_exactly_once_intents(tmp_path: Path) -> None:

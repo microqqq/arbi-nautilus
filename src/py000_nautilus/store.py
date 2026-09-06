@@ -1,6 +1,7 @@
 """One-file durable custody for source orders, fills, and hedge obligations."""
 
 import json
+import logging
 import os
 import tempfile
 from copy import deepcopy
@@ -10,7 +11,11 @@ from hashlib import sha256
 from pathlib import Path
 from typing import cast
 
-from py000_nautilus.durability import ParentDirectorySyncError, replace_and_sync_parent
+from py000_nautilus.durability import (
+    ParentDirectorySyncError,
+    create_and_sync_parent,
+    replace_and_sync_parent,
+)
 from py000_nautilus.economics import round_hedge_ounces
 from py000_nautilus.models import BusinessOrderSide, HedgeIntent, HedgeLeg, ObligationStatus
 
@@ -636,7 +641,9 @@ class JsonStateStore:
         )
 
 
-def _persist_payload(path: Path, payload: dict[str, object]) -> None:
+def _persist_payload(
+    path: Path, payload: dict[str, object], *, overwrite: bool = True,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(
         mode="w",
@@ -649,7 +656,17 @@ def _persist_payload(path: Path, payload: dict[str, object]) -> None:
         handle.flush()
         os.fsync(handle.fileno())
         temporary_path = Path(handle.name)
-    replace_and_sync_parent(temporary_path, path)
+    if overwrite:
+        replace_and_sync_parent(temporary_path, path)
+    else:
+        create_and_sync_parent(temporary_path, path)
+        try:
+            temporary_path.unlink()
+        except OSError as exc:
+            logging.getLogger(__name__).warning(
+                "Created state at %s; temporary file cleanup failed, retained %s: %s",
+                path, temporary_path, exc,
+            )
 
 
 def _optional_string(value: object) -> str | None:

@@ -142,3 +142,49 @@ def test_non_posix_replace_has_explicitly_weaker_directory_guarantee(
     replace_and_sync_parent("state.tmp", "runtime/state.json")
 
     assert calls == ["replace"]
+
+
+def test_create_publishes_complete_bytes_without_replacing_an_existing_target(
+    tmp_path: Path,
+) -> None:
+    source, target = tmp_path / "new.tmp", tmp_path / "state.json"
+    source.write_bytes(b"complete candidate")
+    durability.create_and_sync_parent(source, target)
+    assert target.read_bytes() == source.read_bytes() == b"complete candidate"
+    other = tmp_path / "other.tmp"
+    other.write_bytes(b"different candidate")
+    with pytest.raises(FileExistsError):
+        durability.create_and_sync_parent(other, target)
+    assert target.read_bytes() == b"complete candidate"
+    assert other.read_bytes() == b"different candidate"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires a real POSIX directory descriptor")
+def test_create_parent_sync_failure_retains_complete_new_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source, target = tmp_path / "new.tmp", tmp_path / "state.json"
+    source.write_bytes(b"complete candidate")
+    monkeypatch.setattr(durability, "_DIRECTORY_FSYNC_SUPPORTED", True)
+
+    def fail_sync(_fd: int) -> None:
+        raise OSError("directory sync failed")
+
+    monkeypatch.setattr("py000_nautilus.durability.os.fsync", fail_sync)
+    with pytest.raises(ParentDirectorySyncError, match="creation completed"):
+        durability.create_and_sync_parent(source, target)
+    assert target.read_bytes() == source.read_bytes() == b"complete candidate"
+
+
+def test_create_link_failure_leaves_existing_target_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source, target = tmp_path / "new.tmp", tmp_path / "state.json"
+    source.write_bytes(b"new")
+    target.write_bytes(b"old")
+    synced: list[int] = []
+    monkeypatch.setattr("py000_nautilus.durability.os.fsync", synced.append)
+    with pytest.raises(FileExistsError):
+        durability.create_and_sync_parent(source, target)
+    assert target.read_bytes() == b"old" and source.read_bytes() == b"new"
+    assert synced == []

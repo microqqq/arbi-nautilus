@@ -23,6 +23,42 @@ The simulations and tests use no credentials and contact no live endpoints. A
 persisted unresolved source or hedge submission stops new source orders until an
 operator reconciles it.
 
+## Explicit Maker state migration (offline)
+
+Fresh Maker states use schema 3. To convert an old single-file schema 2 state or
+both schema 1 direction files, stop the old strategy and write to a **different**
+state prefix:
+
+```bash
+uv run py000-maker-migrate \
+  --input-prefix runtime/old-maker \
+  --output-prefix runtime/maker-migrated \
+  --source-instrument XAUTUSDT-PERP.BITFINEX \
+  --hedge-instrument XAUUSD.MT5 \
+  --stopped
+```
+
+This command needs no credentials and does not connect, trade, stop processes, or
+change profiles. `--stopped` is the operator's declaration, not a process lock;
+the tool also rejects inputs that change during conversion. Both old direction
+files must be present for schema 1, including a valid empty file if one direction
+never traded. Its instrument IDs are operator-supplied bindings because schema 1
+has no instrument header; schema 2 must match its existing header.
+
+The new schema 4 file preserves old orders, fill identities, hedge plans and
+UNKNOWN/HOLD states. A labeled legacy checkpoint retains known historical totals
+without inventing missing individual fill quantities or replaying old hedges.
+Only subsequent real fills enter the new per-fill allocation ledger. The old
+files remain unchanged, and an existing destination is never overwritten. If
+publication succeeds but directory sync fails, the complete new file remains:
+inspect it rather than rerunning over it or deleting state to unlock trading.
+Failure to remove a temporary name after successful publication only emits a
+warning: the complete destination remains valid and the command still succeeds.
+
+Review the result before selecting the new `store_path_prefix`. Conversion is not
+reconciliation or recovery of Nautilus's runtime cache. Nonzero route residuals
+still block new orders in strict mode; bounded carry is not enabled by migration.
+
 ## MT5 EA v1 checkpoint
 
 The PY000-specific protocol and EA are specified in

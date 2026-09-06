@@ -8,6 +8,7 @@ This is not an EA, network, live-account or full PnL simulator.
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from copy import deepcopy
@@ -27,7 +28,7 @@ from test_strategy_continuity import _OrdinaryStrategy, _pump
 
 from py000_nautilus.app import _book_snapshot, _quote
 from py000_nautilus.live_runtime import get_source_terminal_reconciler
-from py000_nautilus.models import ObligationStatus
+from py000_nautilus.models import BusinessOrderSide, ObligationStatus, SourceDirection
 from py000_nautilus.mt5_v1_data import instrument_from_snapshot
 from py000_nautilus.mt5_v1_protocol import JsonObject
 from py000_nautilus.store import JsonStateStore
@@ -312,6 +313,71 @@ async def _assert_reports(
     assert len(native) == int(source.net != 0)
     if native:
         assert native[0].avg_px_open == pytest.approx(float(source.average_price), abs=1e-7)
+
+
+@pytest.mark.parametrize("legacy_schema", [1, 2], ids=["dual-v1", "single-v2"])
+def test_both_adapters_maker_continue_from_explicit_legacy_checkpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, legacy_schema: int,
+) -> None:
+    from py000_nautilus.maker_migration import migrate_maker_state
+
+    old_prefix, new_prefix = tmp_path / "old-maker", tmp_path / "maker-state"
+    legacy: dict[str, JsonStateStore] = {}
+    for direction, side in ((SourceDirection.LONG, BusinessOrderSide.BUY),
+                            (SourceDirection.SHORT, BusinessOrderSide.SELL)):
+        cid = f"LEGACY-{direction.value}"
+        store = JsonStateStore(Path(f"{old_prefix}.{direction.value}.json"))
+        store.begin_source(
+            cid, side, D(2), source_account_id="BITFINEX-269312", source_client_id="BITFINEX",
+            hedge_account_id=f"MT5-{_identity().account_id}", hedge_client_id="MT5",
+        )
+        assert store.reserve_source_fill(
+            fill_key=f"{cid}|V-{cid}|T-{cid}", client_order_id=cid, trade_id=f"T-{cid}",
+            source_side=side, fill_ounces=D("0.5"),
+        ) is None
+        store.update_source_status(cid, "CANCELED")
+        store.confirm_source_reconciled(cid)
+        store.freeze_source_submissions("legacy matched source fills")
+        legacy[direction.value] = store
+    if legacy_schema == 2:
+        Path(f"{old_prefix}.maker.json").write_text(json.dumps({
+            "schema_version": 2, "kind": "maker",
+            "source_instrument_id": "XAUTUSDT-PERP.BITFINEX",
+            "hedge_instrument_id": "XAUUSD.MT5",
+            "directions": {key: store._to_payload() for key, store in legacy.items()},
+        }))
+    originals = {path: path.read_bytes() for path in tmp_path.glob("old-maker*.json")}
+    migrated = migrate_maker_state(
+        old_prefix, new_prefix, "XAUTUSDT-PERP.BITFINEX", "XAUUSD.MT5", stopped=True,
+    )
+    checkpoint = json.loads(migrated.path.read_text())["legacy_checkpoint"]
+    assert all(view.source_freeze_reason == "legacy matched source fills"
+               for view in migrated.stores.values())
+
+    async def run() -> None:
+        async with _continuous(
+            tmp_path, monkeypatch, maker=True, long_quantity=2, short_quantity=0,
+        ) as (h, source, wire):
+            # Normal startup consumes the converted state; only the ordinary
+            # strategy's own gates may release the already-complete old cycle.
+            cid = await _accepted_source(h, source, wire, 2)
+            assert source.order(cid).client_order_id.value not in {"LEGACY-bid", "LEGACY-ask"}
+            source.fill(cid, D(2))
+            await _settle_cycle(h, source, wire, cid=cid, expected=1)
+            assert h.node.portfolio.net_position(h.source_instrument.id) == 2
+            assert h.node.portfolio.net_position(h.hedge_instrument.id) == -2
+            for store, restored in zip(_stores(h), h.reload_stores(), strict=True):
+                old = next(record for record in restored.source_orders()
+                           if record.client_order_id.startswith("LEGACY-"))
+                assert old.filled_ounces == D("0.5") and old.status == "CANCELED"
+                assert restored.rounding_residual_ounces == store.rounding_residual_ounces == 0
+            payload = json.loads(h.store.path.read_text())
+            assert payload["schema_version"] == 4
+            assert payload["legacy_checkpoint"] == checkpoint
+            assert len(payload["allocations"]) == 1  # Only the new real two-ounce fill.
+            assert all(path.read_bytes() == original for path, original in originals.items())
+
+    asyncio.run(run())
 
 
 @pytest.mark.parametrize("first_sign", [1, -1], ids=["bid-first", "ask-first"])
