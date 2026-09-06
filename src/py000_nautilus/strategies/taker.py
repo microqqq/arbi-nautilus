@@ -97,6 +97,7 @@ class TakerStrategy(Strategy):
         self._config = config
         self._live_submission_ready = live_submission_ready
         self._restart_gate: Callable[[], bool] | None = None
+        self._draining = False
         self._hedge_quantity_ready = hedge_quantity_ready
         self._live_costs_from_adapters = live_costs_from_adapters
         self._one_shot = one_shot
@@ -270,6 +271,7 @@ class TakerStrategy(Strategy):
             self._session_ts_ns = ts_event_ns
 
     def on_start(self) -> None:
+        self._draining = False
         self._source_terminal_stopped = False
         if self._live_account_reader is not None:
             self._account_loop = asyncio.get_running_loop()
@@ -309,6 +311,14 @@ class TakerStrategy(Strategy):
         self.subscribe_quote_ticks(self._config.hedge_instrument_id)
         self.subscribe_instrument_status(self._config.hedge_instrument_id)
 
+    def begin_drain(self) -> None:
+        """Stop new source risk without disabling fill, terminal or hedge callbacks."""
+        self._draining = True
+
+    def continue_drain(self) -> None:
+        """Progress only existing obligations through the normal hedge path."""
+        self._submit_next_pending_hedge()
+
     def on_stop(self) -> None:
         """Cancel only the exact active source and retain its durable gate."""
         self._source_terminal_stopped = True
@@ -321,7 +331,7 @@ class TakerStrategy(Strategy):
             self.msgbus.unsubscribe(topic, self._on_account_update)
         self._account_topics = ()
         self._account_loop = None
-        if _restart_blocked(self):
+        if _restart_blocked(self) or self._draining:
             return
         client_order_id = self.state_store.active_source_order_id
         if client_order_id is None:
@@ -350,6 +360,9 @@ class TakerStrategy(Strategy):
         self._evaluate_and_submit()
 
     def _evaluate_and_submit(self) -> None:
+        if self._draining:
+            self._last_decision_gate = "draining"
+            return
         if _restart_blocked(self):
             self._last_decision_gate = "restart_pending"
             return
@@ -581,7 +594,7 @@ class TakerStrategy(Strategy):
                 self._submit_next_pending_hedge()
 
     def _submit_source(self, opportunity: Opportunity, *, market_ts_ns: int | None = None) -> bool:
-        if _restart_blocked(self):
+        if _restart_blocked(self) or self._draining:
             return False
         if (
             self._allowed_source_direction is not None

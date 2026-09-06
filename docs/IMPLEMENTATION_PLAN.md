@@ -582,6 +582,8 @@ drain 必须发生在 node/执行客户端仍运行时，完成或到预算后�
 
 使用一个节点内 route 执行 lane：获得 lane 后才从最新 native positions 生成/绑定实际 MT5 腿；订单确认期间 lane 不交给另一个策略。预期外仓位变化暂停新源订单并启动有界核对，不静默继续，也不自动替账户清仓。
 
+Q4（2026-09-06）五个离线原生实验已通过：两个 StrategyId 的 +2/-2（venue flat）及 +3/-1（venue +2）可经真实 Bitfinex mass/native reconciliation 重复核对且完整保留各 owner 的事件/仓位/索引；venue 数量差1时 adapter mass 拒绝，绕过它直接交 native position report 可返回 True 却不消除差额，因此必须保留现 adapter 数量门。不同成交价 BUY3@2400、SELL1@2500 时 venue 剩余2@2400，两个虚拟仓绝对量加权均价2425；现单策略启动均价公式不能套用 W7。后续保留原生策略仓位视图，将 venue 剩余成本与策略虚拟均价分别解释，不重建 NETTING、不因 native 返回 True 放宽数量核验。本探针没有启动普通双策略，不认证共享额度/lane、下一机会或共跑恢复。
+
 共跑时将该route的Maker/Taker残差纳入同一个既有业务状态原子单元，方向/策略保持独立view；不另造平行残差账。若已绑定完整多腿计划，lane持有至该计划完成或明确暂停，不能在两腿之间让另一策略修改计划所依赖的票据。调度按已发生的fill义务公平推进，避免其中一个策略永久饥饿。
 
 依赖原生 cache 中的订单/仓位和现有义务投影，尽量由原协调器注入同一个 lane，不增加服务或第二个订单管理器。若 Q4 证明 native NETTING 与 StrategyId 归属不能直接协调，先记录反例并在本文修订最小设计；禁止把两个独立 runner 同时启动当实现完成。
@@ -678,7 +680,7 @@ drain 必须发生在 node/执行客户端仍运行时，完成或到预算后�
 ## 7. 状态格式、兼容与回滚
 
 1. W1 fee metadata 若改变 CID 根格式，写入明确 schema v2；旧 v1 可读且缺费用表示 UNKNOWN，不是零。v2 包含布尔 `accounting_conflict`，装载时不丢掉已知事实冲突。升级保持 account/CID/last_cid 和绑定不变；老程序应拒绝新格式，不能静默丢 fee 字段。
-2. W5c3 已交付离线 `py000-maker-migrate`：完整旧双v1或单v2转换到不同prefix的v4历史checkpoint，保留旧件，原子no-clobber发布后才由操作人选择新路径；无历史checkpoint的v3读写保持不变。旧程序须停止，`--stopped`及前后输入字节一致只是声明/稳定性检查，不是普通Maker不存在的全程运行锁。转换不猜造逐fill量或跨方向顺序，也不解决UNKNOWN；失败不回退成空状态，发布后父同步失败保留完整新件，只有发布成功后的临时名清理失败告警且仍算创建成功。
+2. 离线 `py000-maker-migrate` 将完整旧双v1或单v2转换到不同prefix，保留旧件，原子no-clobber发布后才由操作人选择新路径。W5c3最初输出v4；W6b9之后当前输出为schema6历史checkpoint。无checkpoint的新文件为schema5，已有v3/v4仍可读，下一次写分别升级为5/6，不猜旧freeze来源，旧程序不得读取新格式。旧程序须停止，`--stopped`及前后输入字节一致只是声明/稳定性检查，不是全程运行锁。转换不猜造逐fill量或跨方向顺序，也不解决UNKNOWN；失败不回退成空状态，发布后父同步失败保留完整新件，只有发布成功后的临时名清理失败告警且仍算创建成功。
 3. 对含未决义务的旧状态，迁移格式不等于解决 UNKNOWN；先保留原语义，完成 W6 权威核对才改变业务状态。
 4. Python/EA wire 不变时可分别发布；字段或闭集错误码变化则文档、codec、EA、配置一起版本匹配。`InpDeclaredSourceSha256` 使用现有 manifest 工具计算，新 hash 不是跳过匹配的理由。
 5. 回滚先停止新源订单、核对在途订单与仓位，再选择兼容代码/配置。不能恢复旧状态备份覆盖升级后真实成交，也不能让旧程序读取不理解的新状态。
@@ -688,12 +690,12 @@ drain 必须发生在 node/执行客户端仍运行时，完成或到预算后�
 
 | 探针 | 已知/需验证 | 最小输入与输出 | 影响 |
 | --- | --- | --- | --- |
-| Q1 费用后补 | 最小codec/真实Engine探针已复跑；普通入口无cache database，选择CID v2来源证据；恢复矩阵待W1b | 原生事件codec落临时文件/重放、TE→TU、inferred→retire→late TU已验证；deferred回调/写盘失败/实际重启随实现验证 | W1第二部分；字段已写回4.1，不阻塞已完成W1a |
+| Q1 费用后补 | 最小codec/真实Engine探针已通过，CID v2保留费用来源；普通入口现可显式配native cache，A07最终报告仍未完成 | 原生事件codec、TE→TU、inferred→retire→late TU及已记录故障已验证；全量跨进程恢复仍按R矩阵验收 | W1第二部分及W6，费用摘要不等于native PnL后补 |
 | Q2 动态Instrument | 原生DataEngine/Actor探针及主审复跑通过，接口/去重缺口已写入4.3 | subscribe_instrument/on_instrument；cache先替换，重复/倒序也回调，策略必须保留last-good | W3动态swap |
-| Q3 重启归属 | 14项native/真实adapter/独立进程实验已通过，支持矩阵和最小原生cache选择写入W6 | reports-only丢owner、双claim不支持；完整事件+显式索引可重建，订单对象独自不能恢复Position；真实后端和普通策略release仍未验收 | W6a–c；Q3不等于R01–R06 |
-| Q4 共账户NETTING | venue净仓和strategy视图可能不同 | 同node Maker/Taker相反fill，检查cache各视图、report reconciliation、共享lane | W7 |
+| Q3 重启归属 | 14项native/真实adapter/独立进程实验已通过，支持矩阵和最小原生cache选择写入W6 | reports-only丢owner、双claim不支持；完整事件+显式索引可重建，订单对象独自不能恢复Position；后续W6仅已认证干净后端load及列明恢复类别 | W6a–c；Q3不等于R01–R06 |
+| Q4 共账户NETTING | 5项真实native双owner/Bitfinex mass探针已通过；owner保留，native单报告True不能替代数量门，venue剩余均价不等于虚拟仓加权价 | 合成+2/-2、+3/-1及不同成交价，重复核对事件/索引；不包含普通共跑或共享lane | W7设计边界已固定，J01–J05仍待实现 |
 | Q5 动态margin映射 | 已认证原ZIP及两端callee，2,000组normalized向量通过；原BFX flat producer存在除零，迁移政策/venue字段接线待固定 | flat/反向持仓/接近margin目标三组输入；不以normalized flat冒充原脚本可空仓启动，只补现有只读查询所缺字段 | W5动态容量 |
-| Q6 普通终态补偿 | W4a–c已验证规定触发下的普通composition；Maker未发cancel且order/trade全丢的主动发现、完整启停仍待探针 | 复用原生open-order/query能力先验证；不新增轮询服务、不把native布尔值或组件停止当完整恢复证明 | W4/W6 |
+| Q6 普通终态补偿 | W4a–d已验证规定触发下普通composition及Maker工作单漏消息发现；在线drain现接普通node停止，跨进程完整矩阵仍未通过 | 复用原生open-order/query和一个现有Actor，不新增轮询服务，不把native布尔值或干净停止当突崩恢复证明 | W4/W6 |
 
 每项只实现一组最小离线实验，结果写回对应设计段后再扩展功能。失败保留反例并只修相关方案，不把失败升级成重建平台。不能没有探针结论就宣称全功能已规划成“若干行即可”。
 
@@ -718,6 +720,32 @@ EA 改动额外执行现有 `tools/mt5_source_manifest.sh --lines`、MetaEditor 
 停点规则：代码可继续本地实现并合并已验证独立包；未决外部事实只阻塞相关 live 阶段。出现交易结果 UNKNOWN，停止增加风险，保留义务并只做有界核对；未证实根因不重复同一 canary。源码错误先离线复现修复，再用一个新运行验证，不靠反复重试碰绿。
 
 ## 10. 完成定义与当前进度
+
+### 收尾安排（2026-09-06，全量复盘后由用户确认继续）
+
+当前实现基线 `799b472`。以下四个交付包重新组织既有 W1–W9 的剩余工作，不新增目标、不废除原验收矩阵；小步提交保留，验收单位改为普通入口可用的完整能力，不继续用内部小包数代替交付完成。
+
+1. **普通入口与完整启停恢复（W6 + W8 入口部分）**：Maker/Taker 共用薄入口、凭据加载和运行生命周期，保留原 Taker CLI；显式可选 native Redis 配置接入普通运行。离线 validate 不连接 Redis/venue、不读取凭据、不执行恢复；rehearsal 不启动策略或业务恢复 Actor、不修改业务暂停。普通 stop 在执行连接在线时停止新源准入、撤本策略源单并核对、继续已确认的 hedge，完成或到预算后才调用 native stop/dispose；信号和显式 node stop 共用路径。成功表示义务已收束，不要求已有已对冲仓位归零；未知或未完返回清楚的未完成结果并保留原持久事实。其余必交：Maker 合格余腿、明确零成交拒单的有界新 ID 尝试、旧 HOLD 诊断/恢复出口，以及安装后普通入口的真实进程 R01–R06。不得把入口接线、干净 Redis load 或停止函数单测当整包通过。
+2. **同节点共账户（W7）**：先完成下述 Q4 固定原生边界，再复用一个节点、每 venue 一组客户端、现有业务 owner/协调器补共享额度与完整计划执行 lane；J01–J05 全部通过才开放 both。分别可运行是阶段成果，不以延期 W7 冒充完整迁移。
+3. **可安装和可解释的产物（A07 + W8）**：显式 FX 最终费用/PnL 报告、fresh wheel/sdist 仓库外验证、脱敏配置与当前启停恢复说明；专项探针复用正式运行路径。EA 两终端互斥和规模/延迟测量给出实测容量准入，只有测量反例才触发容量或协议修改，不新建部署/会计平台。
+4. **冻结候选、有限 DEMO 与发布（W9）**：当前匹配版本按普通 Taker、Maker、both 验收连续加仓、反向、持仓重启、拒单及停止；允许测试阈值但不覆盖正式策略算法。预算按原 W9，真实跨日另验，平仓只作为明确的场景收尾。按依赖边界整理 PR；本地实现和提交不自动授权推送/合并/部署或恢复 canary。
+
+第一包当前实施顺序：先把正常入口和在线停止接成一个可验证的生命周期，同时跑 Q4；再补既定恢复类别和真实进程中断矩阵。生产仅增加必要的共用入口/薄 native node 停止扩展和策略停止准入标记，不替换 Nautilus 引擎，不另存订单日志，不用取消 asyncio 任务冒充撤单确认。停止超时与旧 HOLD 不自动清除；残差原样报告，不通过清仓或改状态凑成功。未完成的恢复类别继续明确列为未认证。
+
+入口的 rehearsal 是无交易、无策略业务恢复的连接核对，不是所有文件零写：adapter 查询可保存 CID 最终费用观测，显式 native cache 也可写入原生对账事实。启动前移除策略及业务恢复 Actor，业务 store 字节和原暂停保持不变；只有 validate 保证不连接数据库/venue、不读凭据。停止预算由普通 profile 显式配置为有限正数，默认10秒；通过薄 `TradingNode.stop_async` 扩展共用 signal/显式 stop 并去重，已有 canary 特殊组合不据此升级验收。停止期间只封新 source/改单，正常 fill/terminal/hedge 回调保持在线；不因缺行情而重复下单，不改 UNKNOWN/旧 HOLD，不为正常退出持久制造一个新的永久 HOLD。最终结果区分收束完成、残差、未决ID和停止错误，缺少结果不得宣称 `PAPER_STOPPED`。
+
+**Q4 固定实验**：仅新增 `tests/test_shared_account_native.py`，使用真实 native 两 StrategyId/NETTING 引擎和现有 Bitfinex adapter/FakeRest。验证 +2/-2 对 venue flat、+3/-1 对 venue +2 的完整 mass/reconciliation 及重复执行；比较各 owner 的 PositionId/数量/价格、订单与仓位事件 UUID、TradeId、索引和零新增发单。另保留 venue 数量冲突（adapter 拒绝与 native 单独返回值区别）、不同成交价格的虚拟仓加权价不等于 venue 实际剩余仓均价两个边界。实验不连接 transport/账户、不启持久服务、不改生产。结论只固定 W7 最小设计，不提前验收共跑或双方下一机会。
+
+**本轮实现与验证（2026-09-06，修订冻结全量与独立复核通过）：**
+
+- 原 Taker 入口提取共用 profile/生命周期，新增19行 Maker CLI wrapper；两者显式接 native cache 与 stop 预算。validate 不构造数据库；rehearsal 移除策略及原恢复 Actor。修复两个实际反例：仅移除策略仍留下业务恢复 Actor，以及 runner 返回但无 drain 结果仍报成功。旧 Taker CLI、paper 身份约束及专项 canary 分工保留。
+- 一个180行 native node 停止扩展先封新源、单次撤已知源单、等在线回调并推进既有 hedge，后调用原生停止；信号、重复 stop 和被取消的等待者共用一次过程。两策略实际普通 node.run_async + 双 adapter 合成 IO 已覆盖撤单竞态成交→hedge→断连，持仓不强制归零。独立反例进一步修复旧 Maker 外因 freeze 被清除、暂停发布失败闩锁遗漏，以及 native stop 报错/取消后成功结果未作废；只接受本入口/在线停止范围，不认证同实例重新 start 或突崩恢复。
+- 定向入口55项、生命周期及独立反例16项通过；Q4五项通过，主agent复跑 Q4/Q3 共19项并核查真实 owner/量价边界。独立 reviewer 给出本切片 RECOMMEND-ACCEPT。中途普通 node 测试误用 wait_for 的4秒等待取消了原生队列，而 drain 预算为10秒；改为有界、不取消的等待，保留生产预算与原行为断言，不将夹具取消计作生产提前成功。
+- 首轮全量未完成：旧 cache 接线测试仍 monkeypatch 原 TradingNode 构造器，被新子类绕过后尝试虚构 offline.invalid 数据库，native 构造器卡住。保留系统采样证据后终止本测试进程，仅修 fixture 返回子类及两个构造拦截点；原四参数 cache/owner/准入/OMS/无写入断言和 one-shot 拒绝断言均保留，独立核查无其它遗漏。修订 cache + 生命周期三文件 **75 passed / 6.66s**；中断全量及当时 import 排序错误均不计通过。
+- 第二轮完整结果为 **30 failed / 2765 passed / 130既有Pandas警告 / 449.75s**，不计验收：30项均为绕过真实构造器的旧 Maker/Taker 测试对象缺 `_draining`。单文件/小组合独立复现后，仅在四个既有测试文件共九处初始化False，真实两策略构造器本已初始化，不将生产改成隐式缺省、不改任何原断言。主agent修订七文件 **404 passed / 72既有警告 / 8.47s**、Ruff、Mypy104文件通过；独立 Maker207项及 Taker122项通过，确认所有补丁均为夹具形状兼容。生产字节不变，再使用新临时Redis进行全量。
+- fresh wheel/sdist 各自独立环境、仓库外、无 PYTHONPATH，22次 CLI help、4次离线模拟、2次 pip check 通过；44个生产模块与源码/两安装逐字节一致，主agent另独立各复跑一个模拟并取得预期数量。初始 sdist 混入本机 .git 指针，仅增排除规则修复，无依赖变动；旧产物保留为未验收。临时证据位于 `/tmp/py000-install-check-lDdhjv`。已验证 wheel SHA256 为 `f085cd869d81ef66ea3f23d9c05fb074512c851edc142c89fc27d369fb8d56ed`；最终 sdist 随本文收口重建，内容及派生 wheel 同一性以旁置 `final-artifact-manifest.json` 为准，不能用旧源码包代表最终字节。此证据仅限本机 Python3.12/macOS arm64，不等于发布、EA 原生验收或 DEMO。
+- 主agent最终新后端全量 **2795 passed / 130既有Pandas警告 / 449.98s**，两项真实Redis跨进程测试均实际执行、无skip；Ruff与Mypy104文件通过。17份改动源码/测试及pyproject测前后SHA不变。本轮两个任务专用临时容器 `254234226ee6`、`2383a2ea519d` 均已停止，自动清除仅供测试的合成数据后复查为空；未动既有服务或账户。全量含既有模拟fixture的原生日志，不据绿色宣称完整突崩/同实例重启已认证。
+- 本次接受普通入口/在线停止、Q4技术前置和上述安装边界，按约定仅形成本地检查点；没有推送、部署、连接交易账户或发单。第一交付包仍需 Maker 合格未绑定余腿、明确零成交拒单恢复、旧 HOLD 诊断出口及真实进程R矩阵；W6/W7/W8/W9父项继续未完成，不再增加新目标或继续微阶段编号。
 
 三种结论必须区分：
 
@@ -781,8 +809,11 @@ EA 改动额外执行现有 `tools/mt5_source_manifest.sh --lines`、MetaEditor 
     - [x] W6b8：本次receipt合格的普通Taker只续做原义务中未绑定的剩余腿，保留完整旧成交/计划/IDs，未完期间新source仍受阻；冻结全量2697项含真实Redis及独立复核通过。旧HOLD、Maker旧freeze、已绑定未决/拒单和突崩矩阵不在本包放行。
     - [x] W6b9：现有Maker owner增加单一持久cycle-only来源，仅新来源合格且全成交的周期暂停可由原启动核验收尾；外因/旧格式不猜测、未绑定腿仍HOLD，冻结全量2737项含真实Redis及独立复核通过。不认证未发布外因的跨重启窗口或突崩/在线drain。
   - [ ] W6c 执行通道在线时drain、进程重启/停止矩阵R01–R06。
+    - [x] 普通Maker/Taker信号及显式停止在线drain：完成/超时/旧HOLD/失败结果边界、实际普通node双adapter路径与独立反例通过；冻结全量2795项通过。R01–R06和同实例重新start不由本项认证。
 - [ ] W7 同节点共账户。
+  - [x] Q4 双owner原生NETTING、数量冲突及venue/虚拟均价区别五项通过；保留原生归属设计，不认证共享额度/lane及both运行。
 - [ ] W8 入口/安装/文档/原生运行边界。
+  - [x] 共用普通入口、Maker CLI及显式native cache/stop配置；wheel/sdist干净安装的全部CLI help与两离线模拟通过。脱敏现场配置、完整运维/费用报告和EA原生边界仍待验收。
 - [ ] W9 有限 DEMO 连续验收。
 
 首次实施从 W1 的原生费用反例和 W2 的完整快照/拒绝分类开始；不继续旧 v4 canary，不先重构整仓。

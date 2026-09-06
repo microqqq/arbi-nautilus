@@ -257,6 +257,7 @@ def test_book_decision_captures_now_once_for_freshness_and_swap_day(
         return CarryConfig()
 
     harness = SimpleNamespace(
+        _draining=False,
         _config=SimpleNamespace(
             source_instrument_id=SOURCE_ID,
             hedge_instrument_id=HEDGE_ID,

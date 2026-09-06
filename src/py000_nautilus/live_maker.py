@@ -30,6 +30,7 @@ from py000_nautilus.bitfinex_v1_execution import (
 )
 from py000_nautilus.config import MakerStrategyConfig
 from py000_nautilus.live_cache import native_cache_config, validate_native_cache
+from py000_nautilus.live_lifecycle import DrainingTradingNode, validate_stop_timeout
 from py000_nautilus.live_runtime import SourceTerminalReconciler, bind_live_account_reader
 from py000_nautilus.maker_store import maker_legacy_paths, maker_state_path
 from py000_nautilus.mt5_v1_data import (
@@ -85,9 +86,11 @@ def build_live_maker_node(
     cache_database: DatabaseConfig | None = None,
     loop: asyncio.AbstractEventLoop | None = None,
     connection_timeout_seconds: float = 10.0,
+    stop_timeout_seconds: float = 10.0,
     strategy_factory: MakerStrategyFactory = MakerStrategy,
 ) -> tuple[TradingNode, MakerStrategy]:
     """Build without trading connections; an explicit cache database connects on construction."""
+    validate_stop_timeout(stop_timeout_seconds)
     _validate_composition(
         bitfinex_data_config,
         bitfinex_exec_config,
@@ -98,7 +101,7 @@ def build_live_maker_node(
     if connection_timeout_seconds <= 0:
         raise ValueError("live Maker connection timeout must be positive")
 
-    node = TradingNode(
+    node = DrainingTradingNode(
         config=TradingNodeConfig(
             trader_id=LIVE_MAKER_TRADER_ID,
             cache=native_cache_config(cache_database),
@@ -171,6 +174,8 @@ def build_live_maker_node(
             source_quote_refresh_paused=lambda: reconciler.busy,
         )
         node.trader.add_strategy(strategy)
+        if strategy_factory is MakerStrategy:
+            node.bind_strategy_drain(strategy, timeout_seconds=stop_timeout_seconds)
         strategy.bind_restart_gate(lambda: reconciler.restart_pending)
         native_history = False
         if cache_database is not None:

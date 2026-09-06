@@ -104,6 +104,7 @@ class MakerStrategy(Strategy):
         self._config = config
         self._live_submission_ready = live_submission_ready
         self._restart_gate: Callable[[], bool] | None = None
+        self._draining = False
         self._hedge_quantity_ready = hedge_quantity_ready
         self._live_costs_from_adapters = live_costs_from_adapters
         self._source_terminal_query = source_terminal_query
@@ -235,6 +236,7 @@ class MakerStrategy(Strategy):
             self.log.error(f"Maker account evaluation failed with {type(exc).__name__}")
 
     def on_start(self) -> None:
+        self._draining = False
         self._stale_timer_loop = (
             asyncio.get_running_loop() if isinstance(self.clock, LiveClock) else None
         )
@@ -278,6 +280,18 @@ class MakerStrategy(Strategy):
             self.subscribe_funding_rates(self._config.source_instrument_id)
         self.subscribe_instrument_status(self._config.hedge_instrument_id)
 
+    def begin_drain(self) -> None:
+        """Freeze quote creation/maintenance, not existing fill or hedge processing."""
+        self._draining = True
+        for name in self._stale_timer_names.values():
+            if name in self.clock.timer_names:
+                self.clock.cancel_timer(name)
+        self._stale_timer_names.clear()
+
+    def continue_drain(self) -> None:
+        self._submit_next_pending_hedge()
+        self._try_release_cycle()
+
     def on_stop(self) -> None:
         self._source_terminal_stopped = True
         self._source_terminal_generation += 1
@@ -289,7 +303,7 @@ class MakerStrategy(Strategy):
             self.msgbus.unsubscribe(topic, self._on_account_update)
         self._account_topics = ()
         self._account_loop = None
-        if _restart_blocked(self):
+        if _restart_blocked(self) or self._draining:
             return
         for direction in _DIRECTIONS:
             self._cancel_working(direction, reason="strategy stop")
@@ -309,7 +323,7 @@ class MakerStrategy(Strategy):
         self._evaluate_quotes()
 
     def _evaluate_quotes(self) -> None:
-        if _restart_blocked(self):
+        if _restart_blocked(self) or self._draining:
             return
         source_tick = self.cache.quote_tick(self._config.source_instrument_id)
         hedge_tick = self.cache.quote_tick(self._config.hedge_instrument_id)
@@ -808,7 +822,7 @@ class MakerStrategy(Strategy):
         return replace(quote, source_price_usdt=price)
 
     def _submit_source(self, quote: MakerQuote) -> None:
-        if _restart_blocked(self):
+        if _restart_blocked(self) or self._draining:
             return
         instrument = self._required_source_instrument()
         side = OrderSide.BUY if quote.direction is SourceDirection.LONG else OrderSide.SELL
@@ -997,7 +1011,7 @@ class MakerStrategy(Strategy):
         return True
 
     def _requote(self, order: Order, desired: MakerQuote) -> None:
-        if _restart_blocked(self):
+        if _restart_blocked(self) or self._draining:
             return
         if cast(bool, order.is_pending_update) or cast(bool, order.is_pending_cancel):
             return
@@ -1153,6 +1167,8 @@ class MakerStrategy(Strategy):
             )
 
     def _schedule_stale_timer(self, direction: SourceDirection, order_id: str) -> None:
+        if self._draining:
+            return
         previous = self._stale_timer_names.pop(direction, None)
         if previous is not None and previous in self.clock.timer_names:
             self.clock.cancel_timer(previous)
@@ -1208,7 +1224,7 @@ class MakerStrategy(Strategy):
         self._on_stale_timer(event)
 
     def _on_stale_timer(self, event: TimeEvent) -> None:
-        if _restart_blocked(self):
+        if _restart_blocked(self) or self._draining:
             return
         target = _maker_timer_target(
             cast(str, event.name),
@@ -1458,6 +1474,8 @@ class MakerStrategy(Strategy):
     def _try_release_cycle(self) -> bool:
         if _restart_blocked(self):
             return False
+        if self._draining and not self._state_store.cycle_freeze_only:
+            return False  # Stopping is not an operator recovery action for an external HOLD.
         if not self._state_store.clear_source_freezes():
             return False
         self._source_hold = False

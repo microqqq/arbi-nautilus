@@ -51,6 +51,7 @@ from py000_nautilus.live_cache import (
     native_cache_config,
     validate_native_cache,
 )
+from py000_nautilus.live_lifecycle import DrainingTradingNode
 from py000_nautilus.live_runtime import SourceTerminalReconciler
 from py000_nautilus.maker_store import MakerStateStore
 from py000_nautilus.models import BusinessOrderSide, SourceDirection
@@ -503,9 +504,11 @@ def test_builder_forwards_native_config_and_gates_only_new_source(
     captured: list[TradingNodeConfig] = []
     built: list[TradingNode] = []
 
-    def offline_node(*, config: TradingNodeConfig, loop: asyncio.AbstractEventLoop) -> TradingNode:
+    def offline_node(
+        *, config: TradingNodeConfig, loop: asyncio.AbstractEventLoop,
+    ) -> DrainingTradingNode:
         captured.append(config)
-        node = TradingNode(config=struct_replace(config, cache=None), loop=loop)
+        node = DrainingTradingNode(config=struct_replace(config, cache=None), loop=loop)
         built.append(node)
         return node
 
@@ -525,7 +528,7 @@ def test_builder_forwards_native_config_and_gates_only_new_source(
         return validate_native_cache(cache, trader_id=trader_id, strategy_id=strategy_id,
                                      routes=routes)
 
-    monkeypatch.setattr(module, "TradingNode", offline_node)
+    monkeypatch.setattr(module, "DrainingTradingNode", offline_node)
     monkeypatch.setattr(module, "validate_native_cache", verify)
     loop = asyncio.new_event_loop()
     builder = module.build_live_taker_node if kind == "taker" else module.build_live_maker_node
@@ -698,7 +701,7 @@ def test_one_shot_rejects_database_before_any_node_is_constructed(
     def forbidden(**_kwargs: object) -> None:
         pytest.fail("one-shot database rejection must precede node construction")
 
-    monkeypatch.setattr(live_taker, "TradingNode", forbidden)
+    monkeypatch.setattr(live_taker, "DrainingTradingNode", forbidden)
     configs = taker._configs(tmp_path)
     with pytest.raises(ValueError, match="one_shot execution cannot use"):
         live_taker.build_live_taker_node(

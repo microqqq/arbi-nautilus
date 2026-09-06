@@ -2247,6 +2247,7 @@ def test_maker_fresh_hedge_quote_retries_pending_leg_exactly_once(
     harness = SimpleNamespace(
         _config=config,
         _state_store=owner,
+        _draining=False,
         _stores=stores,
         _hedges=hedges,
         cache=SimpleNamespace(
@@ -2506,6 +2507,7 @@ class _ModifyInstrument:
 
 class _ModifyHarness:
     def __init__(self, state_prefix: Path) -> None:
+        self._draining = False
         self._config = _maker_strategy_config(state_prefix)
         self.modified: list[dict[str, Any]] = []
 
@@ -2705,6 +2707,7 @@ class _TimerCache:
 
 def test_each_side_replaces_instead_of_accumulating_stale_timers(tmp_path: Path) -> None:
     harness = SimpleNamespace(
+        _draining=False,
         _stale_timer_names={},
         _live_costs_from_adapters=False,
         _live_account_reader=None,
@@ -2766,6 +2769,7 @@ class _StopHarness:
     _live_account_reader = None
 
     def __init__(self) -> None:
+        self._draining = False
         self._live_costs_from_adapters = False
         self._source_terminal_stopped = False
         self._source_terminal_generation = 0
@@ -3362,6 +3366,7 @@ class _LiveQuoteGateHarness:
         MakerStrategy._evaluate_quotes(cast(Any, self))
 
     def __init__(self, state_prefix: Path, *, now_ns: int) -> None:
+        self._draining = False
         self._config = _maker_strategy_config(state_prefix)
         source = _source_instrument()
         hedge = _hedge_instrument()
@@ -3488,6 +3493,7 @@ class _QuoteGateHarness:
         MakerStrategy._evaluate_quotes(cast(Any, self))
 
     def __init__(self, state_prefix: Path, *, blocked: bool, fresh: bool) -> None:
+        self._draining = False
         self._config = _maker_strategy_config(state_prefix)
         self.cache = _QuoteCache()
         self.blocked = blocked

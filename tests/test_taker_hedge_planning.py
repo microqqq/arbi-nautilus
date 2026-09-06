@@ -122,6 +122,7 @@ class _SubmitHarness:
         one_shot: bool = False,
         hedge_must_reduce_only: bool = False,
     ) -> None:
+        self._draining = False
         hedge = _hedge_instrument()
         self._config = SimpleNamespace(
             source_instrument_id=_source_instrument().id,

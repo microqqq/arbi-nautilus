@@ -1,7 +1,7 @@
 # py000-nautilus
 
-Minimal first-stage migration of the active PY000 Taker and Maker strategies to
-NautilusTrader 1.231.0. Both are thin Nautilus `Strategy` implementations using
+Migration of the active PY000 Taker and Maker strategies to
+NautilusTrader 1.231.0. Both are Nautilus `Strategy` implementations using
 native limit orders, order/fill events, clock custody, cache, portfolio,
 execution routing, and `BacktestEngine`.
 
@@ -19,9 +19,11 @@ uv run py000-sim
 uv run py000-maker-sim
 ```
 
-The simulations and tests use no credentials and contact no live endpoints. A
-persisted unresolved source or hedge submission stops new source orders until an
-operator reconciles it.
+The simulations and tests use no credentials and contact no live trading endpoints.
+The opt-in native-cache tests use a disposable local Redis. Persisted unresolved
+source or hedge submissions block new source risk; only explicitly supported,
+fully evidenced startup recovery can release that pause. Other HOLD/UNKNOWN
+states remain for diagnosis, never deletion of state to unlock trading.
 
 ## Explicit Maker state migration (offline)
 
@@ -152,16 +154,18 @@ Bitfinex source leg, Maker maintains `LIMIT` + `GTC` + post-only source quotes, 
 MT5 hedge legs submit `MARKET` + `FOK` to match the currently verified adapter. They are
 not yet deployed. A thin, offline-buildable Taker composition now binds the four existing
 Bitfinex/MT5 data and execution clients with explicit account and venue routes. The
-`py000-taker-live` entry point validates that composition offline by default. Its explicit
-`--rehearse` mode reads only the three `BFX_TEST_*` values and connects after removing the
-strategy, so it can exercise bounded adapter startup/reconciliation without submitting or
-canceling an order. Its mutually exclusive `--run-paper` mode accepts only the bound Bitfinex
-paper symbol, wallet, and account, keeps the existing Taker strategy attached, and runs until a
-signal or normal node stop. Maker now has an offline-buildable live composition but no runnable entry point.
+`py000-taker-live` and `py000-maker-live` entry points share configuration, credential loading,
+and lifecycle code. Default validation is offline, including when the profile specifies a
+cache database. Explicit `--rehearse` reads the three `BFX_TEST_*` values and connects after
+removing the strategy and business recovery Actor: it neither trades nor recovers business
+state. Adapter observations, including CID fees and explicit native-cache writes, are permitted;
+rehearsal is not a promise that every local file remains unchanged. Mutually exclusive
+`--run-paper` requires the bound Bitfinex paper symbol, wallet, and account and runs the ordinary
+strategy until a signal or explicit node stop. Neither command is the canary subclass.
 The live MT5 account and configured magic must be dedicated to this node so an external position
 change cannot invalidate the preflight between a Bitfinex submission and its fill.
 
-## Taker startup and costs
+## Ordinary startup and costs
 
 Live costs stay inside the venue boundaries already owned by Nautilus. The Bitfinex data client
 subscribes to `status` with `deriv:<symbol>` and publishes `NEXT_FUNDING_ACCRUED` as a native
@@ -192,16 +196,27 @@ Offline validation builds and disposes the node without reading `.env` or openin
 
 ```bash
 uv run py000-taker-live --profile /path/to/taker-profile.json
+uv run py000-maker-live --profile /path/to/maker-profile.json
 ```
 
 `--rehearse` is an explicit authenticated network action, but still starts no strategy. It proves
 only adapter connection, reconciliation, portfolio initialization, and clean shutdown—not live
 strategy readiness.
 
-`--run-paper` is an authenticated paper-only action and is not an unattended daemon or production
-deployment. The entry point does not clear or rewrite HOLD, submit recovery orders, or auto-close
-positions; restart or cancel uncertainty remains on HOLD for manual review. The first attached soak
-requires separate authorization.
+`--run-paper` is an authenticated paper-only action, not an unattended production deployment.
+The typed profile accepts optional `cache_database` (native Redis `DatabaseConfig`) and
+`stop_timeout_seconds` (finite, in `(0, 60]`, default `10`). With no database, it does not promise
+cross-process native history. Validation deliberately does not test the configured Redis backend.
+Ordinary startup uses the existing evidenced recovery rules, not a blanket clear-HOLD operation.
+
+Normal node/signal stop first closes new source/modify admission while keeping execution and
+fill/terminal callbacks online. It requests each known source cancel at most once and progresses
+only existing confirmed hedge obligations, then calls native stop. It does not flatten an already
+hedged position. `PAPER_STOPPED` requires a completed drain result; `PAPER_INCOMPLETE` exits nonzero
+with pending IDs/reasons and residuals. A timeout, old external HOLD or failed pause publication
+cannot be reported as success. Keep retained state for diagnosis; don't rerun blindly or delete it.
+Current-code finite DEMO, the remaining startup recovery cases and abrupt-process boundaries
+are still pending qualification. No automatic canary is enabled by installing the command.
 
 The attached cap-bound Taker-paper EA candidate defaults to build ID
 `py000-mt5-ea-v1-taker-paper` and `InpMaxOrderLots=0.02`. Its six-source manifest is
@@ -351,13 +366,16 @@ cache for each account/mode: loaded accounts, instruments, owners and execution-
 must match the single-strategy composition, otherwise construction fails without clearing data.
 An unfilled MT5 reduce-only order must retain its exact-close position index; Bitfinex NETTING
 reduce-only orders do not require an MT5-style ticket index.
-The existing profile/CLI format does not expose this option yet.
+Both ordinary profiles expose this option. `--run-paper` and `--rehearse` pass it to the native
+builder; default offline validation checks its configuration but does not connect the backend.
 
 Native Redis writes and fresh-process loads have offline integration coverage, including
 partial fills, the MT5 identifier and pending exact-close index, fee provenance and duplicate
 TradeIds. This is **not** automatic strategy recovery: loading historical orders or positions
 keeps new-source admission closed with `restart reconciliation is pending`. Joining the venue
-facts and business obligations, abrupt-crash consistency and live stop/drain remain W6 work.
+facts and business obligations is implemented for the recorded startup categories, not every
+HOLD or rejected order. Online drain is wired to ordinary node stop; abrupt-crash consistency,
+the remaining recovery categories and current-account qualification remain W6/W9 work.
 No Redis service is installed or managed by this package.
 
 The opt-in integration test requires a **fresh disposable local Redis**, used only for synthetic
@@ -489,10 +507,10 @@ instrument ticks, rather than claiming executable callee provenance.
 
 It does **not** establish complete oracle or live parity. The current remediation
 checkpoints cover dynamic venue margin and ordinary Maker/Taker continuous execution
-through the two execution adapters with offline venue I/O. Taker has `--run-paper`;
-Maker has the ordinary composition but still lacks a dedicated live entry point.
-Cold-cache restart ownership, complete stop/drain, shared-account operation and
-current-code DEMO acceptance remain unfinished. See the implementation plan for
+through the two execution adapters with offline venue I/O. Both ordinary entries expose
+`--run-paper`, optional native persistence, and online drain before native stop.
+Complete process-crash recovery, shared-account operation and current-code DEMO
+acceptance remain unfinished. See the implementation plan for
 the exact accepted boundaries; these are not live-readiness claims.
 
 The following is the **historical 2026-09-03 initial checkpoint**, not the current

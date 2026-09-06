@@ -264,6 +264,7 @@ class _StopHarness:
     _account_topics: tuple[str, ...] = ()
 
     def __init__(self, active: str, *, fail_cancel: bool = False) -> None:
+        self._draining = False
         self.state_store = _StopStore(active)
         self.cache = _StopCache(active)
         self.canceled: list[_WorkingOrder] = []

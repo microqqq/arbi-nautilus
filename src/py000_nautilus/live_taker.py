@@ -26,6 +26,7 @@ from py000_nautilus.bitfinex_v1_execution import (
 )
 from py000_nautilus.config import TakerStrategyConfig
 from py000_nautilus.live_cache import native_cache_config, validate_native_cache
+from py000_nautilus.live_lifecycle import DrainingTradingNode, validate_stop_timeout
 from py000_nautilus.live_runtime import SourceTerminalReconciler, bind_live_account_reader
 from py000_nautilus.models import SourceDirection
 from py000_nautilus.mt5_v1_data import (
@@ -65,6 +66,7 @@ def build_live_taker_node(
     cache_database: DatabaseConfig | None = None,
     loop: asyncio.AbstractEventLoop | None = None,
     connection_timeout_seconds: float = 10.0,
+    stop_timeout_seconds: float = 10.0,
     one_shot: bool = False,
     allowed_source_direction: SourceDirection | None = None,
     one_shot_expected_source_position: Decimal = Decimal(0),
@@ -77,6 +79,7 @@ def build_live_taker_node(
         raise ValueError("one_shot_close_existing requires one_shot execution")
     if one_shot and cache_database is not None:
         raise ValueError("one_shot execution cannot use a native cache database")
+    validate_stop_timeout(stop_timeout_seconds)
     _validate_composition(
         bitfinex_data_config,
         bitfinex_exec_config,
@@ -98,7 +101,7 @@ def build_live_taker_node(
         ),
     )
 
-    node = TradingNode(
+    node = DrainingTradingNode(
         config=TradingNodeConfig(
             trader_id=LIVE_TAKER_TRADER_ID,
             cache=native_cache_config(cache_database),
@@ -185,6 +188,8 @@ def build_live_taker_node(
             hedge_must_reduce_only=one_shot_close_existing,
         )
         node.trader.add_strategy(strategy)
+        if not one_shot:
+            node.bind_strategy_drain(strategy, timeout_seconds=stop_timeout_seconds)
         strategy.bind_restart_gate(lambda: reconciler.restart_pending)
         native_history = False
         if cache_database is not None:
