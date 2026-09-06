@@ -1443,6 +1443,10 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
         if len(known_positions) > 1 or (
             reduce_only
             and indexed_position != PositionId(cast(str, reserved["position_identifier"]))
+            and not (
+                indexed_position is None and filled and order.status == OrderStatus.FILLED
+                and order.strategy_id.is_external() and order.position_id == journal_position
+            )
         ):
             raise Mt5V1ExecutionError(f"cached MT5 position index conflict: {request_id}")
         status = OrderStatus.FILLED if filled else OrderStatus.REJECTED

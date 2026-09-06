@@ -172,14 +172,19 @@ class SourceTerminalReconciler(Actor):
         self._last_failure: str | None = None
         self._phase = "idle"
         self._restart_recovery: Callable[[], Awaitable[None]] | None = None
+        self._startup_history_present: Callable[[], bool] | None = None
         self._restart_pending = False
 
-    def bind_restart_recovery(self, callback: Callable[[], Awaitable[None]]) -> None:
+    def bind_restart_recovery(
+        self, callback: Callable[[], Awaitable[None]], *,
+        history_present: Callable[[], bool] | None = None,
+    ) -> None:
         """Hold strategy callbacks before start until this bounded recovery succeeds."""
         if self._active:
             raise RuntimeError("restart recovery must be bound before Actor start")
         self._restart_recovery = callback
-        self._restart_pending = True
+        self._startup_history_present = history_present
+        self._restart_pending = history_present is None or history_present()
 
     @property
     def restart_pending(self) -> bool:
@@ -216,6 +221,10 @@ class SourceTerminalReconciler(Actor):
 
     def on_start(self) -> None:
         self._loop = asyncio.get_running_loop()
+        # Native startup reconciliation can import venue history after build.
+        # Actor starts before strategies; use the same existing recovery gate.
+        if self._startup_history_present is not None:
+            self._restart_pending |= self._startup_history_present()
         self._active = True
         self._observed_required = False
         self._next_working_check_ns = 0

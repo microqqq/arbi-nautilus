@@ -15,11 +15,12 @@ import test_live_taker as taker
 from msgspec.structs import replace as struct_replace
 from nautilus_trader.cache.cache import Cache
 from nautilus_trader.config import DatabaseConfig, TradingNodeConfig
+from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.execution.engine import ExecutionEngine
 from nautilus_trader.live.node import TradingNode
 from nautilus_trader.model.currencies import USD
-from nautilus_trader.model.enums import AccountType, OmsType, OrderSide
-from nautilus_trader.model.events import OrderFilled
+from nautilus_trader.model.enums import AccountType, OmsType, OrderSide, PositionAdjustmentType
+from nautilus_trader.model.events import OrderFilled, PositionAdjusted
 from nautilus_trader.model.identifiers import (
     AccountId,
     ClientId,
@@ -40,6 +41,7 @@ from nautilus_trader.test_kit.providers import TestInstrumentProvider
 from nautilus_trader.test_kit.stubs.component import TestComponentStubs
 from nautilus_trader.test_kit.stubs.events import TestEventStubs
 from nautilus_trader.test_kit.stubs.execution import TestExecStubs
+from test_mt5_v1_execution import _closed_external_history
 
 from py000_nautilus import live_maker, live_node, live_taker
 from py000_nautilus.app import _hedge_instrument, _source_instrument
@@ -115,6 +117,104 @@ def _add_position(
     position = Position(instrument, OrderFilled.from_dict(values))
     cache.add_position(position, OmsType.HEDGING)
     return order, position
+
+
+@pytest.mark.parametrize("fault", [None, "rebuilt", "account", "client", "trader",
+                                   "position-index", "business-owner"])
+def test_closed_external_cache_is_not_a_business_identity_exemption(fault: str | None) -> None:
+    async def scenario() -> None:
+        harness, _, closing = await _closed_external_history()
+        cache = harness.cache
+        account, client, trader = harness.client.account_id, harness.client.id, closing.trader_id
+        if fault == "account":
+            account = AccountId("MT5-WRONG")
+        elif fault == "client":
+            client = ClientId("WRONG")
+        elif fault == "trader":
+            trader = TraderId("WRONG-001")
+        elif fault == "position-index":
+            cache.add_position_id(PositionId("999999999"), closing.instrument_id.venue,
+                                  closing.client_order_id, closing.strategy_id)
+        elif fault == "rebuilt":
+            cache.build_index()  # The native loader can reconstruct the missing optional index.
+        business = ({closing.client_order_id.value: StrategyId("OWNED-001")}
+                    if fault == "business-owner" else {})
+        def check() -> bool:
+            return validate_native_cache(
+                cache, trader_id=trader, strategy_id=StrategyId("OWNED-001"),
+                routes={closing.instrument_id: (account, client)}, business_owners=business,
+            )
+        if fault in {None, "rebuilt"}:
+            assert check()
+        else:
+            with pytest.raises(ValueError):
+                check()
+        assert not harness.fake.submit_calls and not harness.fake.close_calls
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("field,value", [("strategy_id", "WRONG-001"),
+                                        ("last_px", "2500.25"), ("commission", "-2.00 USD")])
+def test_external_position_same_event_id_cannot_hide_different_fill(
+    field: str, value: str,
+) -> None:
+    async def scenario() -> None:
+        harness, _, closing = await _closed_external_history()
+        original = harness.cache.position(closing.position_id)
+        instrument = harness.instrument
+        changed = OrderFilled.to_dict(original.events[-1])
+        changed[field] = value
+        position = Position(instrument, original.events[0])
+        position.apply(OrderFilled.from_dict(changed))
+        cache = Cache()
+        cache.add_instrument(instrument)
+        cache.add_account(harness.cache.account(harness.client.account_id))
+        for order in harness.cache.orders():
+            cache.add_order(order)
+        cache.add_position(position, OmsType.HEDGING)
+        cache.update_position(position)
+        cache.build_index()
+        assert cache.check_integrity()
+        with pytest.raises(ValueError, match="external MT5 position history is incomplete"):
+            validate_native_cache(
+                cache, trader_id=closing.trader_id, strategy_id=StrategyId("OWNED-001"),
+                routes={closing.instrument_id: (harness.client.account_id, harness.client.id)},
+            )
+    asyncio.run(scenario())
+
+
+def test_external_adjustment_is_not_a_completed_trade_lifecycle() -> None:
+    async def scenario() -> None:
+        harness, engine, closing = await _closed_external_history()
+        try:
+            original = harness.cache.position(closing.position_id)
+            opening = harness.cache.order(original.opening_order_id)
+            position = Position(harness.instrument, original.events[0])
+            position.apply_adjustment(PositionAdjusted(
+                trader_id=position.trader_id, strategy_id=position.strategy_id,
+                instrument_id=position.instrument_id, position_id=position.id,
+                account_id=position.account_id, adjustment_type=PositionAdjustmentType.COMMISSION,
+                quantity_change=-position.quantity.as_decimal(), pnl_change=None,
+                reason="synthetic non-trade closure", event_id=UUID4(),
+                ts_event=position.ts_last + 1, ts_init=position.ts_last + 1,
+            ))
+            cache = Cache()
+            cache.add_instrument(harness.instrument)
+            cache.add_account(harness.cache.account(harness.client.account_id))
+            cache.add_order(opening)
+            cache.add_position(position, OmsType.HEDGING)
+            cache.build_index()
+            assert cache.check_integrity() and position.is_closed
+            assert len(position.events) == len(position.adjustments) == 1
+            with pytest.raises(ValueError, match="external MT5 history is not closed and bound"):
+                validate_native_cache(
+                    cache, trader_id=closing.trader_id, strategy_id=StrategyId("OWNED-001"),
+                    routes={closing.instrument_id: (harness.client.account_id, harness.client.id)},
+                )
+        finally:
+            await harness.client._disconnect()
+            engine.dispose()
+    asyncio.run(scenario())
 
 
 def test_native_config_is_opt_in_stable_and_non_flushing() -> None:

@@ -36,9 +36,11 @@ from test_adapter_continuity import (
     _settle_cycle,
     _SourceWire,
 )
+from test_mt5_v1_execution import _identity, _snapshot
 from test_strategy_continuity import _OrdinaryStrategy, _pump
 
 from py000_nautilus import store as store_module
+from py000_nautilus.accounting_report import build_run_accounting_report
 from py000_nautilus.app import _source_instrument
 from py000_nautilus.bitfinex_v1_reports import map_position_status_reports
 from py000_nautilus.durability import ParentDirectorySyncError, replace_and_sync_parent
@@ -56,6 +58,76 @@ async def _check(h: _OrdinaryStrategy) -> None:
         source=h.source, hedge=h.hedge,
         source_instrument_id=h.source_instrument.id, hedge_instrument_id=h.hedge_instrument.id,
     )
+
+
+@pytest.mark.parametrize("maker", [False, True], ids=["taker", "maker"])
+@pytest.mark.parametrize("history", ["closed", "open", "opposing-open"])
+def test_cold_native_external_history_is_checked_before_business_admission(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, maker: bool, history: str,
+) -> None:
+    async def scenario() -> None:
+        h = _OrdinaryStrategy(tmp_path, monkeypatch, maker=maker, two_sided=maker,
+                              native_mt5_transport=True, inject_mt5_io=False)
+        snapshot = _snapshot(_identity())
+        snapshot["positions"] = []
+        cast(JsonObject, snapshot["execution_limits"])["max_order_lots"] = "0.02"
+        wire = ContinuousMt5Wire(_identity(), snapshot, now_ns=h.node.kernel.clock.timestamp_ns)
+        h.hedge._transport = wire
+        source = _SourceWire(h)
+        await wire.submit_market_delta(wire.identity.binding(), client_request_id="OLD-OPEN",
+                                       side="buy", quantity_lots="0.02")
+        position = cast(list[JsonObject], wire.current_snapshot["positions"])[0]
+        if history == "closed":
+            await wire.close_position(
+                wire.identity.binding(), client_request_id="OLD-CLOSE", side="sell",
+                quantity_lots="0.02", position_ticket=str(position["ticket"]),
+                position_identifier=str(position["identifier"]),
+            )
+        elif history == "opposing-open":
+            await wire.submit_market_delta(wire.identity.binding(), client_request_id="OLD-SELL",
+                                           side="sell", quantity_lots="0.02")
+        # Only synthetic venue setup above. Ordinary runtime starts with no native orders.
+        wire.submit_calls.clear()
+        wire.close_calls.clear()
+        assert h.node.cache.orders() == []
+        owner = get_source_terminal_reconciler(h.node)
+        assert bool(owner.restart_pending) is False
+        try:
+            h.hedge.connect()
+            async with asyncio.timeout(2):
+                while h.hedge._poll_task is None:
+                    await asyncio.sleep(.005)
+            await h.start(initial_reconciliation=True)
+            await _drive(h, wire, lambda: not owner.busy and (
+                not owner.restart_pending or owner.last_failure is not None
+            ), direction=0)
+            if history != "closed":
+                assert owner.restart_pending, "cold external exposure escaped startup check"
+                assert owner.last_failure is not None
+                assert not owner.source_submission_ready
+                await _market(h, wire, 1)
+                assert not source.rows and not wire.submit_calls and not wire.close_calls
+                return
+            assert not owner.restart_pending, owner.last_failure
+            await _check(h)
+            old = {order.client_order_id: tuple(event.id for event in order.events)
+                   for order in h.node.cache.orders()}
+            cid = await _accepted_source(h, source, wire, 2)
+            source.fill(cid, h.source_quantity)
+            await _settle_cycle(h, source, wire, cid=cid, expected=1)
+            await _check(h)
+            report = build_run_accounting_report(
+                h.node.cache, h.source, h.hedge, trader_id=h.node.trader.id,
+                strategy_id=h.strategy.id, fx=h.strategy.config.economics.fx,
+            )
+            assert report.status == "FINAL", report.pending_reasons
+            assert old == {order.client_order_id: tuple(event.id for event in order.events)
+                           for order in h.node.cache.orders() if order.strategy_id.is_external()}
+            assert len(wire.submit_calls) == 1 and not wire.close_calls
+        finally:
+            await h.hedge._disconnect()
+            await h.close()
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize("fault", [None, "missing", "duplicate", "nonzero", "wrong-side"])

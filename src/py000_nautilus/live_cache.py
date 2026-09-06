@@ -7,10 +7,12 @@ from decimal import Decimal
 
 from nautilus_trader.cache.cache import Cache
 from nautilus_trader.config import CacheConfig, DatabaseConfig
+from nautilus_trader.model.enums import OrderStatus
 from nautilus_trader.model.events import OrderFilled
 from nautilus_trader.model.identifiers import (
     AccountId,
     ClientId,
+    ClientOrderId,
     InstrumentId,
     PositionId,
     StrategyId,
@@ -90,12 +92,15 @@ def validate_native_cache(
         raise ValueError("native cache contains an instrument outside this live composition")
 
     orders, positions = cache.orders(), cache.positions()
+    external_ids = _closed_external_mt5_history(cache, trader_id=trader_id, routes=routes)
     allowed = {strategy_id} if business_owners is None else set(business_owners.values())
     if business_owners is not None and set(business_owners) != {
-        order.client_order_id.value for order in orders
+        order.client_order_id.value for order in orders if order.client_order_id not in external_ids
     }:
         raise ValueError("native cache order set differs from shared business ownership")
     for order in orders:
+        if order.client_order_id in external_ids:
+            continue  # Validated closed venue history is not this strategy's business history.
         route = routes.get(order.instrument_id)
         if (
             route is None
@@ -140,6 +145,8 @@ def validate_native_cache(
                 raise ValueError(f"native cache order position owner differs: {position_id}")
 
     for position in positions:
+        if position.strategy_id.is_external():
+            continue  # Its complete closed lifecycle was checked with the external orders.
         route = routes.get(position.instrument_id)
         if (
             route is None
@@ -155,3 +162,57 @@ def validate_native_cache(
             if opening is None or opening.strategy_id != position.strategy_id:
                 raise ValueError(f"native cache position opening owner differs: {position.id}")
     return bool(orders or positions)
+
+
+def _closed_external_mt5_history(
+    cache: Cache, *, trader_id: TraderId,
+    routes: Mapping[InstrumentId, tuple[AccountId, ClientId]],
+) -> set[ClientOrderId]:
+    """Read-only qualification of NT's unclaimed, completely closed MT5 history.
+
+    Native imported orders may lack account/client/position indexes. The fills
+    must still prove their actual route and exact closed Position, never just a
+    zero aggregate net. Live EA reports remain a separate required check.
+    """
+    external = [order for order in cache.orders() if order.strategy_id.is_external()]
+    expected: dict[PositionId, dict[object, OrderFilled]] = {}
+    for order in external:
+        route = routes.get(order.instrument_id)
+        position = None if order.position_id is None else cache.position(order.position_id)
+        fills = [event for event in order.events if isinstance(event, OrderFilled)]
+        if (
+            route is None or route[1].value != "MT5" or order.trader_id != trader_id
+            or order.status != OrderStatus.FILLED or order.quantity.as_decimal() <= 0
+            or order.filled_qty != order.quantity or len(fills) != 1
+            or order.account_id not in {None, route[0]}
+            or cache.account(route[0]) is None or cache.instrument(order.instrument_id) is None
+            or cache.client_id(order.client_order_id) not in {None, route[1]}
+            or cache.position_id(order.client_order_id) not in {None, order.position_id}
+            or position is None or not position.is_closed or position.adjustments
+            or not position.strategy_id.is_external() or position.trader_id != trader_id
+            or position.instrument_id != order.instrument_id or position.account_id != route[0]
+        ):
+            raise ValueError(
+                f"native external MT5 history is not closed and bound: {order.client_order_id}",
+            )
+        fill = fills[0]
+        if (
+            fill.trader_id != trader_id or fill.strategy_id != order.strategy_id
+            or fill.account_id != route[0] or fill.instrument_id != order.instrument_id
+            or fill.client_order_id != order.client_order_id
+            or fill.position_id != position.id or fill.venue_order_id != order.venue_order_id
+            or fill.order_side != order.side or fill.order_type != order.order_type
+            or fill.last_qty != order.quantity or order.trade_ids != [fill.trade_id]
+        ):
+            raise ValueError(f"native external MT5 fill identity differs: {order.client_order_id}")
+        expected.setdefault(position.id, {})[fill.id] = fill
+    positions = [position for position in cache.positions() if position.strategy_id.is_external()]
+    if {position.id for position in positions} != set(expected) or any(
+        len(position.events) != len(expected[position.id])
+        or {fill.id for fill in position.events} != set(expected[position.id])
+        or any(OrderFilled.to_dict(fill) != OrderFilled.to_dict(expected[position.id][fill.id])
+               for fill in position.events)
+        for position in positions
+    ):
+        raise ValueError("native external MT5 position history is incomplete")
+    return {order.client_order_id for order in external}

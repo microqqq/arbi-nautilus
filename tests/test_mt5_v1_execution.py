@@ -41,6 +41,7 @@ from nautilus_trader.model.identifiers import (
     ExecAlgorithmId,
     InstrumentId,
     PositionId,
+    StrategyId,
     TradeId,
     Venue,
     VenueOrderId,
@@ -3582,6 +3583,91 @@ def test_live_engine_mass_status_fails_on_unknown_and_clears_active_flag() -> No
         assert len(cached.events) == event_count
         assert harness.fake.submit_calls == []
 
+    asyncio.run(scenario())
+
+
+async def _closed_external_history() -> tuple[_Harness, LiveExecutionEngine, Order]:
+    """Let the real native reconciliation import an unowned historical round trip."""
+    identity = _identity()
+    snapshot = _snapshot(identity)
+    snapshot["positions"] = []
+    harness = _Harness(asyncio.get_running_loop(), identity=identity, snapshot=snapshot,
+                       capture_events=False)
+    opening = harness.market(client_order_id=ClientOrderId("EXTERNAL-OPEN-1"))
+    closing = harness.market(client_order_id=ClientOrderId("EXTERNAL-CLOSE-1"),
+                             order_side=OrderSide.SELL, reduce_only=True)
+    events = [_stream_started(identity)]
+    for index, order in enumerate((opening, closing)):
+        reserved = _submission_payload(order)
+        if index:
+            reserved.update(position_identifier="900000002", position_ticket="900000002")
+        terminal = _outcome(identity, order, "order_filled", sequence=3 + 2 * index)
+        cast(JsonObject, terminal["payload"]).update(
+            reserved, venue_order_id=str(700000002 + index),
+            venue_deal_id=str(800000002 + index), venue_position_id="900000002",
+        )
+        events.extend([_event(identity, 2 + 2 * index, "submission_reserved", reserved),
+                       terminal])
+    harness.fake.pages.append(_page(identity, after_cursor="0", events=events))
+    engine = _live_engine(harness, generate_missing_orders=False)
+    await harness.connect()
+    assert await engine.reconcile_execution_state(timeout_secs=1)
+    cached = harness.cache.order(closing.client_order_id)
+    assert cached is not None and cached.is_closed and cached.strategy_id.value == "EXTERNAL"
+    assert cached.position_id == PositionId("900000002")
+    assert harness.cache.position_id(closing.client_order_id) is None
+    assert harness.cache.position(cached.position_id).is_closed
+    return harness, engine, cached
+
+
+@pytest.mark.parametrize("boundary", ["fees", "reconcile", "cache", "complete"])
+def test_native_imported_closed_history_keeps_fee_and_reconciliation_readable(
+    boundary: str,
+) -> None:
+    async def scenario() -> None:
+        harness, engine, closing = await _closed_external_history()
+        before = {order.client_order_id: tuple(event.id for event in order.events)
+                  for order in harness.cache.orders()}
+        if boundary == "reconcile":
+            assert await engine.reconcile_execution_state(timeout_secs=1)
+        elif boundary == "cache":
+            from py000_nautilus.live_cache import validate_native_cache
+            assert validate_native_cache(
+                harness.cache, trader_id=closing.trader_id, strategy_id=StrategyId("OWNED-001"),
+                routes={INSTRUMENT_ID: (harness.client.account_id, harness.client.id)},
+            )
+        elif boundary == "complete":
+            from py000_nautilus.restart_recovery import _complete_orders
+            mass = await harness.client.generate_mass_status()
+            assert mass is not None
+            _complete_orders(mass, harness.cache.orders(), INSTRUMENT_ID)
+        await harness.client._disconnect()
+        if boundary == "fees":
+            assert len(harness.client.raw_commission_cashflows()) == 2
+        assert harness.cache.position_id(closing.client_order_id) is None
+        assert before == {order.client_order_id: tuple(event.id for event in order.events)
+                          for order in harness.cache.orders()}
+        assert not harness.fake.submit_calls and not harness.fake.close_calls
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("field", ["fill_price", "commission", "venue_position_id"])
+def test_imported_external_missing_index_does_not_mask_conflicting_fill(field: str) -> None:
+    async def scenario() -> None:
+        harness, engine, closing = await _closed_external_history()
+        try:
+            payload = cast(JsonObject, harness.client._terminal_events[
+                closing.client_order_id.value
+            ]["payload"])
+            payload[field] = {"fill_price": "2500", "commission": "-2",
+                              "venue_position_id": "900000999"}[field]
+            with pytest.raises(Mt5V1ExecutionError, match="conflict"):
+                harness.client.raw_commission_cashflows()
+            assert harness.cache.position_id(closing.client_order_id) is None
+            assert not harness.fake.submit_calls and not harness.fake.close_calls
+        finally:
+            await harness.client._disconnect()
+            engine.dispose()
     asyncio.run(scenario())
 
 

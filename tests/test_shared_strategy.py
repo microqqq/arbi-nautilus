@@ -318,6 +318,49 @@ class _Joint:
             self.node.kernel.executor.shutdown(wait=True, cancel_futures=True)
 
 
+@pytest.mark.parametrize("closed", [True, False])
+def test_both_cold_start_classifies_imported_external_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, closed: bool,
+) -> None:
+    async def scenario() -> None:
+        h = _Joint(tmp_path, monkeypatch, stop_timeout=.2)
+        await h.wire.submit_market_delta(h.wire.identity.binding(),
+                                        client_request_id="OLD-OPEN", side="buy",
+                                        quantity_lots="0.02")
+        position = cast(list[JsonObject], h.wire.current_snapshot["positions"])[0]
+        if closed:
+            await h.wire.close_position(
+                h.wire.identity.binding(), client_request_id="OLD-CLOSE", side="sell",
+                quantity_lots="0.02", position_ticket=str(position["ticket"]),
+                position_identifier=str(position["identifier"]),
+            )
+        h.wire.submit_calls.clear()
+        h.wire.close_calls.clear()
+        actor = get_source_terminal_reconciler(h.node)
+        assert not actor.restart_pending
+        try:
+            await h.start()
+            await h.until(lambda: not actor.busy and (
+                not actor.restart_pending or actor.last_failure is not None
+            ))
+            if closed:
+                assert not actor.restart_pending, actor.last_failure
+                await h.until(lambda: len(h.venue.rows) == 2, direction=1)
+                for strategy in (h.maker, h.taker):
+                    cid, = h.active(strategy)
+                    h.venue.fill(cid, D(2))
+                await h.settled(2)
+                assert len(h.wire.submit_calls) == 2 and not h.wire.close_calls
+            else:
+                assert bool(actor.restart_pending) is True
+                assert actor.last_failure is not None
+                await h.market(1)
+                assert not h.venue.rows and not h.wire.submit_calls and not h.wire.close_calls
+        finally:
+            await h.close()
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("first", ["maker", "taker"])
 def test_joint_same_tick_both_owners_trade_with_one_lane(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, first: str,

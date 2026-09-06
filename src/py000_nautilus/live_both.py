@@ -230,27 +230,28 @@ def build_live_both_node(
                     maker_config.hedge_instrument_id: (route.account_id, MT5_CLIENT_ID),
                 },
             )
-        if (startup_recovery is not None or has_business_history(owner)
-                or node.cache.orders() or node.cache.positions() or source._cid_store.bindings):
-            receipt = capture_startup_receipt(owner, startup_recovery)
+        receipt = capture_startup_receipt(owner, startup_recovery)
 
-            def retry_check(intent: HedgeIntent, order: Order) -> None:
-                config = (taker_config if any(intent is known
-                                             for known in taker.state_store.intents())
-                          else maker_config)
-                check_rejected_retry_execution(node.cache, hedge, intent, order,
-                                                config=config, data=hedge_data)
+        def retry_check(intent: HedgeIntent, order: Order) -> None:
+            config = (taker_config if any(intent is known
+                                         for known in taker.state_store.intents())
+                      else maker_config)
+            check_rejected_retry_execution(node.cache, hedge, intent, order,
+                                            config=config, data=hedge_data)
 
-            async def recover() -> None:
-                await reconcile_startup(
-                    node.cache, owner, trader_id=LIVE_BOTH_TRADER_ID, strategy_id=maker.id,
-                    source=source, hedge=hedge,
-                    source_instrument_id=maker_config.source_instrument_id,
-                    hedge_instrument_id=maker_config.hedge_instrument_id,
-                    receipt=receipt, rejected_retry_check=retry_check,
-                )
+        async def recover() -> None:
+            await reconcile_startup(
+                node.cache, owner, trader_id=LIVE_BOTH_TRADER_ID, strategy_id=maker.id,
+                source=source, hedge=hedge,
+                source_instrument_id=maker_config.source_instrument_id,
+                hedge_instrument_id=maker_config.hedge_instrument_id,
+                receipt=receipt, rejected_retry_check=retry_check,
+            )
 
-            reconciler.bind_restart_recovery(recover)
+        reconciler.bind_restart_recovery(recover, history_present=lambda: bool(
+            startup_recovery is not None or has_business_history(owner)
+            or node.cache.orders() or node.cache.positions() or source._cid_store.bindings
+        ))
         _verify_built_composition(node, maker, source_data, source, hedge_data, hedge,
                                   other_strategies=(taker,))
     except BaseException:

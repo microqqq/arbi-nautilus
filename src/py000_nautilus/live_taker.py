@@ -160,9 +160,8 @@ def build_live_taker_node(
         if not one_shot:
             node.bind_strategy_drain(strategy, timeout_seconds=stop_timeout_seconds)
         strategy.bind_restart_gate(lambda: reconciler.restart_pending)
-        native_history = False
         if cache_database is not None:
-            native_history = validate_native_cache(
+            validate_native_cache(
                 node.cache,
                 trader_id=LIVE_TAKER_TRADER_ID,
                 strategy_id=strategy.id,
@@ -175,12 +174,7 @@ def build_live_taker_node(
                     ),
                 },
             )
-        if not one_shot and (
-            startup_recovery is not None or native_history
-            or node.cache.orders() or node.cache.positions()
-            or bitfinex_exec._cid_store.bindings
-            or has_business_history(strategy.state_store)
-        ):
+        if not one_shot:
             receipt = capture_startup_receipt(strategy.state_store, startup_recovery)
 
             async def recover_startup() -> None:
@@ -197,8 +191,14 @@ def build_live_taker_node(
                     ),
                 )
 
-            reconciler.bind_restart_recovery(recover_startup)
-            node.kernel.logger.warning("native or business history; restart reconciliation pending")
+            reconciler.bind_restart_recovery(recover_startup, history_present=lambda: bool(
+                startup_recovery is not None or node.cache.orders() or node.cache.positions()
+                or bitfinex_exec._cid_store.bindings or has_business_history(strategy.state_store)
+            ))
+            if reconciler.restart_pending:
+                node.kernel.logger.warning(
+                    "native or business history; restart reconciliation pending",
+                )
         bind_live_account_reader(
             strategy, config=runtime_strategy_config,
             source_data=bitfinex_data, source_client=bitfinex_exec,

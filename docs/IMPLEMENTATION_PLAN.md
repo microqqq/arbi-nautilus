@@ -2,7 +2,7 @@
 
 日期：2026-09-05。设计基线：`7d0d4766c62b98c3e4b950da1d61e789d140e2c5`。
 
-状态：**W1–W8本地实现及下文限定的离线/原生验收收尾；W9当前版本现场验收尚未完成，不能称完整迁移或可上线。** 当前分支为 `codex/audit-remediation`。历史计划和阶段性结果不覆盖后来的反例；最新结果见第10节及 W9。用户已重挂候选EA，时钟窄修后普通无单入口已通过，接下来是有限普通策略成交验收。未推送或恢复旧自动canary。
+状态：**W1–W8本地实现及下文限定的离线/原生验收收尾；W9当前版本现场验收尚未完成，不能称完整迁移或可上线。** 当前分支为 `codex/audit-remediation`。历史计划和阶段性结果不覆盖后来的反例；最新结果见第10节及 W9。用户已重挂匹配EA，普通Taker已有一组完整对冲成交；现场闭合外部历史的费用/重启兼容缺口正按下文窄修，未据单轮成交关闭W9。未推送或恢复旧自动canary。
 
 提交节奏（2026-09-05，按用户本轮要求）：每个可独立验证的小包在测试与独立复核通过后形成本地提交，不是每改一处就提交。此前累积且相互依赖的已验收修复先作为完整检查点提交；之后新包单独提交。提交说明标明实际完成边界，不把W1–W9全部完成作为检查点含义；推送、PR、合并和部署不由本地提交自动触发。
 
@@ -653,6 +653,30 @@ P05 最终原生与loopback证据：两处EA窄修先取得14项中7项失败，
 **06:47 / 时钟窄修完成、普通无单入口通过：** 主 agent 全量 **3131 passed / 133 处既有 Pandas warning / 496.98s**（两项专用 Redis 原生测试包括在内）；聚焦833项、另15项联合控制通过。安装 wheel/sdist 各18项入口/配置/模拟/pip检查通过；安装 wheel 的25项普通恢复进程 **25 passed / 591.02s**，没有skip。Ruff、Mypy123文件、diff-check通过。独立 reviewer 在相同13个生产/测试路径 diff `d3a665ca885ea5d2bf6e23fb04a42eaf291b6bb7111e37645677bc991e2792cd` 上复跑69项通过并给出限定 RECOMMEND-ACCEPT，主 agent 接受此次普通路径窄修。历史 Taker canary 的 session 超时诊断、Maker roundtrip canary 的 arm 附加准入仍是更严格的零未来口径，明确不在本次已统一范围，不扩写这些旧 runner。
 
 06:45:20–06:45:23 四个真实 adapter 均连接，新普通入口最终 `REHEARSED/adapter_startup_rehearsed`、exit0并正常停止；无策略/Actor、无发单，不能当作成交/持仓恢复已验收。两轮前置失败仍保留。此次新 wheel SHA256 `86bac77263e5251cd1e6406813327ebb2d408566d2449ed94675781e3f79d68d`；EA 未变，无需再次重挂。过程证据 `runtime/w9-rehang-20260907-RZEXNQ/`，安装/进程证据 `/tmp/py000-w9-clock-install-YCLALr/`。按步形成一个本地修复提交，不推送；W9成交阶段仍未完成。
+
+**06:50 / 首轮普通 Taker 成交会话（实施前预算）：** 时钟修复已本地提交 `6a885ea`，49模块安装指纹与52个worker/93份观察一致，25份native load事件数为0，25个进程测试Redis均已精确停止清除。当前普通入口前置通过后，在原测试账户/匹配EA上运行安装版 `py000-taker-live --run-paper`，不用canary子类、不改策略或 monkeypatch 发单。独立 profile/业务状态/CID 与专用本机 Redis AOF（always，同账户原生cache；不连接6379、不flush、不删旧状态）保留以供后续原入口重启。
+
+- 本轮最长180秒、最多10个源订单，外部薄观察脚本在第6个源订单或第3个已完成对冲周期即提前 SIGTERM，为停止中的在途事件留余量；完成后实数仍须不超过10，否则本轮不通过。外部观察不替代原策略的单活动源订单/共同净仓准入。
+- 源/对冲各绝对净仓上限2oz，源下单2oz，MT5每条指令≤0.02lot。最大未对冲2oz/20秒；已存在状态HOLD、运行错误或预算到达立即进入原生drain，不自动重新运行。stop_timeout仍10秒，外部90秒最终进程边界。未知结果留存，不重发；不自动强平一个已完整对冲的持仓。
+- 双向阈值沿用已授权测试值-0.005以触发流程；不改变费率、原经济公式、仓位方向或强制每个机会平仓。验收看实际source→hedge、后续周期、费用和停止后两端事实；180秒不冒充30分钟稳定性或跨日验收。此轮结束后先只读核对，再决定下一场景。
+
+**首轮结果与历史边界窄修（实施前记录）：** 普通 Taker 运行 180 秒正常 SIGTERM/drain，无强杀，实际一个 source SELL2oz（243521782667 / trade1969547589）及 MT5 BUY0.02lot（order/position10371046364 / deal10088390492）；约1.65秒完成对冲。06:56:12只读复查源-2oz、对冲+2oz，零活动源单，EA78事件/无未决，业务COMPLETED、无HOLD。完整对冲仓位保留，不称FLAT。最终却是 `PAPER_INCOMPLETE/obligations_settled; accounting_pending`，两项原因为 MT5 history unresolved / coverage incomplete，不能记为W9通过。
+
+- 观察脚本起初只读业务未分配残差，未包含已分配但未完成的 hedge 量；运行中改正计算并另起只读观察器覆盖剩余时间。首周期真实事件时间差证明其在2oz/20秒预算内，但不声称原观察器从启动起完整测量了在途量。以后观察须将未完成义务量计入。
+- EA完整journal为29对预留/终态，无UNKNOWN。native缓存含28笔启动时正常导入的EXTERNAL旧历史和2笔本轮业务订单。原生导入的14笔已成交平仓没有CID→Position副索引，Order/Fill已携带正确PID；普通native重载会仅在内存重建该索引。用实际持久事实的只读索引视图精确复现 `cached MT5 position index conflict: canary-close-20260903T095930Z-88d2be02b5`，不修改真实缓存。重载后手续费逐笔通过，但普通cache准入又因旧EXTERNAL owner不属于当前策略而拒绝；两者是同一历史归属边界遗漏。
+- 窄修只涉及原MT5终态核对、native cache准入、startup核对/业务投影及必要既有测试：已完整成交的EXTERNAL报告允许缺省副索引，必须以Order/Fill/journal的相同PID及完整成交事实证明；非空冲突和未成交exact-close缺索引继续拒绝。仅容纳本组合MT5路由下、原生完整闭合的EXTERNAL订单及其已闭合Position；外部未完成订单、未平仓/错误账户/仪器/Trader或混合业务归属继续拒绝。
+- 全部原生/venue历史仍对照，不按时间/boot丢弃EA记录；只把已核验EXTERNAL历史排除出当前业务义务投影和当前owner收益。保留现有普通cache与2笔真实业务事件，不清Redis、不补写native索引、不领养旧订单、不改变策略、EA、状态schema或原生内核。先真实原生导入闭合历史反例及错误对照，再修复、focused/安装检查/独立复核；此新失败关闭前不启动下一轮发单。完整安装与全量证据随后以新代码身份重取。
+- 独立复核指出build时空cache、native启动对账后才导入外部持仓的窗口；既有恢复回调只在build时发现历史才绑定。窄延伸到三普通builder和现有SourceTerminalReconciler：回调始终可用，在build及Actor启动（原生对账之后、策略启动之前）两处检查是否已有历史，必要时启动同一有界恢复核对。真正无历史的冷启动不增加查询；one-shot原边界不改。回归覆盖Taker/Maker闭合旧历史和开放/双向净量0外部票，以及both同一启动判断；不创建新Actor/持久状态或按行情反复全历史扫描。
+
+**闭合外部历史修订的验证进度：** reviewer先复现仅有开仓成交、以`PositionAdjusted`人工标平仍通过原草案的问题，已增加无adjustment和完整Order/Position逐笔内容相等的要求；不能只靠相同事件UUID集合。最终7生产/4测试路径diff为`356a3a1fcbdfa8025b746a794916b516a76b310d3eee326f1aa110f719511c1d`。原生导入四边界RED、冷启动开放外部票的旧路径RED及adjustment RED均保留。主agent九文件514 passed、全量3157 passed / 133既有Pandas warning / 500.55s（含两项实际Redis，无skip），另15项联合控制通过。独立reviewer同一冻结八文件501 passed / 4既有warning / 160.48s，及原P2、错误副索引、同UUID改内容对照通过，给出限定RECOMMEND-ACCEPT。
+
+安装wheel `dbe7f5d91de8ea60aafd28e134960b49dd46347963e09a4792d039a9177061ac` 与sdist各18项检查通过；新安装版对现场保留30笔native订单及完整EA历史的只读诊断通过，当前owner会计FINAL/无pending，不改真实Redis或业务/CID文件。最初并发启动的进程矩阵有4例在native扩展冷加载的15秒probe期限失败，随即中止，未进入venue worker；失败XML、dyld加载采样及日志保留，不计通过、不延长生产启动期限。4个完成fixture的临时Redis已清理，第5个中断setup遗留的无盘Redis`381752c0d5bb6aacde7beff3a4fa1bc8395f7afe10da396b19288b27f5361e2a`核实后精确停止并移除；实际AOF缓存不动。安装检查完成后另起一次`--maxfail=1`矩阵，使用新证据路径，待其完成后才接受提交和新交易。
+
+**07:43 / 修订验收收束：** 新安装矩阵 **25 passed / 15 deselected / 556.41s**；另15项控制已独立通过，未跳过这部分验收。49生产模块与93份安装后观察完全一致，52个worker PID，25次新进程native load事件数均为0；25个专用Redis全部精确停止且列表复查无遗留。全量前后11路径diff保持`356a3a1f…`，Ruff、Mypy123及diff-check通过。主agent据完整测试、真实保留缓存只读结果和独立RECOMMEND-ACCEPT接受这一窄修，形成本地提交；此前失败轮不改记通过。未发新单、未推送/部署，W9仍不关闭。
+
+**下一次持仓重启场景（实施前预算，须上段验证全部通过）：** 保留同一Taker Trader/Redis AOF、业务文件及CID文件；新profile只把SHORT阈值设1、LONG设-0.02，2oz风险/每次源量及MT5 0.02lot不变，不改变原SHORT-first公式。重新只读确认唯一源-2oz、唯一MT5 BUY2oz票10371046364、零活动源订单及无未决，然后只运行一次新安装版普通`py000-taker-live --run-paper`。目标是经过原恢复门，两个自然LONG机会依次使源-2→0→+2oz、MT5逐票先平旧BUY再开SELL2oz；这不是同向加至4oz的证明。
+
+本轮最长180秒、最多新增10笔源单，新增6笔源单或新增2个COMPLETED义务时提前SIGTERM；停止过程中仍需检查实际新增数≤10。自启动即记录未分配残差加所有未完成hedge余量，最大2oz/20秒，检查完整业务累计源/hedge有符号量各≤2oz；HOLD、未知结果、ERROR或预算触及则进入原drain，不循环重跑。原stop_timeout10秒、外层90秒结束界不变，不自动强平已完整对冲仓位。结束后重新核对实际两端位置、EA完整历史、native和费用，再决定下一场景。
 
 先做不发单连接/对账，再单独 Taker、Maker，最后同节点 both；均使用普通策略。每一轮都事先记录最大时长、最多源订单数、每单/累计净仓上限、最大未对冲量与超时、停止方式，使用已有两测试账户，不申请每一步重复授权。
 

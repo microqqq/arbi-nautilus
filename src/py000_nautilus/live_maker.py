@@ -151,9 +151,8 @@ def build_live_maker_node(
         if strategy_factory is MakerStrategy:
             node.bind_strategy_drain(strategy, timeout_seconds=stop_timeout_seconds)
         strategy.bind_restart_gate(lambda: reconciler.restart_pending)
-        native_history = False
         if cache_database is not None:
-            native_history = validate_native_cache(
+            validate_native_cache(
                 node.cache,
                 trader_id=LIVE_MAKER_TRADER_ID,
                 strategy_id=strategy.id,
@@ -166,29 +165,27 @@ def build_live_maker_node(
                     ),
                 },
             )
-        if (
-            startup_recovery is not None or native_history
-            or node.cache.orders() or node.cache.positions()
-            or bitfinex_exec._cid_store.bindings
-            or has_business_history(strategy._state_store)
-        ):
-            receipt = capture_startup_receipt(strategy._state_store, startup_recovery)
+        receipt = capture_startup_receipt(strategy._state_store, startup_recovery)
 
-            async def recover_startup() -> None:
-                await reconcile_startup(
-                    node.cache, strategy._state_store,
-                    trader_id=LIVE_MAKER_TRADER_ID, strategy_id=strategy.id,
-                    source=bitfinex_exec, hedge=mt5_exec,
-                    source_instrument_id=strategy_config.source_instrument_id,
-                    hedge_instrument_id=strategy_config.hedge_instrument_id,
-                    receipt=receipt,
-                    rejected_retry_check=partial(
-                        check_rejected_retry_execution, node.cache, mt5_exec,
-                        config=strategy_config, data=mt5_data,
-                    ),
-                )
+        async def recover_startup() -> None:
+            await reconcile_startup(
+                node.cache, strategy._state_store,
+                trader_id=LIVE_MAKER_TRADER_ID, strategy_id=strategy.id,
+                source=bitfinex_exec, hedge=mt5_exec,
+                source_instrument_id=strategy_config.source_instrument_id,
+                hedge_instrument_id=strategy_config.hedge_instrument_id,
+                receipt=receipt,
+                rejected_retry_check=partial(
+                    check_rejected_retry_execution, node.cache, mt5_exec,
+                    config=strategy_config, data=mt5_data,
+                ),
+            )
 
-            reconciler.bind_restart_recovery(recover_startup)
+        reconciler.bind_restart_recovery(recover_startup, history_present=lambda: bool(
+            startup_recovery is not None or node.cache.orders() or node.cache.positions()
+            or bitfinex_exec._cid_store.bindings or has_business_history(strategy._state_store)
+        ))
+        if reconciler.restart_pending:
             node.kernel.logger.warning("native or business history; restart reconciliation pending")
         bind_live_account_reader(
             strategy, config=strategy_config,

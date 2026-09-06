@@ -338,8 +338,14 @@ def _complete_orders(mass: ExecutionMassStatus, orders: list[Order],
             # A native rejection has no accepted venue order. The MT5 adapter's
             # complete EA journal authenticates its deterministic report-only ID.
             venue_matches = report.venue_order_id.value == rejected_id
+        account_matches = report.account_id == order.account_id or (
+            order.strategy_id.is_external() and order.account_id is None
+            and report.account_id == mass.account_id
+            and all(event.account_id == report.account_id for event in order.events
+                    if isinstance(event, OrderFilled))
+        )
         if (not order.is_closed or not venue_matches
-                or report.instrument_id != instrument_id or report.account_id != order.account_id
+                or report.instrument_id != instrument_id or not account_matches
                 or report.order_status != order.status or report.quantity != order.quantity
                 or report.filled_qty != order.filled_qty):
             raise ValueError("startup order terminal facts do not match native history")
@@ -634,6 +640,9 @@ async def reconcile_startup(
         if report.signed_decimal_qty
     }:
         raise ValueError("startup hedge reports differ from current tickets")
+    # The complete native/EA history above includes NT's unclaimed closed
+    # orders. Only this composition's orders belong to its business obligations.
+    hedge_orders = [order for order in hedge_orders if not order.strategy_id.is_external()]
     views = _views(store)
     try:
         pauses = tuple((view.halt_reason, view.source_freeze_reason) for view in views)
