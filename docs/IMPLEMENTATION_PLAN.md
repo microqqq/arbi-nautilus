@@ -408,6 +408,23 @@ carry 是同 route 的唯一 signed residual；下一 fill 先与它合并再分
 - 写集：编码agent负责`maker_store.py`的checkpoint接线、新`maker_migration.py`与迁移单测；root维护本文、README、CLI注册、原`durability.py`/`store.py`窄发布原语及单测、普通Maker集成；reviewer只读独立复核。先保留v2/双v1不能继续的RED，覆盖未知历史同累计、两route历史rounding误分配、未决/UNKNOWN/plan保留、旧fill去重与新迟到fill、迁移后普通经济周期、输入变化/既有目标/发布前后故障。全量/静态和独立审核通过后单独本地提交；不推送、部署、修改EA/profile或访问真实账户。
 - 复核补充：link和父同步已经成功后，临时名清理不再属于业务发布失败。清理异常只告警并保留临时名，CLI仍报告完整新件创建成功；不误报迁移拒绝或耐久性未确认。发布/父同步异常仍原样上抛，不能被这条窄清理规则吞掉。
 
+**W5c4a 按实际分配顺序执行Maker对冲（2026-09-06，实施前固定）：** bounded-carry准入之前先修已确认的跨方向调度重排；本小步保持strict，不接新profile额度。
+
+- 真实反例：同route两源各2oz，先后实际fill为BUY0.6、SELL0.2、BUY0.2、SELL0.2、BUY0.2、SELL0.2、BUY0.2。原分配为SELL1/BUY1交错七笔，但首hedge在途时其余入账，当前调度按bid全部→ask全部，实际会先SELL四笔再BUY三笔，中途MT5=-4、unhedged=-3.4。原selector与store API已复现，不以初始源leaves端点作为这种重排的预算证明。
+- 新义务必须沿现成`allocations`实际fill分配顺序全局选择；零分配跳过，已完成跳过，每个多腿intent完整完成后才走下一个，已有in-flight/UNKNOWN/REJECTED/BLOCKED互斥与暂停保持。不得再建或持久化第二个队列，不以intent ID字典序、bid/ask或历史时间戳猜顺序。v4旧checkpoint无跨方向历史顺序：其未决义务仍整体HOLD待W6恢复，不能顺手重放；已完成旧intent保留且不阻塞后续新allocation。
+- 编码agent独占`maker_store.py`、`strategies/maker.py`及各自单测；root维护本文与普通双adapter交错集成，reviewer只读审核。先将原selector真实反例转为RED，覆盖调度顺序、重载、旧checkpoint未决阻断、多腿完成与既有互斥；普通native/adapter必须实际展示交错对冲/票据结果，不靠手动改intent状态充当集成证明。
+- 全量、静态及独立复核后本地单独提交，不推送、部署、改EA/profile或访问账户。只修执行顺序，不据此关闭E09；后续carry预算须在本顺序前提下同时覆盖分片舍入和撤单前双边late fill，不能只放宽残差gate。
+
+**W5c4b 有界carry接线（W5c4a接受后实施，未交付）：** 在有序执行前提下连接余额资格、实际工作单预算和MT5预检；不靠禁用双侧Maker或自动消除dust简化验收。
+
+- Maker配置新增`residual_mode`（默认`strict`）、`residual_limit_ounces`（默认0）、`max_unhedged_ounces`（默认None）。`bounded-carry`须显式给有限正预算和`0 < residual_limit <= 0.5`，先限定一个明确source/hedge账户route；其余非零route或CID隔离余额不得借用本额度。已有`CarryConfig`表示资金费率/swap，不混用。余额仍从原ledger唯一导出；strict默认和Taker不变，未决/UNKNOWN/原HOLD不因额度足够而放行。
+- 上一cycle只有双源终态证据齐、原义务全部完成且未对冲量恰等于允许的残差时，才能一次性解除原双freeze。可从原store提取小余额资格hook；不得删除原已分配未完成量检查。这个终态要求属于上轮release，不额外要求新一轮第二侧入场时第一侧也终态；第二侧继续遵守W5b4的exact ACCEPTED、账户action与无partial/pending资格。
+- 新单以native规范化数量计算；维护旧单按精确CID排除自身后放回候选，不重复计量。当前route的真实BUY/SELL leaves分别记B/S，不把相反挂单提前抵消，第二侧须重读第一侧已经占用的事实。新单和维护共用预算校验，不以报价意图代替cache/store事实，不重复从现金和方向容量扣同一挂单。
+- `max_unhedged`单侧上界为`max(abs(R), abs(R + signed_Q))`；双侧均可能成交时取保守`0.5 + max(B, S)`，不是初始净端点。已复现`R=-0.5, B=2, S=0.1`：SELL0.1→BUY1完成后R=+0.4，再迟到BUY2会产生2.4oz未对冲，初始端点1.5不足。W5c4a有序完成前缀k满足`U=r_k+后续BUY成交-后续SELL成交`且`abs(r_k)<=0.5`，多腿部分执行在相邻前缀间单调变化；这是保守准入界，不是舍入策略变更。
+- MT5容量与净仓风险检查采用有序净delta的保守端点：SELL上界`max(0,floor(R+B+0.5))`，BUY上界`max(0,floor(-R+S+0.5))`，经原动态容量、持仓上限/minimum/only_long规则验证。它们不是gross成交量或单腿手数上界：R=+0.5的BUY2整笔对冲2，分成0.2+1.8可对冲1再2、合计3，不能只按`round(R+Q)`校验累计风险。
+- 单intent/lot预检与上述净delta分开：存在反侧working时，对每侧用`round_hedge_ounces(0.5+Q)`上界；没有反侧才按`max(0,round_hedge_ounces(sign*R+Q))`收窄。沿原`plan_hedge_delta`逐腿验量，不把累计3误当必须单腿3；R=-0.5的BUY1初算0，也不能在SELL1先成交后仍忽略它实际可能产生SELL2。现有已成交义务继续原对冲流程，不能用新准入预算切断它；实际下一腿仍重新读票据，snapshot到EA外部竞态不据此消除。
+- 先离线验收strict不变、±0.5/更小限额/越界、异route、重载、双侧占用、分片与交错、lot和动态容量下降、正常经济机会跨cycle、带dust停止的真实数量报告。停止保留ledger和原保护撤单，不声称FLAT、不自动补偿交易。当前profiles/canary仍strict且不提高0.02lots；W9明定在线预算，W7另接Maker/Taker共享额度，不让两个实例各领一份残差额度。
+
 ### W6：重启与停止形成真实闭环
 
 范围：`store.py`、两个 execution 的报告/重连路径、live lifecycle、必要的原生 cache 配置和恢复测试。先执行 Q3。
@@ -612,7 +629,10 @@ EA 改动额外执行现有 `tools/mt5_source_manifest.sh --lines`、MetaEditor 
   - [x] W5b5：两策略原生连续加仓/反向/穿零矩阵，以及真实MT5 adapter提交前计划一致性、在途/拒绝/未知阻挡；独立复核与全量通过，仅接受该离线分层范围。
   - [x] W5b6：两真实execution adapter的普通连续多票矩阵、原终态/账户刷新闭环与腿间故障；Maker迟到改价拒绝及历史取消判据修复，独立复核与全量通过，仅接受规定的离线范围。
   - [x] W5c1：Maker单文件/双view、fill与双freeze同写、原子release及新旧路径识别；独立复核与全量通过，strict残差语义保持。
-  - [ ] W5后续：同route原子残差分配与strict/bounded-carry、旧双文件显式迁移、剩余原策略parity；不因单文件或连续离线验证完成而关闭。
+  - [x] W5c2：同route原子残差分配、逐fill唯一账与strict净额；独立复核及普通双adapter/全量通过。
+  - [x] W5c3：完整旧双v1/单v2显式转换成v4历史checkpoint，保留原件与未决义务；独立复核及全量通过。
+  - [x] W5c4a：跨方向对冲按真实allocation顺序执行，不重排放大中途敞口；独立复核及全量通过。
+  - [ ] W5后续：W5c4b bounded-carry预算/跨cycle/带dust停止、剩余原策略parity；不因strict净额或顺序修复完成而关闭。
 - [ ] W6 重启/停止。
 - [ ] W7 同节点共账户。
 - [ ] W8 入口/安装/文档/原生运行边界。
@@ -839,3 +859,12 @@ EA 改动额外执行现有 `tools/mt5_source_manifest.sh --lines`、MetaEditor 
 - 新增43项：34项迁移、7项发布原语/原store、2项普通双adapter。跨route余额±0.4即使旧hedge全部COMPLETED、view合计0仍strict HOLD；已知单笔量大于累计、旧/新key交叠及绑定变更拒绝。普通Maker从两种旧格式启动后，原经济判断产生真实native新源2oz，经原Bitfinex/MT5执行路径对冲−2oz；保留旧字节与checkpoint，只增新真实allocation，不用私改store或重放旧单促成续跑。
 - 首冻结全量2097通过后追加上述清理修正；最终候选重新全量 **2098 passed / 124既有Pandas框架弃用警告 / 251.74s**，全仓Ruff、Mypy80文件、diff-check通过。独立reviewer最终八文件 **386 passed / 4 warnings / 3.43s**，另普通双adapter **2 passed / 3.49s**；额外实跑两线程同目标恰一成功一FileExistsError，以及历史±0.5抵消后去重/新fill/重载探针。核验九份代码/测试/入口SHA后RECOMMEND-ACCEPT，主agent据新全量与独立证据接受本小步；子集不与全量累计。
 - 按约定本地提交，不推送、部署、改EA/profile、访问真实账户或发单。E06显式转换部分关闭；不认证在场writer互斥、冷cache恢复或线上升级。E09 bounded-carry、W5剩余parity及W6–W9仍未完，下一步继续离线残差预算与跨cycle行为，不因此提高在线额度。
+
+2026-09-06 / W5c4a Maker跨方向对冲有序执行完成并接受（基线`710b1be`）：
+
+- 预审发现原调度把真实交错义务按bid/ask重排：双源各2oz内的BUY0.6/SELL0.2/BUY0.2等七次实际fill，使原selector先SELL四次再BUY三次，MT5中途净仓-4、未对冲-3.4。该反例由独立reviewer实际store/selector探针确认；主agent普通双adapter两镜像、实施agent真实Engine源事件两镜像均先在原行为上RED，失败是确切次序错误，不是接口缺失或fixture启动失败。
+- 生产净增11行：owner增加从现有allocations和intent表取首个未完成义务的只读视图，策略替换原bid/ask选择；无第二队列、缓存账或schema变化。零分配/已完成略过，多腿全部完成再下一intent；原全局flight/UNKNOWN/REJECTED/BLOCKED门不变。旧checkpoint任一未决义务阻挡后续，不能猜其历史顺序；已完成旧义务保留，不影响新allocation按真实顺序推进。
+- 新增23项：21项owner/原生事件及2项普通双adapter。后者原经济报价生成两工作单、第一MT5实际请求保持在途、其余源TU在保护cancel送达前交错入账，再沿原协议/journal/native/多票执行；每笔真实MT5后净仓仅在0/±1间，最终±0.4 dust仍strict HOLD，完整报告与native一致。两处旧quote-retry私harness改用当前owner并修正其fill key/trade ID不一致，未改原断言或放宽生产校验。
+- 最终五份源码/测试SHA上主agent全量 **2121 passed / 124既有Pandas框架弃用警告 / 258.82s**，全仓Ruff、Mypy80文件、diff-check通过。独立reviewer五文件 **340 passed / 4 warnings / 2.29s**，普通双adapter **2 passed / 7.41s**；原selector探针镜像通过，内存反事实恢复bid/ask选择使原生两例重新精确RED。核验五SHA后给出RECOMMEND-ACCEPT；主agent据全量与上述证据接受本小步，不累加子集。
+- 一次额外adapter子集为31 passed/1 timeout，明确受到主agent在运行中发出的Ctrl-C干预，不记成自然回归或通过。工具独立实测确认非TTY的该操作也发送SIGINT；固定NT源码注册信号并stop当前node而非退出pytest，与失败第五cycle的02:00:58时间相符。主agent随后仅对自身隔离测试进程发SIGINT，原第五cycle再次出现全部义务完成/owner无错但node与MT5断开、原8秒条件超时（21.64s探针通过）；无中断的该case17.14s通过。临时诊断字段已撤回，最终五SHA与全量/独立审核一致，不修改timeout、就绪门或adapter来消除这项人为失败。
+- 按约定本地单独提交，不推送、部署、改EA/profile、访问账户或发单。W5c4b的单/双侧最坏敞口、分片累计净delta与单intent/lot分别验量规则已固定但尚未实现；E09、剩余parity、W6–W9仍未关闭。此次信号诊断只解释受干预测试，不把完整启停/drain认证提前计入W6。

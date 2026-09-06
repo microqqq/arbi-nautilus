@@ -462,6 +462,93 @@ def test_both_adapters_maker_net_actual_dual_fills_then_obey_strict_next_cycle(
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("first_sign", [1, -1], ids=["buy-first", "sell-first"])
+def test_maker_executes_interleaved_hedges_in_real_allocation_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, first_sign: int,
+) -> None:
+    async def run() -> None:
+        async with _continuous(
+            tmp_path, monkeypatch, maker=True, long_quantity=2, short_quantity=2,
+        ) as (h, source, wire):
+            await _accepted_source(h, source, wire, first_sign)
+            await _accepted_source(h, source, wire, -first_sign)
+            by_side = {1 if source.order(cid).side is OrderSide.BUY else -1: cid
+                       for cid, row in source.rows.items() if source._active(row)}
+            assert len(by_side) == 2
+            original_ids = set(source.rows)
+            cancels: list[dict[str, object] | list[object]] = []
+
+            def delay_cancel_delivery(message: dict[str, object] | list[object]) -> None:
+                if isinstance(message, list) and message[1] == "oc":
+                    cancels.append(deepcopy(message))
+                else:
+                    source.respond(message)
+
+            h.transport.after_send = delay_cancel_delivery
+            entered, release = asyncio.Event(), asyncio.Event()
+            verify_serial = wire.before_mutation
+            assert verify_serial is not None
+
+            async def delay_first_hedge(payload: JsonObject) -> None:
+                await verify_serial(payload)
+                if not entered.is_set():
+                    entered.set()
+                    await release.wait()
+
+            wire.before_mutation = delay_first_hedge
+            actual: list[tuple[str, Decimal]] = []
+
+            def record_execution(outcome: JsonObject) -> None:
+                payload = cast(JsonObject, outcome["payload"])
+                actual.append((str(payload["side"]), sum(_ticket_facts(wire).values(), D(0))))
+
+            wire.after_mutation = record_execution
+            try:
+                source.fill(by_side[first_sign], D("0.6"))
+                async with asyncio.timeout(2):
+                    await entered.wait()
+                # Venue receives these genuine fills before the protective
+                # cancels arrive; the first native MT5 order remains in flight.
+                for sign in (-first_sign, first_sign) * 3:
+                    source.fill(by_side[sign], D("0.2"))
+                await _pump()
+                stores = _stores(h)
+                assert sum(len(store.intents()) for store in stores) == 7
+                assert len(wire.submit_calls) == 1 and wire.close_calls == []
+                assert len(cancels) == 2
+                h.transport.after_send = source.respond
+                for message in cancels:
+                    source.respond(message)
+            finally:
+                release.set()
+
+            owner = get_source_terminal_reconciler(h.node)
+
+            def completed() -> bool:
+                return (all(intent.status is ObligationStatus.COMPLETED
+                            for store in stores for intent in store.intents())
+                        and all(source.order(cid).is_closed for cid in original_ids)
+                        and not owner.busy
+                        and h.hedge.account_capacity_ready(h.strategy._config.max_cost_age_ns))
+
+            await _drive(h, wire, completed, direction=0)
+            first, second = ("sell", "buy") if first_sign == 1 else ("buy", "sell")
+            assert [side for side, _ in actual] == [first, second] * 3 + [first]
+            assert [net for _, net in actual] == [-D(first_sign), D(0)] * 3 + [-D(first_sign)]
+            assert source.net == D("0.6") * first_sign
+            assert h.node.portfolio.net_position(h.hedge_instrument.id) == -D(first_sign)
+            assert sum((store.net_unhedged_ounces for store in stores), D(0)) == (
+                D("-0.4") * first_sign
+            )
+            assert all(not store.can_submit_source() for store in stores)
+            assert set(source.rows) == original_ids  # strict dust remains HOLD.
+            assert owner.last_failure is None
+            assert len(h.node.cache.orders(instrument_id=h.hedge_instrument.id)) == 7
+            await _assert_reports(h, source, wire, _ticket_facts(wire))
+
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize("maker", [False, True], ids=["taker", "maker"])
 @pytest.mark.parametrize("sign", [1, -1], ids=["long-first", "short-first"])
 @pytest.mark.parametrize("deltas", [(2, 2, -2, -1, -2), (1, 2, -4)],

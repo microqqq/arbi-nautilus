@@ -58,6 +58,114 @@ def _memory(owner: MakerStateStore) -> object:
     return deepcopy(owner._snapshot())
 
 
+@pytest.mark.parametrize("first", [LONG, SHORT])
+@pytest.mark.parametrize("reload_each", [False, True])
+def test_pending_hedge_view_uses_allocation_order_skips_zero_and_completed(
+    tmp_path: Path, first: SourceDirection, reload_each: bool,
+) -> None:
+    prefix = tmp_path / "ordered"
+    owner = _owner(prefix)
+    other = SHORT if first is LONG else LONG
+    for direction in (first, other):
+        _begin(owner, direction)
+    expected = []
+    for index, (direction, amount) in enumerate(
+        [(first, "0.1"), (first, "0.5"), (other, "0.2"), (first, "0.2")],
+    ):
+        cid, trade = f"S-{direction.value}", f"ORDERED-{index}"
+        intent = owner.stores[direction].reserve_source_fill(
+            fill_key=f"{cid}|V-{direction.value}|{trade}", client_order_id=cid,
+            trade_id=trade, source_side=BUY if direction is LONG else SELL,
+            fill_ounces=D(amount),
+        )
+        if intent is not None:
+            expected.append((direction, intent.intent_id))
+    assert len(expected) == 3
+    for index, (direction, intent_id) in enumerate(expected):
+        if reload_each:
+            owner = _owner(prefix)  # Format/read-order check, not live restart authorization.
+        before = owner.path.read_bytes()
+        pending = owner.next_pending_hedge()
+        assert pending is not None and (pending[0], pending[1].intent_id) == (direction, intent_id)
+        assert owner.path.read_bytes() == before  # Selection does not persist another queue.
+        view = owner.stores[direction]
+        view.bind_hedge_order(intent_id, f"H-{index}")
+        assert owner.next_pending_hedge() is None
+        view.apply_hedge_fill(client_order_id=f"H-{index}", trade_id=f"D-{index}", fill_ounces=D(1))
+    assert owner.next_pending_hedge() is None
+
+
+def test_pending_hedge_view_keeps_multileg_intent_ahead_of_other_direction(
+    tmp_path: Path,
+) -> None:
+    owner = _owner(tmp_path / "multileg-order")
+    for direction in (SHORT, LONG):
+        _begin(owner, direction)
+    first, second = _fill(owner, SHORT), _fill(owner, LONG)
+    assert first is not None and second is not None
+    view = owner.stores[SHORT]
+    view.bind_hedge_plan(first.intent_id, (
+        HedgeLeg(BUY, D(1), "OLD-SELL", SELL, D(1)), HedgeLeg(BUY, D(1)),
+    ))
+    for index in range(2):
+        selected = owner.next_pending_hedge()
+        assert selected is not None and selected[1].intent_id == first.intent_id
+        assert selected[1].hedge_leg_index == index
+        view.bind_hedge_order(first.intent_id, f"H-LEG-{index}")
+        assert owner.next_pending_hedge() is None
+        view.apply_hedge_fill(
+            client_order_id=f"H-LEG-{index}", trade_id=f"D-{index}", fill_ounces=D(1),
+        )
+    selected = owner.next_pending_hedge()
+    assert selected is not None and selected[1].intent_id == second.intent_id
+
+
+@pytest.mark.parametrize("old_status", list(ObligationStatus))
+def test_pending_hedge_view_never_guesses_old_checkpoint_execution_order(
+    tmp_path: Path, old_status: ObligationStatus,
+) -> None:
+    from py000_nautilus.maker_migration import migrate_maker_state
+
+    old_prefix, new_prefix = tmp_path / "old", tmp_path / "new"
+    legacy = JsonStateStore(maker_legacy_paths(old_prefix)[0])
+    legacy.begin_source("OLD", BUY, D(2), source_account_id="BITFINEX-001",
+                        source_client_id="BITFINEX", hedge_account_id="MT5-001",
+                        hedge_client_id="MT5")
+    old_intent = legacy.reserve_source_fill(
+        fill_key="OLD|VENUE|OLD-TRADE", client_order_id="OLD", trade_id="OLD-TRADE",
+        source_side=BUY, fill_ounces=D(1),
+    )
+    assert old_intent is not None
+    if old_status is ObligationStatus.BLOCKED:
+        legacy.block_hedge_intent(old_intent.intent_id, "old blocked")
+    elif old_status is not ObligationStatus.PENDING:
+        legacy.bind_hedge_order(old_intent.intent_id, "OLD-HEDGE")
+        if old_status is ObligationStatus.COMPLETED:
+            legacy.apply_hedge_fill(
+                client_order_id="OLD-HEDGE", trade_id="OLD-DEAL", fill_ounces=D(1),
+            )
+        else:
+            legacy.update_hedge_status("OLD-HEDGE", old_status)
+    JsonStateStore(maker_legacy_paths(old_prefix)[1]).freeze_source_submissions("old state")
+    owner = migrate_maker_state(
+        old_prefix, new_prefix, "SOURCE.BITFINEX", "HEDGE.MT5", stopped=True,
+    )
+    new_intent = owner.stores[LONG].reserve_source_fill(
+        fill_key="OLD|VENUE|NEW-TRADE", client_order_id="OLD", trade_id="NEW-TRADE",
+        source_side=BUY, fill_ounces=D(1),
+    )
+    assert new_intent is not None
+    for current in (owner, _owner(new_prefix)):
+        before = current.path.read_bytes()
+        selected = current.next_pending_hedge()
+        if old_status is ObligationStatus.COMPLETED:
+            assert selected is not None and selected[1].intent_id == new_intent.intent_id
+        else:
+            assert selected is None
+        assert current.path.read_bytes() == before
+        assert current.stores[LONG].intent(old_intent.intent_id).status is old_status
+
+
 def test_paths_and_new_empty_owner_do_not_create_or_read_legacy_files(tmp_path: Path) -> None:
     prefix = tmp_path / "maker.state"
     owner = _owner(prefix)

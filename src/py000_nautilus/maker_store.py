@@ -11,7 +11,7 @@ from typing import cast
 
 from py000_nautilus.durability import ParentDirectorySyncError
 from py000_nautilus.economics import round_hedge_ounces
-from py000_nautilus.models import BusinessOrderSide, HedgeIntent, SourceDirection
+from py000_nautilus.models import BusinessOrderSide, HedgeIntent, ObligationStatus, SourceDirection
 from py000_nautilus.store import JsonStateStore, SourceOrderRecord, StoreState, _persist_payload
 
 _DIRECTIONS = {SourceDirection.LONG: "bid", SourceDirection.SHORT: "ask"}
@@ -119,6 +119,24 @@ class MakerStateStore:
 
     def has_residuals(self) -> bool:
         return any(balance != 0 for balance, _direction in self._route_balances().values())
+
+    def next_pending_hedge(self) -> tuple[SourceDirection, HedgeIntent] | None:
+        """Select the first unfinished allocation; never infer legacy execution order."""
+        intents = {intent.fill_key: (direction, intent)
+                   for direction, view in self.stores.items() for intent in view.intents()}
+        legacy_ids = {intent_id for item in self._legacy_orders for intent_id in item.intent_ids}
+        if any(intent.intent_id in legacy_ids and intent.status is not ObligationStatus.COMPLETED
+               for _, intent in intents.values()):
+            return None
+        for allocation in self._allocations:
+            selected = intents.get(allocation.fill_key)
+            if selected is None or selected[1].status is ObligationStatus.COMPLETED:
+                continue
+            intent = selected[1]
+            if intent.status is ObligationStatus.PENDING and intent.hedge_client_order_id is None:
+                return selected
+            return None
+        return None
 
     def _route_balances(self) -> dict[_Route, tuple[Decimal, SourceDirection]]:
         directions = {key: direction for direction, view in self.stores.items()

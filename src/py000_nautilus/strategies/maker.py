@@ -876,15 +876,7 @@ class MakerStrategy(Strategy):
         }
         if any(intent.status in active_statuses for _, intent in queued):
             return
-        pending = next(
-            (
-                (direction, intent)
-                for direction, intent in queued
-                if intent.status is ObligationStatus.PENDING
-                and intent.hedge_client_order_id is None
-            ),
-            None,
-        )
+        pending = self._state_store.next_pending_hedge()
         if pending is None:
             return
         direction, intent = pending

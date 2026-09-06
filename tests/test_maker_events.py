@@ -1899,6 +1899,85 @@ def test_maker_two_direction_obligations_share_one_global_mt5_flight(
     ]
 
 
+@pytest.mark.parametrize("first", [SourceDirection.LONG, SourceDirection.SHORT])
+def test_maker_dispatch_preserves_native_interleaved_fill_allocation_order(
+    tmp_path: Path, first: SourceDirection,
+) -> None:
+    strategy = RecordingMakerStrategy(tmp_path / "ordered-native-fills")
+    with _event_engine(cast(Any, strategy)) as engine:
+        values = CryptoPerpetual.to_dict(_source_instrument())
+        values.update(size_precision=1, size_increment="0.1", lot_size="0.1")
+        engine.add_instrument(CryptoPerpetual.from_dict(values))
+        engine.trader.start()
+        orders = _seed_native_working_quotes(cast(Any, strategy), exact_route=True)
+        if first is SourceDirection.SHORT:
+            orders.reverse()
+        # Source fills enter the real Engine. Hedge wire is the existing recording
+        # stub: its first binding remains SUBMITTING while every late fill arrives.
+        for index in range(7):
+            _fill_maker_source(
+                engine, orders[index % 2], D("0.6") if index == 0 else D("0.2"),
+                trade_id=f"SEQ-{index}", ts_event=101 + index,
+            )
+        assert len(strategy.recorded) == 1
+        assert sum(len(view.intents()) for view in strategy._stores.values()) == 7
+        net_hedge = D(0)
+        observed_positions: list[Decimal] = []
+        for index in range(7):
+            intent = strategy.recorded[index][3]
+            net_hedge += (D(1) if intent.hedge_side is BusinessOrderSide.BUY else D(-1))
+            strategy.on_order_filled(cast(Any, SimpleNamespace(
+                instrument_id=_hedge_instrument().id,
+                client_order_id=ClientOrderId(f"H-RECORDED-{index + 1}"),
+                trade_id=TradeId(f"HD-{index}"), last_qty=Quantity.from_int(1),
+            )))
+            observed_positions.append(net_hedge)
+        assert [entry[3].source_trade_id for entry in strategy.recorded] == [
+            f"SEQ-{index}" for index in range(7)
+        ]
+        sign = D(-1) if first is SourceDirection.LONG else D(1)
+        assert observed_positions == [sign, D(0), sign, D(0), sign, D(0), sign]
+        assert all(intent.status is ObligationStatus.COMPLETED
+                   for view in strategy._stores.values() for intent in view.intents())
+
+
+@pytest.mark.parametrize("status", [
+    ObligationStatus.SUBMITTING, ObligationStatus.SUBMITTED, ObligationStatus.ACCEPTED,
+    ObligationStatus.BLOCKED, ObligationStatus.REJECTED, ObligationStatus.UNKNOWN,
+])
+def test_maker_ordered_dispatch_keeps_global_failure_and_inflight_gate(
+    tmp_path: Path, status: ObligationStatus,
+) -> None:
+    strategy = RecordingMakerStrategy(tmp_path / "global-ordered-gate")
+    for direction, side in ((SourceDirection.LONG, BusinessOrderSide.BUY),
+                            (SourceDirection.SHORT, BusinessOrderSide.SELL)):
+        strategy._stores[direction].begin_source(
+            direction.value, side, D(1), source_account_id="BITFINEX-001",
+            hedge_account_id="MT5-001",
+        )
+    for direction, side in ((SourceDirection.SHORT, BusinessOrderSide.SELL),
+                            (SourceDirection.LONG, BusinessOrderSide.BUY)):
+        view = strategy._stores[direction]
+        view.reserve_source_fill(
+            fill_key=f"{direction.value}|V|T-{direction.value}",
+            client_order_id=direction.value, trade_id=f"T-{direction.value}",
+            source_side=side, fill_ounces=D(1),
+        )
+    # Even a later allocation's independent failure/flight blocks all dispatch;
+    # switching to allocation order must not turn the global gate into a prefix gate.
+    later = strategy._stores[SourceDirection.LONG]
+    intent = later.intents()[0]
+    if status is ObligationStatus.BLOCKED:
+        later.block_hedge_intent(intent.intent_id, "known block")
+    else:
+        later.bind_hedge_order(intent.intent_id, "OTHER-HEDGE")
+        later.update_hedge_status("OTHER-HEDGE", status)
+    before = later.path.read_bytes()
+    strategy._submit_next_pending_hedge()
+    assert strategy.recorded == [] and later.path.read_bytes() == before
+    assert later.intent(intent.intent_id).status is status
+
+
 def test_maker_uses_shared_multi_ticket_planner_for_exact_close_legs(
     tmp_path: Path,
 ) -> None:
@@ -1995,10 +2074,10 @@ def test_maker_fresh_hedge_quote_retries_pending_leg_exactly_once(
 ) -> None:
     prefix = tmp_path / f"quote-retry-{source_missing}.state"
     config = _maker_strategy_config(prefix)
-    stores = {
-        direction: JsonStateStore(f"{prefix}.{direction.value}.json")
-        for direction in (SourceDirection.LONG, SourceDirection.SHORT)
-    }
+    owner = MakerStateStore(
+        prefix, str(config.source_instrument_id), str(config.hedge_instrument_id),
+    )
+    stores = owner.stores
     hedges = {
         direction: HedgeCoordinator(config.source_instrument_id, stores[direction])
         for direction in (SourceDirection.LONG, SourceDirection.SHORT)
@@ -2012,7 +2091,7 @@ def test_maker_fresh_hedge_quote_retries_pending_leg_exactly_once(
         hedge_client_id=None,
     )
     intent = store.reserve_source_fill(
-        fill_key="O-QUOTE-RETRY|V|T",
+        fill_key="O-QUOTE-RETRY|V|T-QUOTE-RETRY",
         client_order_id="O-QUOTE-RETRY",
         trade_id="T-QUOTE-RETRY",
         source_side=BusinessOrderSide.BUY,
@@ -2051,6 +2130,7 @@ def test_maker_fresh_hedge_quote_retries_pending_leg_exactly_once(
 
     harness = SimpleNamespace(
         _config=config,
+        _state_store=owner,
         _stores=stores,
         _hedges=hedges,
         cache=SimpleNamespace(
