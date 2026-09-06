@@ -10,6 +10,8 @@ double g_py000_execution_max_order_lots = 0.0;
 ulong g_py000_execution_deviation_points = 0;
 ulong g_py000_execution_magic = 0;
 int g_py000_execution_freshness_seconds = 10;
+// Implemented by Protocol using the same complete, stable native ticket reader.
+string Py000NewPositionPreflight();
 struct Py000CloseTarget
 {
    ulong ticket;
@@ -306,7 +308,11 @@ string Py000ExecutionPreflight(
          return close_reason;
    }
    else
+   {
       ZeroMemory(close_target);
+      string capacity = Py000NewPositionPreflight();
+      if(capacity != "") return capacity;
+   }
    return "";
 }
 bool Py000ExecutionFinishSimple(
@@ -451,6 +457,15 @@ bool Py000ExecutionSubmit(
             > volume_tolerance)
          return Py000ExecutionFinishSimple(
             request, boot_id, "order_rejected", "POSITION_CHANGED_AFTER_CHECK", "0",
+            outcome, error_code, error_message
+         );
+   }
+   else
+   {
+      string capacity = Py000NewPositionPreflight();
+      if(capacity != "")
+         return Py000ExecutionFinishSimple(
+            request, boot_id, "order_rejected", capacity, "0",
             outcome, error_code, error_message
          );
    }

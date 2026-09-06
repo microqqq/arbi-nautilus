@@ -76,6 +76,7 @@ class Mt5V1ExecutionError(RuntimeError):
 
 
 _REJECTED_ORDER_ID_DOMAIN = "py000-nautilus:mt5-v1:rejected-order"
+_MAX_SNAPSHOT_POSITION_TICKETS = 32  # Same fixed new-ticket envelope as the EA.
 
 
 def _mt5_usd_commission(native_fee: str) -> Money:
@@ -1138,6 +1139,10 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
         volume_min = Decimal(cast(str, spec["volume_min"]))
         volume_step = Decimal(cast(str, spec["volume_step"]))
         if position_id is None:
+            if len(cast(list[JsonObject], self._require_snapshot()["positions"])) >= (
+                _MAX_SNAPSHOT_POSITION_TICKETS
+            ):
+                raise Mt5V1ExecutionError("MT5 new position capacity is exhausted")
             opposite = "sell" if order.side == OrderSide.BUY else "buy"
             if planned and any(
                 position["side"] == opposite

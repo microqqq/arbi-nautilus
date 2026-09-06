@@ -1678,6 +1678,51 @@ def test_planned_open_forces_snapshot_and_refuses_new_opposing_ticket(
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("count", [31, 32, 33])
+@pytest.mark.parametrize("mode", ["open", "planned-open", "close"])
+def test_position_capacity_blocks_only_new_tickets_in_current_complete_snapshot(
+    count: int, mode: str,
+) -> None:
+    async def scenario() -> None:
+        harness = _Harness(asyncio.get_running_loop(), snapshot_refresh_interval_ms=60_000)
+        fresh = deepcopy(harness.snapshot)
+        template = cast(list[JsonObject], fresh["positions"])[0]
+        fresh["positions"] = [dict(
+            template, ticket=str(700001000 + index), identifier=str(800001000 + index),
+            volume_lots="0.01", side="buy" if mode == "close" else "sell",
+        ) for index in range(count)]
+        # A planned open must notice growth past the bound, not use the
+        # previously admitted empty snapshot. Normal opens check the current one.
+        harness.snapshot["positions"] = [] if mode == "planned-open" else fresh["positions"]
+        await harness.connect()
+        if mode == "planned-open":
+            harness.fake.snapshot_results.append(fresh)
+        order = harness.market("1", order_side=OrderSide.SELL, reduce_only=mode == "close")
+        harness.fake.outcome = _outcome(
+            harness.identity, order, "order_filled", quantity_lots="0.01",
+            position_ticket="700001000" if mode == "close" else None,
+            position_identifier="800001000" if mode == "close" else None,
+            venue_position_id="800001000" if mode == "close" else "800009999",
+        )
+        await harness.submit(
+            order, position_id=PositionId("800001000") if mode == "close" else None,
+            params={"py000_hedge_plan": True} if mode == "planned-open" else None,
+        )
+        if mode != "close" and count >= 32:
+            assert [type(event).__name__ for event in harness.events] == ["OrderDenied"]
+            assert "position capacity" in cast(OrderDenied, harness.events[0]).reason
+            assert not harness.fake.submit_calls and not harness.fake.close_calls
+            assert str(order.client_order_id) not in harness.client._seen_request_ids
+        else:
+            assert isinstance(harness.events[-1], OrderFilled)
+            assert len(harness.fake.close_calls) == int(mode == "close")
+            assert len(harness.fake.submit_calls) == int(mode != "close")
+        assert harness.client.pending_client_order_ids == ()
+        if mode == "planned-open":
+            assert len(harness.fake.snapshot_calls) == 2
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("params,is_close", [
     ({"py000_hedge_plan": False}, False),
     ({"py000_hedge_plan": 1}, False),

@@ -86,7 +86,7 @@ bool Py000DecimalFromDouble(const double value, const int digits, string &result
          && StringGetCharacter(result, StringLen(result) - 1) == '.')
          result = StringSubstr(result, 0, StringLen(result) - 1);
    }
-   return true;
+   return Py000JsonSignedDecimal(result);
 }
 string Py000ObservedUtcMs()
 {
@@ -557,6 +557,18 @@ bool Py000PositionSamplesMatch(
       if(!found) return false;
    }
    return true;
+}
+string Py000NewPositionPreflight()
+{
+   // Fixed implementation envelope, not a configurable limit or snapshot filter.
+   // Every same-symbol ticket consumes space, including manual/foreign magic.
+   Py000PositionSample first[], second[];
+   string error_code;
+   if(!Py000CollectPositions(first, error_code)
+      || !Py000CollectPositions(second, error_code)
+      || !Py000PositionSamplesMatch(first, second))
+      return "POSITION_CAPACITY_UNAVAILABLE";
+   return ArraySize(second) < 32 ? "" : "POSITION_CAPACITY_EXCEEDED";
 }
 bool Py000BuildPositionsJson(string &json, string &error_code)
 {

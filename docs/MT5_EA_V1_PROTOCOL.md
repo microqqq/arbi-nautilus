@@ -1,8 +1,10 @@
 # PY000 MT5 EA v1 protocol
 
-Worktree status (2026-09-05): W2a adds conservative server-rejection classification; W2b adds
-two complete position samples and the closed `SNAPSHOT_UNAVAILABLE` error without changing
-the successful response shape. Both Python clients handle temporary snapshot loss and recovery.
+Worktree status (2026-09-07): conservative server-rejection classification, two complete
+position samples and the closed `SNAPSHOT_UNAVAILABLE` error retain the successful response
+shape. Both Python clients handle temporary snapshot loss and recovery. New opens now have
+a fixed 32-ticket capacity guard; exact closes retain their existing checks. The number
+formatter enforces the existing 64-character decimal grammar.
 This is a local candidate, not a newly deployed EA. Current source
 hashes come from `tools/mt5_source_manifest.sh --lines`; implementation and native-test progress
 are recorded in [the implementation plan](IMPLEMENTATION_PLAN.md).
@@ -41,15 +43,14 @@ The EA owns only the physical MT5 slice: stable venue identity, one-turn snapsho
 idempotent market-open and exact-ticket-close operations, and their durable execution journal.
 It is not an OMS, strategy, generic router, or replacement risk platform.
 
-The worktree contains both data and execution clients. The offline-buildable SHADOW node remains
-data-only. A separate offline-buildable Taker composition registers the Bitfinex and MT5 data and
-execution clients plus one Taker strategy, with startup reconciliation enabled; construction does
-not read credentials, connect, or run. A default-offline entry can start the four adapters only
-after removing that strategy. There is no continuously runnable production-strategy mode; the only
-runnable strategy path is a separately authorized fixed-2oz one-shot canary, which is offline-tested
-but has not yet been executed. Maker live composition remains absent. Reference state and response
-constructors remain test-only.
-Any live Taker use requires exclusive custody of the configured MT5 account/symbol/magic. The
+The worktree contains both data and execution clients. The SHADOW node remains data-only.
+Ordinary Maker, Taker and joint `both` entries are offline by default; construction and validation
+do not read credentials, connect or run. Explicit paper mode runs ordinary strategies; rehearsal
+starts the adapters after removing all strategies and the recovery Actor. `both` uses one node,
+four clients and one shared business owner, not two independent account writers. Current code
+availability is not current-version deployment or DEMO qualification. Reference state and response
+constructors remain test-only; bounded canaries are separate diagnostics, not the normal run loop.
+Live use requires exclusive custody of the configured MT5 account/symbol/magic. The
 strategy preflights the maximum source fill against the current ticket shape, but no cross-venue
 check can make an external MT5 mutation atomic with a Bitfinex order and fill.
 Because this adapter admits only one pending MT5 mutation, source partial-fill obligations are
@@ -130,6 +131,25 @@ reports remain disabled until a new complete snapshot is installed. A successful
 poll alone cannot restore snapshot health. Identity/schema errors retain their existing
 hard-failure behavior. Before the first complete snapshot, connection fails without claiming
 readiness; a later node connection may succeed on the same EA without reattaching it.
+
+The fixed implementation envelope is **32 same-symbol open tickets**, counting all magic values.
+Before a new open and again after `OrderCheck`, the EA requires two complete matching samples
+and room for one more ticket. Failure produces the existing `order_rejected` event with reason
+`POSITION_CAPACITY_UNAVAILABLE` or `POSITION_CAPACITY_EXCEEDED`; no new response fields or
+protocol version are introduced. Python mirrors the count check in the actual open preflight;
+the existing foreign-magic account HOLD remains in force. The count guard does not block exact
+closes at or above 32, but all target/quantity/magic/freshness checks still apply.
+
+The conservative byte bound is 16,384 bytes of fixed overhead plus 1,280 bytes per ticket:
+57,344 bytes at 32, below the 65,536-byte frame limit. This is a new-ticket admission bound,
+not a truncated snapshot: a complete readable pre-existing larger list is still returned.
+If an account already exceeds the frame limit, the EA returns a bounded schema error and Python
+holds; even close preflight may then be unavailable. There is no automatic liquidation promise.
+The tested operational scope remains the original 2oz cumulative / 0.02-lot per-order budget,
+100oz contract and 0.01-lot minimum/step, with an authenticated flat or single-direction initial
+ticket shape. Arbitrarily larger profiles or old mixed/tiny-ticket inventories are not certified
+by this bound; a late source fill may require an open that is rejected and retained for recovery.
+No general ticket-reservation scheduler is added. Mixed-ticket exact-close semantics are unchanged.
 
 `submit_market_delta` adds:
 
@@ -668,9 +688,11 @@ and positions, and returned `REHEARSED / adapter_startup_rehearsed`. A final rea
 only `stream_started` in the current boot and no mutation event. Any canary remains a separate step
 and requires explicit authorization.
 
-This proves one MetaQuotes-Demo exact-ticket full-close path. The remaining boundary is unchanged:
-there is no crash/power-loss durability proof, retention policy, broker-specific
-conformance beyond MetaQuotes-Demo, `MARKET` + `IOC` partial-fill support, or Maker composition.
+The following paragraph records the limitations at that historical checkpoint, not the current
+ordinary-entry implementation described at the top of this document.
+That checkpoint proved one MetaQuotes-Demo exact-ticket full-close path. At that time there was
+no crash/power-loss durability proof, retention policy, broker-specific conformance beyond
+MetaQuotes-Demo, `MARKET` + `IOC` partial-fill support, or Maker composition.
 A thin Taker builder validates the four existing adapter routes; the default startup entry is
 offline, and its explicit network rehearsal removes the strategy before starting the node. A
 separate fixed-2oz one-shot canary entry now exists and is offline-tested, but no live canary has

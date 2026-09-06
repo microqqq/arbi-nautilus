@@ -66,6 +66,7 @@ bool Py000TestNeverCheck(const MqlTradeRequest &request, MqlTradeCheckResult &re
 #define OrderSend Py000TestNeverSend
 #define OrderCheck Py000TestNeverCheck
 #include "../include/Py000Execution.mqh"
+#include "../include/Py000Protocol.mqh"
 #undef OrderSend
 #undef OrderCheck
 

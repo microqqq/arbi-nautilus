@@ -5,10 +5,11 @@ NautilusTrader 1.231.0. Both are Nautilus `Strategy` implementations using
 native limit orders, order/fill events, clock custody, cache, portfolio,
 execution routing, and `BacktestEngine`.
 
-Current remediation design (2026-09-05):
+Current remediation design (updated 2026-09-07):
 [doc-first implementation plan](docs/IMPLEMENTATION_PLAN.md).
-It defines the remaining correctness and continuous-operation work; planned features
-are not yet implemented. The checkpoints below include historical validation results.
+It separates implemented local capabilities from remaining release and DEMO qualification.
+The checkpoints below include historical validation results; old EA hashes are not
+the identity of the current source or proof of the currently attached build.
 
 ```bash
 uv sync --extra dev
@@ -33,7 +34,8 @@ files record whether a freeze came only from a normal fill cycle; this alone
 does not authorize recovery without complete native and venue evidence.
 Taker states now write schema 2 and still read schema 1. The new formats retain
 the original zero-fill rejected hedge ID alongside its single permitted replacement.
-Older binaries cannot read schema 7/8 (Maker) or 2 (Taker); do not downgrade them against upgraded
+Shared Maker/Taker uses a separate schema 9 file; it does not merge standalone states.
+Older binaries cannot read schema 7/8/9 (Maker/shared) or 2 (Taker); do not downgrade them against upgraded
 active state or restore stale state to bypass that check.
 To convert an old single-file schema 2 state or
 both schema 1 direction files, stop the old strategy and write to a **different**
@@ -98,9 +100,9 @@ The residual limit may be smaller than 0.5oz, but never larger. A stop retains
 and reports signed residuals; nonzero residual is not FLAT.
 
 These fields do not change funding/swap `CarryConfig`. Existing online profiles
-and canaries remain strict with their original lot limits. This single-strategy
-offline capability does not certify restart/drain recovery or a shared
-Maker/Taker budget; those remain subsequent implementation-plan work.
+and canaries remain strict with their original lot limits. Shared mode uses one
+route carry budget across all views, not a separate allowance for each strategy.
+Local recovery and shared tests do not certify the current deployed EA or a DEMO session.
 
 ## MT5 EA v1 checkpoint
 
@@ -142,7 +144,8 @@ The current source also contains one deliberately narrow execution candidate:
   Cancel/modify and production deployment remain intentionally absent. General Taker and Maker
   hedges apply signed deltas across MT5 HEDGING positions in deterministic PositionId order: each
   opposing ticket is closed with an exact reduce-only order, then at most one residual position is
-  opened after all planned closes finish. MT5 legs are globally serialized per strategy instance;
+  opened after all planned closes finish. MT5 legs are serialized per standalone strategy,
+  or across both strategies for the full bound plan in the shared node;
   position-shape drift, rejection, or UNKNOWN persists HOLD and stops the remaining legs. Multiple
   Bitfinex partial fills are durably queued behind the same single-flight boundary. The bounded
   one-shot `--close-existing` canary remains restricted to one exact ticket; a multi-ticket close
@@ -150,13 +153,18 @@ The current source also contains one deliberately narrow execution candidate:
 - the MT5 client publishes snapshot-backed equity, used margin, and free margin as a Nautilus
   `AccountState` before reconciliation. Live readiness requires both venue accounts to be
   registered; an inconsistent account equation fails closed.
+- new MT5 tickets have a fixed 32-ticket same-symbol capacity check in Python preflight and
+  the EA, including a second native check after `OrderCheck`. Exact closes keep their existing
+  checks and are not blocked by this count. Full snapshots are never truncated; pre-existing
+  over-size accounts can still require manual recovery. The measured byte envelope and narrow
+  2oz test-profile scope are documented in [the protocol](docs/MT5_EA_V1_PROTOCOL.md).
 
 The strategy layer keeps venue roles explicit: Taker submits `LIMIT` + `IOC` on the
 Bitfinex source leg, Maker maintains `LIMIT` + `GTC` + post-only source quotes, and both
 MT5 hedge legs submit `MARKET` + `FOK` to match the currently verified adapter. They are
-not yet deployed. A thin, offline-buildable Taker composition now binds the four existing
+not yet deployed as the current remediation candidate. Thin ordinary compositions bind the four existing
 Bitfinex/MT5 data and execution clients with explicit account and venue routes. The
-`py000-taker-live` and `py000-maker-live` entry points share configuration, credential loading,
+`py000-taker-live`, `py000-maker-live`, and `py000-both-live` share credential loading,
 and lifecycle code. Default validation is offline, including when the profile specifies a
 cache database. Explicit `--rehearse` reads the three `BFX_TEST_*` values and connects after
 removing the strategy and business recovery Actor: it neither trades nor recovers business
@@ -199,7 +207,41 @@ Offline validation builds and disposes the node without reading `.env` or openin
 ```bash
 uv run py000-taker-live --profile /path/to/taker-profile.json
 uv run py000-maker-live --profile /path/to/maker-profile.json
+uv run py000-both-live --profile /path/to/both-profile.json
 ```
+
+[The redacted profile example](examples/live_profiles.py) prints a complete typed JSON
+profile for any of those modes (`uv run python examples/live_profiles.py both`). It
+does not read `.env`, write state, or connect. Replace the dummy account IDs, endpoints,
+build/hash/stream and instrument specifications with verified values; the example is
+not ready to trade. Keep API key/secret out of JSON: network modes load only
+`BFX_TEST_API_KEY`, `BFX_TEST_API_SECRET`, and `BFX_TEST_USER_ID` from the existing environment
+or `.env`. Native Redis is explicit; do not reuse a previous run's TraderId namespace
+with unrelated business/CID files, and do not erase history to make a profile validate.
+
+### One node, two strategies
+
+`both` uses one `TradingNode`, four venue clients, one CID writer, one recovery Actor,
+and one atomic `<shared_store_prefix>.shared.json` owner with Maker bid/ask and Taker
+views. Each strategy retains its actual native StrategyId and order ownership.
+The standalone paths in the nested configurations are not migration inputs: existing
+standalone state is rejected, not silently imported. Retain all original shared/CID/native
+history together for a restart; never run independent Maker/Taker runners against these accounts.
+
+The account cap is shared. Working, inflight and pending-cancel source orders count at their
+worst possible fill; opposite unfilled orders do not offset. Already created hedge obligations
+execute in allocation order, holding the lane across every close/open leg. A Taker close can
+reduce a Maker ticket without transferring the native Position's opening owner.
+Unexpected current venue/native position differences pause both strategies and start the
+existing bounded reconciliation, without an automatic account cleanup trade.
+
+This is non-preemptive source admission, not an opportunity scheduler. At a 2oz cap,
+Maker working quotes of 2oz on both sides can leave Taker no capacity until a quote is
+confirmed closed. It is valid for Taker to wait indefinitely while that capacity is occupied;
+the entry does not secretly raise the cap or cancel another strategy's valid quote.
+Both strategies' participation is tested where the shared capacity permits it.
+Current-source joint, installed-process and finite-DEMO qualification are separate gates
+in the implementation plan; a present CLI is not a claim that all have passed.
 
 `--rehearse` is an explicit authenticated network action, but still starts no strategy. It proves
 only adapter connection, reconciliation, portfolio initialization, and clean shutdown—not live
@@ -216,6 +258,7 @@ Inspect an existing business file offline, without credentials, Redis, or venue 
 ```bash
 uv run py000-taker-live --profile /path/to/taker-profile.json --inspect-recovery
 uv run py000-maker-live --profile /path/to/maker-profile.json --inspect-recovery
+uv run py000-both-live --profile /path/to/both-profile.json --inspect-recovery
 ```
 
 Inspection reports local pauses and unfinished obligations; it cannot certify remote execution.
@@ -266,6 +309,11 @@ included; missing old NETTING cycles, incomplete fees, unresolved orders or conf
 produce `PENDING` with reasons and null final values. Observed subtotals remain visible.
 A successful execution drain does not override an incomplete report. Validate and rehearse
 do not generate this report; neither command executes business recovery.
+
+For `both`, the report is explicitly the two owners' **native virtual realized trading
+PnL and commissions**, not venue realized cash flow. Opposite native strategy positions
+can remain open while the venue is flat. Their virtual realized PnL cannot be relabeled
+as account cash profit, and an exact MT5 cross-owner close does not invent a new fee allocation.
 
 The attached cap-bound Taker-paper EA candidate defaults to build ID
 `py000-mt5-ea-v1-taker-paper` and `InpMaxOrderLots=0.02`. Its six-source manifest is
