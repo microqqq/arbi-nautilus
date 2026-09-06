@@ -6,6 +6,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from py000_nautilus.config import CarryConfig, FxConfig, TakerEconomicsConfig
 from py000_nautilus.models import BookTop, HedgeAccount, Opportunity, SourceAccount, SourceDirection
+from py000_nautilus.mt5_v1_protocol import MAX_OBSERVATION_FUTURE_NS
 
 _MT5_SWAP_DISABLED = 0
 _MT5_SWAP_POINTS = 1
@@ -268,8 +269,11 @@ def market_inputs_are_fresh(
     max_session_age_ns: int,
 ) -> bool:
     """Small fail-closed gate for the facts needed by one Taker decision."""
-    timestamps = (source_ts_ns, hedge_ts_ns, cost_ts_ns, session_ts_ns)
-    if not session_open or any(timestamp > now_ns for timestamp in timestamps):
+    timestamps = (source_ts_ns, hedge_ts_ns, cost_ts_ns)
+    if (
+        not session_open or any(timestamp > now_ns for timestamp in timestamps)
+        or session_ts_ns > now_ns + MAX_OBSERVATION_FUTURE_NS
+    ):
         return False
     if now_ns - source_ts_ns > max_quote_age_ns:
         return False

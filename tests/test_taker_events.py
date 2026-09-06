@@ -1087,7 +1087,9 @@ def test_native_bad_instrument_keeps_last_good_and_blocks_until_new_legal_observ
         engine.kernel.data_engine.process(good)
         now = 220 if bad_kind == "stale" else 120
         strategy.clock.set_time(now)
-        bad_ts = {"future": 121, "older": 109, "same_time_conflict": 110}.get(bad_kind, 120)
+        bad_ts = {
+            "future": 1_000_000_121, "older": 109, "same_time_conflict": 110,
+        }.get(bad_kind, 120)
         if bad_kind == "stale":
             bad_ts = 119
         changes = {"swap_long": "-7.3"}
@@ -1119,6 +1121,26 @@ def test_native_bad_instrument_keeps_last_good_and_blocks_until_new_legal_observ
         assert _live_inputs_ready(strategy, now)
         if kind == "taker":
             assert strategy.source_independent_inputs_ready()
+
+
+@pytest.mark.parametrize("kind", ["maker", "taker"])
+@pytest.mark.parametrize(("ahead_ns", "accepted"),
+                         [(266_000_000, True), (1_000_000_000, True), (1_000_000_001, False)])
+def test_native_mt5_clock_boundary_reaches_both_cost_and_session_consumers(
+    tmp_path: Path, kind: str, ahead_ns: int, accepted: bool,
+) -> None:
+    with _live_cost_event_engine(kind, tmp_path / kind) as (engine, strategy):
+        original = strategy._hedge_instrument
+        observed = 100 + ahead_ns
+        updated = _swap_instrument(observed)
+        engine.kernel.data_engine.process(updated)
+        strategy.update_hedge_session(True, observed)
+        assert strategy._session_ts_ns == observed  # Never rewrite venue timestamps.
+        assert strategy._hedge_instrument is (updated if accepted else original)
+        assert _live_inputs_ready(strategy, 100) is accepted
+        if kind == "maker":
+            assert strategy._source_hold is not accepted
+        assert strategy._cost_ts_ns == 100  # Bitfinex funding freshness is independent.
 
 
 @pytest.mark.parametrize("kind", ["maker", "taker"])

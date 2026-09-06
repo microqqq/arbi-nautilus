@@ -304,6 +304,19 @@ def test_stale_skewed_closed_or_future_inputs_fail_closed(change: str, value: in
     assert not market_inputs_are_fresh(**inputs)  # type: ignore[arg-type]
 
 
+@pytest.mark.parametrize(("ahead_ns", "accepted"),
+                         [(1, True), (1_000_000_000, True), (1_000_000_001, False)])
+def test_only_mt5_session_allows_bounded_cross_host_clock_skew(
+    ahead_ns: int, accepted: bool,
+) -> None:
+    assert market_inputs_are_fresh(
+        now_ns=10, source_ts_ns=9, hedge_ts_ns=9, cost_ts_ns=9,
+        session_ts_ns=10 + ahead_ns, session_open=True,
+        max_quote_age_ns=2, max_cross_leg_skew_ns=1,
+        max_cost_age_ns=2, max_session_age_ns=2,
+    ) is accepted
+
+
 def test_current_open_cross_leg_inputs_pass_freshness_gate() -> None:
     assert market_inputs_are_fresh(
         now_ns=10,

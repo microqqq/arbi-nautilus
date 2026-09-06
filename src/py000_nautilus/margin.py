@@ -19,6 +19,7 @@ from nautilus_trader.model.objects import Currency
 
 from py000_nautilus.config import HedgeAccountRoute, SourceAccountRoute
 from py000_nautilus.models import BookTop, HedgeAccount, MakerAccount, SourceAccount
+from py000_nautilus.mt5_v1_protocol import MAX_OBSERVATION_FUTURE_NS
 
 # Source/hedge books keep their own timestamps; the last argument requests new
 # source budget. Live composition supplies the IO, not this pure module.
@@ -204,7 +205,10 @@ def mt5_hedge_account(
             or info["mt5_symbol"] != symbol or info["mt5_stream_id"] != stream_id
             or info["mt5_positions_complete"] is not True
             or info["mt5_account_sample_valid"] is not True
-            or not _fresh(info["mt5_account_observed_ns"], now_ns, max_account_age_ns)
+            or not _fresh(
+                info["mt5_account_observed_ns"], now_ns, max_account_age_ns,
+                max_future_ns=MAX_OBSERVATION_FUTURE_NS,
+            )
         ):
             return None
         quantity, equity = _decimal(info["mt5_net_position_ounces"]), _decimal(info["mt5_equity"])
@@ -287,11 +291,11 @@ def _decimal(value: object) -> Decimal:
     return number
 
 
-def _fresh(observed_ns: object, now_ns: int, max_age_ns: int) -> bool:
+def _fresh(observed_ns: object, now_ns: int, max_age_ns: int, *, max_future_ns: int = 0) -> bool:
     return (
         type(observed_ns) is int and type(now_ns) is int and type(max_age_ns) is int
         and observed_ns >= 0 and now_ns >= 0 and max_age_ns >= 0
-        and 0 <= now_ns - observed_ns <= max_age_ns
+        and -max_future_ns <= now_ns - observed_ns <= max_age_ns
     )
 
 

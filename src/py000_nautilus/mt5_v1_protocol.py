@@ -15,6 +15,8 @@ from unicodedata import category
 PROTOCOL = "py000.mt5"
 VERSION = 1
 MAX_WIRE_BYTES = 64 * 1024
+# Host/EA clock-skew budget, not a claim about TimeGMT accuracy or a TTL extension.
+MAX_OBSERVATION_FUTURE_NS = 1_000_000_000
 MAX_TEXT_LENGTH = 256
 MAX_IDENTIFIER_LENGTH = 128
 MAX_EVENTS_LIMIT = 500

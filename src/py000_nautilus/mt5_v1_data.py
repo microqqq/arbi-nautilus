@@ -30,7 +30,13 @@ from nautilus_trader.model.identifiers import ClientId, InstrumentId, Symbol, Ve
 from nautilus_trader.model.instruments import Cfd
 from nautilus_trader.model.objects import Currency, Price, Quantity
 
-from py000_nautilus.mt5_v1_protocol import Binding, Identity, JsonObject, RecoveryState
+from py000_nautilus.mt5_v1_protocol import (
+    MAX_OBSERVATION_FUTURE_NS,
+    Binding,
+    Identity,
+    JsonObject,
+    RecoveryState,
+)
 from py000_nautilus.mt5_v1_transport import (
     Mt5V1RemoteError,
     Mt5V1RequestTimeout,
@@ -607,8 +613,13 @@ class Mt5V1DataClient(LiveMarketDataClient):
         observed_ms = int(cast(str, cast(JsonObject, snapshot["time"])["observed_utc_ms"]))
         now_ms = self._clock.timestamp_ns() // 1_000_000
         age_ms = now_ms - observed_ms
-        if age_ms < 0 or age_ms > self._mt5_config.max_snapshot_age_ms:
-            raise Mt5V1DataError("MT5 snapshot observation is stale or future-dated")
+        if (
+            age_ms < -(MAX_OBSERVATION_FUTURE_NS // 1_000_000)
+            or age_ms > self._mt5_config.max_snapshot_age_ms
+        ):
+            raise Mt5V1DataError(
+                f"MT5 snapshot observation is stale or future-dated (age_ms={age_ms})"
+            )
 
     def _require_identity(self) -> Identity:
         if self._identity is None:

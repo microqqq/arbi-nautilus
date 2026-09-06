@@ -6,6 +6,7 @@ from typing import cast
 from nautilus_trader.model.instruments import Instrument
 
 from py000_nautilus.economics import normalize_mt5_points_swap
+from py000_nautilus.mt5_v1_protocol import MAX_OBSERVATION_FUTURE_NS
 
 type Mt5SwapSpec = tuple[Decimal, Decimal, Decimal, int, tuple[Decimal, ...], str]
 
@@ -46,7 +47,10 @@ def mt5_instrument_structure(instrument: Instrument) -> dict[str, object]:
 
 
 def mt5_instrument_is_fresh(instrument: Instrument, now_ns: int, max_age_ns: int) -> bool:
-    return bool(0 < instrument.ts_event <= now_ns and now_ns - instrument.ts_event <= max_age_ns)
+    return bool(
+        instrument.ts_event > 0
+        and -MAX_OBSERVATION_FUTURE_NS <= now_ns - instrument.ts_event <= max_age_ns
+    )
 
 
 def validate_mt5_instrument_update(

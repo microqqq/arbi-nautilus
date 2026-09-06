@@ -361,6 +361,21 @@ def test_native_flat_account_mapping_and_mt5_shared_view_do_not_mutate_info() ->
     assert (source.info, hedge.info) == original
 
 
+@pytest.mark.parametrize("maker", [False, True])
+@pytest.mark.parametrize(("ahead_ns", "accepted"),
+                         [(266_000_000, True), (1_000_000_000, True), (1_000_000_001, False)])
+def test_mt5_capacity_mapper_cross_host_clock_boundary(
+    maker: bool, ahead_ns: int, accepted: bool,
+) -> None:
+    event = _account_event(bfx=False)
+    event.info["mt5_account_observed_ns"] = 100 + ahead_ns
+    assert (_mt5_view(event, maker=maker) is not None) is accepted
+    assert event.info["mt5_account_observed_ns"] == 100 + ahead_ns
+    source = _account_event(bfx=True)
+    source.info["bitfinex_margin"]["wallet"]["observed_ns"] = 100 + ahead_ns
+    assert _source_view(source) is None  # No relaxation of the local BFX receipt clock.
+
+
 def test_native_held_source_uses_dynamic_base_and_entry_price_not_flat_defaults() -> None:
     event = _account_event(bfx=True)
     event.info["bitfinex_margin"]["positions"]["position"] = _position()
@@ -531,7 +546,7 @@ def test_bfx_identity_and_completeness_cannot_invent_flat(case: str) -> None:
 @pytest.mark.parametrize("maker", [False, True])
 @pytest.mark.parametrize(("field", "invalid"), [
     ("mt5_positions_complete", False), ("mt5_account_sample_valid", False),
-    ("mt5_account_observed_ns", 79), ("mt5_account_observed_ns", 101),
+    ("mt5_account_observed_ns", 79), ("mt5_account_observed_ns", 1_000_000_101),
     ("mt5_account_observed_ns", True), ("mt5_symbol", "OTHER"), ("mt5_stream_id", "old"),
     ("mt5_net_position_ounces", None), ("mt5_net_position_ounces", "NaN"),
     ("mt5_equity", None), ("mt5_equity", "Infinity"),

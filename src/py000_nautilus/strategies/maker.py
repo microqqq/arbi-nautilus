@@ -68,6 +68,7 @@ from py000_nautilus.models import (
     SourceAccount,
     SourceDirection,
 )
+from py000_nautilus.mt5_v1_protocol import MAX_OBSERVATION_FUTURE_NS
 from py000_nautilus.store import JsonStateStore
 from py000_nautilus.strategies._mt5_costs import (
     mt5_instrument_is_fresh,
@@ -205,7 +206,9 @@ class MakerStrategy(Strategy):
         if ts_event_ns >= self._session_ts_ns:
             self._hedge_session_open = is_open
             self._session_ts_ns = ts_event_ns
-            if not is_open or ts_event_ns > cast(int, self.clock.timestamp_ns()):
+            if not is_open or ts_event_ns > (
+                cast(int, self.clock.timestamp_ns()) + MAX_OBSERVATION_FUTURE_NS
+            ):
                 self._freeze_and_cancel_all(
                     "hedge session closed or future-dated", market_input=True,
                 )

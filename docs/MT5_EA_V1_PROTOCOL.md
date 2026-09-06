@@ -352,10 +352,19 @@ never be interpreted against an old snapshot. A journal stream change fails clos
 Complete snapshots also refresh native same-ID Instrument observations. Swap values,
 mode, and rollover multipliers are dynamic; contract size, price/volume increments,
 currency and timezone remain structurally bound. Identity, observation time and session
-consistency are checked before publishing any replacement. Backward, future, stale or
+consistency are checked before publishing any replacement. Backward, over-tolerance future, stale or
 same-time conflicting costs do not replace the last-good Instrument. Native Instrument
 subscribers receive new MT5 observations independently of Bitfinex funding timestamps;
 the Maker/Taker strategies validate their own reference and freshness before new sources.
+
+Snapshot-derived Instrument, session and account-capacity observations share a fixed
+1000ms maximum future offset (inclusive) against the Python host clock. This permits
+bounded cross-host clock skew; second-precision `TimeGMT()` alone does not establish
+clock synchronization. Raw timestamps are preserved, past-age TTLs are not extended,
+and backward/same-time conflicting costs remain invalid. The margin mapper and both
+strategy consumers use the same bound, not just the data adapter. Bitfinex funding and
+local account receipt-time validation are unchanged. Offsets exceeding this budget stop
+admission and require diagnosis; the adapter error includes measured snapshot age.
 
 The MT5 contract is represented in canonical ounces: a 100-ounce contract is the
 Nautilus `lot_size`, and a 0.01-lot MT5 volume step becomes a one-ounce

@@ -62,7 +62,13 @@ from nautilus_trader.model.instruments import Instrument
 from nautilus_trader.model.objects import AccountBalance, Money
 from nautilus_trader.model.orders import Order
 
-from py000_nautilus.mt5_v1_protocol import Binding, Identity, JsonObject, RecoveryState
+from py000_nautilus.mt5_v1_protocol import (
+    MAX_OBSERVATION_FUTURE_NS,
+    Binding,
+    Identity,
+    JsonObject,
+    RecoveryState,
+)
 from py000_nautilus.mt5_v1_transport import (
     Mt5V1RemoteError,
     Mt5V1RequestTimeout,
@@ -399,7 +405,7 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
         ):
             return False
         age_ns = self._clock.timestamp_ns() - self._account_sample_observed_ns
-        return bool(0 <= age_ns <= max_age_ns)
+        return bool(-MAX_OBSERVATION_FUTURE_NS <= age_ns <= max_age_ns)
 
     def can_execute_quantity(self, quantity_ounces: Decimal) -> bool:
         """Return whether the installed MT5 snapshot can express this ounce quantity."""
@@ -965,7 +971,7 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
         observed_ns = (
             int(cast(str, cast(JsonObject, snapshot["time"])["observed_utc_ms"])) * 1_000_000
         )
-        sample_valid = observed_ns <= self._clock.timestamp_ns() and (
+        sample_valid = observed_ns <= self._clock.timestamp_ns() + MAX_OBSERVATION_FUTURE_NS and (
             self._account_sample_last_valid_ns is None
             or observed_ns >= self._account_sample_last_valid_ns
         )

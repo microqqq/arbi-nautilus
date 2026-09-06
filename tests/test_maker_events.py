@@ -3339,7 +3339,7 @@ def test_future_session_fact_immediately_cancels_instead_of_scheduling() -> None
     harness._hedge_session_open = True
     harness.clock = _NowClock()
 
-    MakerStrategy.update_hedge_session(cast(Any, harness), True, 3)
+    MakerStrategy.update_hedge_session(cast(Any, harness), True, 1_000_000_003)
 
     assert harness.cache.requested == ["O-BID", "O-ASK"]
     assert len(harness.canceled) == 2

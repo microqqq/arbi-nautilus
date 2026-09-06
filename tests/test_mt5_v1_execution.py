@@ -1098,7 +1098,8 @@ def test_capacity_metadata_uses_complete_exact_ticket_sample(
 
 
 @pytest.mark.parametrize(
-    ("elapsed_ns", "ready"), [(0, True), (5_000_000_000, True), (5_000_000_001, False), (-1, False)]
+    ("elapsed_ns", "ready"), [(0, True), (5_000_000_000, True), (5_000_000_001, False),
+                            (-1, True), (-1_000_000_000, True), (-1_000_000_001, False)]
 )
 def test_capacity_age_is_checked_at_read_time(elapsed_ns: int, ready: bool) -> None:
     async def scenario() -> None:
@@ -1133,7 +1134,7 @@ def test_capacity_bad_sample_time_does_not_poison_watermark_or_execution(bad_kin
         clock.set_time(original.ts_event + 10_000_000)
         invalid = deepcopy(harness.snapshot)
         bad_ns = (
-            clock.timestamp_ns() + 1_000_000
+            clock.timestamp_ns() + 1_001_000_000
             if bad_kind == "future"
             else original.ts_event - 1_000_000
         )
@@ -1158,6 +1159,24 @@ def test_capacity_bad_sample_time_does_not_poison_watermark_or_execution(bad_kin
         assert harness.account_states[-1].info["mt5_account_sample_valid"] is True
         assert invalid_event.info["mt5_account_sample_valid"] is False
         assert original.info == original_info
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(("ahead_ms", "ready"), [(266, True), (1000, True), (1001, False)])
+def test_capacity_install_cross_host_clock_boundary(ahead_ms: int, ready: bool) -> None:
+    async def scenario() -> None:
+        harness, clock = await _capacity_harness(asyncio.get_running_loop())
+        sample = deepcopy(harness.snapshot)
+        observed = clock.timestamp_ns() + ahead_ms * 1_000_000
+        cast(JsonObject, sample["time"])["observed_utc_ms"] = str(observed // 1_000_000)
+        harness.fake.current_snapshot = sample
+        await harness.client._refresh_snapshot_if_due(force=True)
+        event = harness.account_states[-1]
+        assert event.ts_event == observed
+        assert event.info["mt5_account_sample_valid"] is ready
+        assert harness.client.account_capacity_ready(5_000_000_000) is ready
+        assert harness.client.execution_admitted
 
     asyncio.run(scenario())
 

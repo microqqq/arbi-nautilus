@@ -2,7 +2,7 @@
 
 日期：2026-09-05。设计基线：`7d0d4766c62b98c3e4b950da1d61e789d140e2c5`。
 
-状态：**W1–W8本地实现及下文限定的离线/原生验收收尾；W9当前版本现场验收尚未完成，不能称完整迁移或可上线。** 当前分支为 `codex/audit-remediation`。历史计划和阶段性结果不覆盖后来的反例；最新结果见第10节。现场仍为旧EA，未推送、部署或恢复旧自动canary。
+状态：**W1–W8本地实现及下文限定的离线/原生验收收尾；W9当前版本现场验收尚未完成，不能称完整迁移或可上线。** 当前分支为 `codex/audit-remediation`。历史计划和阶段性结果不覆盖后来的反例；最新结果见第10节及 W9。用户已重挂候选EA，时钟窄修后普通无单入口已通过，接下来是有限普通策略成交验收。未推送或恢复旧自动canary。
 
 提交节奏（2026-09-05，按用户本轮要求）：每个可独立验证的小包在测试与独立复核通过后形成本地提交，不是每改一处就提交。此前累积且相互依赖的已验收修复先作为完整检查点提交；之后新包单独提交。提交说明标明实际完成边界，不把W1–W9全部完成作为检查点含义；推送、PR、合并和部署不由本地提交自动触发。
 
@@ -136,7 +136,7 @@ Taker 将同一 `max(source_book.ts_last, hedge_tick.ts_event)` 的行情回调�
 
 - Data adapter 的结构签名保留 symbol、contract size、currency、digits、point、tick/lot increments/min/max、timezone；只把 `swap_long/swap_short/swap_mode/swap_rates` 分离为动态输入。执行 adapter 既有结构签名已经不含 swap，不放宽其单位与账户检查。
 - 每次更新的完整 snapshot 生成同 ID Instrument，经过既有 `_handle_data` 交给 DataEngine；同值新观测也传播，以维护 MT5 自己的新鲜度，同时间同值可不重复发布。补齐 data client 原生 Instrument 订阅入口，不增加事件总线。提交 snapshot/健康状态后再发布 Instrument 和 status，使同步回调读取的是本次有效状态。
-- snapshot/Instrument 的观测时间不得倒退、超期或来自未来；同时间不同 swap 不覆盖 last-good。此处不借用 PUB tick 的 1 秒时钟容差。结构变化继续走既有停止准入路径，不把动态更新当作重新标定交易单位。
+- snapshot/Instrument 的观测时间不得倒退或超期；跨机器 UTC 允许最多 1 秒超前（含边界），超过即拒绝。同时间不同 swap 不覆盖 last-good。此处与账户容量样本使用相同固定容差；它是时钟偏差预算，不是把秒精度当作时钟已同步的证明。不改写原始时间，不扩大过去方向的 TTL。结构变化继续走既有停止准入路径，不把动态更新当作重新标定交易单位。此条取代原零未来容差，现场依据与实施范围见 W9。
 - 两策略订阅 hedge Instrument，校验目标 ID、结构、时间及 swap 可计算性后更新自己的 last-good 引用；不能直接信任已被倒序事件替换的 cache。拒绝更新时暂停新源，不清除既有 hedge 义务；后续合法新观测可恢复动态成本有效性。MT5 Instrument 时间与 Bitfinex funding/FX 时间独立，更新 swap 不写 `_cost_ts_ns`。
 - 同经济值新 Instrument 不撤 Maker 单；真正 swap 数值/模式/倍率变化走已有撤旧报价路径，撤单确认前不补新单。Taker 在下一合法行情使用新成本。测试必须经过真实 DataEngine/策略回调，覆盖重复/倒序/未来、funding 仍过期及结构变化；不只测试手工改私有引用。
 
@@ -640,6 +640,19 @@ P05 最终原生与loopback证据：两处EA窄修先取得14项中7项失败，
 前置：W1–W8 对相应运行模式验收通过、当前 EA 与 Python/profile 匹配、无未解释活动订单/义务。暂停的自动 canary 不能自行拿旧 v4 profile 越过这些条件。
 
 当前现场停点（2026-09-07 02:54:53 Asia/Shanghai）：安装版transport仅执行一次有界`hello`，6001/6002对应EA仍声明历史`e8126bf3ef0b42d01facdd2ef30f048972062b5ca38c81b84717156fb74cad00`、build `py000-mt5-ea-v1-taker-paper`，recovery ready、execution enabled；与本次候选`1ff6ce551b2f11c0876e5e0d4780d348da6a582d1eda9bb609371478a7f5daff`不匹配。本读操作未读取凭据、没有执行请求，也未更换EA/profile。W9因此不启动；先发布/重挂新EA并更新现有profile绑定，再不发单核对当前账户、订单和义务，保留原2oz/0.02lot测试边界。旧EA ready不等于本次修复已部署。
+
+**2026-09-07 06:25 / 用户重挂后的新停点与实施前窄修计划：** 新 EA 声明匹配 `1ff6ce55…`，账户/magic/stream/DEMO/0.02lot 均匹配。两端只读空仓，Bitfinex 无活动订单，EA 76 条事件无未决请求；三份历史本地 SUBMITTED 记录分别由保留 EA 最终成交和 Bitfinex 对应 CID 的历史 EXECUTED 解释，旧文件不改。安装版普通 `--rehearse` 移除全部策略/Actor，首轮于 06:19:32 因 `MT5 snapshot observation is stale or future-dated` 失败，06:20:30 完成有界退出，未发单；不将其记为通过。证据保留在 `runtime/w9-rehang-20260907-RZEXNQ/`。
+
+- 10 次独立只读快照中 5 次 receipt age 为 -2 至 -266ms；5 次 Windows UTC 与本机请求前后时间夹逼，guest 快于 host 的下界为 308–325ms。Windows 时间服务与 Parallels 60 秒同步均启用，但不能满足原零容差。原因是跨机器时钟偏差，不是旧数据、时区错误或部署未生效。
+- 固定采用与既有 PUB tick 同量级的 **1000ms 最大超前**，一个协议模块常量供 snapshot、成本 Instrument 和 execution 账户容量读取资格复用；不新增配置、时钟服务、重试循环，不改 EA/系统时间/原始时间戳/TTL/倒序及同时间冲突规则。历史 W5 的 `0<=age` 说明由本条替代。
+- 先补边界反例：精确 +1000ms 接受、+1000ms+1ns（毫秒快照为 +1001ms）拒绝；同值新样本可刷新，过期/倒序/同时间成本冲突不替换 last-good。真实 DataEngine、两策略成本消费和原账户容量路径都覆盖，避免只修 adapter 后仍在策略层停止。
+- 接线扫描另确认同一 snapshot 派生的 session 状态在 Maker 入口/共享 freshness 函数，以及账户在 margin mapper 还各有零容差；一并接同一个常量，防止 adapter 通过后策略仍反复撤单或拿不到容量。因此写集为上述四模块加 `economics.py`、`margin.py`、`strategies/maker.py` 这三个直接消费者及对应既有测试/本文/协议说明。Bitfinex funding、行情报价和过去方向 TTL 不变。完成 focused、全量和安装检查后单独本地提交；保留首轮失败日志，更新安装产物后只执行一次新的无订单 rehearsal。无单 rehearsal 可在 focused/安装入口检查通过后与其余离线进程测试并行收集证据，不把它当作代码已验收；全部通过前不启动 Taker/Maker/both 交易，原 2oz/0.02lot 上限不变。
+
+**06:44 / 网络前置与一次新无单会话预算：** 06:40–06:41 的修复版 rehearsal 中 MT5 两通道持续健康，无 snapshot 时钟错误；Bitfinex 公共 WS 在握手时发生 `ConnectionResetError`，执行端因 instrument 未发布而未启动，整轮仍为 FAILED 并正常退出。06:42 一次独立无认证 WS 握手已恢复（info v2/platform=1），非应用路径的 api-pub REST status 探针为 HTTP403，不拿它代替真实执行 REST 资格。06:43:44 使用应用实际 REST client 的 user_info/positions/active-orders/wallets 全部成功，测试身份不变；MT5 仍空仓/76事件/无未决，Bitfinex 仍空仓/零活动订单。在这些新只读事实后只再给一轮普通无单 rehearsal 的原 15s 启动、60s外层预算，使用独立 `clock-network-rehearsal` 文件；若再失败就保留现场诊断停点，不循环直到绿，不发交易请求。
+
+**06:47 / 时钟窄修完成、普通无单入口通过：** 主 agent 全量 **3131 passed / 133 处既有 Pandas warning / 496.98s**（两项专用 Redis 原生测试包括在内）；聚焦833项、另15项联合控制通过。安装 wheel/sdist 各18项入口/配置/模拟/pip检查通过；安装 wheel 的25项普通恢复进程 **25 passed / 591.02s**，没有skip。Ruff、Mypy123文件、diff-check通过。独立 reviewer 在相同13个生产/测试路径 diff `d3a665ca885ea5d2bf6e23fb04a42eaf291b6bb7111e37645677bc991e2792cd` 上复跑69项通过并给出限定 RECOMMEND-ACCEPT，主 agent 接受此次普通路径窄修。历史 Taker canary 的 session 超时诊断、Maker roundtrip canary 的 arm 附加准入仍是更严格的零未来口径，明确不在本次已统一范围，不扩写这些旧 runner。
+
+06:45:20–06:45:23 四个真实 adapter 均连接，新普通入口最终 `REHEARSED/adapter_startup_rehearsed`、exit0并正常停止；无策略/Actor、无发单，不能当作成交/持仓恢复已验收。两轮前置失败仍保留。此次新 wheel SHA256 `86bac77263e5251cd1e6406813327ebb2d408566d2449ed94675781e3f79d68d`；EA 未变，无需再次重挂。过程证据 `runtime/w9-rehang-20260907-RZEXNQ/`，安装/进程证据 `/tmp/py000-w9-clock-install-YCLALr/`。按步形成一个本地修复提交，不推送；W9成交阶段仍未完成。
 
 先做不发单连接/对账，再单独 Taker、Maker，最后同节点 both；均使用普通策略。每一轮都事先记录最大时长、最多源订单数、每单/累计净仓上限、最大未对冲量与超时、停止方式，使用已有两测试账户，不申请每一步重复授权。
 

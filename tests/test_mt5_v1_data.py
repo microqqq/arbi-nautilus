@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 import pytest
 import zmq
 import zmq.asyncio
+from nautilus_trader.common.component import TestClock
 from nautilus_trader.common.providers import InstrumentProvider
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.data.engine import DataEngine
@@ -776,7 +777,7 @@ def test_invalid_snapshot_never_replaces_last_good_instrument(anomaly: str) -> N
             bad_time = {
                 "backward": now_ms - 1_001,
                 "same_time_conflict": now_ms - 1_000,
-                "future": now_ms + 800,
+                "future": now_ms + 2_000,
                 "stale": now_ms - 60_001,
                 "structure": now_ms,
                 "authority": now_ms,
@@ -800,6 +801,41 @@ def test_invalid_snapshot_never_replaces_last_good_instrument(anomaly: str) -> N
             assert fake.closed
             status = cache.instrument_status(INSTRUMENT_ID)
             assert status is not None and status.is_trading is False
+        finally:
+            await client._disconnect()
+            engine.dispose()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(("ahead_ms", "accepted"), [(266, True), (1000, True), (1001, False)])
+def test_snapshot_cross_host_clock_boundary(ahead_ms: int, accepted: bool) -> None:
+    async def scenario() -> None:
+        clock = TestClock()
+        clock.set_time(1_780_000_000_000_000_000)
+        msgbus, cache = TestComponentStubs.msgbus(), TestComponentStubs.cache()
+        engine = DataEngine(msgbus=msgbus, cache=cache, clock=clock)
+        identity = _identity()
+        now_ms = clock.timestamp_ns() // 1_000_000
+        fake = _FakeTransport(identity, _fresh_snapshot(identity, now_ms))
+        client = Mt5V1DataClient(
+            loop=asyncio.get_running_loop(), name="MT5", config=_config(),
+            msgbus=msgbus, cache=cache, clock=clock,
+            instrument_provider=InstrumentProvider(), transport=fake,
+        )
+        try:
+            await client._connect()
+            original = cache.instrument(INSTRUMENT_ID)
+            fake.current_snapshot = _fresh_snapshot(identity, now_ms + ahead_ms)
+            if accepted:
+                await client._refresh_snapshot(allow_rehandshake=False)
+                assert client.committed_snapshot_count == 2
+                assert cache.instrument(INSTRUMENT_ID).ts_event == (now_ms + ahead_ms) * 1_000_000
+            else:
+                with pytest.raises(Mt5V1DataError, match="future-dated"):
+                    await client._refresh_snapshot(allow_rehandshake=False)
+                assert cache.instrument(INSTRUMENT_ID) is original
+                assert client.committed_snapshot_count == 1
         finally:
             await client._disconnect()
             engine.dispose()
