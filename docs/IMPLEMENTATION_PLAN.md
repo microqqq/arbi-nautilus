@@ -544,6 +544,15 @@ carry 是同 route 的唯一 signed residual；下一 fill 先与它合并再分
 - 实施中窄补（先核实后修改）：索引修复后的普通组合为6失败/27通过。真实flat的REST空列表被既有BFX mapper映射为**一个显式FLAT零量报告**，native/current也均为零且current/complete=True；原`restart_recovery._positions`错误要求报告数为0。这是本包需同时修复的产品表示不一致，由实施agent仅修改NETTING报告判据：必须恰好一份匹配的明确报告（零仓为FLAT/零量），缺报告、重复报告或量/方向不符仍拒绝，MT5与查询竞态/新鲜度门不变。主agent在原启动测试中加入显式flat正例及缺失/重复/错误量反例。
 - 同轮另外两个夹具事实分别处理：新节点复建closed Position后需用原生`update_position`恢复open/closed分类，它不补order副索引；`_SourceWire`始终固定raw position ID44，重开时被现有adapter正确拒绝复活旧ID，实际探针为native/REST=2但current=None且current/complete=False。主agent只窄改`tests/test_adapter_continuity.py`的合成仓位生命周期ID及明确flat报告断言，使同一周期保留ID、从flat新开产生新ID；原保护不豁免、不清内部margin状态。这两项不计为产品修复或真实账户认证。
 
+**W6b8 Taker已知义务的未发送剩余腿（2026-09-06，实施前固定）：** 基线`fee8865`。仅拓展普通`JsonStateStore`/Taker恢复，不解除Maker旧freeze、不引入新schema或恢复调度器。
+
+- 已只读实证：无plan无CID的完整PENDING义务、旧close已记账且下一腿未绑定、当前close实际FILLED但业务回调落后且未来open未绑定，均可有本次有效receipt并通过既有投影，最后被`_settle_completed`要求整义务全完成而拒绝。Taker原quote回调已经调度pending hedge，无需修改Actor、builder、策略、adapter或EA。
+- 完整native/CID/venue订单及逐笔成交集合、费用、前后观测不变、当前私有仓位/MT5逐票和业务守恒仍为前置。每个已绑定hedge CID必须在完整历史里且为FILLED、量/票据/seen均已验证；缺native或只查不到旧单不能当作未发送。复用原plan与persist-bind-before-submit顺序：已有完整旧腿前缀保留，当前腿只有满量已确认才推进一次，下一index等于原已绑定IDs长度；不补旧ID、不重发旧request、不重规划已绑定计划。
+- 原finalizer保留默认全完成合同，只由普通Taker启动显式启用未绑定剩余分类。planned累计成交必须等于已完整绑定前缀之和，未完成段设PENDING/current为空/当前腿成交0；unplanned仅无任何历史或当前CID且累计成交0的整义务可PENDING，已有CID的旧单腿仍须全完成。原source全部终态、已记成交与native吻合，严格rounding residual为0；有PENDING时新source继续被原store阻挡，不能强行标COMPLETED或让不同义务净额抵消。全部义务完成类别仍走原准入/完整性判断。
+- 保留receipt所有者/本次暂停归属和旧HOLD/UNKNOWN/BLOCKED/REJECTED入口限制。在原单次原子发布中更新source终态、完成前缀与pending资格，不改plan、旧IDs、TradeIds或数量；发布前失败整包回滚，replace后父目录同步失败永久作废本次receipt，不能因磁盘已PENDING就二次开门。最终核对/发布/Actor清启动门之间无await；实际派发由下一原有回调执行，并重新检查行情、路由、票据及原adapter准入。Maker和默认私有finalizer的未来腿拒绝测试保留。
+- 独立预审补充：schema可构造“SUBMITTED却无current CID”，`recover_for_start`会把它和合法PENDING无CID一起改成相同UNKNOWN快照，不能在事后靠absence区分。capture须在该覆盖前拒绝SUBMITTING/SUBMITTED/ACCEPTED缺current CID，以及PENDING却带current CID的矛盾入口；只否定资格、不修写原状态。此为入口形状反例，不声称正常bind-before-submit会产生它。rounding residual为0不同于总net_unhedged为0，后者在合法剩余义务恢复时本来非零。
+- 写集仅实施agent的`restart_recovery.py`、`tests/test_startup_settlement.py`，主agent的本文及`tests/test_startup_recovery.py`。主agent用真实普通双adapter先SELL2→hedgeBUY2，再BUY4的close2/open2计划，在未计划、计划后未绑定、腿间和已成交回调滞后处注入暂停，恢复新节点只发剩余腿；原生/业务历史不重放，新source先被挡住，完成后新机会正常。另保留旧暂停、已绑定未决、原子发布失败和零重复反例；这仍是合成venue新节点组合，不冒充进程突崩或DEMO认证。先固定旧路径RED再改生产，全量包含新的专用临时Redis，独立复核通过后仅本地提交，W6父项/R01–R06仍未完成。
+
 恢复分类：
 
 - 已结束订单、对冲义务均完成，venue 仓位和本地记录吻合：恢复原策略运行，保留现有仓位。
@@ -761,6 +770,7 @@ EA 改动额外执行现有 `tools/mt5_source_manifest.sh --lines`、MetaEditor 
     - [x] W6b5：普通启动核验后放行完整已结算历史；冻结全量2599项含真实Redis及独立复核通过。缺历史、原HOLD、未决/补账义务仍暂停，不计作突崩恢复或在线drain认证。
     - [x] W6b6：仅收尾本次receipt有资格、原绑定义务已全成交的业务滞后；冻结全量2628项含真实Redis及独立复核通过。旧Maker freeze/旧失败状态、待发腿仍HOLD；当时额外普通round-trip的Bitfinex归零索引红例由下项W6b7闭环，原失败记录保留。
     - [x] W6b7：兼容原生NETTING缺省副索引及显式FLAT报告；两策略同向加仓/归零/重开/再归零的新节点恢复后均可继续新机会，冻结全量2664项含真实Redis及独立复核通过。不补索引、不放宽MT5按票约束，不计作突崩或在线drain认证。
+    - [x] W6b8：本次receipt合格的普通Taker只续做原义务中未绑定的剩余腿，保留完整旧成交/计划/IDs，未完期间新source仍受阻；冻结全量2697项含真实Redis及独立复核通过。旧HOLD、Maker旧freeze、已绑定未决/拒单和突崩矩阵不在本包放行。
   - [ ] W6c 执行通道在线时drain、进程重启/停止矩阵R01–R06。
 - [ ] W7 同节点共账户。
 - [ ] W8 入口/安装/文档/原生运行边界。
@@ -1101,3 +1111,11 @@ EA 改动额外执行现有 `tools/mt5_source_manifest.sh --lines`、MetaEditor 
 - 未实施reviewer在七份冻结源码/测试上独立八文件**319 passed / 306.46s**，无skip；Ruff、Mypy98文件与diff-check通过。其对同一真实Taker往返历史仅在内存换回两个旧判据，分别精确RED，恢复冻结实现后GREEN；所有原生/业务事实及发单计数不变。七SHA测前测后相同，给出仅限W6b7的RECOMMEND-ACCEPT；独立复核未连接Redis，不与主agent后端证据混称。
 - 主agent冻结单次全量**2664 passed / 130既有Pandas警告 / 411.30s**，包含两项真实Redis跨进程测试且无skip；全仓Ruff、Mypy98文件及diff-check通过，七SHA全量前后不变。前置后端定向为2 passed / 32.15s，不累加进全量。两轮任务专用临时容器`3644c8ce2d1d`、`8d1f736dfa6d`均按完整ID停止，由`--rm`清除合成数据并复查为空；未动既有服务、镜像或账户。全量仍有既有模拟fixture的RUNNING→DISPOSE日志，W6c仍须单独验证。
 - 主agent据全量和独立复核接受W6b7，仅将这八个既定文件形成本地提交，不推送、部署或交易。W6a/b/c父项、R01–R06与W7–W9保持未完成；下一步继续既有未完成义务的窄恢复分类，再完成执行通道仍在线的停止/drain，不清外因HOLD、不重发未知旧request。
+
+2026-09-06，W6b8 Taker未发送剩余腿续跑：冻结全量与独立复核通过，仅接受固定窄类别：
+
+- 基线`fee8865`。主agent普通双adapter新节点取得原`_settle_completed`的精确RED：`startup hedge still has an incomplete or unbound leg`（1 failed / 3.44s）。独立预审另发现入口SUBMITTED无CID与合法PENDING无CID经启动覆盖后不可区分，实施者四项入口形状测试先RED再修。生产只在原`restart_recovery.py`净增33行，复用receipt、finalizer单次原子发布及原quote调度；不新建schema、Actor、订单账或重试框架，不改adapter/策略/store/EA。完整已绑定前缀须逐单FILLED，只有尚未绑定段回到PENDING，原身份/计划/数量/seen不变，原有暂停与未决旧请求不释放。
+- 新增/扩参33项：纯settlement26项、普通启动7项。后者真实先SELL2并对冲BUY2，再BUY4规划close2/open2；四截点恢复时全部原生订单/Position事件、数量、副索引不变且零交易，正负有利行情仍不能创建新source。随后原dispatcher以新CID串行执行剩余腿，完成后下一新机会通过；旧HOLD保持、发布前Actor正常重试、发布后同receipt第二次仍拒绝。普通定向7 passed / 29.31s；实施者六文件374 passed / 2.61s，子集不累加。中途测试误用重载后的`intents()[-1]`取得另一个哈希排序义务，已改按原intent_id定位；这项夹具错误不记为生产缺陷或额外业务RED。
+- 未实施reviewer独立十文件454 passed / 113.18s，无skip；原MT5送前目标/反向仓门另9 passed / 0.98s。仅在其测试进程换回旧finalizer，真实普通两节点腿间恢复精确RED，冻结实现GREEN；三个未来腿目标量变/消失/新反向票探针均被原coordinator阻挡、无新CID或重规划。这三个探针属于finalizer＋原生Position＋原coordinator层，不冒充完整两节点漂移认证。三份源码/测试SHA测前测后相同，结论为仅限W6b8的RECOMMEND-ACCEPT。
+- 主agent同一冻结上单次全量**2697 passed / 130既有Pandas警告 / 441.74s**，包括两项真实Redis跨进程测试且无skip；全仓Ruff、Mypy98文件及diff-check通过。三SHA全量前后不变，专用临时容器`863c9d594b20`按完整ID停止，`--rm`清除合成测试数据后列表复查为空；未动既有服务、镜像或账户。该结果不代替W6c的完整停止/信号/drain验证。
+- 主agent据全量与独立证据接受W6b8，仅将四个既定文件形成本地提交，不推送、部署或发单。Maker旧freeze/外因HOLD、已绑定未决和明确拒单恢复仍按既定后续分类处理；W6a/b/c父项、R01–R06与W7–W9保持未完成，不能据本包宣布突崩恢复或上线验收完成。

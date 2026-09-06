@@ -131,7 +131,7 @@ def test_restart_records_only_a_new_durably_published_hold(tmp_path: Path, maker
                                    "source_rejected", "intent_unknown", "intent_blocked",
                                    "intent_rejected"])
 def test_capture_does_not_adopt_old_text_or_unresolved_status(tmp_path: Path, fault: str) -> None:
-    owner, _, _ = _history(tmp_path / "old")
+    owner, sources, hedges = _history(tmp_path / "old")
     view = _view(owner)
     intent = view.intents()[0]
     if fault == "old_halt":
@@ -153,6 +153,9 @@ def test_capture_does_not_adopt_old_text_or_unresolved_status(tmp_path: Path, fa
     assert not receipt.eligible and not receipt.halts and not receipt.freezes
     assert owner.path.read_bytes() == before
     assert not capture_startup_receipt(_reload(owner)).eligible
+    with pytest.raises(ValueError, match="does not authorize"):
+        _settle_completed(owner, sources, hedges, receipt, resume_unbound=True)
+    assert owner.path.read_bytes() == before
 
 
 @pytest.mark.parametrize("maker", [False, True])
@@ -180,15 +183,17 @@ def test_fresh_receipt_settles_once_and_reload_is_noop(
 
 
 @pytest.mark.parametrize("planned", [False, True])
+@pytest.mark.parametrize("resume_unbound", [False, True])
 def test_final_leg_retains_unique_history_and_legacy_current_shape(
-    tmp_path: Path, planned: bool,
+    tmp_path: Path, planned: bool, resume_unbound: bool,
 ) -> None:
     owner, sources, hedges, receipt = _prepared(
         tmp_path / "legs", legs=3 if planned else 1, planned=planned,
     )
     view = _view(owner)
     before = view.intents()[0]
-    _settle_completed(owner, sources, list(reversed(hedges)), receipt)
+    _settle_completed(owner, sources, list(reversed(hedges)), receipt,
+                      resume_unbound=resume_unbound)
     after = view.intents()[0]
     assert after.status is ObligationStatus.COMPLETED
     assert after.hedge_order_ids == before.hedge_order_ids and after.hedge_plan == before.hedge_plan
@@ -277,12 +282,14 @@ def test_candidate_validation_failure_restores_both_maker_views(
     _settle_completed(owner, sources, hedges, receipt)
 
 
+@pytest.mark.parametrize("maker", [False, True])
 def test_a_fully_filled_old_leg_does_not_authorize_an_unbound_future_leg(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, maker: bool,
 ) -> None:
-    owner, sources, hedges = _history(tmp_path / "future", legs=2, pending_leg=True)
+    owner, sources, hedges = _history(tmp_path / "future", maker=maker, legs=2, pending_leg=True)
     receipt = capture_startup_receipt(owner)
-    _view(owner).recover_for_start()
+    for view in owner.stores.values() if isinstance(owner, MakerStateStore) else (owner,):
+        view.recover_for_start()
     _project(owner, sources, hedges, receipt)
     before, disk = deepcopy(owner._to_payload()), owner.path.read_bytes()
     publications = _observe(monkeypatch)
@@ -327,3 +334,229 @@ def test_restart_hold_receipt_requires_successful_publication(
     with pytest.raises(ParentDirectorySyncError if after_replace else OSError):
         _view(owner).recover_for_start()
     assert not receipt.halts and receipt.publication_failed is after_replace
+
+
+def _pending_history(
+    path: Path, stage: str,
+) -> tuple[JsonStateStore, list[Order], list[Order]]:
+    """Persist before a new leg's binding, or after its fill missed the business callback."""
+    owner = JsonStateStore(path)
+    legs = 3 if stage == "two-old-legs" else 2
+    quantity = str(2 * legs)
+    amounts = ("2", "2") if stage == "unplanned" else (quantity,)
+    source = _source_order("S", amounts, quantity=quantity)
+    _begin(owner, source)
+    for fill in (event for event in source.events if isinstance(event, OrderFilled)):
+        owner.reserve_source_fill(
+            fill_key=f"S|{fill.venue_order_id.value}|{fill.trade_id.value}",
+            client_order_id="S", trade_id=fill.trade_id.value,
+            source_side=BusinessOrderSide.BUY, fill_ounces=fill.last_qty.as_decimal(),
+        )
+    hedges: list[Order] = []
+    if stage == "unplanned":
+        return owner, [source], hedges
+    intent = owner.intents()[0]
+    owner.bind_hedge_plan(intent.intent_id, tuple(
+        HedgeLeg(intent.hedge_side, D(2), f"90000010{index}", BusinessOrderSide.BUY, D(2))
+        if index < legs - 1 else HedgeLeg(intent.hedge_side, D(2))
+        for index in range(legs)
+    ))
+    bound = {"planned-first": 0, "between-legs": 1, "two-old-legs": 2, "current-lag": 1}[stage]
+    for index in range(bound):
+        cid = f"H-CLOSE-{index}"
+        owner.bind_hedge_order(intent.intent_id, cid)
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(hedge_fixture, "STRATEGY", STRATEGY)
+            hedge = hedge_fixture._order(cid, ("2",), quantity="2", position=f"90000010{index}")
+        hedges.append(hedge)
+        if stage == "current-lag":
+            owner.update_hedge_status(cid, ObligationStatus.ACCEPTED)
+        else:
+            _record(owner, hedge, 1)
+    return owner, [source], hedges
+
+
+def _pending_prepared(
+    path: Path, stage: str = "current-lag",
+) -> tuple[JsonStateStore, list[Order], list[Order], _StartupReceipt]:
+    owner, sources, hedges = _pending_history(path, stage)
+    receipt = capture_startup_receipt(owner)
+    assert receipt.eligible
+    owner.recover_for_start()
+    _project(owner, sources, hedges, receipt)
+    return owner, sources, hedges, receipt
+
+
+@pytest.mark.parametrize("stage", ["unplanned", "planned-first", "between-legs",
+                                   "two-old-legs", "current-lag"])
+def test_taker_can_restore_only_unsent_hedge_work_without_replaying_facts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stage: str,
+) -> None:
+    owner, sources, hedges, receipt = _pending_prepared(tmp_path / "pending", stage)
+    original = owner.intents()
+    before = deepcopy(owner._to_payload())
+    native = [tuple(order.events) for order in (*sources, *hedges)]
+    publications = _observe(monkeypatch)
+    with pytest.raises(ValueError, match="incomplete or unbound"):
+        _settle_completed(owner, sources, hedges, receipt)
+    assert not publications and owner._to_payload() == before
+
+    _settle_completed(owner, sources, hedges, receipt, resume_unbound=True)
+
+    assert len(publications) == 1
+    assert owner.halt_reason is None and owner.source_freeze_reason is None
+    assert owner.active_source_order_id is None and owner.rounding_residual_ounces == 0
+    assert not owner.can_submit_source() and not owner.cycle_evidence_complete()
+    assert owner.net_unhedged_ounces > 0  # Known remaining obligation, not rounding carry.
+    for old, intent in zip(original, owner.intents(), strict=True):
+        assert intent == replace(
+            old, status=ObligationStatus.PENDING, hedge_client_order_id=None,
+            hedge_leg_index=len(old.hedge_order_ids), hedge_leg_filled_ounces=D(0),
+        )
+    assert owner._to_payload()["seen_source_fills"] == before["seen_source_fills"]
+    assert owner._to_payload()["seen_hedge_fills"] == before["seen_hedge_fills"]
+    assert [tuple(order.events) for order in (*sources, *hedges)] == native
+    _settle_completed(owner, sources, hedges, receipt, resume_unbound=True)
+    loaded = _reload(owner)
+    _settle_completed(loaded, sources, hedges, capture_startup_receipt(loaded), resume_unbound=True)
+    assert len(publications) == 1 and loaded._to_payload() == owner._to_payload()
+
+
+@pytest.mark.parametrize("status", [ObligationStatus.SUBMITTING, ObligationStatus.SUBMITTED,
+                                    ObligationStatus.ACCEPTED, ObligationStatus.PENDING])
+def test_receipt_rejects_contradictory_binding_status_before_restart_erases_it(
+    tmp_path: Path, status: ObligationStatus,
+) -> None:
+    stage = "current-lag" if status is ObligationStatus.PENDING else "planned-first"
+    owner, _, _ = _pending_history(tmp_path / "entry", stage)
+    intent = owner.intents()[0]
+    owner._state.hedge_intents[intent.intent_id] = replace(intent, status=status)
+    owner._persist()
+    before = owner.path.read_bytes()
+    receipt = capture_startup_receipt(owner)
+    assert not receipt.eligible
+    assert owner.path.read_bytes() == before
+
+
+@pytest.mark.parametrize("fault", ["missing-cid", "extra-cid", "partial-fok",
+                                   "plan-index", "leg-quantity", "wrong-ticket"])
+def test_unbound_recovery_does_not_bypass_complete_projection_preflight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: str,
+) -> None:
+    owner, sources, hedges = _pending_history(tmp_path / "conflict", "current-lag")
+    receipt = capture_startup_receipt(owner)
+    owner.recover_for_start()
+    intent = owner.intents()[0]
+    if fault == "missing-cid":
+        hedges = []
+    elif fault in {"extra-cid", "partial-fok"}:
+        with monkeypatch.context() as patch:
+            patch.setattr(hedge_fixture, "STRATEGY", STRATEGY)
+            order = hedge_fixture._order(
+                "EXTRA" if fault == "extra-cid" else hedges[0].client_order_id.value,
+                ("2",) if fault == "extra-cid" else ("1",), quantity="2", position="900000100",
+            )
+        hedges = [*hedges, order] if fault == "extra-cid" else [order]
+    elif fault == "plan-index":
+        owner._state.hedge_intents[intent.intent_id] = replace(
+            intent, status=ObligationStatus.BLOCKED, hedge_leg_index=1,
+        )
+    else:
+        first, second = intent.hedge_plan
+        plan = ((replace(first, quantity_ounces=D(1)), replace(second, quantity_ounces=D(3)))
+                if fault == "leg-quantity" else (replace(first, position_id="WRONG"), second))
+        owner._state.hedge_intents[intent.intent_id] = replace(intent, hedge_plan=plan)
+    owner._persist()
+    before, disk = deepcopy(owner._to_payload()), owner.path.read_bytes()
+    publications = _observe(monkeypatch)
+    with pytest.raises(ValueError, match="hedge projection"):
+        _project(owner, sources, hedges, receipt)
+    assert not publications and owner._to_payload() == before and owner.path.read_bytes() == disk
+
+
+@pytest.mark.parametrize("residual", ["0.1", "-0.1"])
+def test_unbound_final_candidate_still_requires_zero_rounding_residual(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, residual: str,
+) -> None:
+    owner, sources, hedges, receipt = _pending_prepared(tmp_path / "residual")
+    owner._state.net_unhedged_ounces = D(residual)
+    owner._persist()
+    before, disk = deepcopy(owner._to_payload()), owner.path.read_bytes()
+    publications = _observe(monkeypatch)
+    with pytest.raises(ValueError, match="inadmissible business residuals"):
+        _settle_completed(owner, sources, hedges, receipt, resume_unbound=True)
+    assert not publications and owner._to_payload() == before and owner.path.read_bytes() == disk
+
+
+def test_maker_cannot_enable_taker_unbound_recovery(tmp_path: Path) -> None:
+    owner, sources, hedges, receipt = _prepared(tmp_path / "maker", maker=True)
+    before, disk = deepcopy(owner._to_payload()), owner.path.read_bytes()
+    with pytest.raises(TypeError, match="JsonStateStore"):
+        _settle_completed(owner, sources, hedges, receipt, resume_unbound=True)
+    assert owner._to_payload() == before and owner.path.read_bytes() == disk
+
+
+@pytest.mark.parametrize("state", ["ACCEPTED", "REJECTED"])
+def test_bound_unfilled_legacy_request_is_not_reclassified_as_unsent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, state: str,
+) -> None:
+    owner, sources, hedges = _history(tmp_path / "legacy", planned=False)
+    receipt = capture_startup_receipt(owner)
+    _view(owner).recover_for_start()
+    with monkeypatch.context() as patch:
+        patch.setattr(hedge_fixture, "STRATEGY", STRATEGY)
+        order = hedge_fixture._order(
+            hedges[0].client_order_id.value, (), quantity="2", close=False, state=state,
+        )
+    _project(owner, sources, [order], receipt)
+    before, disk = deepcopy(owner._to_payload()), owner.path.read_bytes()
+    publications = _observe(monkeypatch)
+    with pytest.raises(ValueError, match="incomplete or unbound"):
+        _settle_completed(owner, sources, [order], receipt, resume_unbound=True)
+    assert not publications and owner._to_payload() == before and owner.path.read_bytes() == disk
+
+
+def test_later_invalid_intent_cannot_partially_publish_earlier_pending_candidate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    owner, sources, hedges, receipt = _pending_prepared(tmp_path / "batch", "unplanned")
+    later = owner.intents()[1]
+    owner._state.hedge_intents[later.intent_id] = replace(later, hedge_filled_ounces=D(1))
+    owner._persist()
+    before, disk = deepcopy(owner._to_payload()), owner.path.read_bytes()
+    publications = _observe(monkeypatch)
+    with pytest.raises(ValueError, match="incomplete or unbound"):
+        _settle_completed(owner, sources, hedges, receipt, resume_unbound=True)
+    assert not publications and owner._to_payload() == before and owner.path.read_bytes() == disk
+
+
+@pytest.mark.parametrize("after_replace", [False, True])
+def test_pending_publication_failure_rolls_back_or_invalidates_this_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, after_replace: bool,
+) -> None:
+    owner, sources, hedges, receipt = _pending_prepared(tmp_path / "pending-atomic")
+    before, disk = deepcopy(owner._to_payload()), owner.path.read_bytes()
+    attempts = 0
+
+    def fail(source: Path, destination: Path) -> None:
+        nonlocal attempts
+        attempts += 1
+        if after_replace:
+            os.replace(source, destination)
+            raise ParentDirectorySyncError("pending candidate published")
+        raise OSError("pending candidate not published")
+
+    monkeypatch.setattr(store_module, "replace_and_sync_parent", fail)
+    with pytest.raises(ParentDirectorySyncError if after_replace else OSError):
+        _settle_completed(owner, sources, hedges, receipt, resume_unbound=True)
+    assert attempts == 1 and receipt.publication_failed is after_replace
+    assert owner._to_payload() == _reload(owner)._to_payload()
+    assert (owner._to_payload() != before) is after_replace
+    assert (owner.path.read_bytes() != disk) is after_replace
+    monkeypatch.setattr(store_module, "replace_and_sync_parent", replace_and_sync_parent)
+    if after_replace:
+        assert owner.intents()[0].status is ObligationStatus.PENDING
+        with pytest.raises(RuntimeError, match="invalid after publication"):
+            _settle_completed(owner, sources, hedges, receipt, resume_unbound=True)
+    else:
+        _settle_completed(owner, sources, hedges, receipt, resume_unbound=True)

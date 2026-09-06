@@ -31,6 +31,7 @@ from test_adapter_continuity import (
     _accepted_source,
     _continuous,
     _drive,
+    _market,
     _settle_cycle,
     _SourceWire,
 )
@@ -41,7 +42,7 @@ from py000_nautilus.app import _source_instrument
 from py000_nautilus.bitfinex_v1_reports import map_position_status_reports
 from py000_nautilus.durability import ParentDirectorySyncError, replace_and_sync_parent
 from py000_nautilus.live_runtime import get_source_terminal_reconciler
-from py000_nautilus.models import ObligationStatus
+from py000_nautilus.models import HedgeIntent, ObligationStatus
 from py000_nautilus.mt5_v1_protocol import JsonObject
 from py000_nautilus.restart_recovery import _positions, reconcile_startup
 
@@ -227,6 +228,199 @@ def test_new_ordinary_node_resumes_native_netting_history_without_repairing_inde
             source2.fill(cid, second.source_quantity)
             await _settle_cycle(second, source2, wire2, cid=cid, expected=len(deltas) + 1)
             assert len(wire2.submit_calls) == 1 and not wire2.close_calls
+        finally:
+            await second.hedge._disconnect()
+            await second.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("cut,fault", [
+    ("unbound", None), ("planned", None), ("between-legs", None), ("current-filled", None),
+    ("between-legs", "old-hold"), ("unbound", "before-publish"),
+    ("current-filled", "after-publish"),
+])
+def test_taker_startup_continues_only_unbound_remaining_legs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cut: str, fault: str | None,
+) -> None:
+    async def scenario() -> None:
+        async with _continuous(
+            tmp_path, monkeypatch, maker=False, long_quantity=4, short_quantity=2,
+        ) as (first, source, wire):
+            initial = await _accepted_source(first, source, wire, -2)
+            assert source.order(initial).quantity.as_decimal() == 2
+            source.fill(initial, Decimal(2))
+            await _settle_cycle(first, source, wire, cid=initial, expected=1)
+            original_submit = first.strategy._submit_hedge_intent
+
+            def stop_before_binding(intent: HedgeIntent) -> None:
+                # Inject a stop at an existing durable boundary; never undo a
+                # binding or pretend that a previously sent request was absent.
+                if cut == "planned":
+                    first.strategy._hedges.next_hedge_leg(
+                        intent.intent_id, first.strategy._hedge_positions(),
+                    )
+                if cut in {"unbound", "planned"} or (
+                    cut == "between-legs" and intent.hedge_leg_index == 1
+                ):
+                    return
+                original_submit(intent)
+
+            monkeypatch.setattr(first.strategy, "_submit_hedge_intent", stop_before_binding)
+            if cut == "current-filled":
+                verify_serial = wire.before_mutation
+                assert verify_serial is not None
+
+                async def stop_business_delivery(payload: JsonObject) -> None:
+                    await verify_serial(payload)
+                    first.strategy.bind_restart_gate(lambda: True)
+
+                wire.before_mutation = stop_business_delivery
+            cid = await _accepted_source(first, source, wire, 4)
+            assert source.order(cid).quantity.as_decimal() == 4
+            source.fill(cid, Decimal(4))
+
+            def captured() -> bool:
+                if len(first.store.intents()) != 2:
+                    return False
+                intent = first.store.intents()[-1]
+                if cut == "between-legs":
+                    return intent.hedge_leg_index == 1 and intent.hedge_client_order_id is None
+                if cut == "current-filled":
+                    return bool(intent.hedge_client_order_id) and (
+                        first.node.cache.order(ClientOrderId(intent.hedge_client_order_id)).status
+                        is OrderStatus.FILLED
+                    )
+                return bool(intent.hedge_plan) is (cut == "planned")
+
+            await _drive(first, wire, captured, direction=0)
+            assert await first.node.kernel.exec_engine.reconcile_execution_state(timeout_secs=2)
+            first.source.confirm_terminal_reconciliation()
+            intent_before = first.store.intents()[-1]
+            assert len(wire.submit_calls) == 1  # Only the initial BUY2 hedge open.
+            assert len(wire.close_calls) == int(cut in {"between-legs", "current-filled"})
+            assert first.store.halt_reason is None and first.store.source_freeze_reason is None
+            if fault == "old-hold":
+                first.store._state.halt_reason = "operator inspection still required"
+                first.store._persist()
+            history = _History(first, source, wire)
+            old_positions = {position.id: (position.signed_decimal_qty(),
+                                           tuple(event.id for event in position.events))
+                             for position in first.node.cache.positions()}
+
+        second = _OrdinaryStrategy(
+            tmp_path, monkeypatch, maker=False, source_quantity=4, source_short_quantity=2,
+            native_mt5_transport=True, inject_mt5_io=False,
+        )
+        owner = get_source_terminal_reconciler(second.node)
+        source2, wire2 = history.restore(second)
+        dispatch_enabled = False
+        next_submit = second.strategy._submit_hedge_intent
+
+        async def verify_remaining_serial(payload: JsonObject) -> None:
+            request_id = str(payload["client_request_id"])
+            assert request_id not in {events[0].client_order_id.value
+                                      for events, _, _ in history.orders}
+            assert set(source2.rows) == set(history.source_facts[0])
+            assert all(order.status is OrderStatus.FILLED for order in
+                       second.node.cache.orders(instrument_id=second.hedge_instrument.id)
+                       if order.client_order_id.value != request_id)
+
+        wire2.before_mutation = verify_remaining_serial
+
+        def observe_before_dispatch(intent: HedgeIntent) -> None:
+            assert not second.store.can_submit_source()
+            assert set(source2.rows) == set(history.source_facts[0])
+            if dispatch_enabled:
+                next_submit(intent)
+
+        monkeypatch.setattr(second.strategy, "_submit_hedge_intent", observe_before_dispatch)
+        publications = 0
+
+        def publish(candidate: Path, destination: Path) -> None:
+            nonlocal publications
+            if destination == second.store.path and second.store.halt_reason is None:
+                publications += 1
+                if publications == 1:
+                    if fault == "after-publish":
+                        os.replace(candidate, destination)
+                        raise ParentDirectorySyncError("pending candidate published")
+                    raise OSError("pending candidate not yet published")
+            replace_and_sync_parent(candidate, destination)
+
+        if fault in {"before-publish", "after-publish"}:
+            monkeypatch.setattr(store_module, "replace_and_sync_parent", publish)
+        try:
+            second.hedge.connect()
+            async with asyncio.timeout(2):
+                while second.hedge._poll_task is None:
+                    await asyncio.sleep(.005)
+            await second.start(initial_reconciliation=True)
+            await _drive(second, wire2, lambda: not owner.busy and (
+                not owner.restart_pending or owner.last_failure is not None
+            ), direction=0)
+            resumed = second.store.intent(intent_before.intent_id)
+            assert resumed.intent_id == intent_before.intent_id
+            assert resumed.hedge_plan == intent_before.hedge_plan
+            assert resumed.hedge_order_ids == intent_before.hedge_order_ids
+            assert {order.client_order_id: tuple(event.id for event in order.events)
+                    for order in second.node.cache.orders()} == {
+                events[0].client_order_id: tuple(event.id for event in events)
+                for events, _, _ in history.orders
+            }
+            assert {position.id: (position.signed_decimal_qty(),
+                                  tuple(event.id for event in position.events))
+                    for position in second.node.cache.positions()} == old_positions
+            assert all(second.node.cache.position_id(events[0].client_order_id) == position_id
+                       for events, _, position_id in history.orders)
+            assert not wire2.submit_calls and not wire2.close_calls
+            assert not second.source_cancel_commands
+            assert second.reload_stores()[0]._state == second.store._state
+            assert not second.store.can_submit_source()
+            if fault in {"old-hold", "after-publish"}:
+                assert owner.restart_pending and owner.last_failure is not None
+                if fault == "old-hold":
+                    assert second.store.halt_reason == "operator inspection still required"
+                else:
+                    assert resumed.status is ObligationStatus.PENDING and publications == 1
+                    assert owner._restart_recovery is not None
+                    with pytest.raises(RuntimeError, match="invalid after publication"):
+                        await owner._restart_recovery()
+                    assert publications == 1 and owner.restart_pending
+                return
+            if owner.restart_pending:
+                # Expose the exact ordinary recovery exception on a RED run,
+                # instead of hiding it behind the Actor's bounded failure label.
+                assert owner._restart_recovery is not None
+                await owner._restart_recovery()
+            assert not owner.restart_pending, owner.last_failure
+            assert resumed.status is ObligationStatus.PENDING
+            assert resumed.hedge_client_order_id is None and resumed.hedge_leg_filled_ounces == 0
+            assert resumed.hedge_leg_index == len(resumed.hedge_order_ids)
+            assert resumed.hedge_filled_ounces == (
+                Decimal(2) if cut in {"between-legs", "current-filled"} else Decimal(0)
+            )
+            if fault == "before-publish":
+                assert publications == 2
+            for direction in (1, -1):
+                await _market(second, wire2, direction)
+                assert set(source2.rows) == set(history.source_facts[0])
+                assert not wire2.submit_calls and not wire2.close_calls
+            dispatch_enabled = True
+            await _settle_cycle(second, source2, wire2, cid=cid, expected=2)
+            assert len(wire2.submit_calls) == 1
+            assert len(wire2.close_calls) == int(cut in {"unbound", "planned"})
+            completed = second.store.intent(intent_before.intent_id)
+            assert completed.hedge_filled_ounces == completed.hedge_quantity_ounces == 4
+            assert completed.hedge_order_ids[:len(intent_before.hedge_order_ids)] == (
+                intent_before.hedge_order_ids
+            )
+            monkeypatch.setattr(second.strategy, "_submit_hedge_intent", next_submit)
+            wire2.before_mutation = None
+            next_cid = await _accepted_source(second, source2, wire2, -2)
+            assert next_cid not in history.source_facts[0]
+            source2.fill(next_cid, Decimal(2))
+            await _settle_cycle(second, source2, wire2, cid=next_cid, expected=3)
+            await _check(second)
         finally:
             await second.hedge._disconnect()
             await second.close()
