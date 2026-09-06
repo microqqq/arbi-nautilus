@@ -23,8 +23,10 @@ from nautilus_trader.execution.messages import (
 )
 from nautilus_trader.live.config import LiveExecEngineConfig
 from nautilus_trader.live.execution_engine import LiveExecutionEngine
+from nautilus_trader.model.currencies import USD
 from nautilus_trader.model.enums import (
     AccountType,
+    LiquiditySide,
     OrderSide,
     OrderStatus,
     OrderType,
@@ -33,14 +35,17 @@ from nautilus_trader.model.enums import (
 )
 from nautilus_trader.model.events import AccountState, OrderDenied, OrderEvent, OrderFilled
 from nautilus_trader.model.identifiers import (
+    AccountId,
     ClientId,
     ClientOrderId,
     ExecAlgorithmId,
     InstrumentId,
     PositionId,
+    TradeId,
     Venue,
     VenueOrderId,
 )
+from nautilus_trader.model.objects import Money
 from nautilus_trader.model.orders import Order
 from nautilus_trader.model.position import Position
 from nautilus_trader.test_kit.stubs.component import TestComponentStubs
@@ -48,6 +53,7 @@ from nautilus_trader.test_kit.stubs.events import TestEventStubs
 from nautilus_trader.test_kit.stubs.execution import TestExecStubs
 
 import py000_nautilus.mt5_v1_execution as mt5_execution
+import py000_nautilus.mt5_v1_protocol as mt5_protocol
 from py000_nautilus.mt5_v1_data import instrument_from_snapshot
 from py000_nautilus.mt5_v1_execution import (
     Mt5V1ExecClientConfig,
@@ -2924,6 +2930,258 @@ def test_live_engine_reconciles_rejected_order_once_without_fill() -> None:
         )
         assert repeated is not None
         assert repeated.venue_order_id == report.venue_order_id
+
+    asyncio.run(scenario())
+
+
+async def _boundary_report(harness: _Harness, order: Order, path: str) -> object:
+    if path == "single":
+        return await harness.client.generate_order_status_report(GenerateOrderStatusReport(
+            instrument_id=INSTRUMENT_ID, client_order_id=order.client_order_id,
+            venue_order_id=None, command_id=UUID4(), ts_init=harness.clock.timestamp_ns(),
+        ))
+    if path == "orders":
+        return await harness.client.generate_order_status_reports(_order_reports_command(harness))
+    if path == "fills":
+        return await harness.client.generate_fill_reports(_fill_reports_command(harness))
+    assert path == "mass"
+    return await harness.client.generate_mass_status()
+
+
+@pytest.mark.parametrize("field", [
+    "account", "instrument", "side", "quantity", "type", "time_in_force", "reduce_only",
+    "quote_quantity", "client", "venue_order", "reverse_venue_order",
+])
+def test_report_boundary_rejects_known_cached_order_conflicts(field: str) -> None:
+    async def scenario() -> None:
+        harness, original, _ = await _connected_report_harness(asyncio.get_running_loop())
+        cid = original.client_order_id
+        if field in {"instrument", "type"}:
+            factory = TestComponentStubs.order_factory()
+            if field == "type":
+                order = factory.limit(
+                    instrument_id=INSTRUMENT_ID, order_side=OrderSide.BUY,
+                    quantity=harness.instrument.make_qty(100), time_in_force=TimeInForce.FOK,
+                    price=harness.instrument.make_price(2400), client_order_id=cid,
+                )
+            else:
+                order = factory.market(
+                    instrument_id=InstrumentId.from_str("OTHER.MT5"), order_side=OrderSide.BUY,
+                    quantity=harness.instrument.make_qty(100), time_in_force=TimeInForce.FOK,
+                    client_order_id=cid,
+                )
+        else:
+            order = harness.market(
+                "99" if field == "quantity" else "100", client_order_id=cid,
+                order_side=OrderSide.SELL if field == "side" else OrderSide.BUY,
+                time_in_force=TimeInForce.IOC if field == "time_in_force" else TimeInForce.FOK,
+                reduce_only=field == "reduce_only", quote_quantity=field == "quote_quantity",
+            )
+        if field in {"account", "venue_order"}:
+            account = AccountId("MT5-OTHER") if field == "account" else harness.client.account_id
+            order.apply(TestEventStubs.order_submitted(order, account))
+            if field == "venue_order":
+                order.apply(TestEventStubs.order_accepted(
+                    order, account, VenueOrderId("700000099"),
+                ))
+        harness.cache.add_order(order, client_id=(ClientId("OTHER") if field == "client"
+                                                 else harness.client.id))
+        harness.cache.update_order(order)
+        if field == "reverse_venue_order":
+            other = harness.market(client_order_id=ClientOrderId("OTHER-CACHED"))
+            harness.cache.add_order(other, client_id=harness.client.id)
+            harness.cache.add_venue_order_id(other.client_order_id, VenueOrderId("700000002"))
+        before = list(order.events)
+        try:
+            with pytest.raises(Mt5V1ExecutionError, match="cached MT5"):
+                await _boundary_report(harness, order, "single")
+            assert order.events == before
+            assert harness.events == []
+            assert not harness.fake.submit_calls and not harness.fake.close_calls
+        finally:
+            await harness.client._disconnect()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("path", ["single", "orders", "fills", "mass"])
+def test_report_boundary_rejects_position_index_conflict_on_every_report_path(path: str) -> None:
+    async def scenario() -> None:
+        harness, order, _ = await _connected_report_harness(asyncio.get_running_loop())
+        wrong = PositionId("900000099")
+        harness.cache.add_order(order, client_id=harness.client.id, position_id=wrong)
+        before = list(order.events)
+        try:
+            with pytest.raises(Mt5V1ExecutionError, match="cached MT5"):
+                await _boundary_report(harness, order, path)
+            assert harness.cache.position_id(order.client_order_id) == wrong
+            assert order.events == before and harness.events == []
+            assert not harness.fake.submit_calls and not harness.fake.close_calls
+            if path == "mass":
+                assert harness.fake.closed and harness.client._identity is None
+        finally:
+            await harness.client._disconnect()
+
+    asyncio.run(scenario())
+
+
+def _cache_report_fill(harness: _Harness, order: Order, **changed: object) -> None:
+    order.apply(TestEventStubs.order_submitted(order, harness.client.account_id))
+    order.apply(TestEventStubs.order_accepted(order, harness.client.account_id,
+                                             VenueOrderId("700000002")))
+    fill = TestEventStubs.order_filled(
+        order, harness.instrument, account_id=harness.client.account_id,
+        trade_id=TradeId("800000002"), position_id=PositionId("900000002"),
+        last_qty=harness.instrument.make_qty(100), last_px=harness.instrument.make_price("2401.25"),
+        commission=Money(1.25, USD), liquidity_side=LiquiditySide.NO_LIQUIDITY_SIDE,
+        ts_event=1_788_271_200_000_000_000,
+    )
+    values = OrderFilled.to_dict(fill)
+    values.update(changed)
+    order.apply(OrderFilled.from_dict(values))
+    harness.cache.add_order(order, client_id=harness.client.id, position_id=order.position_id)
+    harness.cache.update_order(order)
+
+
+@pytest.mark.parametrize(("field", "value"), [
+    ("trade_id", "800000099"), ("last_qty", "50"), ("last_px", "2401.26"),
+    ("commission", "1.26 USD"), ("liquidity_side", "TAKER"),
+    ("ts_event", 1_788_271_200_001_000_000), ("position_id", "900000099"),
+    ("order_side", "SELL"),
+])
+def test_report_boundary_rejects_changed_recorded_fill_fact(field: str, value: object) -> None:
+    async def scenario() -> None:
+        harness, order, _ = await _connected_report_harness(asyncio.get_running_loop())
+        _cache_report_fill(harness, order, **{field: value})
+        before = list(order.events)
+        try:
+            with pytest.raises(Mt5V1ExecutionError, match="cached MT5"):
+                await _boundary_report(harness, order, "fills")
+            assert order.events == before and harness.events == []
+        finally:
+            await harness.client._disconnect()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(("field", "cache_state"), [
+    ("quantity", "INITIALIZED"), ("quantity", "FILLED"),
+    ("price", "INITIALIZED"), ("price", "FILLED"),
+])
+def test_report_boundary_rejects_raw_decimal_conflict_hidden_by_rounding(
+    field: str, cache_state: str,
+) -> None:
+    async def scenario() -> None:
+        harness = _Harness(asyncio.get_running_loop())
+        order = harness.market()
+        lots = "1.004" if field == "quantity" else "1"
+        terminal = _outcome(harness.identity, order, "order_filled", quantity_lots=lots)
+        if field == "price":
+            cast(JsonObject, terminal["payload"])["fill_price"] = "2401.254"
+        page = _page(harness.identity, after_cursor="0", events=[
+            _stream_started(harness.identity),
+            _event(harness.identity, 2, "submission_reserved", _submission_payload(order, lots)),
+            terminal,
+        ])
+        mt5_protocol._validate_events_data(page)  # Wire decimals may exceed native precision.
+        harness.fake.pages.append(page)
+        await harness.connect()
+        if cache_state == "FILLED":
+            _cache_report_fill(harness, order)
+        else:
+            harness.cache.add_order(order, client_id=harness.client.id)
+        before = list(order.events)
+        try:
+            with pytest.raises(Mt5V1ExecutionError, match="cached MT5"):
+                await _boundary_report(harness, order, "fills")
+            assert order.events == before and harness.events == []
+            assert not harness.fake.submit_calls and not harness.fake.close_calls
+        finally:
+            await harness.client._disconnect()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("cache_state", ["INITIALIZED", "FILLED", "REJECTED"])
+def test_report_boundary_accepts_first_complete_fill_identical_fill_and_native_rejection(
+    cache_state: str,
+) -> None:
+    async def scenario() -> None:
+        harness, filled, rejected = await _connected_report_harness(asyncio.get_running_loop())
+        order = rejected if cache_state == "REJECTED" else filled
+        if cache_state == "FILLED":
+            _cache_report_fill(harness, order)
+        else:
+            if cache_state == "REJECTED":
+                order.apply(TestEventStubs.order_submitted(order, harness.client.account_id))
+                order.apply(TestEventStubs.order_rejected(order, harness.client.account_id))
+            harness.cache.add_order(order)  # Legacy/reports-only cache may have no client index.
+            harness.cache.update_order(order)
+            assert order.venue_order_id is None
+        before = list(order.events)
+        try:
+            for path in ("single", "orders", "fills", "mass"):
+                assert await _boundary_report(harness, order, path) is not None
+            assert order.events == before and harness.events == []
+            assert not harness.fake.submit_calls and not harness.fake.close_calls
+        finally:
+            await harness.client._disconnect()
+
+    asyncio.run(scenario())
+
+
+def test_report_boundary_rejects_filled_fact_for_already_canceled_native_order() -> None:
+    async def scenario() -> None:
+        harness, order, _ = await _connected_report_harness(asyncio.get_running_loop())
+        order.apply(TestEventStubs.order_submitted(order, harness.client.account_id))
+        order.apply(TestEventStubs.order_accepted(order, harness.client.account_id,
+                                                VenueOrderId("700000002")))
+        order.apply(TestEventStubs.order_canceled(order, harness.client.account_id))
+        harness.cache.add_order(order, client_id=harness.client.id)
+        harness.cache.update_order(order)
+        before = list(order.events)
+        try:
+            with pytest.raises(Mt5V1ExecutionError, match="cached MT5"):
+                await _boundary_report(harness, order, "single")
+            assert order.status is OrderStatus.CANCELED and order.events == before
+        finally:
+            await harness.client._disconnect()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("index", [None, "900000099", "900000002"])
+def test_report_boundary_exact_close_requires_reserved_index_not_current_open_ticket(
+    index: str | None,
+) -> None:
+    async def scenario() -> None:
+        identity = _identity()
+        snapshot = _snapshot(identity)
+        snapshot["positions"] = []  # A historical close target is not required to remain open.
+        harness = _Harness(asyncio.get_running_loop(), identity=identity, snapshot=snapshot)
+        order = harness.market(reduce_only=True)
+        binding = {"position_ticket": "700000001", "position_identifier": "900000002"}
+        harness.fake.pages.append(_page(identity, after_cursor="0", events=[
+            _stream_started(identity),
+            _event(identity, 2, "submission_reserved", _submission_payload(order, **binding)),
+            _outcome(identity, order, "order_filled", position_ticket="700000001",
+                     position_identifier="900000002"),
+        ]))
+        harness.cache.add_order(order, client_id=harness.client.id,
+                                position_id=PositionId(index) if index is not None else None)
+        await harness.connect()
+        try:
+            if index == "900000002":
+                assert await _boundary_report(harness, order, "single") is not None
+            else:
+                with pytest.raises(Mt5V1ExecutionError, match="cached MT5"):
+                    await _boundary_report(harness, order, "single")
+            assert harness.events == [] and harness.fake.current_snapshot["positions"] == []
+            assert harness.cache.position_id(order.client_order_id) == (
+                PositionId(index) if index is not None else None
+            )
+        finally:
+            await harness.client._disconnect()
 
     asyncio.run(scenario())
 

@@ -47,6 +47,7 @@ from nautilus_trader.model.enums import (
     PositionSide,
     TimeInForce,
 )
+from nautilus_trader.model.events import OrderFilled
 from nautilus_trader.model.identifiers import (
     AccountId,
     ClientId,
@@ -1354,7 +1355,90 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
         ).encode()
         return VenueOrderId(f"PY000_REJ_{hashlib.sha256(material).hexdigest()}")
 
+    def _validate_cached_terminal(self, request_id: str, event: JsonObject) -> None:
+        """Reject known native/journal conflicts before the engine can overwrite facts."""
+        client_order_id = ClientOrderId(request_id)
+        reserved = cast(JsonObject, self._reservations[request_id]["payload"])
+        payload = cast(JsonObject, event["payload"])
+        filled = event["event_type"] == "order_filled"
+        venue_order_id = (
+            VenueOrderId(cast(str, payload["venue_order_id"]))
+            if filled else self._synthetic_rejected_venue_order_id(request_id)
+        )
+        indexed_cid = self._cache.client_order_id(venue_order_id)
+        if indexed_cid is not None and indexed_cid != client_order_id:
+            raise Mt5V1ExecutionError(f"cached MT5 venue order index conflict: {request_id}")
+        order = self._cache.order(client_order_id)
+        if order is None:
+            return
+        instrument = self._report_instrument()
+        quantity = Decimal(cast(str, reserved["quantity_lots"])) * Decimal(str(instrument.lot_size))
+        side = self._order_side(reserved)
+        reduce_only = "position_identifier" in reserved
+        indexed_client = self._cache.client_id(client_order_id)
+        if (
+            (order.account_id is not None and order.account_id != self.account_id)
+            or (indexed_client is not None and indexed_client != self.id)
+            or order.instrument_id != self._mt5_config.instrument_id
+            or order.side != side
+            or order.quantity.as_decimal() != quantity
+            or order.order_type != OrderType.MARKET
+            or order.time_in_force != TimeInForce.FOK
+            or order.is_reduce_only != reduce_only
+            or order.is_quote_quantity
+        ):
+            raise Mt5V1ExecutionError(f"cached MT5 order facts conflict: {request_id}")
+        for known_venue_id in (order.venue_order_id, self._cache.venue_order_id(client_order_id)):
+            if known_venue_id is not None and known_venue_id != venue_order_id:
+                raise Mt5V1ExecutionError(f"cached MT5 venue order conflict: {request_id}")
+        journal_position = (
+            PositionId(cast(str, payload["venue_position_id"]))
+            if filled else (
+                PositionId(cast(str, reserved["position_identifier"])) if reduce_only else None
+            )
+        )
+        indexed_position = self._cache.position_id(client_order_id)
+        known_positions = {
+            value for value in (indexed_position, order.position_id, journal_position)
+            if value is not None
+        }
+        if len(known_positions) > 1 or (
+            reduce_only
+            and indexed_position != PositionId(cast(str, reserved["position_identifier"]))
+        ):
+            raise Mt5V1ExecutionError(f"cached MT5 position index conflict: {request_id}")
+        status = OrderStatus.FILLED if filled else OrderStatus.REJECTED
+        if order.is_closed and order.status != status:
+            raise Mt5V1ExecutionError(f"cached MT5 closed order conflicts: {request_id}")
+        price = Decimal(cast(str, payload["fill_price"])) if filled else None
+        if price is not None and instrument.make_price(price).as_decimal() != price:
+            raise Mt5V1ExecutionError(f"cached MT5 fill price loses precision: {request_id}")
+        fills = [item for item in order.events if isinstance(item, OrderFilled)]
+        if order.filled_qty == 0 and not fills and not order.trade_ids:
+            return  # A first complete FOK report may fill an existing unfilled order.
+        if not filled or order.filled_qty.as_decimal() != quantity or len(fills) != 1:
+            raise Mt5V1ExecutionError(f"cached MT5 filled quantity conflicts: {request_id}")
+        trade_id = TradeId(cast(str, payload["venue_deal_id"]))
+        recorded = fills[0]
+        # W1 currency quantization is intentional for fees, not quantity or price facts.
+        if (
+            order.trade_ids != [trade_id]
+            or recorded.account_id != self.account_id
+            or recorded.instrument_id != self._mt5_config.instrument_id
+            or recorded.venue_order_id != venue_order_id
+            or recorded.position_id != journal_position
+            or recorded.order_side != side
+            or recorded.trade_id != trade_id
+            or recorded.last_qty.as_decimal() != quantity
+            or recorded.last_px.as_decimal() != price
+            or recorded.commission != _mt5_usd_commission(cast(str, payload["commission"]))
+            or recorded.liquidity_side != LiquiditySide.NO_LIQUIDITY_SIDE
+            or recorded.ts_event != self._event_ts_ns(event)
+        ):
+            raise Mt5V1ExecutionError(f"cached MT5 recorded fill conflicts: {request_id}")
+
     def _order_report(self, request_id: str, event: JsonObject) -> OrderStatusReport:
+        self._validate_cached_terminal(request_id, event)
         reservation = self._reservations[request_id]
         reserved = cast(JsonObject, reservation["payload"])
         payload = cast(JsonObject, event["payload"])
@@ -1410,6 +1494,7 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
         )
 
     def _fill_report(self, request_id: str, event: JsonObject) -> FillReport:
+        self._validate_cached_terminal(request_id, event)
         payload = cast(JsonObject, event["payload"])
         instrument = self._report_instrument()
         contract_size = Decimal(str(instrument.lot_size))
@@ -1444,6 +1529,15 @@ class Mt5V1ExecutionClient(LiveExecutionClient):
             try:
                 await self._consume_event_pages()
                 await self._refresh_snapshot_if_due(force=True)
+                try:
+                    _, projection = self._require_reportable_state()
+                except Mt5V1ExecutionError:
+                    pass  # Preserve the native None result for existing unreportable states.
+                else:
+                    # Native mass reporting swallows child exceptions; conflicts must reach
+                    # this client's existing fail-closed disconnect before any report escapes.
+                    for request_id, event in projection.terminals.items():
+                        self._validate_cached_terminal(request_id, event)
                 return await super().generate_mass_status(lookback_mins)
             except Mt5V1RequestTimeout as exc:
                 self._mark_snapshot_unavailable(exc)

@@ -480,6 +480,16 @@ carry 是同 route 的唯一 signed residual；下一 fill 先与它合并再分
 - 两个普通builder分别做真实Native LiveExecutionEngine事件入队→原生cache后台写入→dispose→全新Python进程native load。消费者不能重放生产者事件或重新seed账户/订单；只从数据库读回账号、原始OrderInitialized/事件UUID/TradeId、partial数量、Position、MT5 identifier、未成交exact-close索引及TE来源。追加重复TradeId须不增量、新TradeId阳性须增量；账户不符、缺索引/不完整载入和服务不可用失败且不能触发交易。不在这里声称突然断电、Redis自身重启耐久、netting翻仓、同节点双策略或下一机会已认证。
 - 写集：两个live builder、一份短`live_cache.py`、对应纯接线测试、紧凑独立进程helper/显式Redis集成测试、本文及必要README说明。实施agent负责生产薄接线与单元反例，主agent负责独立进程/真实后端和集成，未实施agent独立复核。通过后单独本地提交W6a1；W6a完整异常边界、W6b/c及W6父项不提前勾选。
 
+**W6b1 MT5报告/cache事实边界（2026-09-06，修改前固定）：** 基线`e1f8148`。主agent用真实MT5 adapter与Q3合成历史复现：两个各100oz的原订单显式position索引互换后，原生`reconcile_execution_state=True`，但两张票据的owner互换。`execution/engine.pyx`优先用cache索引覆盖fill内position，合计数量相同不能发现这一错误。因此先在adapter报告进入Engine之前阻断冲突，再实施义务投影。
+
+- 只在现有MT5 execution模块加短共享核验，覆盖单单、批量order、fill及mass报告路径；复用原reservation/terminal及native缓存，不增加数据库、恢复状态机、订单日志或EA字段。报告生成不得修索引、补owner、改订单或提交交易；完整mass失败须沿原失败路径阻挡启动对账，不能返回删掉冲突订单的部分绿色报告。
+- 已有缓存CID时核对account已知值、instrument、side、base quantity、MARKET/FOK、reduce-only及已知venue order ID；已知client索引不符拒绝。尚未Submitted的account/venue ID为空允许由首次报告补充；既有reports-only/EXTERNAL无client索引不因此改成已认证本地归属，W6a1持久cache严格完整性门不放宽。不从CID推测StrategyId，不要求报告携带不存在的策略身份。
+- 比较cache显式position索引、order已知PositionId和journal给出的真实identifier，任意已知冲突拒绝；已有MT5 exact-close必须保留等于reservation目标的索引。未成交open尚无PositionId是正常状态，允许首次真实filled报告给出identifier；不要要求历史已平票据仍在当前snapshot。拒单沿用稳定合成venue ID及零成交事实，不强求数字venue ID或预先已知新仓identifier。
+- 已记成交必须与原EA terminal的TradeId、数量、价格、signed USD commission和毫秒事件时间一致，不能以同累计量掩盖换trade/换事实。缓存已闭单而报告事实不同、已记量回退或原生无法吸收的额外成交明确拒绝，不在本包强修closed订单。保持现有UNKNOWN/partial-FOK/journal完整性规则。
+- 数量比较须先以原始Decimal的lots×contract_size对照native base quantity，已记价格须与原始Decimal fill_price对照，不能先make_qty/make_price舍入后掩盖差异。已有缓存CID首次报告完整成交前也须确认原始价格能被native Price无损表达，避免首次舍入入账后对同一journal重报才拒绝；空cache旧reports语义不在本包扩大。commission不同：保持W1既定USD按currency precision逐笔半偶量化，比较其原生Money，原始小数分保留在journal，不改既有费用规范。
+- 写集：`mt5_v1_execution.py`及现有adapter测试由实施agent负责；紧凑`tests/test_restart_reconciliation.py`由主agent固定真实native反例、无事件污染及正常对照；本文记录边界/证据，未实施agent独立复核。先在旧实现获得业务RED，再修复、全量回归后单独本地提交。此包不接业务HOLD释放、不改两个builder、策略、store、profile、EA或canary，不访问真实账户，不推送/部署/发单。
+- 后续W6b2复用原source去重/intent及Maker原子allocation，不能调用会发hedge/cancel的策略fill回调当纯投影。Maker跨源单事件只有每单保序，不能把cache遍历或venue时间排序假装原全局分配次序；多单缺失且顺序不明继续HOLD。MT5旧腿IDs须逐腿核对，不把旧腿成交计到当前腿；持久写失败不得留下仅内存已seen的假幂等。先交付事实可证明的恢复类别，再扩矩阵，不为不明历史另造平行账。
+
 恢复分类：
 
 - 已结束订单、对冲义务均完成，venue 仓位和本地记录吻合：恢复原策略运行，保留现有仓位。
@@ -690,6 +700,7 @@ EA 改动额外执行现有 `tools/mt5_source_manifest.sh --lines`、MetaEditor 
   - [ ] W6a 原生持久cache接线与真实后端跨进程恢复认证。
     - [x] W6a1：可选Redis薄接线、加载组合身份核验及历史source准入暂停；独立复核发现的MT5未成交exact-close缺索引遗漏已窄修，修订全量2340项含真实Redis及独立复核通过。只认证干净退出后的原生load；突崩/存储滞后与义务一致性随W6b/c验收。
   - [ ] W6b 完整事实核对、既有义务幂等恢复及普通策略解除HOLD。
+    - [x] W6b1：MT5报告进入原生Engine前核验原订单/票据索引/已记成交；独立复核发现的量价舍入遗漏已窄修，修订全量2376项含真实Redis及独立复核通过。仅接受报告事实边界，不解除业务HOLD。
   - [ ] W6c 执行通道在线时drain、进程重启/停止矩阵R01–R06。
 - [ ] W7 同节点共账户。
 - [ ] W8 入口/安装/文档/原生运行边界。
@@ -962,3 +973,14 @@ EA 改动额外执行现有 `tools/mt5_source_manifest.sh --lines`、MetaEditor 
 - 主agent把该反例加入原backend矩阵：合法owner/account/client的未成交MT5 close唯一缺目标索引，native integrity仍为真而普通新进程必须拒绝；仅测试fixture用原生数据库索引接口补回其已知合成目标，再以未修改的普通builder重新load核对只有该索引变化，随后独立验证缺client拒绝。这不是生产恢复入口，不绕过消费者校验。修订定向 **61 passed / 31.30s**（含两项真实Redis）。
 - 最终六份冻结源码/测试上，主agent显式选择全新临时Redis运行单次全量：**2340 passed / 129既有类别Pandas弃用警告 / 327.26s**，包含两项真实backend，无skip。全仓Ruff、Mypy89文件与diff-check通过；六SHA测前测后不变。独立reviewer在其另一个全新临时实例上 **61 passed / 30.58s**，复验原MT5反例、Bitfinex阳性、fixture精确恢复及其余失败边界，静态检查和六SHA一致，给出RECOMMEND-ACCEPT；主agent据修订全量与独立证据接受本小步。各子集不相加为全量数量。
 - 主agent与独立reviewer创建的临时容器均已按准确ID停止，`--rm`删除仅用于测试的合成数据；最终列表确认主agent容器不存在，未操作既有服务、镜像、volume或真实账户。按约定单独本地提交，不推送、部署或交易；W6b/c、R01–R06和W6父项保持未完成。下一步将已恢复cache与venue事实、原业务义务接起来，确认既有成交只投影一次后再开放正常续跑，不重复造持久化系统。
+
+2026-09-06，W6b1 MT5报告/cache事实核验：首冻结全量后独立REWORK，修订重新全量及复核：
+
+- 基线`e1f8148`。首候选仅原MT5 execution增加92行，使用原reservation/terminal和native Order/OrderFilled/索引核对已知身份、exact-close目标及已记成交；报告单单/批量/fill入口共用同一函数。完整mass在原生收集前检查，让新增冲突进入既有断连路径；原生会吞子报告异常返回None，不能以单单raise冒充mass已经闭合。原有UNKNOWN/pending等不可报告状态仍保留原None行为，无第二HOLD状态机，不修改cache、业务store或策略。
+- 实施者30项新增测试在旧版取得26个确切DID NOT RAISE与4个正常阳性；修复后30项及整个MT5 adapter **199 passed / 1.41s**。字段冲突、四报告入口、逐fill原生数量/价格/费用/时间/身份、closed FOK和缺/错close索引均覆盖；首次完整FOK、相同fill、合成拒单ID、无client的旧reports及已关闭历史票据保留。
+- 主agent的单owner双票真实adapter/native测试先正常产生两张100oz票，再加载两笔Submitted的1oz exact-close；两分支均通过W6a完整缓存核验，EA完整journal每票close1且snapshot各99。旧版正确索引通过，互换索引仍返回True，在应拒绝断言处精确RED；修复后错误分支无任何订单事件/仓位变化并关闭执行就绪，正常分支按票成交及重复对账去重。两例与Q3/live-cache合计 **48 passed / 6.03s**；前期fixture补Submitted/inflight索引和更正快照helper接收对象的修正不计作业务RED。
+- 首冻结全量 **2372 passed / 129既有类别Pandas弃用警告 / 327.87s**，含两项既有真实Redis回归且无skip，三SHA测前测后不变；全仓Ruff、Mypy90文件和diff-check通过。独立reviewer247项6.35s通过并在内存关闭helper后让root错票据例重新精确RED，但另发现数量先舍入的确切REWORK：journal 1.004lot×100=100.400oz被make_qty变成100，与cached100错误相等。主agent和实施者进一步复现已记价格2401.25与raw2401.254被make_price掩盖。该全量不能认证此遗漏；等首轮自然退出后才开始窄修，未中断原生测试。
+- 修订只改原helper比较顺序并补精度反例；数量和价格各覆盖INITIALIZED/FILLED，先3项精确DID NOT RAISE，再补首次价格1 RED/3 PASS，修复后4项均通过。已有CID首笔价格先做无损检查，避免先记舍入成交再拒绝不变重报；USD commission仍按已固定W1货币量化语义。实施者MT5/真实native/Q3定向 **219 passed / 6.81s**，Ruff、两文件Mypy与diff-check通过；原模块累计增加94行，两份实施文件重新冻结。首轮临时Redis已准确停止并删除合成数据，修订全量另用全新实例，不沿用旧全量放行。
+- 修订冻结上主agent定向 **251 passed / 6.82s**，全仓Ruff、Mypy90文件与diff-check通过。独立reviewer另跑 **251 passed / 6.62s**，静态检查及三SHA测前测后相同；四个量价精度反例逐一经完整mass拒绝、断连且不污染订单事件。费用正例`-1.254→1.25`、`-1.255→1.26`、`-1.245→1.24`、返佣`1.254→-1.25 USD`在四报告入口保留，空cache旧报告/正常FOK/拒单/已关闭票据/UNKNOWN行为通过；内存关闭helper让错票据例重新在拒绝断言处RED，恢复后两对照GREEN。reviewer给出仅限W6b1的RECOMMEND-ACCEPT，不外推业务恢复或停止矩阵。
+- 主agent在修订冻结上使用全新临时Redis单次全量，**2376 passed / 129既有类别Pandas弃用警告 / 327.40s**，包含两项真实backend且无skip；三SHA测前测后相同。该临时容器已按准确ID停止并由`--rm`清除合成数据，列表复查为空；未动既有服务、镜像或真实账户。全量退出阶段另有native BACKTESTER的RUNNING→DISPOSE/DISPOSE_COMPLETED日志：只读定位未修改的`tests/test_taker_events.py:337–362`共享BacktestEngine fixture直接dispose，Maker例如`test_maker_events.py:3236–3255`手动trader.start后未stop；安装的`common/component.pyx:2195–2197`捕获无效转换并仅记ERROR。该模拟venue路径不经过新增MT5 live报告guard，不由本步修复；本步不以pytest通过替代W6c生命周期验收。
+- 主agent结合修订全量和独立RECOMMEND-ACCEPT接受W6b1，按约定单独本地提交，仅四个既定文件；不推送、部署或发单。W6b/c、R01–R06及W6父项仍未完成。下一步复用原store做完整已知事实与既有义务的幂等投影，先保留HOLD，不能重放会发单的策略回调或猜测Maker跨源单分配次序。
