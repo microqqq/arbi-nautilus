@@ -768,6 +768,14 @@ P05 最终原生与loopback证据：两处EA窄修先取得14项中7项失败，
 
 固定依赖隔离wheel/sdist各18检查通过，wheel SHA `98927fc6a342151fbb5c3a03d1f803770cb07d67ad01d030cfcc54282c761239`、资格sdist SHA `3e88a71d1ecfbc1e9479f8e524c42ad5910d0084edac220cff749cdfe6f6d0f6`（先于本段及观察器记录，最终交付另重建）。安装版普通进程 **25 passed / 15 deselected / 297.56s**；93份观测/52个worker PID的49模块匹配、25次native冷load事件0、25个专用合成Redis全部删除；另15项共享控制通过。全量专用`6245ee035d991a9edf65d21623bedee2a944f6c5edaa9db057225fb398ac7031`准确删除，真实61613/native39订单及原业务SHA不动。按约定本地提交后，另待修订观察器独立复核和新的真实preflight才续跑；不推送、部署或改EA，W9未据离线绿色关闭。
 
+**10:40 / Maker新有限续跑正常停止，保留对冲仓位：** 生产`08aff23`的49模块与已资格安装版逐字节一致、clean tree。新观察器SHA `803ca2bb8b7531c6ebfb2c02d58f6ecb2b6a7c5252dceb225d6a9f77a94277ea`通过原53+新增31共84项独立控制；新增例由真正Maker owner生成分片/分配状态，确认从首个小数fill累计20秒、转成义务不重置，同route已结抵消不产生虚假敞口。前一只读快照等待审查超过90秒后完整保留为`preflight-before-maker-cancel-resume-initial.json`，重新实读而未放宽时效。
+
+02:36:26.160Z开始`run_maker_cancel_resume.py`，8.604秒原启动核验释放已审旧暂停；183.914秒按6新源CID预算早停，exit0/PAPER_STOPPED/obligations_settled，原10秒drain正常完成、无pending/residual。BUY2 @4415.3 的source`O-20260907-023637-001-000-8`、venue243562431622/trade1969648262为MAKER/fee0USD；MT5 SELL2 @4412.97，source对应唯一义务COMPLETED，order/ticket10373366524、deal10090809545。实际ACK先到、随后fill赶在已排队cancel前使该cancel返回already terminal；既有精确终态处理正确保留fill/义务，无新HOLD。其后5个新SELL报价零成交取消，各原终态查询自行完成，最后一笔在正常drain收束。新增6源/1完成，而非目标3完成；只接受本轮恢复、成交/对冲、后续报价/撤单及带仓停止，不冒称已完成全部连续成交覆盖。
+
+02:40:05后置只读：BFX唯一+2oz、MT5唯一SELL .02lot/identifier=ticket10373366524、无活动/其它仓位/未决请求，EA90事件。未对冲峰值2oz、最长观测1.605秒，各端净仓≤2oz。native46订单中旧39原生事件完全不变，cache/restart验证通过；冷热已实现费用报告均FINAL −16.56USDT，冷读按原路径恢复一个已闭历史周期，未将当前未实现盈亏或funding/swap混入已实现范围。保留新业务SHA `bfc41e4bd1c3a74033f1fcb86b867f9db5ac8def990c3c5188cf1c03fc8da7d9`及全部日志，不自动平仓。
+
+下一有界场景用该精确业务/CID/native及新鲜账户/票据证据做普通Maker带仓重启，无旧HOLD故不传`--resume-held`；30分钟/最多10新源，8新源或2新完成早停，保留每端2oz/未对冲gross2oz与20秒/.02lot/原10秒drain，不为成交改阈值或额度。新观察器仍只观察/发一次SIGTERM，不注入订单或抹状态；先独立复核再运行。新Both observer已离线准备，要求同账户flat及独立新namespace为空的两份fresh90秒证据，schema9三view与每策略实际进度分别统计、同向leaves沿原风险计算；须Maker场景合格且明确场景切换收尾后才执行，不能拿准备或其它策略成交代替Both现场证据。真实rollover与最终交付包仍未完成。
+
 先做不发单连接/对账，再单独 Taker、Maker，最后同节点 both；均使用普通策略。每一轮都事先记录最大时长、最多源订单数、每单/累计净仓上限、最大未对冲量与超时、停止方式，使用已有两测试账户，不申请每一步重复授权。
 
 建议初始会话预算为每模式 30 分钟、最多 10 次源订单；这是待运行 profile 确认的测试预算，不是立即执行命令。不得为了达到次数忽略市场关闭或不断重跑失败会话。跨日能力另外运行一个覆盖真实 broker rollover 的有界会话，结束时间按实际时区/市场时段设置；不伪称 30 分钟已证明跨日。
