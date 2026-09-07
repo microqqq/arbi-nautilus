@@ -678,6 +678,28 @@ P05 最终原生与loopback证据：两处EA窄修先取得14项中7项失败，
 
 本轮最长180秒、最多新增10笔源单，新增6笔源单或新增2个COMPLETED义务时提前SIGTERM；停止过程中仍需检查实际新增数≤10。自启动即记录未分配残差加所有未完成hedge余量，最大2oz/20秒，检查完整业务累计源/hedge有符号量各≤2oz；HOLD、未知结果、ERROR或预算触及则进入原drain，不循环重跑。原stop_timeout10秒、外层90秒结束界不变，不自动强平已完整对冲仓位。结束后重新核对实际两端位置、EA完整历史、native和费用，再决定下一场景。
 
+**07:46 / 普通持仓重启成交与新的报告边界：** `390b08c`安装版实际75.562秒、两笔新BUY2oz源单、两笔SELL2oz hedge，完成源-2→0→+2、MT5旧BUY票10371046364关闭/新SELL票10371369552开启。真实成交事件间隔1.343秒及0.598秒；外部业务观察分别约2.08秒、0.91秒，均低于20秒。首次30笔native历史逐字段不变，现34笔；EA82事件/31笔实际成交、零未决。停止后两端只读源+2oz、MT5-2oz，零活动源单，业务全COMPLETED/无HOLD。普通结果PAPER_STOPPED、drain_complete、当前运行会计FINAL，已实现交易/commission按FX=1为-14.96 USDT，不含浮盈/资金费/swap。此处只验收持仓恢复与两次反向机会，不称30分钟稳定或同向4oz加仓。
+
+随后原生只读重载使同一报告变成`PENDING/native_position_history_incomplete`，不能据热进程FINAL忽略。固定NT的`cache.snapshot_position()`只保留内存历史周期，`database.add_position()`在NETTING重开时替换当前Position记录；load不恢复旧snapshot。现存OrderFilled仍完整，当前仓位也正确。`snapshot_positions`配置只持久快照字典、现有load不读它，不能靠打开该选项宣称修好；单独`Position.apply`会重置已平历史，且不能代替Engine的穿零分拆与分费。
+
+**只读报告历史窄修（doc-first）：** 在现有会计模块复用固定NT 1.231.0的原生Position转换，建立一次性、无backing的Cache/MessageBus/TestClock/ExecutionEngine计算上下文，只调用原生open/update/flip计算，不调用start/process/execute、不接任何live bus/Portfolio/adapter或数据库。输入为已有owned OrderFilled副本，按持久接收顺序重建；不新建日志、持久账、Actor/服务、不手补现场cache、订单或策略状态，不复制PnL与分费公式。临时原生对象只服务报告、完成即丢弃；内部cpdef接口是固定版本适配边界，升级必须差分回归。
+
+同一身份组中保留订单内事件序、仅在跨单顺序可确定时重建；同时间歧义/顺序冲突继续PENDING，不按CID/TradeId猜序。必须核对已有当前Position及每个已存在快照与重建周期相符，拒绝重复/冲突/adjustment/缺instrument或当前仓位漂移；只能补确证缺失的闭合旧周期，不能重建一个候选来覆盖被篡改或未知的现有事实。EXTERNAL归属、全部原生/venue费用比较、FX及排除cashflow口径保持。先固定reopen/flip及实际-2→0→+2的热/冷报告差异，再验证分费舍入/多owner、负例和输入字节不变；现有报告之外不扩大恢复或下单逻辑。主agent负责全量、当前真实保留缓存只读验证与安装，独立复核后按步本地提交，此缺口关闭前不再发单。
+
+报告增加默认0的`reconstructed_closed_cycles`输出计数，明确区分当前保留的Position快照与从既有原生成交补算的历史；只增加结果元信息，不进入持久状态或改变分币金额、FINAL规则。补全只限Bitfinex NETTING，MT5票据历史保持既有严格检查。主agent用实际三笔源成交的纯原生计算探针已复现旧周期-5.4 USDT与当前+2oz，输入事件字典不变；首次探针误把Decimal同float比较造成夹具失败已分开保留，不记为产品缺陷。
+
+独立预审取得倍率冲突反例：保留Position倍率1、同ID缓存Instrument倍率10时，草案把热报告10.00错误重算为100.00并标FINAL。`Position.to_dict()`不含这些计算字段，因此须在原helper同时核对Position原有multiplier、inverse及精度/类别字段；不增加合约版本账。正常保留fill的事件UUID仍须相等，只有NT穿零新开分片的原生随机UUID以及闭合snapshot的原生UUID后缀可按各自明确场景处理。这些反例与部分历史快照、多owner及输入不变一起验证，预审REWORK不能当作最终接受。
+
+首轮安装进程矩阵在第9例`between-legs-taker`停止，1 failed/8 passed/167.10s：旧测试显式要求`native_position_history_incomplete`，新报告已FINAL。逐笔核对该合成场景SELL2@3946.8→BUY4@3926.7→SELL2@3946.8、MT5两票完整闭合且佣金0，两个原生周期各40.2，总80.4无缺失；不是未决状态被放行。只将既有`test_restart_process.py`这处旧限制断言更新为FINAL、补算1、完整金额（Taker80.4/Maker82）、空pending与exit0，原`request-pending`仍PENDING/exit1，其余恢复/身份/不重复断言不动。生产两路径冻结不变；原失败日志/XML和合成证据保留，9个无盘临时Redis已回收。新的完整25进程证据另取路径；不能把首轮失败改记通过。
+
+**08:30 / 报告历史窄修验收：** 三个生产/测试路径最终diff `f71ae1665513ac7f5b5cfe3a1ff79685b9558e40cb4829af026cbaffe3825ec9`；其中原报告两路径始终为`6bd65c14…`。全量3183 passed / 133既有Pandas warning /501.17s（含两项真实Redis），另15项联合控制通过；修订后安装版普通恢复矩阵25 passed /15 deselected /559.60s。49模块、93份观察、52个worker、25次native load零事件均核对一致；全部专用临时Redis已精确回收。独立reviewer复跑88项并运行倍率冲突/倍率10正控/普通UUID/flip分片五组只读反事实，重复报告不改输入；对旧进程oracle的补算数0/单周期金额/重新pending三反例也确认拒绝，给出限定RECOMMEND-ACCEPT。根接受本报告窄修，Ruff/Mypy123/diff-check通过，按步仅本地提交。
+
+新wheel `77ce9f2e7ab8bfeb0c523885184fbe43e4462e97b61fd596c38a0716410cb4b2` 及初始sdist分别18项安装检查通过；sdist第一次禁用隔离构建时缺hatchling，改用已声明构建依赖的离线隔离安装后通过，未修改依赖要求。安装版只读真实34笔订单、持仓/索引、31笔MT5终态与修前逐字段相同，报告FINAL -14.96 USDT、补算1，完全等于热进程金额。08:20:29重新实读仍源+2、MT5 SELL0.02票10371369552、EA82事件/零未决/无活动单，无新交易。安装证据在`/tmp/py000-w9-report-install-zoe4Uh/`；当前sdist是试验前文档/旧oracle快照，不冒充最终交付源码包，最终交付须随最后提交重建。EA未变、不需重挂，W9其余现场场景继续，尚未推送/发布。
+
+**下一场景的实施前预算（仅在报告窄修全量/安装/独立复核通过后执行）：** 为切换到独立Maker场景，显式结束本轮Taker库存。仍用原Trader、业务/CID和Redis；新`taker-flat.profile.json`只将SHORT阈值设-0.02、LONG设1，并将既有共同source/hedge max_abs均收至0，账户路由上限仍2oz。现有经济/容量函数离线证明源+2/hedge-2只允许SHORT2，归零后两方向容量均0，不使用`only_long`冒充禁止重开。新安装普通入口最长180秒，新增1个COMPLETED或6笔源单提前SIGTERM，停止后实数不得超过10；2oz/20秒未对冲、各腿绝对净仓2oz、单MT5指令0.02lot、原10秒drain及90秒进程结束界不变。新只读前置必须确认当前唯一源+2和MT5 SELL票10371369552、无活动单/未决、匹配EA与开放session；结果必须核对真正双边flat、费用和原生历史。不得直接修改状态标平或使用adapter专项canary替代普通入口；新红先定位，不循环重跑。Maker仅在此显式收尾确证后从flat启动，其预算另行固定。
+
+**普通Maker首轮预算（在上轮确证双边flat之后）：** 新独立Maker业务/CID路径、普通`PY000-MAKER-LIVE-001`原生namespace，复用任务专用Redis服务而不删改Taker任何历史；与Taker不并发运行。新四adapter profile保持已认证身份/账户/2oz各路由与共同绝对净仓上限、MT5 0.02lot。bid/ask每次2oz、open_spread=-0.02、delta=0.0001，原2tick被动价格clamp与strict残差模式不变，不为成交绕开报价规则。最长1800秒，最多10个新源订单，第6笔源单或第3个COMPLETED提前SIGTERM，最终仍核实停止中的实际新增数；有成交不代表满30分钟稳定性。只读观察全部方向未分配净残差与全部未完成hedge量，最大2oz/20秒，外因HOLD/未知或ERROR进入原drain；正常`cycle_freeze_only`不误判为外因暂停。原10秒drain及90秒退出界保留，不自动强平完整对冲库存。新前置必须为90秒内、两端flat/零活动源单/无未决/匹配EA且session开放；新红先诊断，有限期内无成交如实记为未覆盖成交，不改passive规则刷绿。辅助脚本只启动普通已安装CLI、观察与发SIGTERM；主agent负责实际两端、native、业务、费用和继续能力的后置核对。
+
 先做不发单连接/对账，再单独 Taker、Maker，最后同节点 both；均使用普通策略。每一轮都事先记录最大时长、最多源订单数、每单/累计净仓上限、最大未对冲量与超时、停止方式，使用已有两测试账户，不申请每一步重复授权。
 
 建议初始会话预算为每模式 30 分钟、最多 10 次源订单；这是待运行 profile 确认的测试预算，不是立即执行命令。不得为了达到次数忽略市场关闭或不断重跑失败会话。跨日能力另外运行一个覆盖真实 broker rollover 的有界会话，结束时间按实际时区/市场时段设置；不伪称 30 分钟已证明跨日。

@@ -353,12 +353,21 @@ def test_ordinary_process_kill_then_original_entry_recovers_or_holds(
             result = next(json.loads(line) for line in reversed(lines)
                           if line.startswith('{"outcome"'))
             assert result["drain_complete"] is (cut not in _HELD)
-            report_pending = cut in {"between-legs", "request-pending"}
+            report_pending = cut == "request-pending"
             assert result["accounting"]["status"] == ("PENDING" if report_pending else "FINAL")
             if cut == "between-legs":
-                assert result["accounting"]["pending_reasons"] == [
-                    "native_position_history_incomplete",
-                ]
+                # Native Redis loses the closed source snapshot, but retained
+                # fills prove both zero-fee cycles. Reporting must include both,
+                # without repairing the native cache or replaying executions.
+                accounting = result["accounting"]
+                expected = Decimal("80.4") if kind == "taker" else Decimal(82)
+                assert accounting["pending_reasons"] == []
+                assert accounting["reconstructed_closed_cycles"] == 1
+                assert Decimal(accounting["final_realized_pnl_usdt"]) == expected
+                assert Decimal(accounting["currencies"]["USDT"][
+                    "native_observed_realized_pnl"
+                ]) == expected
+                assert Decimal(accounting["currencies"]["USD"]["final_realized_pnl"]) == 0
             incomplete = cut in _HELD or report_pending
             assert exit_code == (1 if incomplete else 0)
             assert result["outcome"] == (

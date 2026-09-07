@@ -10,11 +10,22 @@ from collections import defaultdict
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Literal
+from uuid import UUID
 
 from nautilus_trader.cache.cache import Cache
-from nautilus_trader.model.enums import OrderStatus
+from nautilus_trader.common.component import MessageBus, TestClock
+from nautilus_trader.execution.engine import ExecutionEngine
+from nautilus_trader.model.enums import OmsType, OrderStatus
 from nautilus_trader.model.events import OrderFilled
-from nautilus_trader.model.identifiers import ClientOrderId, StrategyId, TradeId, TraderId
+from nautilus_trader.model.identifiers import (
+    ClientOrderId,
+    InstrumentId,
+    PositionId,
+    StrategyId,
+    TradeId,
+    TraderId,
+)
+from nautilus_trader.model.position import Position
 
 from py000_nautilus.bitfinex_v1_execution import (
     BitfinexV1ExecutionClient,
@@ -54,6 +65,7 @@ class RunAccountingReport:
     excluded_cashflows: tuple[str, ...] = (
         "funding", "swap", "other_broker_fees", "unrealized_pnl",
     )
+    reconstructed_closed_cycles: int = 0
 
 
 @dataclass
@@ -73,6 +85,116 @@ def _fill_identity(fill: OrderFilled) -> tuple[object, ...]:
         fill.order_side, fill.order_type, fill.last_px, fill.currency,
         fill.commission.currency, fill.liquidity_side, fill.ts_event,
     )
+
+
+def _same_position_cycle(
+    actual: Position, expected: Position,
+    fills: dict[tuple[ClientOrderId, TradeId], OrderFilled],
+    *, snapshot: bool = False,
+) -> bool:
+    # Only the second half of a native flip gets a freshly generated event UUID.
+    left_state, right_state = actual.to_dict(), expected.to_dict()
+    if snapshot:
+        canonical = expected.events[0].position_id.value
+        for state in (left_state, right_state):
+            suffix = state["position_id"].removeprefix(f"{canonical}-")
+            if str(UUID(suffix, version=4)) != suffix or not actual.is_closed:
+                return False
+            state["position_id"] = canonical
+    # Position.to_dict omits these native calculation-contract fields.
+    contract = ("multiplier", "is_inverse", "price_precision", "size_precision",
+                "instrument_class", "is_spot_currency")
+    if (actual.adjustments or left_state != right_state
+            or any(getattr(actual, field) != getattr(expected, field) for field in contract)
+            or len(actual.events) != len(expected.events)):
+        return False
+    for retained, rebuilt in zip(actual.events, expected.events, strict=True):
+        left, right = OrderFilled.to_dict(retained), OrderFilled.to_dict(rebuilt)
+        original = fills[rebuilt.client_order_id, rebuilt.trade_id]
+        if rebuilt.id != original.id:
+            left.pop("event_id")
+            right.pop("event_id")
+        if left != right:
+            return False
+    return True
+
+
+def _missing_netting_cycles(
+    cache: Cache, fills: dict[tuple[ClientOrderId, TradeId], OrderFilled],
+    positions: list[Position], instrument_id: InstrumentId, trader_id: TraderId,
+) -> list[Position]:
+    """Recover only missing closed cycles using pinned NT 1.231.0 position math.
+
+    Native Redis restores current Positions, not volatile NETTING snapshots.
+    This disposable context has no backing, adapters or live bus, and never
+    starts or processes orders. An NT upgrade requires hot/cold differential tests.
+    """
+    source_fills = {key: fill for key, fill in fills.items()
+                    if fill.instrument_id == instrument_id}
+    observed: defaultdict[tuple[ClientOrderId, TradeId], Decimal] = defaultdict(Decimal)
+    for position in positions:
+        if position.instrument_id == instrument_id:
+            for fill in position.events:
+                observed[fill.client_order_id, fill.trade_id] += fill.last_qty.as_decimal()
+    if dict(observed) == {key: fill.last_qty.as_decimal() for key, fill in source_fills.items()}:
+        return []
+    instrument = cache.instrument(instrument_id)
+    if instrument is None:
+        raise ValueError("missing NETTING instrument")
+    groups: defaultdict[PositionId, list[OrderFilled]] = defaultdict(list)
+    for fill in source_fills.values():
+        groups[fill.position_id].append(fill)
+    current = {position.id: position for position in cache.positions()
+               if position in positions and position.instrument_id == instrument_id}
+    if set(current) != set(groups):
+        raise ValueError("NETTING current position coverage differs")
+    clock = TestClock()
+    local = Cache()
+    bus = MessageBus(trader_id=trader_id, clock=clock)
+    bus.register("Portfolio.update_position", lambda event: None)
+    engine = ExecutionEngine(msgbus=bus, cache=local, clock=clock)
+    missing: list[Position] = []
+    try:
+        for pid, events in groups.items():
+            identity = {(fill.trader_id, fill.strategy_id, fill.account_id, fill.instrument_id)
+                        for fill in events}
+            receipts: dict[int, ClientOrderId] = {}
+            last: dict[ClientOrderId, int] = {}
+            for fill in events:  # Dict insertion preserves each retained order's event sequence.
+                if (len(identity) != 1 or fill.ts_init <= 0
+                        or fill.ts_init < last.get(fill.client_order_id, 0)
+                        or receipts.get(fill.ts_init, fill.client_order_id)
+                        != fill.client_order_id):
+                    raise ValueError("NETTING fill reception order is ambiguous")
+                receipts[fill.ts_init] = fill.client_order_id
+                last[fill.client_order_id] = fill.ts_init
+            for original in sorted(events, key=lambda fill: fill.ts_init):
+                fill = OrderFilled.from_dict(OrderFilled.to_dict(original))
+                position = local.position(pid)
+                if position is None or position.is_closed:
+                    engine._open_position(instrument, position, fill, OmsType.NETTING)
+                elif engine._will_flip_position(position, fill):
+                    engine._flip_position(instrument, position, fill, OmsType.NETTING)
+                else:
+                    engine._update_position(instrument, position, fill, OmsType.NETTING)
+            if not _same_position_cycle(current[pid], local.position(pid), source_fills):
+                raise ValueError("NETTING current position differs from retained fills")
+            closed = local.position_snapshots(pid)
+            for existing in cache.position_snapshots(pid):
+                matches = [index for index, candidate in enumerate(closed)
+                           if _same_position_cycle(
+                               existing, candidate, source_fills, snapshot=True,
+                           )]
+                if len(matches) != 1:
+                    raise ValueError("NETTING snapshot differs or is duplicated")
+                closed.pop(matches[0])
+            if any(not position.is_closed for position in closed):
+                raise ValueError("NETTING missing cycle is not closed")
+            missing.extend(closed)
+        return missing
+    finally:
+        engine.dispose()
+        bus.dispose()
 
 
 def build_run_accounting_report(
@@ -135,6 +257,15 @@ def build_run_accounting_report(
     commissions: defaultdict[tuple[ClientOrderId, TradeId], Decimal] = defaultdict(Decimal)
     positions = [position for position in cache.positions() + cache.position_snapshots()
                  if position.strategy_id in owners]
+    reconstructed: list[Position] = []
+    if not issues:
+        try:
+            reconstructed = _missing_netting_cycles(
+                cache, fills, positions, source._bfx_config.instrument_id, trader_id,
+            )
+            positions += reconstructed
+        except (ValueError, ArithmeticError, KeyError, RuntimeError):
+            issues.append("native_position_history_incomplete")
     for position in positions:
         if (position.trader_id != trader_id
                 or position.account_id != routes.get(position.instrument_id)):
@@ -268,4 +399,5 @@ def build_run_accounting_report(
         scope=("shared_owned_cached_history:native_virtual_realized_trading_pnl_and_commission;"
                "not_venue_realized_cashflow" if len(owners) > 1
                else "owned_cached_history:realized_trading_pnl_and_commission"),
+        reconstructed_closed_cycles=len(reconstructed),
     )

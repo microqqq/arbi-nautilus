@@ -13,13 +13,20 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
 
+import msgspec
 import pytest
 from nautilus_trader.backtest.engine import BacktestEngine
 from nautilus_trader.cache.cache import Cache
 from nautilus_trader.core.uuid import UUID4
-from nautilus_trader.model.currencies import USD
-from nautilus_trader.model.enums import LiquiditySide, OmsType, OrderSide, TimeInForce
-from nautilus_trader.model.events import OrderFilled
+from nautilus_trader.model.currencies import USD, USDT
+from nautilus_trader.model.enums import (
+    LiquiditySide,
+    OmsType,
+    OrderSide,
+    PositionAdjustmentType,
+    TimeInForce,
+)
+from nautilus_trader.model.events import OrderFilled, PositionAdjusted
 from nautilus_trader.model.identifiers import (
     AccountId,
     ClientId,
@@ -29,9 +36,11 @@ from nautilus_trader.model.identifiers import (
     TradeId,
     VenueOrderId,
 )
-from nautilus_trader.model.instruments import Cfd, Instrument
-from nautilus_trader.model.objects import Money
-from nautilus_trader.model.orders import LimitOrder, MarketOrder, Order
+from nautilus_trader.model.instruments import Cfd, CryptoPerpetual, Instrument
+from nautilus_trader.model.objects import Currency, Money
+from nautilus_trader.model.orders import LimitOrder, MarketOrder, Order, OrderUnpacker
+from nautilus_trader.model.position import Position
+from nautilus_trader.serialization.serializer import MsgSpecSerializer
 from nautilus_trader.test_kit.stubs.events import TestEventStubs
 from nautilus_trader.test_kit.stubs.identifiers import TestIdStubs
 from restart_replay_worker import _engine
@@ -124,6 +133,7 @@ class _History:
         self, source: bool, side: OrderSide, *, quantity: int = 1, price: int = 100,
         fee: str = "-1.25", provisional: bool = False, pending: bool = False,
         owner: StrategyId = OWNER, total_quantity: int | None = None,
+        fee_currency: Currency = USD,
     ) -> Order:
         cache = self.engine.cache
         instrument = cache.instrument((_source_instrument() if source else _hedge_instrument()).id)
@@ -164,10 +174,16 @@ class _History:
             order, instrument, account_id=account, venue_order_id=venue, trade_id=trade,
             position_id=position_id,
             last_qty=instrument.make_qty(D(quantity)), last_px=instrument.make_price(D(price)),
-            commission=Money(0, USD) if provisional else usd_commission(D(fee)),
+            commission=(Money(0, fee_currency) if provisional else
+                        usd_commission(D(fee)) if fee_currency == USD
+                        else Money(-D(fee), fee_currency)),
             liquidity_side=LiquiditySide.TAKER if source else LiquiditySide.NO_LIQUIDITY_SIDE,
             ts_event=number * 1_000_000,
         )
+        # A retained reception timestamp, unlike TestEventStubs' default zero.
+        values = OrderFilled.to_dict(event)
+        values["ts_init"] = number * 1_000_000 + 100
+        event = OrderFilled.from_dict(values)
         process(event)
         assert order.filled_qty.as_decimal() == quantity
         fill = cast(OrderFilled, order.events[-1])
@@ -181,7 +197,7 @@ class _History:
             self.source._cid_store.record_venue_trade(scope, BitfinexFeeTrade(
                 int(trade.value), number, D(quantity) * (1 if side == OrderSide.BUY else -1),
                 D(price), "LIMIT", D(price), False,
-                None if pending else D(fee), None if pending else "USD",
+                None if pending else D(fee), None if pending else fee_currency.code,
             ))
         else:
             lots = str(D(quantity) / Decimal(str(instrument.lot_size)))
@@ -311,6 +327,293 @@ def test_real_netting_snapshots_cover_old_cycles_and_split_trades(
         assert pending.status == "PENDING"
         assert "native_position_history_incomplete" in pending.pending_reasons
         assert pending.final_realized_pnl_usdt is None
+
+
+def _cold_cache(
+    cache: Cache, *, order_receipts: dict[str, list[int]] | None = None,
+    position_changes: dict[str, object] | None = None,
+) -> Cache:
+    """Native serialized order/current-position facts, without volatile snapshots."""
+    codec = MsgSpecSerializer(msgspec.msgpack, timestamps_as_str=True)
+    cold = Cache()
+    for instrument in cache.instruments():
+        cold.add_instrument(instrument)
+    for original in cache.orders():
+        events = [codec.deserialize(codec.serialize(event)) for event in original.events]
+        receipts = iter((order_receipts or {}).get(original.client_order_id.value, []))
+        for index, event in enumerate(events):
+            if isinstance(event, OrderFilled):
+                values = OrderFilled.to_dict(event)
+                values["ts_init"] = next(receipts, event.ts_init)
+                events[index] = OrderFilled.from_dict(values)
+        order = OrderUnpacker.from_init(events[0])
+        for event in events[1:]:
+            order.apply(event)
+        cold.add_order(order, position_id=cache.position_id(original.client_order_id),
+                       client_id=cache.client_id(original.client_order_id))
+    for original_position in cache.positions():
+        fills = [codec.deserialize(codec.serialize(event)) for event in original_position.events]
+        if position_changes is not None:
+            fills = [OrderFilled.from_dict(dict(OrderFilled.to_dict(fill), **position_changes))
+                     for fill in fills]
+        position = Position(cold.instrument(original_position.instrument_id), fills[0])
+        for fill in fills[1:]:
+            position.apply(fill)
+        for adjustment in original_position.adjustments:
+            position.apply_adjustment(codec.deserialize(codec.serialize(adjustment)))
+        cold.add_position(position, OmsType.NETTING)
+    return cold
+
+
+@pytest.mark.parametrize("case", ["reopen", "flip", "two-2oz-reversal"])
+def test_serialized_cold_netting_history_matches_hot_report(tmp_path: Path, case: str) -> None:
+    with _engine() as engine:
+        history = _History(engine, tmp_path / "cid")
+        if case == "two-2oz-reversal":
+            history.fill(True, OrderSide.SELL, quantity=2, price=100)
+            history.fill(True, OrderSide.BUY, quantity=2, price=110)
+            history.fill(True, OrderSide.BUY, quantity=2, price=105)
+        else:
+            history.fill(True, OrderSide.BUY, price=100)
+            history.fill(True, OrderSide.SELL, quantity=3 if case == "flip" else 1,
+                         price=110, fee="-0.011337")
+            if case == "reopen":
+                history.fill(True, OrderSide.BUY, price=105)
+        hot = history.report()
+        assert hot.status == "FINAL"
+        cold = _cold_cache(engine.cache)
+        assert not cold.position_snapshots()
+        restored = history.report(cache=cold)
+        assert restored.reconstructed_closed_cycles == 1
+        assert hot.reconstructed_closed_cycles == 0
+        assert asdict(replace(restored, reconstructed_closed_cycles=0)) == asdict(hot)
+        assert not cold.position_snapshots()  # Reporting does not repair the input cache.
+
+
+def _retain_snapshot(cache: Cache, original: Position) -> None:
+    fills = [OrderFilled.from_dict(OrderFilled.to_dict(fill)) for fill in original.events]
+    position = Position(cache.instrument(original.instrument_id), fills[0])
+    for fill in fills[1:]:
+        position.apply(fill)
+    cache.snapshot_position(position)
+
+
+def test_one_valid_snapshot_remains_while_another_closed_cycle_is_missing(tmp_path: Path) -> None:
+    with _engine() as engine:
+        history = _History(engine, tmp_path / "cid")
+        for side, price in ((OrderSide.BUY, 100), (OrderSide.SELL, 110),
+                            (OrderSide.BUY, 105), (OrderSide.SELL, 115),
+                            (OrderSide.BUY, 109)):
+            history.fill(True, side, price=price)
+        cold = _cold_cache(engine.cache)
+        _retain_snapshot(cold, engine.cache.position_snapshots()[0])
+        assert len(cold.position_snapshots()) == 1
+        restored = history.report(cache=cold)
+        assert restored.reconstructed_closed_cycles == 1
+        assert asdict(replace(restored, reconstructed_closed_cycles=0)) == asdict(history.report())
+        assert len(cold.position_snapshots()) == 1
+
+
+def test_changed_instrument_multiplier_cannot_reprice_missing_closed_profit(tmp_path: Path) -> None:
+    with _engine() as engine:
+        history = _History(engine, tmp_path / "cid")
+        for side, price in ((OrderSide.BUY, 100), (OrderSide.SELL, 110), (OrderSide.BUY, 105)):
+            history.fill(True, side, price=price, fee="0")
+        assert history.report().final_realized_pnl_usdt == 10
+        cold = _cold_cache(engine.cache)
+        values = CryptoPerpetual.to_dict(cold.instrument(history.source._bfx_config.instrument_id))
+        values["multiplier"] = "10"
+        cold.add_instrument(CryptoPerpetual.from_dict(values))
+        report = history.report(cache=cold)
+        assert report.status == "PENDING"
+        assert report.final_realized_pnl_usdt is None
+        assert report.reconstructed_closed_cycles == 0
+
+
+@pytest.mark.parametrize("changes", [
+    {"strategy_id": "FOREIGN-001"}, {"account_id": "BITFINEX-999"},
+    {"position_id": "FOREIGN-PID"}, {"last_qty": "3.0"}, {"last_px": "999.00"},
+    {"commission": "9.99 USD"}, {"event_id": str(UUID4())},
+], ids=["owner", "account", "pid", "quantity", "price", "commission", "ordinary-event-uuid"])
+def test_cold_reconstruction_never_replaces_conflicting_current_position(
+    tmp_path: Path, changes: dict[str, object],
+) -> None:
+    with _engine() as engine:
+        history = _History(engine, tmp_path / "cid")
+        history.fill(True, OrderSide.BUY)
+        history.fill(True, OrderSide.SELL, price=110)
+        history.fill(True, OrderSide.BUY, price=105)
+        cold = _cold_cache(engine.cache, position_changes=changes)
+        report = history.report(cache=cold)
+        assert report.status == "PENDING" and report.final_realized_pnl_usdt is None
+        assert "native_position_history_incomplete" in report.pending_reasons
+        assert report.reconstructed_closed_cycles == 0
+
+
+@pytest.mark.parametrize("mode", ["duplicate", "altered", "adjusted", "missing-current"])
+def test_cold_reconstruction_does_not_replace_retained_snapshot_or_adjustment(
+    tmp_path: Path, mode: str,
+) -> None:
+    with _engine() as engine:
+        history = _History(engine, tmp_path / "cid")
+        for side, price in ((OrderSide.BUY, 100), (OrderSide.SELL, 110),
+                            (OrderSide.BUY, 105), (OrderSide.SELL, 115),
+                            (OrderSide.BUY, 109)):
+            history.fill(True, side, price=price)
+        cold = _cold_cache(engine.cache)
+        if mode in {"duplicate", "altered"}:
+            snapshot = engine.cache.position_snapshots()[0]
+            if mode == "altered":
+                values = OrderFilled.to_dict(snapshot.events[0])
+                values["event_id"] = str(UUID4())
+                changed = Position(cold.instrument(snapshot.instrument_id),
+                                   OrderFilled.from_dict(values))
+                for event in snapshot.events[1:]:
+                    changed.apply(OrderFilled.from_dict(OrderFilled.to_dict(event)))
+                snapshot = changed
+            _retain_snapshot(cold, snapshot)
+            if mode == "duplicate":
+                _retain_snapshot(cold, snapshot)
+        elif mode == "adjusted":
+            position = cold.positions()[0]
+            position.apply_adjustment(PositionAdjusted(
+                trader_id=position.trader_id, strategy_id=position.strategy_id,
+                instrument_id=position.instrument_id, position_id=position.id,
+                account_id=position.account_id, adjustment_type=PositionAdjustmentType.COMMISSION,
+                quantity_change=D(0), pnl_change=Money("0.01", USDT),
+                reason="synthetic adjustment", event_id=UUID4(),
+                ts_event=position.ts_last + 1, ts_init=position.ts_last + 1,
+            ))
+        else:
+            incomplete = Cache()
+            for instrument in cold.instruments():
+                incomplete.add_instrument(instrument)
+            for order in cold.orders():
+                incomplete.add_order(order)
+            cold = incomplete
+        report = history.report(cache=cold)
+        assert report.status == "PENDING" and report.final_realized_pnl_usdt is None
+        assert report.reconstructed_closed_cycles == 0
+
+
+@pytest.mark.parametrize("receipts", [[0], [1_000_100], [4_000_100]])
+def test_cold_cross_order_reception_ambiguity_or_conflict_is_not_guessed(
+    tmp_path: Path, receipts: list[int],
+) -> None:
+    with _engine() as engine:
+        history = _History(engine, tmp_path / "cid")
+        history.fill(True, OrderSide.BUY)
+        closing = history.fill(True, OrderSide.SELL, price=110)
+        history.fill(True, OrderSide.BUY, price=105)
+        cold = _cold_cache(engine.cache, order_receipts={closing.client_order_id.value: receipts})
+        report = history.report(cache=cold)
+        assert report.status == "PENDING" and report.final_realized_pnl_usdt is None
+        assert report.reconstructed_closed_cycles == 0
+
+
+@pytest.mark.parametrize("fee_currency", [USD, USDT], ids=["usd", "usdt"])
+@pytest.mark.parametrize("shared", [False, True], ids=["per-owner", "shared"])
+def test_cold_multiowner_flips_preserve_native_fractional_fee_split_and_fx(
+    tmp_path: Path, fee_currency: Currency, shared: bool,
+) -> None:
+    with _engine() as engine:
+        history = _History(engine, tmp_path / "cid")
+        other = StrategyId("OTHER-001")
+        for owner in (OWNER, other):
+            for side, quantity, price in ((OrderSide.BUY, 1, 100), (OrderSide.SELL, 3, 110),
+                                          (OrderSide.BUY, 4, 105)):
+                history.fill(True, side, quantity=quantity, price=price, owner=owner,
+                             fee="-0.01133717", fee_currency=fee_currency)
+        cold = _cold_cache(engine.cache)
+
+        def report(cache: Cache) -> RunAccountingReport:
+            return build_run_accounting_report(
+                cache, cast(BitfinexV1ExecutionClient, history.source),
+                cast(Mt5V1ExecutionClient, history.hedge), trader_id=TestIdStubs.trader_id(),
+                strategy_id=OWNER, strategy_ids=(OWNER, other) if shared else None, fx=FX,
+            )
+
+        hot, restored = report(engine.cache), report(cold)
+        assert hot.status == restored.status == ("FINAL" if fee_currency == USD else "PENDING")
+        if fee_currency == USDT:
+            # The configured BFX fee contract remains USD-only; reconstruction
+            # must not turn an unsupported venue fee currency into final PnL.
+            assert all("source_fee_facts_invalid" in reason for reason in hot.pending_reasons)
+        assert restored.reconstructed_closed_cycles == (4 if shared else 2)
+        assert asdict(replace(restored, reconstructed_closed_cycles=0)) == asdict(hot)
+        # The 1/3 close portion is rounded by NT, not an implementation here.
+        snapshots = engine.cache.position_snapshots()
+        original = snapshots[0].events[-1]
+        assert original.last_qty.as_decimal() == 1
+        assert original.commission.as_decimal() == (0 if fee_currency == USD else D("0.00377906"))
+
+
+@pytest.mark.parametrize("reverse_receipts", [False, True], ids=["interleaved", "single-order-red"])
+def test_reconstruction_preserves_each_order_event_sequence_between_other_order_fills(
+    tmp_path: Path, reverse_receipts: bool,
+) -> None:
+    with _engine() as engine:
+        history = _History(engine, tmp_path / "cid")
+        opening = history.fill(True, OrderSide.BUY, quantity=1, total_quantity=3)
+        history.fill(True, OrderSide.SELL, price=110)
+        instrument = engine.cache.instrument(opening.instrument_id)
+        event = TestEventStubs.order_filled(
+            opening, instrument, account_id=history.source.account_id,
+            venue_order_id=opening.venue_order_id, trade_id=TradeId("9000000"),
+            position_id=opening.position_id, last_qty=instrument.make_qty(2),
+            last_px=instrument.make_price(105), commission=usd_commission(D("-0.011337")),
+            ts_event=3_000_000,
+        )
+        values = OrderFilled.to_dict(event)
+        values["ts_init"] = 3_000_100
+        engine.kernel.exec_engine.process(OrderFilled.from_dict(values))
+        binding = history.source._cid_store.binding_for_client(opening.client_order_id.value)
+        assert binding is not None
+        scope = BitfinexFeeMetadata(binding.cid, int(opening.venue_order_id.value),
+                                   instrument.id.value, PAPER_RAW_SYMBOL)
+        history.source._cid_store.record_native_fill(
+            scope, _native_fill_evidence(opening.events[-1], "tu"),
+        )
+        history.source._cid_store.record_venue_trade(scope, BitfinexFeeTrade(
+            9000000, 3, D(2), D(105), "LIMIT", D(100), False, D("-0.011337"), "USD",
+        ))
+        assert history.report().status == "FINAL"
+        receipts = {opening.client_order_id.value: [3_000_100, 1_000_100]}
+        cold = _cold_cache(engine.cache, order_receipts=receipts if reverse_receipts else None)
+        restored = history.report(cache=cold)
+        if reverse_receipts:
+            assert restored.status == "PENDING" and restored.reconstructed_closed_cycles == 0
+        else:
+            assert restored.reconstructed_closed_cycles == 1
+            assert (asdict(replace(restored, reconstructed_closed_cycles=0))
+                    == asdict(history.report()))
+
+
+def test_cold_history_reconstruction_is_repeatable_without_mutating_any_input(
+    tmp_path: Path,
+) -> None:
+    with _engine() as engine:
+        history = _History(engine, tmp_path / "cid")
+        history.fill(True, OrderSide.BUY)
+        history.fill(True, OrderSide.SELL, quantity=3, price=110, fee="-0.011337")
+        history.fill(False, OrderSide.SELL)
+        cold = _cold_cache(engine.cache)
+        codec = MsgSpecSerializer(msgspec.msgpack, timestamps_as_str=True)
+
+        def facts() -> object:
+            return (
+                [[codec.serialize(event) for event in order.events] for order in cold.orders()],
+                [(position.to_dict(), [codec.serialize(event) for event in position.events])
+                 for position in cold.positions()],
+                cold.position_snapshots(), history.source._cid_store.path.read_bytes(),
+                deepcopy(history.hedge._terminal_events),
+            )
+
+        before = facts()
+        first, second = history.report(cache=cold), history.report(cache=cold)
+        assert first.status == "FINAL" and first.reconstructed_closed_cycles == 1
+        assert asdict(first) == asdict(second)
+        assert facts() == before
 
 
 def test_report_is_read_only_and_repeatable_and_does_not_mark_open_inventory(
