@@ -74,13 +74,13 @@ def _snapshot(node: TradingNode, strategy: LiveStrategy) -> DrainResult:
     if isinstance(allocation_owner, MakerStateStore):
         if allocation_owner._freeze_publication_failed:
             pending.append("maker_pause_publication_failed")
-        # Shared input freshness pauses new source admission, not a completed
+        # Input freshness pauses new source admission, not a completed
         # drain. Retain the flag; stopping must not grant permission to quote.
-        shared_settled = allocation_owner.shared_strategy_ids is not None and all(
+        settled = all(
             view.cycle_evidence_complete() and view.source_freeze_reason is None
             for view in allocation_owner.all_views()
         )
-        if isinstance(strategy, MakerStrategy) and strategy._source_hold and not shared_settled:
+        if isinstance(strategy, MakerStrategy) and strategy._source_hold and not settled:
             pending.append("maker_source_hold")
         for route, quantity in allocation_owner.residuals().items():
             residuals["|".join(value or "" for value in route)] = str(quantity)

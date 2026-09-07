@@ -21,8 +21,47 @@ from test_strategy_continuity import _OrdinaryStrategy, _pump
 from py000_nautilus import live_lifecycle
 from py000_nautilus.live_lifecycle import DrainingTradingNode, DrainResult, drain_strategy
 from py000_nautilus.live_runtime import get_source_terminal_reconciler
-from py000_nautilus.models import ObligationStatus
+from py000_nautilus.models import BusinessOrderSide, ObligationStatus, SourceDirection
 from py000_nautilus.mt5_v1_protocol import JsonObject
+
+
+@pytest.mark.parametrize("fault", [None, "old-freeze", "wal", "sibling-active", "unknown"])
+def test_standalone_maker_soft_pause_drain_still_requires_all_facts_settled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: str | None,
+) -> None:
+    async def scenario() -> None:
+        async with _continuous(
+            tmp_path, monkeypatch, maker=True, long_quantity=2, short_quantity=0,
+        ) as (h, source, wire):
+            actor = get_source_terminal_reconciler(h.node)
+            assert await actor.reconcile()
+            # Isolate the existing instance-only pause state from the separate
+            # market-input classification bug; all business/native facts are settled.
+            h.strategy._source_hold = True
+            assert all(view.cycle_evidence_complete() and view.source_freeze_reason is None
+                       for view in h.strategy._state_store.all_views())
+            if fault == "old-freeze":
+                h.strategy._state_store.freeze_sources("Maker costs changed")
+            elif fault == "wal":
+                h.strategy._state_store._freeze_publication_failed = True
+            elif fault in {"sibling-active", "unknown"}:
+                sibling = h.strategy._stores[SourceDirection.SHORT]
+                sibling.begin_source("ASK-PENDING", BusinessOrderSide.SELL, Decimal(2))
+                if fault == "unknown":
+                    sibling.mark_source_unknown("ASK-PENDING", "unresolved source")
+            result = await drain_strategy(h.node, h.strategy, timeout_seconds=.05)
+            assert result.complete is (fault is None), result
+            if fault is not None:
+                expected = {
+                    "old-freeze": "freeze:Maker costs changed",
+                    "wal": "maker_pause_publication_failed",
+                    "sibling-active": "source:ASK-PENDING",
+                    "unknown": "hold:unresolved source",
+                }
+                assert expected[fault] in result.pending
+            assert h.strategy._source_hold and h.strategy._draining
+            assert not source.rows and not wire.submit_calls and not wire.close_calls
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize("maker", [False, True])

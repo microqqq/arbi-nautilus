@@ -702,6 +702,28 @@ P05 最终原生与loopback证据：两处EA窄修先取得14项中7项失败，
 
 **08:31 / Taker显式收尾通过：** 本地`35becae`的49模块与安装版逐一相同；普通入口10.361秒、仅1笔源SELL2 reduce-only（243541232094 / trade1969594351 @4417.4）及MT5 BUY0.02按票关闭10371369552（order10371796079 / deal10089168031 @4421.75），没有反开。外部业务观察未对冲约1.03秒，原成交时间差0.213秒（两端时钟/EA秒精度口径，不等于网络耗时）。正常SIGTERM/drain、PAPER_STOPPED/exit0；08:31:23实际两账户完全flat、无活动源单/未决、EA84事件/32终态。原34笔订单逐字段不变，现36笔；native所有仓位闭合，业务零残差/无HOLD。热/冷报告完整逐字段相等，FINAL按FX1为-25.22 USDT（USD13.98、USDT-39.2，仍不含funding/swap等现金流），补算1。证据`runtime/w9-rehang-20260907-RZEXNQ/taker-flat-postflight.json`。这是切换场景的显式平仓，不是每个机会都强平的策略规则；Taker原生/业务/CID/AOF继续保留。Maker新namespace当前不存在，尚未启动。
 
+**08:34 / Maker首轮未通过，先诊断启动顺序：** 普通入口启动6.04秒时，首次成本更新写入两view的`Maker costs changed`持久freeze，尚无任何源订单/义务；外部观察器按该外因freeze触发SIGTERM。其后原对账两venue事实均成功，但回调记录`startup recovery: ValueError`，最终16.533秒`PAPER_INCOMPLETE/drain_timeout`，进程已自然退出、无发单。原profile、空业务的真实freeze、native/CID及日志都保留，不删文件重新冷启。
+
+窄诊断/实施计划：先用普通Maker与原启动receipt复现“receipt捕获→有效成本首次变更→启动对账”顺序，必须证明不依赖观察器的提前SIGTERM仍会失败，不能把夹具停止当生产缺陷。候选原因是W7已将shared Maker的明确market_input callsite改为本次进程soft hold，但standalone仍写永久freeze，因而与启动receipt冲突。若该反例成立，只在原Maker两处分类/释放函数复用已有soft-hold路径用于standalone：明确成本/行情/会话/账户临时输入变更仍撤旧报价，只有完整健康输入、全部终态/义务与无任何外因HOLD/持久化失败时释放；真正unknown、外因freeze、发布失败及旧状态继续持久HOLD，不按文案认领或洗掉。仅原Maker模块和必要既有测试/本文，不加Actor、状态schema、恢复账或profile开关。先RED，再成本/启动/旧HOLD/冷恢复负控和普通停止差分、全量/安装/独立复核，完成前不发新单；现场旧freeze若需恢复，后续只用原显式`--resume-held`及完整事实检查，不编辑它。
+
+接线核对补充：原`live_lifecycle._snapshot`也仅对shared允许“所有终态/义务完整且无持久freeze，但本次市场输入soft hold仍在”的已完成drain。上述分类若扩到standalone，须同步这一个原判定与既有生命周期负控；仍保留soft flag，不因停止授予报价权限，断连、原生/业务订单不符、未决义务、外因HOLD、发布失败和超限残差仍各自阻止完成。写集因此增加原`live_lifecycle.py`及其必要既有测试，不新增停止机制。08:35后置只读证实真实两端仍flat、EA84事件无变化；Maker native仅32笔闭合EXTERNAL、无owned订单/义务、原费用核对通过。
+
+首个无SIGTERM普通启动RED已成立：原receipt→首个有效FundingRateUpdate→原生闭合EXTERNAL导入，两venue对账成功后仍`startup recovery: ValueError`，strategy保持RUNNING且非draining、零新订单/义务；因此不是观察器早停才造成的产品失败。独立复核另要求同模块保护撤单回归：原`_source_action_is_obsolete`依赖持久freeze，须检查零成交PendingUpdate→成本变化soft保护PendingCancel→迟到ModifyRejected不被误判UNKNOWN。若需适配，仅在既有ACCEPTED/零成交/当前真实pending-cancel/同一_source_hold及完整事件和路由身份下处理；原partial-fill缺freeze、取消拒绝及身份冲突等负控保持，不整体删掉保护判据。
+
+本包合格后的现场续跑预算：使用同一`maker-ordinary` profile、业务前缀、CID和`PY000-MAKER-LIVE-001`原生namespace，以普通`--resume-held`复核并恢复本次已审旧暂停；不重写或删除状态。启动前重新只读确认两端flat、无活动/未决订单及EA身份，保留原业务字节副本；入口只接受当前已审空业务文件SHA `5b7bbbfcfd76c94ad66d0af9cc3415b7e619278f3737f6cbcc7da9209aba5dee`。外部观察器仅对该完全不变的旧文件给予最多30秒启动核验等待，不按原因文本豁免新HOLD；原恢复完成后沿用正常观察，任何不同状态的新外因HOLD、UNKNOWN或运行错误即正常停止。等待只属本次外部观察，不改变生产恢复/数据时效或drain预算。仍最多1800秒/10次源单，观察到6源单或3项完成义务即提前停止；两端净仓与未对冲上限2oz、未对冲20秒、MT5单指令0.02lot、普通drain10秒/外部90秒。失败首轮日志/业务/原生事实原样保留，续跑使用独立日志和结果文件；最终必须实读venue、原生cache、费用及冷热报告，不以外部进程退出单独判成功。
+
+首次完整回归3208通过/1失败（500.71秒），不计验收：唯一失败为`test_strategy_continuity`普通Maker部分成交后失去公共数据的旧用例，仍要求持久`stale, closed, or unresolved`，实际已结清且`source_freeze_reason=None`。此处适配同一个已规定soft分类，只增加该既有测试文件到写集：要求本次_source_hold保持、两view无持久freeze，并完整保留断流期间新机会零发单、行情恢复后原策略下一CID正常发出的行为断言。生产保持冻结不变；修后四参数场景、独立复核与新全量重跑，不用仅删断言取绿。此前首轮因测试跨await类型收窄错误提前中止，修正仅重新获取原actor；中止与失败的专用合成Redis已分别移除，真实AOF未动。
+
+后续both配置仅先离线准备，不自动执行：复用同一EA/两测试账户、61613原生Redis，使用新`both-ordinary`共享业务前缀/CID及`PY000-BOTH-LIVE-001` namespace，不导入或删除两份standalone业务历史。两策略相同source/hedge route、FX1、margin500和合计2oz risk；Maker双侧2oz/-0.02/delta0.0001/被动2ticks/strict，Taker双向2oz/-0.02且原SHORT-first选择不变。启动前必须前一Maker会话已接受、完成所需持仓重启检查并显式收尾至实读flat、无活动/未决单；不能在standalone库存上另开namespace绕过归属。仍单次1800秒、合计10个源CID、6个源CID或3项完成义务早停，全部view共用2oz/20秒未对冲约束、MT5单指令0.02lot和10秒drain/90秒外部停止观察。两策略争用既有额度时允许健康工作单继续占用，不为获得成交次数新造报价公平调度或增加4oz；只认证实际发生的双方行为，单方成交不冒充双方成交。
+
+**Maker soft-input窄修本地接受：** 两个既有生产文件共8增10删，未改receipt/schema/EA或增加机制；新26项边界及旧断言适配只改四个既有测试文件。最终六路径diff SHA `b466ec3c2a0cac7c5cc521e7d93e63c56bfd3701c62fe58e18cd3a3d162ee7bd`；根重新全量**3209 passed / 133既有Pandas warnings / 501.84s**，包括两项真实native Redis且无skip；Ruff全仓、Mypy123文件、diff-check通过。日志/XML/result为`maker-soft-qualified-full.*`；本次合成Redis `86a7a0eb22e3b8962fcd0fe20da3e412acc251d5cc1f551442f793ddb8b34097`已停止移除，真实AOF仍保留。
+
+未参与编码的reviewer在最终原五路径上独立310 passed/147.08秒，并以仅内存替回旧分类/旧drain两项精确RED，恢复候选正控通过；新增第六路径只改旧soft期望，根/独立四参数各4 passed，独立确认断流零新单/恢复新CID/迟到fill不重复等原行为检查完整保留，给出本包RECOMMEND-ACCEPT。其结论与根全量分别记录，不累计数量或冒称重复全量。
+
+安装证据`/tmp/py000-w9-maker-soft-install-HvniRq/`：wheel SHA `ed9b6eccaa7cceb1f910a1cbd66959a77239049ea583bab452db33a6e31c2eea`，wheel/sdist各在独立venv以固定runtime非editable安装、仓库外无PYTHONPATH完成18项CLI/validate/模拟/pip检查。安装版普通进程**25 passed/324.24秒**、独立门级15 passed；后置核验49生产模块、93观察/52worker PID同源，25次native load事件数全0，25个专用合成Redis全移除。该生产wheel未因随后一处测试断言适配而变化；当前sdist是适配前的资格产物，不冒充最终交付，最终文档/测试随收尾另行重建。安装版只读原Maker native仍32笔闭合EXTERNAL、完整费用/原生核验通过、旧真实业务SHA不变；不是现场成交通过。
+
+主agent据最终全量、独立语义复核和相同生产安装证据接受本次小修并仅本地提交，不推送/部署。上文W7“仅shared”的历史分类约束由本段明确扩至standalone的已列market_input callsite；旧持久HOLD仍须原显式恢复。下一步按已定预算实际Maker `--resume-held`，现场Maker/持仓重启/both/跨日仍未通过，不将本次本地绿色称为完整收尾。
+
 先做不发单连接/对账，再单独 Taker、Maker，最后同节点 both；均使用普通策略。每一轮都事先记录最大时长、最多源订单数、每单/累计净仓上限、最大未对冲量与超时、停止方式，使用已有两测试账户，不申请每一步重复授权。
 
 建议初始会话预算为每模式 30 分钟、最多 10 次源订单；这是待运行 profile 确认的测试预算，不是立即执行命令。不得为了达到次数忽略市场关闭或不断重跑失败会话。跨日能力另外运行一个覆盖真实 broker rollover 的有界会话，结束时间按实际时区/市场时段设置；不伪称 30 分钟已证明跨日。

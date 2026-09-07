@@ -134,8 +134,18 @@ def test_maker_releases_both_freezes_in_one_write(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     strategy = MakerStrategy(_maker_strategy_config(tmp_path / "atomic-release"))
-    for store in strategy._stores.values():
-        store.freeze_source_submissions("same cycle")
+    store = strategy._stores[SourceDirection.LONG]
+    store.begin_source("SOURCE", BusinessOrderSide.BUY, D(1))
+    intent = store.reserve_source_fill(
+        fill_key="SOURCE|VENUE|TRADE", client_order_id="SOURCE", trade_id="TRADE",
+        source_side=BusinessOrderSide.BUY, fill_ounces=D(1),
+    )
+    assert intent is not None
+    store.bind_hedge_order(intent.intent_id, "HEDGE")
+    assert store.apply_hedge_fill(
+        client_order_id="HEDGE", trade_id="HEDGE-TRADE", fill_ounces=D(1),
+    )
+    assert strategy._state_store.cycle_freeze_only
     strategy._source_hold = True
     snapshots: list[dict[str, Any]] = []
     replace_file = replace_and_sync_parent
@@ -178,6 +188,46 @@ def test_restart_gate_records_external_freeze_but_prevents_release_cancel_and_st
         assert not strategy._state_store.cycle_freeze_only
         assert strategy._source_hold and not canceled
         assert strategy._source_terminal_stopped
+
+
+@pytest.mark.parametrize("market_input", ["changed-cost", "invalid-cost", "closed-session"])
+@pytest.mark.parametrize("fault", [None, "operator", "same-text-old", "sibling-active", "wal"])
+def test_standalone_market_pause_releases_only_with_healthy_inputs_and_all_views_settled(
+    tmp_path: Path, market_input: str, fault: str | None,
+) -> None:
+    strategy = RecordingMakerStrategy(tmp_path / "soft-input")
+    with _event_engine(cast(Any, strategy)) as engine:
+        engine.trader.start()
+        now = strategy._cost_ts_ns + 1
+        strategy.clock.set_time(now)
+        before = deepcopy(strategy._state_store._to_payload())
+        if market_input == "changed-cost":
+            assert strategy.update_cost_snapshot(CarryConfig(bitfinex_long=D("0.001")),
+                                                 strategy._fx, now)
+        elif market_input == "invalid-cost":
+            assert not strategy.update_cost_snapshot(strategy._carry, strategy._fx, 0)
+        else:
+            strategy.update_hedge_session(False, now)
+        assert strategy._source_hold and strategy.canceled == list(SourceDirection)
+        assert strategy._state_store._to_payload() == before
+        assert not strategy._try_release_cycle() and strategy._source_hold
+        if fault in {"operator", "same-text-old"}:
+            reason = "operator HOLD" if fault == "operator" else "Maker costs changed"
+            strategy._state_store.freeze_sources(reason)
+            restored = MakerStrategy(strategy.config)
+            assert all(view.source_freeze_reason == reason for view in restored._stores.values())
+            assert not restored._try_release_cycle(inputs_fresh=True)
+        elif fault == "sibling-active":
+            strategy._stores[SourceDirection.SHORT].begin_source(
+                "ASK-PENDING", BusinessOrderSide.SELL, D(2),
+            )
+        elif fault == "wal":
+            strategy._state_store._freeze_publication_failed = True
+        strategy.clock.set_time(now + 1)
+        assert strategy.update_cost_snapshot(strategy._carry, strategy._fx, now + 1)
+        strategy.update_hedge_session(True, now + 1)
+        assert strategy._try_release_cycle(inputs_fresh=True) is (fault is None)
+        assert strategy._source_hold is (fault is not None)
 
 
 def test_post_replace_failure_blocks_the_sibling_source_even_without_pause_text(
@@ -1244,6 +1294,48 @@ def test_native_maker_net_residual_before_allocating_new_hedge(
             reloaded = _reload_maker_store(strategy, direction)
             assert reloaded.rounding_residual_ounces == store.rounding_residual_ounces
             assert reloaded.can_submit_source() is (expected == 0)
+
+
+@pytest.mark.parametrize("fault", ["none", "no_pending", "no_hold", "identity", "cancel_rejected"])
+def test_zero_fill_market_soft_cancel_keeps_exact_facts_on_obsolete_modify_rejection(
+    tmp_path: Path, fault: str,
+) -> None:
+    strategy = _InstrumentLifecycleMaker(struct_replace(
+        _maker_strategy_config(tmp_path / "soft-modify"), initial_cost_ts_ns=100,
+    ))
+    with _event_engine(cast(Any, strategy)) as engine:
+        engine.kernel.clock.set_time(100)
+        strategy.clock.set_time(100)
+        engine.trader.start()
+        order, = _seed_native_working_quotes(
+            strategy, exact_route=True, directions=(SourceDirection.LONG,),
+        )
+        engine.kernel.exec_engine.process(TestEventStubs.order_pending_update(order, ts_event=101))
+        strategy.clock.set_time(102)
+        assert strategy.update_cost_snapshot(CarryConfig(bitfinex_long=D("0.001")), FxConfig(), 102)
+        view = strategy._stores[SourceDirection.LONG]
+        assert view.source_freeze_reason is None and strategy._source_hold
+        assert order.status is OrderStatus.PENDING_CANCEL and _cancel_is_pending(order)
+        if fault == "no_pending":
+            # A rejected actual cancel is not ongoing protection.
+            order.apply(_cancel_rejected(order))
+            strategy.cache.update_order(order)
+        elif fault == "no_hold":
+            strategy._source_hold = False
+        before = view.path.read_bytes()
+        event = (_cancel_rejected(order) if fault == "cancel_rejected" else _modify_rejected(
+            order, **({"account_id": AccountId("BITFINEX-OTHER")} if fault == "identity" else {}),
+        ))
+        engine.kernel.exec_engine.process(event)
+        record = view.source_order(order.client_order_id.value)
+        assert record is not None and record.filled_ounces == 0
+        if fault == "none":
+            assert record.status == "ACCEPTED" and view.halt_reason is None
+            assert view.path.read_bytes() == before and _cancel_is_pending(order)
+            assert strategy._source_hold
+            assert view.active_source_order_id == order.client_order_id.value
+        else:
+            assert record.status == "UNKNOWN" and view.halt_reason is not None
 
 
 @pytest.mark.parametrize("fault", ["none", "no_pending", "native_partial", "identity",
@@ -2606,14 +2698,14 @@ def test_live_maker_stale_timer_mutates_real_state_only_on_running_loop(
             # LiveClock may wake before the deadline and legitimately rearm.
             # Every callback, including an early one, must run on this loop.
             assert handler_threads and all(thread == loop_thread for thread in handler_threads)
-            assert persist_threads == [loop_thread]
+            assert persist_threads == []  # Input-only pauses do not persist an external HOLD.
             assert [thread for thread, _ in cancellations] == [loop_thread, loop_thread]
             assert [cmd.client_order_id for _, cmd in cancellations] == [
                 order.client_order_id for order in orders
             ]
             assert all(order.status == OrderStatus.PENDING_CANCEL for order in orders)
             assert strategy._source_hold
-            assert all(store.source_freeze_reason == "stale timer"
+            assert all(store.source_freeze_reason is None
                        for store in strategy._stores.values())
         finally:
             strategy.stop()
@@ -2849,7 +2941,7 @@ def test_stop_cancels_exact_two_active_gtc_orders_without_releasing_gates() -> N
     assert harness._stores[SourceDirection.SHORT].active_source_order_id == "O-ASK"
 
 
-def test_current_stale_timer_freezes_and_cancels_both_exact_active_ids() -> None:
+def test_current_stale_timer_soft_pauses_and_cancels_both_exact_active_ids() -> None:
     harness = _StopHarness()
     timer_name = _maker_timer_name(SourceDirection.LONG, "O-BID")
     harness._stale_timer_names[SourceDirection.LONG] = timer_name
@@ -2861,7 +2953,8 @@ def test_current_stale_timer_freezes_and_cancels_both_exact_active_ids() -> None
 
     assert harness.cache.requested == ["O-BID", "O-ASK"]
     assert len(harness.canceled) == 2
-    assert all(store.freeze_reason == "stale timer" for store in harness._stores.values())
+    assert harness._source_hold
+    assert all(store.freeze_reason is None for store in harness._stores.values())
 
 
 def test_old_stale_timer_is_a_total_noop_for_replacement_orders() -> None:
@@ -2993,7 +3086,8 @@ def test_same_cost_refresh_preserves_orders_until_actual_input_expiry(
     handlers[0].handle()
     assert harness.cache.requested == ["O-BID", "O-ASK"]
     assert len(harness.canceled) == 2
-    assert all(store.freeze_reason == "stale timer" for store in harness._stores.values())
+    assert harness._source_hold
+    assert all(store.freeze_reason is None for store in harness._stores.values())
 
 
 class _MakerCostHarness:

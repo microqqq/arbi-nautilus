@@ -21,6 +21,7 @@ from continuous_mt5_wire import ContinuousMt5Wire
 from nautilus_trader.cache.cache import Cache
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.execution.reports import ExecutionMassStatus, PositionStatusReport
+from nautilus_trader.model.data import FundingRateUpdate
 from nautilus_trader.model.enums import OmsType, OrderSide, OrderStatus, PositionSide
 from nautilus_trader.model.events import OrderFilled
 from nautilus_trader.model.identifiers import AccountId, ClientId, ClientOrderId, VenueOrderId
@@ -58,6 +59,68 @@ async def _check(h: _OrdinaryStrategy) -> None:
         source=h.source, hedge=h.hedge,
         source_instrument_id=h.source_instrument.id, hedge_instrument_id=h.hedge_instrument.id,
     )
+
+
+def test_first_valid_maker_funding_after_receipt_does_not_create_a_startup_pause(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        h = _OrdinaryStrategy(tmp_path, monkeypatch, maker=True, two_sided=True,
+                              native_mt5_transport=True, inject_mt5_io=False)
+        # The ordinary builder has already captured its startup receipt.
+        actor = get_source_terminal_reconciler(h.node)
+        assert actor._restart_recovery is not None and not actor.restart_pending
+        snapshot = _snapshot(_identity())
+        snapshot["positions"] = []
+        cast(JsonObject, snapshot["execution_limits"])["max_order_lots"] = "0.02"
+        wire = ContinuousMt5Wire(_identity(), snapshot, now_ns=h.node.kernel.clock.timestamp_ns)
+        h.hedge._transport = wire
+        source = _SourceWire(h)
+        # Native startup imports this complete old external history, as on the
+        # real account. No current source order or business obligation exists.
+        await wire.submit_market_delta(wire.identity.binding(), client_request_id="OLD-OPEN",
+                                       side="buy", quantity_lots="0.02")
+        position = cast(list[JsonObject], wire.current_snapshot["positions"])[0]
+        await wire.close_position(
+            wire.identity.binding(), client_request_id="OLD-CLOSE", side="sell",
+            quantity_lots="0.02", position_ticket=str(position["ticket"]),
+            position_identifier=str(position["identifier"]),
+        )
+        wire.submit_calls.clear()
+        wire.close_calls.clear()
+        now = h.node.kernel.clock.timestamp_ns()
+        h.strategy.on_funding_rate(FundingRateUpdate(
+            instrument_id=h.source_instrument.id, rate=Decimal("0.0001"),
+            ts_event=now, ts_init=now,
+        ))
+        assert h.strategy._carry.bitfinex_long == Decimal("0.0001")
+        assert h.strategy._source_hold
+        try:
+            h.hedge.connect()
+            async with asyncio.timeout(2):
+                while h.hedge._poll_task is None:
+                    await asyncio.sleep(.005)
+            await h.start(initial_reconciliation=True)
+            actor = get_source_terminal_reconciler(h.node)
+            async with asyncio.timeout(3):
+                while actor.busy or (actor.restart_pending and actor.last_failure is None):
+                    await asyncio.sleep(.005)
+            assert h.strategy.is_running and not h.strategy._draining
+            assert not source.rows and not wire.submit_calls and not wire.close_calls
+            assert not h.store.source_orders() and not h.store.intents()
+            # No SIGTERM, observer or stop request has run. Baseline fails here
+            # with startup recovery: ValueError from the original receipt.
+            assert not actor.restart_pending, actor.last_failure
+            assert actor.last_failure is None
+            assert all(view.source_freeze_reason is None for view in h.strategy._stores.values())
+            cid = await _accepted_source(h, source, wire, 2)
+            source.fill(cid, h.source_quantity)
+            await _settle_cycle(h, source, wire, cid=cid, expected=1)
+            await _check(h)
+        finally:
+            await h.hedge._disconnect()
+            await h.close()
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize("maker", [False, True], ids=["taker", "maker"])
@@ -589,8 +652,8 @@ def test_new_ordinary_node_only_resumes_complete_settled_history(
     (True, "closed-session"), (True, "after-capture"),
     (True, "before-publish"), (True, "after-publish"),
 ], ids=["taker-resumes", "maker-cycle-resumes", "retry-before-publish", "hold-after-publish",
-        "maker-old-format-held", "maker-same-text-external-held", "maker-cost-held",
-        "maker-session-held", "maker-capture-revoked", "maker-retry-before-publish",
+        "maker-old-format-held", "maker-same-text-external-held", "maker-old-cost-held",
+        "maker-old-session-held", "maker-external-capture-revoked", "maker-retry-before-publish",
         "maker-hold-after-publish"])
 def test_new_node_settles_actual_hedge_fill_with_lagging_business_callback(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, maker: bool, fault: str | None,
@@ -652,8 +715,12 @@ def test_new_node_settles_actual_hedge_fill_with_lagging_business_callback(
                 first.strategy.update_cost_snapshot(
                     first.strategy._carry, first.strategy._fx, 0,
                 )
+                # Older standalone versions persisted these input pauses.
+                # Their durable provenance must never be reclassified by text.
+                first.strategy._state_store.freeze_sources("Maker costs are invalid")
             elif fault == "closed-session":
                 first.strategy.update_hedge_session(False, first.strategy._session_ts_ns + 1)
+                first.strategy._state_store.freeze_sources("hedge session closed or future-dated")
 
         second = _OrdinaryStrategy(
             tmp_path, monkeypatch, maker=maker, two_sided=maker,
@@ -663,11 +730,12 @@ def test_new_node_settles_actual_hedge_fill_with_lagging_business_callback(
         assert owner.restart_pending
         source2, wire2 = history.restore(second)
         if fault == "after-capture":
-            # The receipt was captured by the ordinary builder. A real later
-            # health invalidation must revoke it even while callbacks are gated.
+            # The receipt was captured by the ordinary builder. A later external
+            # pause must still revoke it even while callbacks are gated.
             second.strategy.update_cost_snapshot(
                 second.strategy._carry, second.strategy._fx, 0,
             )
+            second.strategy._freeze_and_cancel_all("Maker costs are invalid")
         publications = 0
 
         def publish(candidate: Path, destination: Path) -> None:

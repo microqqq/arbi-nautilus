@@ -487,7 +487,7 @@ class MakerStrategy(Strategy):
     def _source_action_is_obsolete(
         self, event: OrderCancelRejected | OrderModifyRejected,
     ) -> bool:
-        """Preserve exact terminal facts or a partial fill's pending protective cancel."""
+        """Preserve exact terminal facts or a pending protective cancel."""
         direction = self._direction_for_source_order(event.client_order_id.value)
         if direction is None or event.venue_order_id is None:
             return False
@@ -502,13 +502,13 @@ class MakerStrategy(Strategy):
             isinstance(event, OrderModifyRejected)
             and (
                 (record.status == "PARTIALLY_FILLED"
-                 and 0 < record.filled_ounces < record.quantity_ounces)
+                 and 0 < record.filled_ounces < record.quantity_ounces
+                 and self._stores[direction].source_freeze_reason is not None)
                 or (record.status == "ACCEPTED" and record.filled_ounces == 0
                     and order.status is OrderStatus.PENDING_CANCEL)
             )
             and self._stores[direction].active_source_order_id == event.client_order_id.value
             and self._source_hold
-            and self._stores[direction].source_freeze_reason is not None
             and order.status in {OrderStatus.PENDING_CANCEL, OrderStatus.PARTIALLY_FILLED}
             and _cancel_is_pending(order)
         )
@@ -1492,7 +1492,7 @@ class MakerStrategy(Strategy):
         if _restart_blocked(self):
             return False
         owner = self._state_store
-        if owner.shared_strategy_ids is not None and not owner.cycle_freeze_only:
+        if not owner.cycle_freeze_only:
             if (not inputs_fresh or owner._freeze_publication_failed
                     or not owner.source_balance_is_admissible()
                     or any(view.halt_reason is not None or view.source_freeze_reason is not None
@@ -1500,8 +1500,6 @@ class MakerStrategy(Strategy):
                 return False
             self._source_hold = False
             return True  # Only this healthy callback clears the instance-only market-input hold.
-        if self._draining and not self._state_store.cycle_freeze_only:
-            return False  # Stopping is not an operator recovery action for an external HOLD.
         if not self._state_store.clear_source_freezes():
             return False
         self._source_hold = False
@@ -1509,7 +1507,7 @@ class MakerStrategy(Strategy):
 
     def _freeze_and_cancel_all(self, reason: str, *, market_input: bool = False) -> None:
         self._source_hold = True
-        if not (market_input and self._state_store.shared_strategy_ids is not None):
+        if not market_input:
             self._freeze_all_best_effort(reason)
         if _restart_blocked(self):
             return  # External pauses remain durable; startup still forbids cancellation.

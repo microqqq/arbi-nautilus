@@ -680,8 +680,11 @@ def test_ordinary_partial_cancel_waits_for_real_hedge_then_continues(
             if public_data_lost:
                 assert state.active_source_order_id is None and state.halt_reason is None
                 if maker:
-                    # Account wakeup also reruns the existing public-data gate.
-                    assert state.source_freeze_reason == "stale, closed, or unresolved"
+                    # Account wakeup keeps the public-data pause in this process;
+                    # settled fills do not turn a data outage into a durable HOLD.
+                    assert harness.strategy._source_hold
+                    assert all(view.source_freeze_reason is None
+                               for view in harness.reload_stores())
             elif state.active_source_order_id is None:
                 assert state.can_submit_source(), (
                     state.halt_reason, state.source_freeze_reason,
