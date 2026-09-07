@@ -288,7 +288,7 @@ A timeout, old external HOLD or failed pause publication
 cannot be reported as success. Keep retained state for diagnosis; don't rerun blindly or delete it.
 The in-tree ordinary process matrix covers 22 Maker/Taker cases using real SIGKILL/SIGTERM and
 disposable Redis, with synthetic venue I/O. It retains UNKNOWN/old HOLD and reports incomplete
-accounting when old native NETTING snapshots are unavailable. This is not installed-artifact,
+accounting when retained native fills cannot prove missing NETTING cycles. This is not installed-artifact,
 real-EA/network, power-loss or finite-DEMO qualification. Those remaining release boundaries
 are tracked in the implementation plan; installing a command does not enable an automatic canary.
 
@@ -307,6 +307,12 @@ swap, other broker fees and unrealized PnL are excluded, not estimated as zero o
 `CarryConfig`. It is **not** the account's complete net profit. Native Position snapshots are
 included; missing old NETTING cycles, incomplete fees, unresolved orders or conflicting facts
 produce `PENDING` with reasons and null final values. Observed subtotals remain visible.
+When native Redis has retained all owned Bitfinex fills but not old in-memory NETTING
+snapshots, the report can reconstruct missing closed cycles using pinned Nautilus position
+math in a disposable, disconnected context. It first checks retained positions, calculation
+fields and unambiguous fill order; it never repairs the live cache or replays trading events.
+`reconstructed_closed_cycles` identifies this report-only provenance. Unprovable history
+remains `PENDING`; MT5 ticket and fee checks are unchanged.
 A successful execution drain does not override an incomplete report. Validate and rehearse
 do not generate this report; neither command executes business recovery.
 
