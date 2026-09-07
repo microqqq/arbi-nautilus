@@ -6211,6 +6211,171 @@ def test_working_maker_observation_only_detects_differences(tmp_path: Path, stat
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("operation", ["on", "ou", "oc", "os"])
+@pytest.mark.parametrize("post_only", [0, 1])
+def test_stream_metadata_is_used_consistently_and_explicit_denial_is_not_opaque(
+    operation: str, post_only: int,
+) -> None:
+    async def scenario() -> None:
+        harness = _Harness(raw_symbol=PAPER_RAW_SYMBOL, wallet_currency="TESTUSDTF0")
+        harness.msgbus.deregister("ExecEngine.process", harness.events.append)
+        engine = ExecutionEngine(msgbus=harness.msgbus, cache=harness.cache, clock=harness.clock)
+        engine.register_client(harness.client)
+        harness.cache.add_instrument(harness.instrument)
+        harness.cache.add_account(TestExecStubs.margin_account(account_id=harness.client.account_id))
+        await harness.connect()
+        try:
+            order = harness.order(quantity="2")
+            harness.cache.add_order(order)
+            cid = await harness.submit(order)
+            if operation != "on":
+                harness.client._consume_private_frame(harness.order_frame("on", cid, order))
+            if operation == "ou":
+                await harness.modify(order, price="3927.00")
+            elif operation == "oc":
+                await harness.cancel(order)
+            frame = harness.order_frame(
+                "on" if operation == "os" else operation, cid, order,
+                price="3927.00" if operation == "ou" else None,
+                status="CANCELED" if operation == "oc" else "ACTIVE",
+            )
+            row = cast(list[object], frame[2])
+            row[12] = 0
+            row.extend([None] * (31 - len(row)))
+            row.append({"_$F7": post_only})
+            if operation == "os":
+                frame = [0, "os", [row]]
+            original_events, sent = list(order.events), list(harness.fake.sent)
+            if post_only:
+                harness.client._consume_private_frame(frame)
+                live = harness.client._by_cid[cid]
+                assert live.venue_flags_verified
+                if operation == "oc":
+                    assert harness.client._terminal_report(live).post_only
+                    assert not harness.client._terminal_post_only_is_opaque(live)
+                assert order.status is (OrderStatus.CANCELED if operation == "oc"
+                                        else OrderStatus.ACCEPTED)
+            else:
+                with pytest.raises(BitfinexV1ExecutionError, match="differs from local submission"):
+                    harness.client._consume_private_frame(frame)
+                assert order.events == original_events
+            assert harness.fake.sent == sent and row[12] == 0 and row[31] == {"_$F7": post_only}
+        finally:
+            await harness.close()
+            engine.dispose()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("entry", ["single", "batch", "working", "mass"])
+@pytest.mark.parametrize("post_only", [0, 1])
+def test_rest_metadata_denial_cannot_inherit_same_run_opaque_permission(
+    tmp_path: Path, entry: str, post_only: int,
+) -> None:
+    async def scenario() -> None:
+        async with _terminal_recovery_case(
+            tmp_path, partial=False, zero=True, maker=True, silent=True, working=True,
+        ) as (harness, _, store, order, _):
+            row = cast(list[object], harness.rest.active[0])
+            row[12] = 0
+            row.extend([None] * (31 - len(row)))
+            row.append({"$F7": post_only})
+            original_events, sent = list(order.events), list(harness.fake.sent)
+            cid_bytes = (tmp_path / "cids.json").read_bytes()
+
+            async def query() -> object:
+                if entry == "single":
+                    return await harness.client.generate_order_status_report(
+                        GenerateOrderStatusReport(
+                            instrument_id=SOURCE_ID, client_order_id=order.client_order_id,
+                            venue_order_id=order.venue_order_id, command_id=UUID4(), ts_init=0,
+                        ),
+                    )
+                if entry == "batch":
+                    return await harness.client.generate_order_status_reports(
+                        GenerateOrderStatusReports(
+                            instrument_id=SOURCE_ID, start=None, end=None, open_only=True,
+                            command_id=UUID4(), ts_init=0,
+                        ),
+                    )
+                if entry == "working":
+                    return await harness.client.check_working_orders()
+                return await harness.client.generate_mass_status(None)
+
+            if post_only:
+                result = await query()
+                if entry == "single":
+                    assert result is None  # Original stream acceptance suppresses duplicate REST.
+                elif entry == "working":
+                    assert result is False  # No discrepancy in the still-working native order.
+                else:
+                    assert result is not None
+            elif entry == "mass":
+                assert await query() is None  # Native mass conversion reports the strict rejection.
+            else:
+                with pytest.raises(BitfinexV1ExecutionError, match="post_only metadata"):
+                    await query()
+            assert order.events == original_events and harness.fake.sent == sent
+            assert not store.intents() and (tmp_path / "cids.json").read_bytes() == cid_bytes
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("cold", [False, True], ids=["fully-retired", "native-cold-reload"])
+@pytest.mark.parametrize("post_only", [None, 0, 1], ids=["absent", "denied", "explicit"])
+def test_explicit_post_only_metadata_survives_terminal_retirement_and_native_reload(
+    tmp_path: Path, cold: bool, post_only: int | None,
+) -> None:
+    async def scenario() -> None:
+        async with _terminal_recovery_case(
+            tmp_path, partial=not cold, zero=cold, maker=True, request_cancel=True,
+            terminal_flags=0, rest_flags=0,
+        ) as (harness, engine, store, order, _):
+            assert await engine.reconcile_execution_state(timeout_secs=1)
+            harness.client.confirm_terminal_reconciliation()
+            assert order.status is OrderStatus.CANCELED
+            assert order.filled_qty.as_decimal() == (0 if cold else 2)
+            if not cold:
+                assert harness.client._live_for_client(order.client_order_id) is None
+            assert harness.client.fee_summary().complete
+            original_intents = store.intents()
+            row = cast(list[object], harness.rest.history[0])
+            row.extend([None] * (32 - len(row)))
+            row[31] = None if post_only is None else {"_$F7": post_only}
+            codec = MsgSpecSerializer(msgspec.msgpack, timestamps_as_str=True)
+            original = [codec.serialize(event) for event in order.events]
+            cid_bytes = (tmp_path / "cids.json").read_bytes()
+            selected = harness
+            if cold:
+                restored = OrderUnpacker.from_init(codec.deserialize(original[0]))
+                for data in original[1:]:
+                    restored.apply(codec.deserialize(data))
+                selected = _Harness(
+                    cid_store_path=tmp_path / "cids.json", raw_symbol=PAPER_RAW_SYMBOL,
+                    wallet_currency="TESTUSDTF0",
+                )
+                selected.cache.add_order(restored)
+                selected.rest.history = [row]
+                await selected.connect()
+            try:
+                assert selected.client._live_for_client(order.client_order_id) is None
+                mass = await selected.client.generate_mass_status(None)
+                if post_only == 1:
+                    assert mass is not None
+                    report = mass.order_reports[order.venue_order_id]
+                    assert report.post_only and report.order_status is OrderStatus.CANCELED
+                    assert bool(mass.fill_reports) is (not cold)
+                else:
+                    assert mass is None  # Neither explicit denial nor cold absence is permission.
+                cached = selected.cache.order(order.client_order_id)
+                assert cached is not None
+                assert [codec.serialize(event) for event in cached.events] == original
+                assert (tmp_path / "cids.json").read_bytes() == cid_bytes
+                assert store.intents() == original_intents
+            finally:
+                if cold:
+                    await selected.close()
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("entry", ["single", "batch", "mass"])
 @pytest.mark.parametrize("fault", ["flags", "price", "filled", "average"])
 def test_returned_closed_order_conflict_is_rejected_without_live_table(

@@ -641,7 +641,8 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
             filled_qty=live.instrument.make_qty(filled),
             price=live.instrument.make_price(state.price),
             avg_px=state.average_price if filled else None,
-            post_only=state.flags == POST_ONLY_FLAG, reduce_only=state.flags == REDUCE_ONLY_FLAG,
+            post_only=state.effective_flags == POST_ONLY_FLAG,
+            reduce_only=state.effective_flags == REDUCE_ONLY_FLAG,
             cancel_reason=state.status if _terminal_disposition(state) == "canceled" else None,
             report_id=UUID4(), ts_accepted=state.ts_created_ms * 1_000_000,
             ts_last=state.ts_updated_ms * 1_000_000, ts_init=self._clock.timestamp_ns(),
@@ -651,7 +652,8 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
         # This exact streamed terminal already passed _validate_order_state while
         # the same-run pending cancel/accepted authority was still available.
         return (
-            live.terminal is not None and live.terminal.flags == 0
+            live.terminal is not None and live.terminal.effective_flags == 0
+            and live.terminal.post_only_meta is None
             and self._bfx_config.raw_symbol == PAPER_RAW_SYMBOL
             and live.submitted_in_process and cast(bool, live.order.is_post_only)
         )
@@ -1614,7 +1616,7 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
             operation not in {"on", "oc", "os"}
             or self._bfx_config.raw_symbol != PAPER_RAW_SYMBOL
             or not cast(bool, live.order.is_reduce_only)
-            or state.flags != REDUCE_ONLY_FLAG
+            or state.effective_flags != REDUCE_ONLY_FLAG
         ):
             raise BitfinexV1ExecutionError(
                 "unbound Bitfinex paper interim fill requires exact reduce-only order evidence"
@@ -2043,13 +2045,13 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
             and live.filled_qty == expected_qty
             and _terminal_filled(state) == expected_qty
         )
-        flags_match = state.flags == expected_flags or (
+        flags_match = state.effective_flags == expected_flags or (
             self._bfx_config.raw_symbol == PAPER_RAW_SYMBOL
             and live.submitted_in_process
             and expected_flags == POST_ONLY_FLAG
             and live.order.order_type == OrderType.LIMIT
             and live.order.time_in_force == TimeInForce.GTC
-            and state.flags == 0
+            and state.effective_flags == 0 and state.post_only_meta is None
             and (
                 operation == "on"
                 or (operation == "ou" and live.pending_modify_price is not None)
@@ -2990,6 +2992,18 @@ class BitfinexV1ExecutionClient(LiveExecutionClient):
         assert isinstance(snapshot, OrderSnapshot)
         for state in snapshot.orders:
             self._validate_closed_raw_identity(state.venue_order_id, state.client_order_id)
+            if state.post_only_meta is None or state.client_order_id is None:
+                continue
+            client_order_id = self._client_order_id_for_cid(state.client_order_id)
+            order = None if client_order_id is None else self._cache.order(client_order_id)
+            live = self._by_cid.get(state.client_order_id)
+            if order is None and live is not None:
+                order = live.order
+            # Preserve explicit denial before native reports collapse absence and False.
+            if order is not None and cast(bool, order.is_post_only) != state.post_only_meta:
+                raise BitfinexV1ExecutionError(
+                    "Bitfinex order post_only metadata differs from local submission",
+                )
         return map_order_status_reports(
             active_rows=active_rows,
             history_rows=history_rows,

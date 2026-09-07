@@ -730,6 +730,24 @@ P05 最终原生与loopback证据：两处EA窄修先取得14项中7项失败，
 
 观察器实施/复核已通过：独立发现同CID跨方向重见ACCEPTED会重置等待的草案反例；修订固定首次方向/route、计时及tainted均按CID保留，新SHA `0ed615cae80d525a35a3a6ce7a30cc3ed5cbcf04ca98de46ad04967ee026b366`。脚本自测及独立安装版纯内存14项通过，包含该反例、最早deadline、无halt时先锚定终态、同形状operator HOLD及所有上述负控，reviewer限定RECOMMEND-ACCEPT；无状态修改/连接/发单。仅外围观测变更，不因此重复未变生产的3209/25资格；下一真实续跑仍须单独后置核对。
 
+**09:25 / 下一普通Maker启动发现新的真实字段解析遗漏，零新发单：** 当前`e193605`源码/原安装版在初始Bitfinex mass的closed报告校验报`cached open Bitfinex order differs from venue report: post_only`，策略未启动，14.813秒正常SIGTERM结束但PAPER_INCOMPLETE；该错误名称来自复用open字段比较，不表示旧单仍活动。09:25:35后置两账户仍flat、EA84事件、无活动/未决；原业务SHA不变，保留`maker-continue.log/result.json`而不盲试。
+
+根于09:27:37只读认证同paper账户并取得唯一原始订单行`maker-canceled-rest-row.json`：venue243538491952、CID1788743501126、LIMIT、CANCELED、原/剩数量2、价4406.7、均价0，row12 FLAGS=0，而row31 META明确`_$F7=1`。官方[Orders History](https://docs.bitfinex.com/reference/rest-auth-orders-history)定义FLAGS为当前active flags、META的`$F7`为IS_POST_ONLY；下划线别名是本次真实返回证据，不冒称文档已列出。现parser只读row12、mapper据此产生post_only=False；此前依赖本次live对象的opaque兼容不能跨退休/重启。根因是漏读实际已有的明确元数据，不应增加closed/cold豁免来掩盖。
+
+本次doc-first窄写集：原`bitfinex_v1_protocol.py`、`bitfinex_v1_reports.py`、`bitfinex_v1_execution.py`及必要既有protocol/reports/execution/startup测试和本文；不改EA、策略、native缓存、CID/业务schema或新建状态账。OrderState保留raw flags，增加仅内存的可选post_only_meta及一个effective_flags只读归一化；只认`$F7`、`_$F7`两个精确alias，值须严格int 0/1，显式坏值、alias冲突及raw post-only bit与meta0冲突拒绝。缺META保持原语义，meta1补post-only含义但不擦掉其它原始bits，现不支持的flag组合/IOC-post-only/reduce-only边界继续拒绝。报告和stream/终态所有语义判断统一有效flags；旧缺位兼容必须另外要求meta缺失，不能吞明确meta0。REST在现有_order_reports已解析snapshot的同一遍历里，对已绑定本地订单的明确meta与原委托post_only一致性核对，避免mapper压成bool后丢失“缺失/明确否认”的区别；不新加report sidecar。
+
+现有`bitfinex_v1_paper_canary.py`还直接消费同一OrderState，其两处post-only语义判断一并纳入窄写集，缺位兼容同样不得吞明确meta0；原`historical_flags`仍输出未经改写的raw值。不是新建canary或改测试交易行为。
+
+先固定实际行解析/普通退休后复查/新client原生重载后mass的RED，再补meta别名、0/1/缺失/坏类型/冲突、stream与单单/批量/working/mass一致性、原生事件/CID及所有非post-only字段不变的正负控。原live对象缺失时的flags0且无META仍按旧严格边界，不凭本地意图推断venue证据。根做完整回归/固定依赖wheel-sdist安装/必要普通进程资格、独立review并本地提交后，才按保留的相同Maker历史进行一次新的有界续跑；本次期间不发单、不改额度、不改EA、不推送/部署。
+
+**09:55 / META窄修离线资格完成：** 四个既有生产模块净增45行，META只接受object/null，未新增状态、schema或closed/cold缺位豁免。实际已捕获行与原生初始化的离线对照先得到仅post-only不一致的RED，安装版修后原始FLAGS仍0、有效post-only为true，其余身份/数量/价格/TIF/终态一致；首个探针未恢复证据writer的Decimal字符串而在类型前置失败，保留但不计产品RED。实施者的三个资格RED分别为实际mapper、已完整退休的部分成交终态和原生序列化冷重载的零成交CANCELED；零成交立即退休的初版fixture假设另行更正，不冒充业务反例。显式0及缺META在退休/冷路径仍拒绝，stream/单单/批量/working/mass/canary均覆盖，native事件/CID/业务字节不变。
+
+八个冻结源/测试路径diff SHA `864a10735492cb71bfd805a92167f70d669bbaa13ad554ad30f314c75d931f63`。主agent单次完整 **3265 passed / 133既有Pandas warnings / 503.84s**，含两项真实专用Redis回归且无skip；Ruff all、Mypy123文件、diff-check通过。独立reviewer四模块及21个自有反例 **633 passed / 4既有warnings / 17.10s**，仅内存替回旧parser时meta1遗漏和meta0被opaque吞掉均精确RED，给出仅限本包的RECOMMEND-ACCEPT。其首次退休fixture前置失败也保留，不要求候选返工。主agent依据完整结果接受本窄修；模拟fixture原有PRE_INITIALIZED→DISPOSE日志在上一冻结全量也存在，不将其误写为本次新增现场错误。
+
+隔离wheel/sdist各18检查通过，wheel SHA `ec824360184c4b95e50108510ced5f61b12772d9cd18b48efb0459d1b960ebeb`、本轮资格sdist SHA `8db0b6d5fe456c5a0990178cf02317c1572304c1975c31217444ab2c552fe80b`（先于本段结果记录，最终交付另重建）。安装版普通进程 **25 passed / 15 deselected / 298.53s**；93份观测/52个worker PID的49模块匹配，25次native冷load事件计数0，25个专用合成Redis均删除。全量专用`fe7c3500cc579d78fe9db44307c0282a2ab6123a55ff730099196c6b286435b8`也已准确删除；未动真实61613缓存及其它服务。另15项共享控制通过，不累加为全量。失败启动前后真实33订单/native events/positions/索引/FINAL0报告逐字段相同，业务SHA仍`cead149b…`。
+
+按既定授权仅本地提交本包后，以同profile/state/CID/native进行一次新有限Maker续跑；`run_maker_meta_continue.py`仅替换已审观察器的安装和输出路径，SHA `5b0d74fb75ab64e4b2fc780026e519218e84d82f955ddcdbd9a7681387fad133`，安装版自测通过。预算和无自动平仓语义均不变，不使用`--resume-held`，不重挂EA、不推送/部署。资格与后续现场订单/持仓重启/both/真实跨日仍分别取证。
+
 先做不发单连接/对账，再单独 Taker、Maker，最后同节点 both；均使用普通策略。每一轮都事先记录最大时长、最多源订单数、每单/累计净仓上限、最大未对冲量与超时、停止方式，使用已有两测试账户，不申请每一步重复授权。
 
 建议初始会话预算为每模式 30 分钟、最多 10 次源订单；这是待运行 profile 确认的测试预算，不是立即执行命令。不得为了达到次数忽略市场关闭或不断重跑失败会话。跨日能力另外运行一个覆盖真实 broker rollover 的有界会话，结束时间按实际时区/市场时段设置；不伪称 30 分钟已证明跨日。

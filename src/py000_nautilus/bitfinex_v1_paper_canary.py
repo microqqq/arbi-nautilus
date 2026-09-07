@@ -466,9 +466,9 @@ async def read_owned_evidence(
     post_only_assurance: PostOnlyAssurance = "UNPROVEN"
     if exact:
         order = historical[0]
-        post_only_exact = post_only_intent_submitted and order.flags == POST_ONLY_FLAG
+        post_only_exact = post_only_intent_submitted and order.effective_flags == POST_ONLY_FLAG
         if (
-            order.flags == 0
+            order.effective_flags == 0 and order.post_only_meta is None
             and post_only_intent_submitted
             and same_run_ownership_venue_order_id is not None
             and same_run_ownership_venue_order_id == venue_order_id

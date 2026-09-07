@@ -41,6 +41,12 @@ class OrderState:
     status: str
     price: Decimal
     average_price: Decimal
+    post_only_meta: bool | None = None
+
+    @property
+    def effective_flags(self) -> int:
+        """META retains post-only intent when the venue clears its active flag."""
+        return self.flags | (POST_ONLY_FLAG if self.post_only_meta else 0)
 
 
 @dataclass(frozen=True, slots=True)
@@ -308,6 +314,7 @@ def validate_interim_trade_message(message: object) -> None:
 
 def _parse_order(value: object) -> OrderState:
     row = _array(value, "order row", minimum=18)
+    flags = _nonnegative_int(row[12], "order.flags")
     return OrderState(
         venue_order_id=_positive_int(row[0], "order.id"),
         group_id=_optional_int(row[1], "order.gid"),
@@ -320,11 +327,34 @@ def _parse_order(value: object) -> OrderState:
         order_type=_text(row[8], "order.type"),
         previous_order_type=_optional_text(row[9], "order.type_prev"),
         tif_expiry_ms=_optional_nonnegative_int(row[10], "order.mts_tif"),
-        flags=_nonnegative_int(row[12], "order.flags"),
+        flags=flags,
         status=_text(row[13], "order.status"),
         price=_decimal(row[16], "order.price"),
         average_price=_decimal(row[17], "order.price_avg"),
+        post_only_meta=_order_post_only_meta(row, flags),
     )
+
+
+def _order_post_only_meta(row: list[object], flags: int) -> bool | None:
+    if len(row) <= 31 or row[31] is None:
+        return None
+    meta = row[31]
+    if not isinstance(meta, dict):
+        raise BitfinexV1ProtocolError("order.meta must be a JSON object or null")
+    observed: int | None = None
+    # $F7 is documented; _$F7 is the observed wire spelling. Other META is unrelated.
+    for key in ("$F7", "_$F7"):
+        if key not in meta:
+            continue
+        value = _exact_int(meta[key], f"order.meta.{key}")
+        if value not in {0, 1}:
+            raise BitfinexV1ProtocolError("order.meta post-only must be 0 or 1")
+        if observed is not None and observed != value:
+            raise BitfinexV1ProtocolError("order.meta post-only aliases conflict")
+        observed = value
+    if observed == 0 and flags & POST_ONLY_FLAG:
+        raise BitfinexV1ProtocolError("order.meta post-only conflicts with active flag")
+    return None if observed is None else bool(observed)
 
 
 def _parse_trade(value: object) -> TradeUpdate:

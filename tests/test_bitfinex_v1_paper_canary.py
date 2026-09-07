@@ -319,6 +319,26 @@ def test_terminal_zero_flags_require_same_run_ownership_and_post_only_intent(
     assert evidence.historical_flags == (flags,)
 
 
+@pytest.mark.parametrize("key", ["$F7", "_$F7"])
+@pytest.mark.parametrize("value", [0, 1])
+def test_owned_metadata_is_exact_evidence_and_denial_cannot_use_opaque_fallback(
+    key: str, value: int,
+) -> None:
+    rest = _Rest()
+    row = _order_row(status="CANCELED", flags=0)
+    row.extend([None] * (31 - len(row)))
+    row.append({key: value})
+    rest.history = [row]
+    evidence = asyncio.run(read_owned_evidence(
+        rest, cid=456, venue_order_id=123, price=Decimal("4370.0"), start_ms=0,
+        same_run_ownership_venue_order_id=123, post_only_intent_submitted=True,
+    ))
+    assert evidence.terminal_lifecycle_exact is bool(value)
+    assert not evidence.submitted_intent_fallback_used
+    assert evidence.historical_flags == (0,)
+    assert evidence.post_only_assurance == ("VENUE_FLAG_OBSERVED" if value else "UNPROVEN")
+
+
 def test_credentials_load_only_named_values_and_environment_wins(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

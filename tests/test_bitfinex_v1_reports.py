@@ -106,6 +106,43 @@ def _order_row(
     ]
 
 
+def test_captured_paper_canceled_order_retains_explicit_post_only_metadata() -> None:
+    # Actual 2026-09-07 closed row: active FLAGS cleared, META retained _$F7=1.
+    row = [
+        243538491952, None, 1788743501126, PAPER_RAW_SYMBOL,
+        1788743501335, 1788743501901, Decimal(2), Decimal(2), "LIMIT",
+        None, None, None, 0, "CANCELED", None, None, Decimal("4406.7"), Decimal(0),
+        0, 0, None, None, None, 0, 0, None, None, None, "API>BFX", None, None,
+        {"lev": 16, "ugrp_id": "0.3045599654553539", "_$F33": 16, "_$F7": 1},
+    ]
+    report, = map_order_status_reports(
+        active_rows=[], history_rows=[row], instrument=_instrument(PAPER_RAW_SYMBOL),
+        account_id=ACCOUNT_ID, cid_lookup=lambda _: ClientOrderId("CAPTURED-MAKER"),
+        ts_init=TS_INIT,
+    )
+    assert report.order_status is OrderStatus.CANCELED and report.filled_qty.as_decimal() == 0
+    assert report.post_only
+    assert row[12] == 0 and row[31] == {
+        "lev": 16, "ugrp_id": "0.3045599654553539", "_$F33": 16, "_$F7": 1,
+    }
+
+
+@pytest.mark.parametrize("flags,order_type", [
+    (REDUCE_ONLY_FLAG, "IOC"), (8192, "LIMIT"), (0, "IOC"),
+])
+def test_metadata_does_not_hide_unsupported_flags_or_post_only_tif(
+    flags: int, order_type: str,
+) -> None:
+    row = _order_row(flags=flags, order_type=order_type)
+    row.extend([None] * (31 - len(row)))
+    row.append({"$F7": 1})
+    with pytest.raises(BitfinexV1ReportError, match="flags|post-only"):
+        map_order_status_reports(
+            active_rows=[row], history_rows=[], instrument=_instrument(), account_id=ACCOUNT_ID,
+            cid_lookup=lambda _: ClientOrderId("META-CONFLICT"), ts_init=TS_INIT,
+        )
+
+
 def _trade_row(
     *,
     trade_id: int = 5001,

@@ -402,17 +402,18 @@ def _order_report(
     ts_init: int,
 ) -> OrderStatusReport:
     _exact_symbol(state.symbol, instrument)
-    if state.flags not in {0, POST_ONLY_FLAG, REDUCE_ONLY_FLAG}:
-        raise BitfinexV1ReportError(f"unsupported Bitfinex order flags {state.flags}")
+    flags = state.effective_flags
+    if flags not in {0, POST_ONLY_FLAG, REDUCE_ONLY_FLAG}:
+        raise BitfinexV1ReportError(f"unsupported Bitfinex order flags {flags}")
     if state.order_type == "LIMIT":
         time_in_force = TimeInForce.GTC
     elif state.order_type == "IOC":
         time_in_force = TimeInForce.IOC
     else:
         raise BitfinexV1ReportError(f"unsupported Bitfinex order type {state.order_type!r}")
-    if state.flags == POST_ONLY_FLAG and time_in_force != TimeInForce.GTC:
+    if flags == POST_ONLY_FLAG and time_in_force != TimeInForce.GTC:
         raise BitfinexV1ReportError("post-only Bitfinex order must be LIMIT/GTC")
-    if state.flags == REDUCE_ONLY_FLAG and time_in_force != TimeInForce.IOC:
+    if flags == REDUCE_ONLY_FLAG and time_in_force != TimeInForce.IOC:
         raise BitfinexV1ReportError("reduce-only Bitfinex order must be LIMIT/IOC")
     if state.tif_expiry_ms is not None:
         raise BitfinexV1ReportError("Bitfinex v1 does not support expiring orders")
@@ -460,8 +461,8 @@ def _order_report(
         filled_qty=filled_qty,
         price=price,
         avg_px=avg_px,
-        post_only=state.flags == POST_ONLY_FLAG,
-        reduce_only=state.flags == REDUCE_ONLY_FLAG,
+        post_only=flags == POST_ONLY_FLAG,
+        reduce_only=flags == REDUCE_ONLY_FLAG,
         cancel_reason=(
             state.status if order_status in {OrderStatus.CANCELED, OrderStatus.REJECTED} else None
         ),
