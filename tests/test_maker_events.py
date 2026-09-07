@@ -22,6 +22,7 @@ from nautilus_trader.execution.reports import OrderStatusReport
 from nautilus_trader.model.data import FundingRateUpdate
 from nautilus_trader.model.enums import OrderSide, OrderStatus, TimeInForce
 from nautilus_trader.model.events import (
+    OrderAccepted,
     OrderCancelRejected,
     OrderExpired,
     OrderModifyRejected,
@@ -328,6 +329,94 @@ def _seed_native_working_quotes(
     for instrument in (_source_instrument(), _hedge_instrument()):
         strategy.cache.add_quote_tick(_quote(instrument, "2399", "2401", "5", 100))
     return orders
+
+
+@pytest.mark.parametrize("native_status", [OrderStatus.INITIALIZED, OrderStatus.SUBMITTED])
+@pytest.mark.parametrize("boundary", ["repeat", "stop", "old-generation", "startup-gate"])
+def test_deferred_maker_cancel_keeps_exact_cid_and_native_lifecycle(
+    tmp_path: Path, native_status: OrderStatus, boundary: str,
+) -> None:
+    async def run() -> None:
+        strategy = _InstrumentLifecycleMaker(_maker_strategy_config(tmp_path / boundary))
+        with _event_engine(cast(Any, strategy)) as engine:
+            engine.trader.start()
+            order, = _seed_native_working_quotes(
+                strategy, exact_route=True, directions=(SourceDirection.LONG,),
+                native_status=native_status,
+            )
+            before = [event.to_dict(event) for event in order.events]
+            for _ in range(2):
+                strategy._cancel_working(SourceDirection.LONG, reason="risk changed")
+            assert not strategy._source_hold  # A direct risk cancel is not a global freeze.
+            assert strategy._pending_source_cancels == {order.client_order_id.value}
+            assert [event.to_dict(event) for event in order.events] == before
+            if native_status is OrderStatus.INITIALIZED:
+                engine.kernel.exec_engine.process(TestEventStubs.order_submitted(
+                    order, account_id=AccountId("BITFINEX-001"), ts_event=101,
+                ))
+            event = TestEventStubs.order_accepted(
+                order, account_id=AccountId("BITFINEX-001"),
+                venue_order_id=VenueOrderId("accepted"), ts_event=102,
+            )
+            generation = strategy._source_terminal_generation
+            engine.kernel.exec_engine.process(event)
+            assert not strategy.cancel_ids  # Even TestClock with a running loop must defer.
+            if boundary == "stop":
+                strategy.begin_drain()
+                strategy.stop()
+            elif boundary == "old-generation":
+                strategy._source_terminal_generation += 1
+            elif boundary == "startup-gate":
+                strategy.bind_restart_gate(lambda: True)
+            else:
+                strategy.on_order_accepted(event)  # Same callback twice cannot double-cancel.
+            await asyncio.sleep(0)
+            assert strategy.cancel_ids == (
+                [order.client_order_id.value] if boundary == "repeat" else []
+            )
+            if boundary == "old-generation":
+                strategy._cancel_after_acceptance(event, generation)
+                assert not strategy.cancel_ids
+                strategy._cancel_after_acceptance(event, strategy._source_terminal_generation)
+                assert strategy.cancel_ids == [order.client_order_id.value]
+            if boundary == "stop":
+                assert not strategy._pending_source_cancels
+            strategy.begin_drain()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("fault", ["account", "venue", "instrument", "strategy", "other-cid"])
+def test_deferred_maker_cancel_does_not_use_mismatched_acceptance(
+    tmp_path: Path, fault: str,
+) -> None:
+    async def run() -> None:
+        strategy = _InstrumentLifecycleMaker(_maker_strategy_config(tmp_path / fault))
+        with _event_engine(cast(Any, strategy)) as engine:
+            engine.trader.start()
+            order, = _seed_native_working_quotes(
+                strategy, exact_route=True, directions=(SourceDirection.LONG,),
+            )
+            strategy._pending_source_cancels.add(order.client_order_id.value)
+            accepted = next(event for event in order.events if isinstance(event, OrderAccepted))
+            values = OrderAccepted.to_dict(accepted)
+            field, value = {
+                "account": ("account_id", "BITFINEX-OTHER"),
+                "venue": ("venue_order_id", "wrong"),
+                "instrument": ("instrument_id", "OTHER.BITFINEX"),
+                "strategy": ("strategy_id", "OTHER-001"),
+                "other-cid": ("client_order_id", "OTHER-CID"),
+            }[fault]
+            values[field] = value
+            event = OrderAccepted.from_dict(values)
+            strategy._cancel_after_acceptance(event, strategy._source_terminal_generation)
+            assert not strategy.cancel_ids
+            assert order.status is OrderStatus.ACCEPTED
+            assert strategy._pending_source_cancels == {order.client_order_id.value}
+            if fault != "other-cid":
+                assert strategy._stores[SourceDirection.LONG].halt_reason is not None
+                assert strategy._source_hold
+            strategy.begin_drain()
+    asyncio.run(run())
 
 
 @pytest.mark.parametrize(
@@ -2840,6 +2929,7 @@ class _WorkingOrder:
     events: tuple[object, ...] = ()
     is_closed = False
     is_pending_cancel = False
+    status = OrderStatus.ACCEPTED
 
 
 class _StopCache:
@@ -2866,6 +2956,7 @@ class _StopHarness:
         self._source_terminal_stopped = False
         self._source_terminal_generation = 0
         self._source_terminal_inflight: set[str] = set()
+        self._pending_source_cancels: set[str] = set()
         self._stores = {
             SourceDirection.LONG: _StopStore("O-BID"),
             SourceDirection.SHORT: _StopStore("O-ASK"),

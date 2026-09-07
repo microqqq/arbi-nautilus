@@ -748,6 +748,26 @@ P05 最终原生与loopback证据：两处EA窄修先取得14项中7项失败，
 
 按既定授权仅本地提交本包后，以同profile/state/CID/native进行一次新有限Maker续跑；`run_maker_meta_continue.py`仅替换已审观察器的安装和输出路径，SHA `5b0d74fb75ab64e4b2fc780026e519218e84d82f955ddcdbd9a7681387fad133`，安装版自测通过。预算和无自动平仓语义均不变，不使用`--resume-held`，不重挂EA、不推送/部署。资格与后续现场订单/持仓重启/both/真实跨日仍分别取证。
 
+**10:00 / Maker真实往返已执行，第三轮在提交与撤单竞态停下：** `7bffd25`安装版01:57:00.989Z启动，旧33订单带历史的普通mass通过；先有一笔零成交撤单及自主终态核验，随后BUY2（trade1969595015，4414.7，MAKER）→MT5 SELL2（ticket10372961836），再SELL2（trade1969595024，4404.6，MAKER）→MT5按原ticket精确BUY2关闭。两个义务各完成一次、双向归零由普通机会触发而非runner自动平仓。未对冲峰值2oz、最长观测1.038秒，始终保持2oz/.02lot上限。
+
+第三轮源CID`O-20260907-015957-001-000-7`在01:59:57.303 SUBMITTED，.379 Maker向尚无venue ID的订单调用原生cancel；adapter正确拒绝`order has no authoritative Bitfinex venue ID`，原生已进入PENDING_CANCEL却不能回退SUBMITTED，策略据reject持久化`maker cancel rejected`。真实ACK在.536才到、venue243554317697；正常drain在.820成功零成交撤单，但旧HOLD不被洗掉，186.897秒/exit1/PAPER_INCOMPLETE。保留整次log/result，不能把前两笔成交当整轮验收通过，也不扩大观察器豁免。02:00:31后置实读双端flat、无活动/未决，EA88事件；native39订单中原33原生事件完全不变。冷热报告同为FINAL −16.56USDT（USD3.64与USDT−20.2按FX1），费用/仓位无缺口；暂停的原业务SHA`8963732a0bfe62763a45066c9a84043e955615f524536e7c2c966e77470d7701`原样保留。
+
+下一doc-first窄修只解决Maker在INITIALIZED/SUBMITTED尚未有venue接受事实时的撤单请求。固定Nautilus在`cancel_order`调用阶段就改变原生状态，所以应在策略调用之前等待，不改adapter的严格venue-ID契约、不扩CID撤单wire路径。优先只改原`strategies/maker.py`和必要既有Maker/普通启动/停止测试：用本实例按精确CID保留已请求撤单意图，在同一原订单的原生接受回调继续既有cancel路径；无后续tick也必须继续，重复等待/ACK不多发，完整终态/拒绝清理本实例意图。满成交或部分成交抢先到达仍只对冲实际量，真实cancel拒绝/UNKNOWN/错误身份保持原HOLD；未收到ACK由原adapter期限/原停止预算收束，不能新增无限等待、timer、持久撤单账或改native引擎。
+
+接受回调不得盲目同步撤：原adapter在已知fill路径先发布Accepted再发布OrderFilled；复用已有live loop下一回调重新读取cache终态、active CID和venue接受事实后继续，可避免对同批已满成交单抢先发撤单。该一次调度不新建timer或重试队列，并由原停止/回调generation边界阻止旧任务越过生命周期；同步回测路径按原生事件事实单独验证，不用模拟spy冒充live队列行为。
+
+先用真实Engine+两adapter的延迟ACK普通链固定“过早cancel命令→本地拒绝→持久HOLD”的RED，再验证ACK/填量/明确拒绝/静默超时/停止/同CID重复事件等交错，源单和义务不重复、原始状态不改写。仅跳过无ID而不记原撤单需求不是修复。独立复核、相关回归/全量和安装版普通进程完成后本地提交。当前已审旧暂停的续跑使用已有`--resume-held`，仍由完整原生/venue/最终费用及receipt验证清理，外围观察器只给已绑定旧暂停有限核验时间；不手改业务文件、清CID/Redis、重发旧单或增加恢复豁免。EA/限额/阈值及最终Maker持仓重启、both、真实跨日待验范围不变。
+
+已准备的ignored `run_maker_cancel_resume.py`保留30分钟/10新CID、6新CID或3新完成早停、2oz/20秒/.02lot、原终态5秒观察和正常drain，仅增加对上述精确旧业务SHA的30秒一次性启动等待及`--resume-held`。`recover_for_start`会将这条已审旧halt在on_start打印ERROR，观察器据固定native首次`self.config.oms_type=None`→RUNNING/停止区间、当前原bytes及<30秒，仅允许一次精确组件/level/body旧日志；完整行增量消费，重复旧行不重复计数，第二次同文案/其它ERROR仍停止。没有假设INFO会输出STARTING。若第一次读到旧ERROR时业务已完成释放，仍保守停止，不倒推豁免。新SHA `10840467c5d7966841c71536964ce7a7b3439e876f2acd4ca7c55820c14f57f0`，安装版自测及独立53项纯内存控制通过，reviewer只接受观察器；未连接现场/改状态，不代表生产补丁或真实续跑通过。
+
+**10:31 / 发单前补足外围敞口观察：** Both准备时确认schema7/9的未分配残差由`allocations`拥有，view原始`net_unhedged_ounces`是0占位。根用纯内存0.2oz真实格式部分成交复现旧Maker观察器报outstanding0的RED；此前现场完整2oz成交的allocation余额确实0，不反推已有现场峰值错报，但旧观察器不具备小数分片资格。本次只改ignored观察器：复用原allocation parser，按完整route累计signed_fill−allocated后各route取绝对值，再加各未完成义务剩量；不同route和未完成义务不互相净掉。同route已完成的原子抵消遵循既有owner语义，不能把跨view早期分配差额虚报永久未对冲。补分片/跨route相反余额/已结同route抵消/已分配未完成等内存控制，原53项启动、错误、期限控制复跑并独立审查后才发单。不动生产、状态、profile、额度或EA。
+
+**10:33 / Maker提交前撤单窄修已取得生产离线资格：** 生产仅`strategies/maker.py`净增59行，按CID保留实例撤单意图，原接受事件下一loop回调复核当前原生身份/终态后撤单；停止/代际/启动门隔离旧回调，不新增持久账、timer、adapter或恢复例外。新增21项边界；实施者首轮三模块300pass/9个旧替身缺字段失败原样保留，补两字段后Maker240项全过，未把首轮说成全绿。
+
+四路径冻结diff SHA `7d54c941ec20b296d1b4032c2649e5fee00b47059bf2de17fd3a4c2fce9076ac`；主agent单次完整 **3286 passed / 133既有Pandas warnings / 504.17s**，含两项真实专用Redis回归、零skip；Ruff all、Mypy123文件及diff-check通过。独立完整三模块 **309 passed / 2既有warnings / 226.782s**，再在原生普通双adapter链验证0/1/2oz ACK前成交：仅内存恢复旧撤单方法精确重现PENDING_CANCEL/持久HOLD，仅改成同步接受回调在满成交例产生多余真实CancelOrder；当前候选原样通过。reviewer冻结前后SHA一致并限定RECOMMEND-ACCEPT，根依据全量接受此窄修。
+
+固定依赖隔离wheel/sdist各18检查通过，wheel SHA `98927fc6a342151fbb5c3a03d1f803770cb07d67ad01d030cfcc54282c761239`、资格sdist SHA `3e88a71d1ecfbc1e9479f8e524c42ad5910d0084edac220cff749cdfe6f6d0f6`（先于本段及观察器记录，最终交付另重建）。安装版普通进程 **25 passed / 15 deselected / 297.56s**；93份观测/52个worker PID的49模块匹配、25次native冷load事件0、25个专用合成Redis全部删除；另15项共享控制通过。全量专用`6245ee035d991a9edf65d21623bedee2a944f6c5edaa9db057225fb398ac7031`准确删除，真实61613/native39订单及原业务SHA不动。按约定本地提交后，另待修订观察器独立复核和新的真实preflight才续跑；不推送、部署或改EA，W9未据离线绿色关闭。
+
 先做不发单连接/对账，再单独 Taker、Maker，最后同节点 both；均使用普通策略。每一轮都事先记录最大时长、最多源订单数、每单/累计净仓上限、最大未对冲量与超时、停止方式，使用已有两测试账户，不申请每一步重复授权。
 
 建议初始会话预算为每模式 30 分钟、最多 10 次源订单；这是待运行 profile 确认的测试预算，不是立即执行命令。不得为了达到次数忽略市场关闭或不断重跑失败会话。跨日能力另外运行一个覆盖真实 broker rollover 的有界会话，结束时间按实际时区/市场时段设置；不伪称 30 分钟已证明跨日。

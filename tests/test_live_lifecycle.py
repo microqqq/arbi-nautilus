@@ -14,7 +14,13 @@ from continuous_mt5_wire import ContinuousMt5Wire
 from nautilus_trader.config import TradingNodeConfig
 from nautilus_trader.model.enums import OrderStatus
 from nautilus_trader.trading.strategy import Strategy
-from test_adapter_continuity import _accepted_source, _continuous, _market, _SourceWire
+from test_adapter_continuity import (
+    _accepted_source,
+    _continuous,
+    _hold_source_acceptance,
+    _market,
+    _SourceWire,
+)
 from test_mt5_v1_execution import _identity, _snapshot
 from test_strategy_continuity import _OrdinaryStrategy, _pump
 
@@ -23,6 +29,47 @@ from py000_nautilus.live_lifecycle import DrainingTradingNode, DrainResult, drai
 from py000_nautilus.live_runtime import get_source_terminal_reconciler
 from py000_nautilus.models import BusinessOrderSide, ObligationStatus, SourceDirection
 from py000_nautilus.mt5_v1_protocol import JsonObject
+
+
+@pytest.mark.parametrize("accept_during_drain", [False, True])
+def test_maker_pre_acceptance_cancel_and_original_drain_share_one_bounded_cancel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, accept_during_drain: bool,
+) -> None:
+    async def scenario() -> None:
+        async with _continuous(
+            tmp_path, monkeypatch, maker=True, long_quantity=2, short_quantity=0,
+        ) as (h, source, wire):
+            held = _hold_source_acceptance(source, monkeypatch)
+            await _market(h, wire, 1)
+            assert len(held) == 1
+            order = source.order(int(held[0][2]))
+            h.strategy.update_hedge_session(False, h.node.kernel.clock.timestamp_ns())
+            await _pump()
+            assert order.status is OrderStatus.SUBMITTED and not h.source_cancel_commands
+            draining = asyncio.create_task(drain_strategy(
+                h.node, h.strategy, timeout_seconds=.15 if not accept_during_drain else 2,
+            ))
+            await _pump()
+            assert h.strategy._draining and not h.source_cancel_commands
+            if accept_during_drain:
+                h.transport.queue.put_nowait([0, "on", held[0]])
+            result = await draining
+            assert result.complete is accept_during_drain, result
+            assert h.source_cancel_commands == (
+                [order.client_order_id] if accept_during_drain else []
+            )
+            if accept_during_drain:
+                assert order.status is OrderStatus.CANCELED
+            else:
+                assert result.reason == "drain_timeout"
+                assert f"source:{order.client_order_id}" in result.pending
+                assert order.status is OrderStatus.SUBMITTED
+            h.node.trader.stop()
+            await _pump()
+            assert not h.strategy._pending_source_cancels
+            assert len(h.source_cancel_commands) == int(accept_during_drain)
+            assert len(source.rows) == 1 and not wire.submit_calls and not wire.close_calls
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize("fault", [None, "old-freeze", "wal", "sibling-active", "unknown"])

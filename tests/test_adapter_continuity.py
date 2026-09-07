@@ -19,13 +19,19 @@ from typing import Any, cast
 import pytest
 from continuous_mt5_wire import ContinuousMt5Wire
 from nautilus_trader.model.enums import OrderSide, OrderStatus, PositionSide
-from nautilus_trader.model.events import OrderModifyRejected
+from nautilus_trader.model.events import (
+    OrderAccepted,
+    OrderCancelRejected,
+    OrderFilled,
+    OrderModifyRejected,
+    OrderPendingCancel,
+)
 from nautilus_trader.model.identifiers import ClientOrderId
 from nautilus_trader.model.orders import Order
-from test_bitfinex_v1_execution import _position_row
+from test_bitfinex_v1_execution import _notification, _position_row
 from test_maker_migration import _v1_payload
 from test_mt5_v1_execution import _identity, _snapshot
-from test_strategy_continuity import _OrdinaryStrategy, _pump
+from test_strategy_continuity import _OrdinaryStrategy, _pump, _wait_until
 
 from py000_nautilus.app import _book_snapshot, _quote
 from py000_nautilus.live_runtime import get_source_terminal_reconciler
@@ -253,6 +259,143 @@ async def _accepted_source(
         }) from exc
     assert len(candidates()) == 1
     return candidates()[0]
+
+
+def _hold_source_acceptance(
+    source: _SourceWire, monkeypatch: pytest.MonkeyPatch,
+) -> list[list[Any]]:
+    emit = source.emit
+    held: list[list[Any]] = []
+
+    def delay_acceptance(operation: str, row: list[Any]) -> None:
+        if operation == "on":
+            held.append(deepcopy(row))
+        else:
+            emit(operation, row)
+
+    monkeypatch.setattr(source, "emit", delay_acceptance)
+    return held
+
+
+@pytest.mark.parametrize("fill_before_acceptance", [0, 1, 2])
+def test_maker_requested_cancel_waits_for_native_acceptance_without_another_tick(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fill_before_acceptance: int,
+) -> None:
+    async def scenario() -> None:
+        async with _continuous(
+            tmp_path, monkeypatch, maker=True, long_quantity=2, short_quantity=0,
+        ) as (h, source, wire):
+            held = _hold_source_acceptance(source, monkeypatch)
+            await _market(h, wire, 1)
+            assert len(held) == 1
+            cid = int(held[0][2])
+            order = source.order(cid)
+            assert order.status is OrderStatus.SUBMITTED and order.venue_order_id is None
+            # A genuine input change invokes the ordinary protective cancellation
+            # before the delayed venue acceptance, as in the live failure.
+            h.strategy.update_hedge_session(False, h.node.kernel.clock.timestamp_ns())
+            await _pump()
+            assert not h.source_cancel_commands, (
+                order.status, [type(event).__name__ for event in order.events],
+                [store.halt_reason for store in h.reload_stores()],
+            )
+            assert not any(isinstance(event, OrderCancelRejected) for event in order.events)
+            assert order.status is OrderStatus.SUBMITTED
+            assert all(store.halt_reason is None for store in h.reload_stores())
+            if fill_before_acceptance:
+                # A TU without on runs the adapter's original _apply_trade_fill,
+                # which queues Accepted immediately before the same native Filled.
+                source.fill(cid, D(fill_before_acceptance))
+            else:
+                h.transport.queue.put_nowait([0, "on", held[0]])
+            await _pump()  # No fresh quote/session event may be needed to finish the cancel.
+            assert order.status is (
+                OrderStatus.FILLED if fill_before_acceptance == 2 else OrderStatus.CANCELED
+            )
+            assert h.source_cancel_commands == (
+                [] if fill_before_acceptance == 2 else [order.client_order_id]
+            )
+            assert not h.strategy._pending_source_cancels
+            assert not any(isinstance(event, OrderCancelRejected) for event in order.events)
+            assert len(source.rows) == 1 and not wire.close_calls
+            if fill_before_acceptance:
+                await _wait_until(lambda: all(
+                    intent.status is ObligationStatus.COMPLETED
+                    for store in h.reload_stores() for intent in store.intents()
+                ))
+                events = [type(event) for event in order.events]
+                assert events.index(OrderAccepted) < events.index(OrderFilled)
+                if fill_before_acceptance == 1:
+                    assert events.index(OrderFilled) < events.index(OrderPendingCancel)
+                else:
+                    assert OrderPendingCancel not in events
+                intents = [intent for store in h.reload_stores() for intent in store.intents()]
+                assert len(intents) == len(wire.submit_calls) == 1
+                assert sum(position.signed_qty for position in h.node.cache.positions_open(
+                    instrument_id=h.hedge_instrument.id,
+                )) == -fill_before_acceptance
+                assert source.net == fill_before_acceptance
+            else:
+                assert not wire.submit_calls
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("outcome", ["rejected", "timeout", "unknown-then-accepted"])
+def test_maker_deferred_cancel_does_not_convert_submit_failure_to_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome: str,
+) -> None:
+    async def scenario() -> None:
+        async with _continuous(
+            tmp_path, monkeypatch, maker=True, long_quantity=2, short_quantity=0,
+        ) as (h, source, wire):
+            held = _hold_source_acceptance(source, monkeypatch)
+            await _market(h, wire, 1)
+            assert len(held) == 1
+            cid = int(held[0][2])
+            order = source.order(cid)
+            h.strategy.update_hedge_session(False, h.node.kernel.clock.timestamp_ns())
+            await _pump()
+            assert not h.source_cancel_commands and order.status is OrderStatus.SUBMITTED
+            if outcome == "rejected":
+                # This finite venue fixture declines, rather than accepting, the submission.
+                source.rows.pop(cid)
+                source.publish()
+                h.transport.queue.put_nowait(_notification(
+                    "on-req", cid=cid, venue_order_id=None,
+                ))
+                await _pump()
+                assert order.status is OrderStatus.REJECTED
+                assert not h.strategy._pending_source_cancels
+                assert h.store.active_source_order_id is None
+            else:
+                live = h.source._by_cid[cid]
+                deadline = h.source._ack_deadlines[(cid, "submit")]
+                deadline.cancel()
+                h.source._expire_ack_deadline(live, "submit")  # Original bounded failure path.
+                assert "submit" in live.unknown_operations
+                assert h.source.execution_hold_reason is not None
+                if outcome == "unknown-then-accepted":
+                    # An independent business UNKNOWN remains held even after later
+                    # native acceptance permits the requested protective cancellation.
+                    h.strategy._mark_source_unknown(
+                        order.client_order_id.value, "independent unresolved source evidence",
+                    )
+                    await _pump()
+                    assert h.store.halt_reason is not None
+                    old_hold = h.store.halt_reason
+                    h.transport.queue.put_nowait([0, "on", held[0]])
+                    await _pump()
+                    assert order.status is OrderStatus.CANCELED
+                    assert h.source_cancel_commands == [order.client_order_id]
+                    assert h.store.halt_reason == old_hold
+                else:
+                    await _pump()
+                    assert order.status is OrderStatus.SUBMITTED
+                    assert h.store.active_source_order_id == order.client_order_id.value
+                    assert order.client_order_id.value in h.strategy._pending_source_cancels
+                    assert not h.source_cancel_commands
+            assert not wire.submit_calls and not wire.close_calls
+    asyncio.run(scenario())
 
 
 async def _settle_cycle(

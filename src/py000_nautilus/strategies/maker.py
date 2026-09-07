@@ -144,6 +144,7 @@ class MakerStrategy(Strategy):
             for direction in _DIRECTIONS
         }
         self._working_quotes: dict[str, MakerQuote] = {}
+        self._pending_source_cancels: set[str] = set()
         self._stale_timer_names: dict[SourceDirection, str] = {}
         self._stale_timer_loop: asyncio.AbstractEventLoop | None = None
         self._source_hold = False
@@ -248,6 +249,7 @@ class MakerStrategy(Strategy):
 
     def on_start(self) -> None:
         self._draining = False
+        self._pending_source_cancels.clear()
         self._stale_timer_loop = (
             asyncio.get_running_loop() if isinstance(self.clock, LiveClock) else None
         )
@@ -314,6 +316,7 @@ class MakerStrategy(Strategy):
             self.msgbus.unsubscribe(topic, self._on_account_update)
         self._account_topics = ()
         self._account_loop = None
+        self._pending_source_cancels.clear()
         if _restart_blocked(self) or self._draining:
             return
         for direction in _DIRECTIONS:
@@ -438,6 +441,51 @@ class MakerStrategy(Strategy):
 
     def on_order_accepted(self, event: OrderAccepted) -> None:
         self._update_order_status(event.client_order_id.value, "ACCEPTED")
+        if event.client_order_id.value in self._pending_source_cancels:
+            # The adapter can emit Accepted and Filled together. Let native event
+            # processing finish before deciding whether any quantity still needs canceling.
+            try:
+                loop = self._stale_timer_loop or asyncio.get_running_loop()
+            except RuntimeError:
+                return  # Synchronous backtests retain the intent for the next native input.
+            loop.call_soon(self._cancel_after_acceptance, event, self._source_terminal_generation)
+
+    def _cancel_after_acceptance(self, event: OrderAccepted, generation: int) -> None:
+        if (self._source_terminal_stopped or generation != self._source_terminal_generation
+                or _restart_blocked(self)):
+            return
+        client_order_id = event.client_order_id.value
+        if client_order_id not in self._pending_source_cancels:
+            return
+        direction = self._direction_for_source_order(client_order_id)
+        if direction is None or self._stores[direction].active_source_order_id != client_order_id:
+            self._pending_source_cancels.discard(client_order_id)
+            return
+        store = self._stores[direction]
+        order = self.cache.order(event.client_order_id)
+        record = store.source_order(client_order_id)
+        if order is not None and order.is_closed:
+            self._pending_source_cancels.discard(client_order_id)
+            return
+        if not (
+            order is not None and record is not None
+            and event.trader_id == order.trader_id == self.trader_id
+            and event.strategy_id == order.strategy_id == self.id
+            and event.instrument_id == order.instrument_id == self._config.source_instrument_id
+            and event.account_id == order.account_id
+            and event.account_id.value == record.source_account_id
+            and event.venue_order_id == order.venue_order_id
+            and order.venue_order_id is not None
+            and self.cache.client_id(event.client_order_id) == (
+                ClientId(record.source_client_id) if record.source_client_id is not None else None
+            )
+        ):
+            reason = "Maker deferred cancel acceptance identity differs"
+            self._source_hold = True
+            store.mark_source_unknown(client_order_id, reason)
+            self._freeze_all_best_effort(reason)
+            return
+        self._cancel_working(direction, expected_order_id=client_order_id, reason="accepted cancel")
 
     def on_order_denied(self, event: OrderDenied) -> None:
         self._finish_or_reject(event.client_order_id.value, "DENIED")
@@ -579,6 +627,7 @@ class MakerStrategy(Strategy):
                 self._cancel_all_best_effort("source fill froze Maker quoting")
             if self._stores[direction].active_source_order_id is None:
                 self._working_quotes.pop(event.client_order_id.value, None)
+                self._pending_source_cancels.discard(event.client_order_id.value)
             return
         if event.instrument_id == self._config.hedge_instrument_id:
             applied = any(
@@ -608,6 +657,9 @@ class MakerStrategy(Strategy):
             store.mark_source_unknown(active_id, "Maker cache lost the active source order")
             return
         if order.is_closed:
+            return
+        if active_id in self._pending_source_cancels:
+            self._cancel_working(direction, expected_order_id=active_id, reason="requested cancel")
             return
         bound = self._working_quotes.get(active_id)
         if bound is None:
@@ -1171,10 +1223,16 @@ class MakerStrategy(Strategy):
         if order is None:
             store.mark_source_unknown(active_id, f"{reason}: active Maker order missing from cache")
             return
-        if order.is_closed or order.is_pending_cancel:
+        if order.is_closed or order.is_pending_cancel or _cancel_is_pending(order):
+            self._pending_source_cancels.discard(active_id)
             return
-        if _cancel_is_pending(order):
+        if order.status in {OrderStatus.INITIALIZED, OrderStatus.SUBMITTED}:
+            # Native cancel_order already enters PENDING_CANCEL; the adapter can
+            # only send a cancel once venue acceptance has supplied its order ID.
+            if not self._source_terminal_stopped:
+                self._pending_source_cancels.add(active_id)
             return
+        self._pending_source_cancels.discard(active_id)
         try:
             self.cancel_order(order)
         except Exception as exc:
@@ -1563,6 +1621,7 @@ class MakerStrategy(Strategy):
         if direction is not None:
             self._stores[direction].update_source_status(client_order_id, status)
             self._working_quotes.pop(client_order_id, None)
+            self._pending_source_cancels.discard(client_order_id)
             self._try_release_cycle()
             return
         for store in self._stores.values():
