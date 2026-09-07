@@ -724,6 +724,12 @@ P05 最终原生与loopback证据：两处EA窄修先取得14项中7项失败，
 
 主agent据最终全量、独立语义复核和相同生产安装证据接受本次小修并仅本地提交，不推送/部署。上文W7“仅shared”的历史分类约束由本段明确扩至standalone的已列market_input callsite；旧持久HOLD仍须原显式恢复。下一步按已定预算实际Maker `--resume-held`，现场Maker/持仓重启/both/跨日仍未通过，不将本次本地绿色称为完整收尾。
 
+**09:12 / 原Maker暂停已恢复，外围观察器提前结束会话：** 本地`3805086`的49模块与运行安装版一致。普通`--resume-held`在6.447秒由原事实核验清除旧暂停；48.439秒真实BUY2 post-only GTC @4406.7被接受（CID `O-20260907-011141-001-000-1`，venue243538491952），49.202秒收到零成交CANCELED并按原流程暂留终态核验halt。外围观察器错误把这个短暂状态当永久故障立即SIGTERM；原Actor在其后1.707秒自行完成核验清halt，51.368秒正常PAPER_STOPPED/drain true/exit0。不是生产恢复失败，也没有成交/对冲连续覆盖。09:12:49后置实读两账户flat、无活动/未决，EA仍84事件；native原32笔EXTERNAL逐字段不变，只增1笔owned零成交撤单，post-only原始事件、终态/费用与冷热FINAL0已核对。
+
+只修ignored外围观察器后以同profile/state/CID/native正常续跑，不改生产也不再使用`--resume-held`：入口固定当前已审正常业务SHA `cead149babe5f99dfc67a6f63bace3a1fe087fd252a40b60fc4958c1f0eab631`，保存副本；新增源单/完成义务按基线集合差计数，额度仍1800秒/10新源CID、6新CID或3新完成早停、2oz/20秒、0.02lot、10秒drain/90秒外部观察。正常撤单等待仅对本轮新CID、在同方向/完整route已见SUBMITTED/ACCEPTED/PARTIALLY_FILLED后进入CANCELED/EXPIRED、仍active且halt精确匹配原`_source_reconcile_reason(cid)`的组合；只观察最多5秒原Actor自行完成，不清改状态或授予下单权限。每CID从首次终态观测计时且不因重复、填量更新、方向或halt消失重现而重置；历史/首次只见终态/错误active、曾UNKNOWN或其他HOLD不得借用等待，多view必须全部满足。ERROR、原Actor明确`Source terminal reconciliation held:`、新外因freeze、数量/未对冲越界仍停止，不等待5秒。先正常/边界/错误身份/operator HOLD/不重置/暴露超限自测及独立复核再执行，新日志/结果保留前两次原文件；仍不以正常启动/撤单覆盖冒充Maker成交验收。
+
+观察器实施/复核已通过：独立发现同CID跨方向重见ACCEPTED会重置等待的草案反例；修订固定首次方向/route、计时及tainted均按CID保留，新SHA `0ed615cae80d525a35a3a6ce7a30cc3ed5cbcf04ca98de46ad04967ee026b366`。脚本自测及独立安装版纯内存14项通过，包含该反例、最早deadline、无halt时先锚定终态、同形状operator HOLD及所有上述负控，reviewer限定RECOMMEND-ACCEPT；无状态修改/连接/发单。仅外围观测变更，不因此重复未变生产的3209/25资格；下一真实续跑仍须单独后置核对。
+
 先做不发单连接/对账，再单独 Taker、Maker，最后同节点 both；均使用普通策略。每一轮都事先记录最大时长、最多源订单数、每单/累计净仓上限、最大未对冲量与超时、停止方式，使用已有两测试账户，不申请每一步重复授权。
 
 建议初始会话预算为每模式 30 分钟、最多 10 次源订单；这是待运行 profile 确认的测试预算，不是立即执行命令。不得为了达到次数忽略市场关闭或不断重跑失败会话。跨日能力另外运行一个覆盖真实 broker rollover 的有界会话，结束时间按实际时区/市场时段设置；不伪称 30 分钟已证明跨日。
