@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
 from pathlib import Path
 
 _DIRECTORY_FSYNC_SUPPORTED = os.name == "posix"
 
 
 class ParentDirectorySyncError(OSError):
-    """The destination was replaced, but its directory entry may not be durable."""
+    """The destination was published, but its directory entry may not be durable."""
 
 
 def replace_and_sync_parent(source: str | Path, destination: str | Path) -> None:
@@ -20,6 +21,24 @@ def replace_and_sync_parent(source: str | Path, destination: str | Path) -> None
     the caller's file-fsync plus ``os.replace`` guarantee without overstating
     parent-directory durability.
     """
+    _publish_and_sync_parent(source, destination, os.replace, "replacement")
+
+
+def create_and_sync_parent(source: str | Path, destination: str | Path) -> None:
+    """Link a complete file at a new name without clobbering an existing target.
+
+    The caller owns the temporary source and must fsync its content first. It
+    remains available after publication. Unsupported hard links fail explicitly;
+    there is no non-atomic or replacing fallback. Parent sync has the same
+    platform limits as ``replace_and_sync_parent``.
+    """
+    _publish_and_sync_parent(source, destination, os.link, "creation")
+
+
+def _publish_and_sync_parent(
+    source: str | Path, destination: str | Path,
+    publish: Callable[[Path, Path], None], action: str,
+) -> None:
     source_path = Path(source)
     destination_path = Path(destination)
     directory_fd: int | None = None
@@ -28,13 +47,13 @@ def replace_and_sync_parent(source: str | Path, destination: str | Path) -> None
         flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
         directory_fd = os.open(destination_path.parent, flags)
     try:
-        os.replace(source_path, destination_path)
+        publish(source_path, destination_path)
         if directory_fd is not None:
             try:
                 os.fsync(directory_fd)
             except OSError as exc:
                 raise ParentDirectorySyncError(
-                    f"replacement completed but parent directory sync failed: "
+                    f"{action} completed but parent directory sync failed: "
                     f"{destination_path.parent}"
                 ) from exc
     finally:
@@ -45,6 +64,6 @@ def replace_and_sync_parent(source: str | Path, destination: str | Path) -> None
                 close_error = exc
     if close_error is not None:
         raise ParentDirectorySyncError(
-            f"replacement completed but parent directory close failed: "
+            f"{action} completed but parent directory close failed: "
             f"{destination_path.parent}"
         ) from close_error

@@ -1,9 +1,11 @@
 """Minimal Taker strategy using Nautilus books, orders, and fill events."""
 
+import asyncio
 from collections.abc import Callable
 from decimal import ROUND_FLOOR, Decimal
 from typing import cast
 
+from nautilus_trader.execution.reports import OrderStatusReport
 from nautilus_trader.model.book import BookLevel, OrderBook
 from nautilus_trader.model.data import (
     FundingRateUpdate,
@@ -33,7 +35,13 @@ from py000_nautilus.economics import (
     normalize_mt5_points_swap,
     round_hedge_ounces,
 )
-from py000_nautilus.hedge import HedgeCoordinator, HedgePlanningError, plan_hedge_delta
+from py000_nautilus.hedge import (
+    HedgeCoordinator,
+    HedgePlanningError,
+    hedge_order_params,
+    plan_hedge_delta,
+)
+from py000_nautilus.margin import LiveAccountReader
 from py000_nautilus.models import (
     BookTop,
     BusinessOrderSide,
@@ -45,6 +53,16 @@ from py000_nautilus.models import (
     SourceDirection,
 )
 from py000_nautilus.store import JsonStateStore
+from py000_nautilus.strategies._mt5_costs import (
+    mt5_instrument_is_fresh,
+    mt5_instrument_structure,
+    mt5_swap_spec,
+    validate_mt5_instrument_update,
+)
+from py000_nautilus.strategies._source_terminal import (
+    SourceTerminalQuery,
+    source_cancel_report_is_exact,
+)
 
 _ONE_SHOT_FREEZE_REASON = "one-shot source attempt claimed"
 
@@ -62,6 +80,11 @@ class TakerStrategy(Strategy):
         one_shot: bool = False,
         allowed_source_direction: SourceDirection | None = None,
         hedge_must_reduce_only: bool = False,
+        source_terminal_query: SourceTerminalQuery | None = None,
+        state_store: JsonStateStore | None = None,
+        source_admission: (
+            Callable[[JsonStateStore, BusinessOrderSide, Decimal], bool] | None
+        ) = None,
     ) -> None:
         super().__init__(config)
         if type(one_shot) is not bool:
@@ -77,11 +100,21 @@ class TakerStrategy(Strategy):
             raise ValueError("hedge_must_reduce_only requires one_shot execution")
         self._config = config
         self._live_submission_ready = live_submission_ready
+        self._restart_gate: Callable[[], bool] | None = None
+        self._draining = False
         self._hedge_quantity_ready = hedge_quantity_ready
         self._live_costs_from_adapters = live_costs_from_adapters
         self._one_shot = one_shot
         self._allowed_source_direction = allowed_source_direction
         self._hedge_must_reduce_only = hedge_must_reduce_only
+        self._source_terminal_query = source_terminal_query
+        self._source_terminal_inflight: set[str] = set()
+        self._source_terminal_stopped = False
+        self._source_terminal_generation = 0
+        self._live_account_reader: LiveAccountReader | None = None
+        self._account_loop: asyncio.AbstractEventLoop | None = None
+        self._account_handle: asyncio.Handle | None = None
+        self._account_topics: tuple[str, ...] = ()
         self._one_shot_hedge_position_id: PositionId | None = None
         self._one_shot_hedge_position_quantity_ounces: Decimal | None = None
         self._one_shot_armed = False
@@ -89,11 +122,17 @@ class TakerStrategy(Strategy):
         self._one_shot_closed = False
         self._source_book_subscribed = False
         self._source_book_callback_count = 0
+        self._last_source_attempt_market_ts_ns: int | None = None
         self._last_decision_gate = "not_armed" if one_shot else "not_started"
-        self.state_store = JsonStateStore(config.store_path)
+        if state_store is not None and one_shot:
+            raise ValueError("injected state is supported only by the ordinary Taker")
+        self.state_store = (state_store if state_store is not None
+                            else JsonStateStore(config.store_path))
+        self._source_admission = source_admission
         self._hedges = HedgeCoordinator(config.source_instrument_id, self.state_store)
         self._source_instrument: Instrument | None = None
         self._hedge_instrument: Instrument | None = None
+        self._hedge_instrument_valid = False
         self._carry = config.economics.carry
         self._fx = config.economics.fx
         self._cost_ts_ns = config.initial_cost_ts_ns
@@ -101,6 +140,33 @@ class TakerStrategy(Strategy):
         self._cost_recovery_after_ns = 0
         self._hedge_session_open = config.initial_hedge_session_open
         self._session_ts_ns = config.initial_session_ts_ns
+
+    def bind_restart_gate(self, pending: Callable[[], bool]) -> None:
+        """Bind only the ordinary composition's startup HOLD, not general health."""
+        self._restart_gate = pending
+
+    def bind_live_account_reader(self, reader: LiveAccountReader) -> None:
+        """Bind the composition's current-account view before strategy start."""
+        self._live_account_reader = reader
+
+    def _on_account_update(self, _event: object) -> None:
+        # Account publication can be nested inside a fill: never re-enter trading here.
+        loop = self._account_loop
+        if self._source_terminal_stopped or loop is None or loop.is_closed():
+            return
+        if self._account_handle is None:
+            self._account_handle = loop.call_soon(
+                self._evaluate_account_update, self._source_terminal_generation,
+            )
+
+    def _evaluate_account_update(self, generation: int) -> None:
+        if self._source_terminal_stopped or generation != self._source_terminal_generation:
+            return
+        self._account_handle = None
+        try:
+            self._evaluate_and_submit()
+        except Exception as exc:
+            self.log.error(f"Taker account evaluation failed with {type(exc).__name__}")
 
     @property
     def one_shot_armed(self) -> bool:
@@ -124,6 +190,12 @@ class TakerStrategy(Strategy):
         if hedge_tick is None or not self._cost_snapshot_valid:
             return False
         now_ns = cast(int, self.clock.timestamp_ns())
+        if self._live_costs_from_adapters and (
+            not self._hedge_instrument_valid or not mt5_instrument_is_fresh(
+                self._required_hedge_instrument(), now_ns, self._config.max_cost_age_ns,
+            )
+        ):
+            return False
         return market_inputs_are_fresh(
             now_ns=now_ns,
             source_ts_ns=hedge_tick.ts_event,
@@ -172,6 +244,10 @@ class TakerStrategy(Strategy):
         if type(ts_event_ns) is not int or ts_event_ns <= 0:
             self._invalidate_cost_snapshot()
             return False
+        now_ns = cast(int, self.clock.timestamp_ns())
+        if not 0 <= now_ns - ts_event_ns <= self._config.max_cost_age_ns:
+            self._invalidate_cost_snapshot()
+            return False
         if ts_event_ns < self._cost_ts_ns:
             self._invalidate_cost_snapshot()
             return False
@@ -203,6 +279,16 @@ class TakerStrategy(Strategy):
             self._session_ts_ns = ts_event_ns
 
     def on_start(self) -> None:
+        self._draining = False
+        self._source_terminal_stopped = False
+        if self._live_account_reader is not None:
+            self._account_loop = asyncio.get_running_loop()
+            self._account_topics = tuple({
+                f"events.account.{self._config.source_accounts[0].account_id}",
+                f"events.account.{self._config.hedge_account_id}",
+            })
+            for topic in self._account_topics:
+                self.msgbus.subscribe(topic, self._on_account_update)
         self._source_instrument = self.cache.instrument(self._config.source_instrument_id)
         self._hedge_instrument = self.cache.instrument(self._config.hedge_instrument_id)
         if self._source_instrument is None or self._hedge_instrument is None:
@@ -212,6 +298,12 @@ class TakerStrategy(Strategy):
         if self._live_costs_from_adapters:
             try:
                 self._mt5_swap_spec()
+                mt5_instrument_structure(self._hedge_instrument)
+                if not mt5_instrument_is_fresh(
+                    self._hedge_instrument, self.clock.timestamp_ns(), self._config.max_cost_age_ns,
+                ):
+                    raise ValueError("MT5 instrument observation is not fresh")
+                self._hedge_instrument_valid = True
             except (KeyError, TypeError, ValueError) as exc:
                 self.log.error(f"MT5 swap specification is unavailable: {exc}")
                 self.stop()
@@ -222,12 +314,35 @@ class TakerStrategy(Strategy):
         if not self._one_shot or self._one_shot_armed:
             self._subscribe_source_book()
         if self._live_costs_from_adapters:
+            self.subscribe_instrument(self._config.hedge_instrument_id)
             self.subscribe_funding_rates(self._config.source_instrument_id)
         self.subscribe_quote_ticks(self._config.hedge_instrument_id)
         self.subscribe_instrument_status(self._config.hedge_instrument_id)
 
+    def begin_drain(self) -> None:
+        """Stop new source risk without disabling fill, terminal or hedge callbacks."""
+        self._draining = True
+
+    def continue_drain(self) -> None:
+        """Progress only existing obligations through the normal hedge path."""
+        self._submit_next_pending_hedge()
+        if not _restart_blocked(self):
+            self.state_store.release_completed_cycle()
+
     def on_stop(self) -> None:
         """Cancel only the exact active source and retain its durable gate."""
+        self._source_terminal_stopped = True
+        self._source_terminal_generation += 1
+        self._source_terminal_inflight.clear()
+        if self._account_handle is not None:
+            self._account_handle.cancel()
+            self._account_handle = None
+        for topic in self._account_topics:
+            self.msgbus.unsubscribe(topic, self._on_account_update)
+        self._account_topics = ()
+        self._account_loop = None
+        if _restart_blocked(self) or self._draining:
+            return
         client_order_id = self.state_store.active_source_order_id
         if client_order_id is None:
             return
@@ -252,6 +367,16 @@ class TakerStrategy(Strategy):
         if deltas.instrument_id != self._config.source_instrument_id:
             return
         self._source_book_callback_count += 1
+        self._evaluate_and_submit()
+
+    def _evaluate_and_submit(self) -> None:
+        if self._draining:
+            self._last_decision_gate = "draining"
+            return
+        if _restart_blocked(self):
+            self._last_decision_gate = "restart_pending"
+            return
+        self.state_store.release_completed_cycle()
         if not self.state_store.can_submit_source():
             self._last_decision_gate = "state_store_closed"
             return
@@ -268,8 +393,25 @@ class TakerStrategy(Strategy):
         if reference_book is None:
             self._last_decision_gate = "reference_depth_insufficient"
             return
-        if not self._inputs_are_fresh(deltas.ts_event, hedge_tick, now_ns):
+        if not self._inputs_are_fresh(source_book.ts_last, hedge_tick, now_ns):
             self._last_decision_gate = "inputs_not_fresh"
+            return
+        accounts: tuple[SourceAccount, ...]
+        if self._live_account_reader is not None:
+            view = self._live_account_reader(
+                reference_book, source_book.ts_last, _book_top(hedge_tick),
+                hedge_tick.ts_event, True,
+            )
+            if view is None or not view[3]:
+                self._last_decision_gate = "account_budget_unavailable"
+                return
+            accounts, hedge = (view[0],), view[1]
+        else:
+            accounts, hedge = self._source_accounts(), self._hedge_account()
+        # Coalesce one market timestamp without changing either freshness clock.
+        market_ts_ns = max(source_book.ts_last, hedge_tick.ts_event)
+        if market_ts_ns == self._last_source_attempt_market_ts_ns:
+            self._last_decision_gate = "market_event_already_claimed"
             return
         carry = self._carry_for_hedge_tick(hedge_tick, now_ns)
         if carry is None:
@@ -278,8 +420,8 @@ class TakerStrategy(Strategy):
         opportunity = evaluate_taker(
             source_book=reference_book,
             hedge_book=_book_top(hedge_tick),
-            accounts=self._source_accounts(),
-            hedge=self._hedge_account(),
+            accounts=accounts,
+            hedge=hedge,
             config=self._config.economics,
             allowed_direction=self._allowed_source_direction,
             carry=carry,
@@ -289,16 +431,16 @@ class TakerStrategy(Strategy):
             self._last_decision_gate = "not_qualifying"
             return
         self._last_decision_gate = "source_admission"
-        self._submit_source(opportunity)
         self._last_decision_gate = (
             "source_claimed"
-            if not self._one_shot or self._one_shot_claimed
+            if self._submit_source(opportunity, market_ts_ns=market_ts_ns)
             else "source_admission_blocked"
         )
 
     def on_quote_tick(self, tick: QuoteTick) -> None:
         if tick.instrument_id == self._config.hedge_instrument_id:
             self._submit_next_pending_hedge()
+            self._evaluate_and_submit()
 
     def _subscribe_source_book(self) -> None:
         if self._source_book_subscribed:
@@ -315,6 +457,24 @@ class TakerStrategy(Strategy):
         if status.instrument_id != self._config.hedge_instrument_id:
             return
         self.update_hedge_session(status.is_trading is True, status.ts_event)
+
+    def on_instrument(self, instrument: Instrument) -> None:
+        """Keep a validated MT5 reference; swap never refreshes source funding."""
+        if not self._live_costs_from_adapters or instrument.id != self._config.hedge_instrument_id:
+            return
+        previous = self._required_hedge_instrument()
+        try:
+            validate_mt5_instrument_update(
+                previous, instrument, self.clock.timestamp_ns(), self._config.max_cost_age_ns,
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            self._hedge_instrument_valid = False
+            self.log.error(f"MT5 instrument update rejected: {exc}")
+            return
+        if instrument.ts_event == previous.ts_event and not self._hedge_instrument_valid:
+            return
+        self._hedge_instrument = instrument
+        self._hedge_instrument_valid = True
 
     def on_funding_rate(self, funding_rate: FundingRateUpdate) -> None:
         """Install the source venue's signed next-period funding observation."""
@@ -356,6 +516,8 @@ class TakerStrategy(Strategy):
         self._finish_or_reject(event.client_order_id.value, "DENIED")
 
     def on_order_rejected(self, event: OrderRejected) -> None:
+        if _restart_blocked(self):
+            return
         if event.reason.strip().upper() == "UNKNOWN":
             client_order_id = event.client_order_id.value
             if self.state_store.knows_source_order(client_order_id):
@@ -373,11 +535,65 @@ class TakerStrategy(Strategy):
 
     def on_order_canceled(self, event: OrderCanceled) -> None:
         self._finish_or_reject(event.client_order_id.value, "CANCELED")
+        self._request_source_terminal_query(event)
 
     def on_order_expired(self, event: OrderExpired) -> None:
         self._finish_or_reject(event.client_order_id.value, "EXPIRED")
+        self._request_source_terminal_query(event)
+
+    def _request_source_terminal_query(self, event: OrderCanceled | OrderExpired) -> None:
+        if _restart_blocked(self):
+            return
+        client_order_id = event.client_order_id.value
+        query = self._source_terminal_query
+        if (
+            query is None or self._source_terminal_stopped
+            or not self.state_store.knows_source_order(client_order_id)
+            or client_order_id in self._source_terminal_inflight
+        ):
+            return
+        if event.venue_order_id is None:
+            self.log.error("Taker source terminal has no venue order ID")
+            return
+        self._source_terminal_inflight.add(client_order_id)
+        generation = self._source_terminal_generation
+        try:
+            query(
+                event.client_order_id, event.venue_order_id,
+                lambda report: self._complete_source_terminal_query(event, report)
+                if generation == self._source_terminal_generation else False,
+            )
+        except Exception as exc:
+            self._source_terminal_inflight.discard(client_order_id)
+            self.log.error(f"Taker source terminal query submission failed: {type(exc).__name__}")
+
+    def _complete_source_terminal_query(
+        self, event: OrderCanceled | OrderExpired, report: OrderStatusReport | None,
+    ) -> bool:
+        if _restart_blocked(self):
+            return False
+        client_order_id = event.client_order_id.value
+        if self._source_terminal_stopped or client_order_id not in self._source_terminal_inflight:
+            return False
+        try:
+            if report is None or not source_cancel_report_is_exact(
+                record=self.state_store.source_order(client_order_id),
+                order=self.cache.order(event.client_order_id), event=event, report=report,
+                source_instrument_id=self._config.source_instrument_id,
+                source_accounts=self._config.source_accounts, maker=False,
+            ):
+                self.log.error("Taker source terminal query was not exact")
+                return False
+            self.state_store.confirm_source_reconciled(client_order_id)
+        except Exception as exc:
+            self.log.error(f"Taker source terminal query failed: {type(exc).__name__}")
+            return False
+        self._source_terminal_inflight.discard(client_order_id)
+        return True
 
     def on_order_filled(self, event: OrderFilled) -> None:
+        if _restart_blocked(self):
+            return
         if event.instrument_id == self._config.source_instrument_id:
             intent = self._hedges.on_source_filled(event)
             if intent is not None:
@@ -388,21 +604,29 @@ class TakerStrategy(Strategy):
             if applied:
                 self._submit_next_pending_hedge()
 
-    def _submit_source(self, opportunity: Opportunity) -> None:
+    def _submit_source(self, opportunity: Opportunity, *, market_ts_ns: int | None = None) -> bool:
+        if _restart_blocked(self) or self._draining:
+            return False
         if (
             self._allowed_source_direction is not None
             and opportunity.direction is not self._allowed_source_direction
         ):
-            return
+            return False
         instrument = self._required_source_instrument()
         source_quantity = instrument.make_qty(opportunity.source_quantity_ounces)
+        business_side = (BusinessOrderSide.BUY if opportunity.direction is SourceDirection.LONG
+                         else BusinessOrderSide.SELL)
+        if self._source_admission is not None and not self._source_admission(
+            self.state_store, business_side, source_quantity.as_decimal(),
+        ):
+            return False
         if not self._source_hedge_is_executable(
             opportunity,
             Decimal(str(source_quantity)),
         ):
-            return
+            return False
         if not self._claim_one_shot():
-            return
+            return False
         side = OrderSide.BUY if opportunity.direction is SourceDirection.LONG else OrderSide.SELL
         source_before = opportunity.source_account.position_ounces
         source_reduction = (
@@ -456,6 +680,8 @@ class TakerStrategy(Strategy):
             ),
             source_freeze_reason=_ONE_SHOT_FREEZE_REASON if self._one_shot else None,
         )
+        if market_ts_ns is not None:
+            self._last_source_attempt_market_ts_ns = market_ts_ns
         try:
             self.submit_order(
                 order,
@@ -468,6 +694,7 @@ class TakerStrategy(Strategy):
                 f"source submission raised {type(exc).__name__}",
             )
             raise
+        return True
 
     def _claim_one_shot(self) -> bool:
         if not self._one_shot:
@@ -539,6 +766,8 @@ class TakerStrategy(Strategy):
         return True
 
     def _submit_next_pending_hedge(self) -> None:
+        if _restart_blocked(self):
+            return
         intents = self.state_store.intents()
         failed_statuses = {
             ObligationStatus.BLOCKED,
@@ -567,6 +796,8 @@ class TakerStrategy(Strategy):
             self._submit_hedge_intent(pending)
 
     def _submit_hedge_intent(self, intent: HedgeIntent) -> None:
+        if _restart_blocked(self) or not self.state_store.hedge_dispatch_ready(intent.intent_id):
+            return
         source = self.state_store.source_order(intent.source_client_order_id)
         configured_client_id = (
             self._config.hedge_client_id.value
@@ -611,6 +842,7 @@ class TakerStrategy(Strategy):
                 order,
                 position_id=position_id,
                 client_id=self._config.hedge_client_id,
+                params=hedge_order_params(leg),
             )
         except Exception as exc:
             self.state_store.update_hedge_status(
@@ -664,6 +896,8 @@ class TakerStrategy(Strategy):
         )
 
     def _update_order_status(self, client_order_id: str, status: str) -> None:
+        if _restart_blocked(self):
+            return
         if self.state_store.knows_source_order(client_order_id):
             self.state_store.update_source_status(client_order_id, status)
             return
@@ -674,10 +908,14 @@ class TakerStrategy(Strategy):
         self.state_store.update_hedge_status(client_order_id, obligation_status)
 
     def _finish_or_reject(self, client_order_id: str, status: str) -> None:
+        if _restart_blocked(self):
+            return
         if self.state_store.knows_source_order(client_order_id):
             self.state_store.update_source_status(client_order_id, status)
         else:
-            self.state_store.update_hedge_status(client_order_id, ObligationStatus.REJECTED)
+            self.state_store.update_hedge_status(
+                client_order_id, ObligationStatus.REJECTED, native_status=status,
+            )
 
     def _inputs_are_fresh(
         self,
@@ -685,6 +923,12 @@ class TakerStrategy(Strategy):
         hedge_tick: QuoteTick,
         now_ns: int,
     ) -> bool:
+        if self._live_costs_from_adapters and (
+            not self._hedge_instrument_valid or not mt5_instrument_is_fresh(
+                self._required_hedge_instrument(), now_ns, self._config.max_cost_age_ns,
+            )
+        ):
+            return False
         if self._one_shot and (not self._one_shot_armed or self._one_shot_claimed):
             return False
         if self._live_submission_ready is not None and not self._live_submission_ready():
@@ -742,33 +986,7 @@ class TakerStrategy(Strategy):
     def _mt5_swap_spec(
         self,
     ) -> tuple[Decimal, Decimal, Decimal, int, tuple[Decimal, ...], str]:
-        info = self._required_hedge_instrument().info
-        if not isinstance(info, dict):
-            raise TypeError("MT5 instrument info must be a mapping")
-        swap_long = Decimal(str(info["swap_long"]))
-        swap_short = Decimal(str(info["swap_short"]))
-        point = Decimal(str(info["point"]))
-        mode = info["swap_mode"]
-        native_swap_rates = info["swap_rates"]
-        timezone = info["server_timezone"]
-        if (
-            type(mode) is not int
-            or not isinstance(native_swap_rates, list | tuple)
-            or not isinstance(timezone, str)
-        ):
-            raise TypeError("MT5 swap mode, rates, or timezone has the wrong type")
-        swap_rates = tuple(Decimal(str(rate)) for rate in native_swap_rates)
-        normalize_mt5_points_swap(
-            swap_long=swap_long,
-            swap_short=swap_short,
-            point=point,
-            ask=Decimal(1),
-            native_swap_mode=mode,
-            swap_rates=swap_rates,
-            now_ns=0,
-            server_timezone=timezone,
-        )
-        return swap_long, swap_short, point, mode, swap_rates, timezone
+        return mt5_swap_spec(self._required_hedge_instrument())
 
     def _quote_is_fresh(self, tick: QuoteTick) -> bool:
         now_ns = cast(int, self.clock.timestamp_ns())
@@ -784,6 +1002,11 @@ class TakerStrategy(Strategy):
         if self._hedge_instrument is None:
             raise RuntimeError("hedge instrument unavailable before strategy start")
         return self._hedge_instrument
+
+
+def _restart_blocked(strategy: object) -> bool:
+    gate = getattr(strategy, "_restart_gate", None)
+    return gate is not None and bool(gate())
 
 
 def _book_top(tick: QuoteTick) -> BookTop:

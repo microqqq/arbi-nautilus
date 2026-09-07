@@ -10,6 +10,8 @@ double g_py000_execution_max_order_lots = 0.0;
 ulong g_py000_execution_deviation_points = 0;
 ulong g_py000_execution_magic = 0;
 int g_py000_execution_freshness_seconds = 10;
+// Implemented by Protocol using the same complete, stable native ticket reader.
+string Py000NewPositionPreflight();
 struct Py000CloseTarget
 {
    ulong ticket;
@@ -17,6 +19,28 @@ struct Py000CloseTarget
    double volume_before;
    ENUM_POSITION_TYPE position_type;
 };
+bool Py000ExecutionResultIsRejected(
+   const MqlTradeResult &result
+)
+{
+   // Unknown external-system codes and contradictory execution facts stay UNKNOWN.
+   if(result.order != 0 || result.deal != 0
+      || !MathIsValidNumber(result.volume) || result.volume != 0.0
+      || result.retcode_external != 0)
+      return false;
+   switch(result.retcode)
+   {
+      case TRADE_RETCODE_REJECT:
+      case TRADE_RETCODE_MARKET_CLOSED:
+      case TRADE_RETCODE_NO_MONEY:
+      case TRADE_RETCODE_REQUOTE:
+      case TRADE_RETCODE_PRICE_CHANGED:
+      case TRADE_RETCODE_PRICE_OFF:
+         return true;
+      default:
+         return false;
+   }
+}
 string Py000ExecutionUint(ulong value)
 {
    if(value == 0) return "0";
@@ -284,7 +308,11 @@ string Py000ExecutionPreflight(
          return close_reason;
    }
    else
+   {
       ZeroMemory(close_target);
+      string capacity = Py000NewPositionPreflight();
+      if(capacity != "") return capacity;
+   }
    return "";
 }
 bool Py000ExecutionFinishSimple(
@@ -432,10 +460,24 @@ bool Py000ExecutionSubmit(
             outcome, error_code, error_message
          );
    }
+   else
+   {
+      string capacity = Py000NewPositionPreflight();
+      if(capacity != "")
+         return Py000ExecutionFinishSimple(
+            request, boot_id, "order_rejected", capacity, "0",
+            outcome, error_code, error_message
+         );
+   }
    MqlTradeResult result = {};
    ResetLastError();
    bool sent = OrderSend(native_request, result);
    string retcode = Py000ExecutionUint((ulong)result.retcode);
+   if(Py000ExecutionResultIsRejected(result))
+      return Py000ExecutionFinishSimple(
+         request, boot_id, "order_rejected", "ORDER_SEND_REJECTED", retcode,
+         outcome, error_code, error_message
+      );
    if(!sent || result.retcode != TRADE_RETCODE_DONE
       || result.order == 0 || result.deal == 0
       || !HistoryDealSelect(result.deal))

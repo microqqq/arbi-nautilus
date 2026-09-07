@@ -45,6 +45,7 @@ from py000_nautilus.config import (
     TakerEconomicsConfig,
     TakerStrategyConfig,
 )
+from py000_nautilus.live_runtime import get_source_terminal_reconciler
 from py000_nautilus.live_taker import build_live_taker_node
 from py000_nautilus.models import SourceDirection
 from py000_nautilus.mt5_v1_data import Mt5V1DataClient, Mt5V1DataClientConfig
@@ -211,8 +212,20 @@ def test_builds_exact_offline_taker_composition_without_creating_state(
         assert exec_engine.open_check_interval_secs is None
         assert exec_engine.position_check_interval_secs is None
         assert node.trader.strategies() == [strategy]
+        assert [type(actor).__name__ for actor in node.trader.actors()] == [
+            "SourceTerminalReconciler"
+        ]
+        reconciler = get_source_terminal_reconciler(node)
+        assert not reconciler.is_running and not reconciler.clock.timer_names
+        assert not bitfinex_exec._tasks and not asyncio.all_tasks(loop)
+        assert cast(Any, strategy)._source_terminal_query.__self__ is reconciler
         readiness = cast(Any, strategy)._live_submission_ready
         assert readiness is not None and readiness() is False
+
+        async def start_reconciler() -> None:
+            reconciler.start()  # Explicit lifecycle start; build itself created no work.
+
+        loop.run_until_complete(start_reconciler())
         with monkeypatch.context() as readiness_patch:
             readiness_patch.setattr(
                 BitfinexV1DataClient,
@@ -254,12 +267,18 @@ def test_builds_exact_offline_taker_composition_without_creating_state(
             assert readiness() is False
             mt5_data._snapshot_refresh_healthy = True
             assert readiness() is True
+            bitfinex_exec._accounting_failure = "synthetic final fee conflict"
+            assert readiness() is False
+            bitfinex_exec._accounting_failure = None
+            assert readiness() is True
             mt5_data._snapshot_refresh_healthy = False
             assert readiness() is False
         assert cast(Any, strategy)._live_costs_from_adapters is True
         assert not Path(configs.bitfinex_exec.cid_store_path).exists()
         assert not Path(configs.strategy.store_path).exists()
     finally:
+        if get_source_terminal_reconciler(node).is_running:
+            get_source_terminal_reconciler(node).stop()
         node.dispose()
 
     assert loop.is_closed()

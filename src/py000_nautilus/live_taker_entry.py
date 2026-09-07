@@ -1,4 +1,4 @@
-"""Safe startup entry point for the offline-buildable PY000 Taker composition."""
+"""Shared ordinary Maker/Taker entry, retaining the original Taker CLI."""
 
 from __future__ import annotations
 
@@ -9,30 +9,42 @@ import math
 import os
 import sys
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Literal, Protocol, cast
+from typing import TYPE_CHECKING, Literal, Protocol, TypeVar, cast
 
 from msgspec.structs import replace as struct_replace
 from nautilus_trader.common.config import NautilusConfig
+from nautilus_trader.config import DatabaseConfig
 from nautilus_trader.live.execution_client import LiveExecutionClient
 from nautilus_trader.live.node import TradingNode
 from nautilus_trader.model.identifiers import ClientId
+from nautilus_trader.trading.strategy import Strategy
 
+from py000_nautilus.accounting_report import RunAccountingReport, build_run_accounting_report
 from py000_nautilus.bitfinex_v1_data import PAPER_RAW_SYMBOL, BitfinexV1DataClientConfig
 from py000_nautilus.bitfinex_v1_execution import (
     BitfinexV1ExecClientConfig,
     BitfinexV1ExecutionClient,
 )
-from py000_nautilus.config import TakerStrategyConfig
+from py000_nautilus.config import MakerStrategyConfig, TakerStrategyConfig
+from py000_nautilus.live_cache import native_cache_config
+from py000_nautilus.live_maker import build_live_maker_node
+from py000_nautilus.live_runtime import SourceTerminalReconciler
 from py000_nautilus.live_taker import (
     BITFINEX_CLIENT_ID,
     MT5_CLIENT_ID,
     build_live_taker_node,
 )
+from py000_nautilus.maker_store import MakerStateStore, maker_legacy_paths, maker_state_path
 from py000_nautilus.mt5_v1_data import Mt5V1DataClientConfig
 from py000_nautilus.mt5_v1_execution import Mt5V1ExecClientConfig, Mt5V1ExecutionClient
-from py000_nautilus.strategies.taker import TakerStrategy
+from py000_nautilus.restart_recovery import StartupRecoveryOptions, describe_business_recovery
+from py000_nautilus.store import JsonStateStore
+
+if TYPE_CHECKING:
+    from py000_nautilus.live_both_entry import LiveBothNodeBuilder
+    from py000_nautilus.live_lifecycle import DrainResult
 
 _ENV_NAMES = frozenset({"BFX_TEST_API_KEY", "BFX_TEST_API_SECRET", "BFX_TEST_USER_ID"})
 _OFFLINE_API_KEY = "OFFLINE-VALIDATION-ONLY"
@@ -43,21 +55,34 @@ class LiveTakerEntryError(RuntimeError):
     """The requested startup mode could not establish its bounded result."""
 
 
-class LiveTakerProfile(NautilusConfig, frozen=True):
-    """One typed, credential-free profile for the four-client Taker composition."""
+class _LiveProfile(NautilusConfig, frozen=True):
+    """The common four-client configuration; Bitfinex credentials are loaded separately."""
 
     bitfinex_data_config: BitfinexV1DataClientConfig
     bitfinex_exec_config: BitfinexV1ExecClientConfig
     mt5_data_config: Mt5V1DataClientConfig
     mt5_exec_config: Mt5V1ExecClientConfig
-    strategy_config: TakerStrategyConfig
     connection_timeout_seconds: float = 10.0
+    stop_timeout_seconds: float = 10.0
+    cache_database: DatabaseConfig | None = None
+
+
+class LiveTakerProfile(_LiveProfile, frozen=True, kw_only=True):
+    strategy_config: TakerStrategyConfig
+
+
+class LiveMakerProfile(_LiveProfile, frozen=True, kw_only=True):
+    strategy_config: MakerStrategyConfig
 
 
 @dataclass(frozen=True, slots=True)
 class LiveTakerEntryResult:
-    outcome: Literal["VALIDATED", "REHEARSED", "PAPER_STOPPED"]
+    outcome: Literal["VALIDATED", "REHEARSED", "PAPER_STOPPED", "PAPER_INCOMPLETE"]
     reason: str
+    pending: tuple[str, ...] = ()
+    residuals: dict[str, str] = field(default_factory=dict)
+    drain_complete: bool | None = None
+    accounting: RunAccountingReport | None = None
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -67,7 +92,11 @@ class BitfinexTestCredentials:
     user_id: int
 
 
-class LiveTakerNodeBuilder(Protocol):
+_ConfigT = TypeVar("_ConfigT", TakerStrategyConfig, MakerStrategyConfig)
+_BuilderConfigT = TypeVar("_BuilderConfigT", contravariant=True)
+
+
+class _LiveNodeBuilder(Protocol[_BuilderConfigT]):
     def __call__(
         self,
         *,
@@ -75,10 +104,17 @@ class LiveTakerNodeBuilder(Protocol):
         bitfinex_exec_config: BitfinexV1ExecClientConfig,
         mt5_data_config: Mt5V1DataClientConfig,
         mt5_exec_config: Mt5V1ExecClientConfig,
-        strategy_config: TakerStrategyConfig,
+        strategy_config: _BuilderConfigT,
+        cache_database: DatabaseConfig | None,
         loop: asyncio.AbstractEventLoop | None,
         connection_timeout_seconds: float,
-    ) -> tuple[TradingNode, TakerStrategy]: ...
+        stop_timeout_seconds: float,
+        startup_recovery: StartupRecoveryOptions | None = None,
+    ) -> tuple[TradingNode, Strategy | tuple[Strategy, ...]]: ...
+
+
+LiveTakerNodeBuilder = _LiveNodeBuilder[TakerStrategyConfig]
+LiveMakerNodeBuilder = _LiveNodeBuilder[MakerStrategyConfig]
 
 
 class LiveTakerRehearsalRunner(Protocol):
@@ -98,28 +134,82 @@ def load_live_taker_profile(path: Path) -> LiveTakerProfile:
 
 
 def validate_live_taker_profile(profile: LiveTakerProfile) -> None:
-    """Reject secrets and ambiguous local paths before constructing a node."""
+    _validate_live_profile(profile, profile.strategy_config)
+
+
+def parse_live_maker_profile(raw: bytes | str) -> LiveMakerProfile:
+    profile = cast(LiveMakerProfile, LiveMakerProfile.parse(raw))
+    validate_live_maker_profile(profile)
+    return profile
+
+
+def load_live_maker_profile(path: Path) -> LiveMakerProfile:
+    return parse_live_maker_profile(path.read_bytes())
+
+
+def inspect_profile_recovery(profile: LiveTakerProfile | LiveMakerProfile) -> dict[str, object]:
+    """Open only the existing business file, without building a node or reading secrets."""
+    config = profile.strategy_config
+    store: JsonStateStore | MakerStateStore
+    if isinstance(config, TakerStrategyConfig):
+        path = _required_path(config.store_path, "Taker state store")
+        if not path.is_file():
+            raise ValueError("no existing Taker state to inspect")
+        store = JsonStateStore(path)
+    else:
+        prefix = _required_path(config.store_path_prefix, "Maker state store prefix")
+        if not maker_state_path(prefix).is_file():
+            raise ValueError("no existing Maker state to inspect")
+        carry_route = None
+        if config.residual_mode == "bounded-carry":
+            source, hedge = config.source_accounts[0], config.hedge_accounts[0]
+            carry_route = (source.account_id.value,
+                           source.client_id.value if source.client_id is not None else None,
+                           hedge.account_id.value,
+                           hedge.client_id.value if hedge.client_id is not None else None)
+        store = MakerStateStore(
+            prefix, str(config.source_instrument_id), str(config.hedge_instrument_id),
+            residual_limit_ounces=config.residual_limit_ounces, carry_route=carry_route,
+        )
+    return describe_business_recovery(store)
+
+
+def validate_live_maker_profile(profile: LiveMakerProfile) -> None:
+    _validate_live_profile(profile, profile.strategy_config)
+
+
+def _validate_live_profile(
+    profile: _LiveProfile, strategy: TakerStrategyConfig | MakerStrategyConfig,
+) -> None:
+    """Validate configuration without connecting its optional database or either venue."""
     execution = profile.bitfinex_exec_config
     if execution.api_key != "" or execution.api_secret != "":
-        raise ValueError("live Taker profile must not contain Bitfinex credentials")
-    max_cost_age_ns = profile.strategy_config.max_cost_age_ns
+        raise ValueError("live profile must not contain Bitfinex credentials")
+    native_cache_config(profile.cache_database)
+    max_cost_age_ns = strategy.max_cost_age_ns
     if type(max_cost_age_ns) is not int or max_cost_age_ns <= 0:
         raise ValueError("max_cost_age_ns must be a positive exact integer")
-    timeout = profile.connection_timeout_seconds
-    if (
-        isinstance(timeout, bool)
-        or not isinstance(timeout, int | float)
-        or not math.isfinite(timeout)
-        or not 0 < timeout <= 60
-    ):
-        raise ValueError("connection_timeout_seconds must be finite and in (0, 60]")
+    for field_name in ("connection_timeout_seconds", "stop_timeout_seconds"):
+        timeout = getattr(profile, field_name)
+        if (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, int | float)
+            or not math.isfinite(timeout)
+            or not 0 < timeout <= 60
+        ):
+            raise ValueError(f"{field_name} must be finite and in (0, 60]")
 
-    paths = {
-        _required_path(execution.cid_store_path, "Bitfinex CID store"),
-        _required_path(profile.strategy_config.store_path, "Taker state store"),
-    }
-    if len(paths) != 2:
-        raise ValueError("Bitfinex CID and Taker state stores must use distinct paths")
+    if isinstance(strategy, TakerStrategyConfig):
+        state_paths = [_required_path(strategy.store_path, "Taker state store")]
+    else:
+        prefix = _required_path(strategy.store_path_prefix, "Maker state store prefix")
+        state_paths = [
+            path.resolve(strict=False)
+            for path in (maker_state_path(prefix), *maker_legacy_paths(prefix))
+        ]
+    paths = [_required_path(execution.cid_store_path, "Bitfinex CID store"), *state_paths]
+    if len(set(paths)) != len(paths):
+        raise ValueError("Bitfinex CID and strategy state stores must use distinct paths")
 
 
 def load_bitfinex_test_credentials(
@@ -155,15 +245,62 @@ def run_live_taker_entry(
     *,
     rehearse: bool = False,
     run_paper: bool = False,
+    resume_held: bool = False,
+    retry_rejected_hedge: str | None = None,
     environment: Mapping[str, str] | None = None,
     env_file: Path | None = None,
     node_builder: LiveTakerNodeBuilder = build_live_taker_node,
     rehearsal_runner: LiveTakerRehearsalRunner | None = None,
 ) -> LiveTakerEntryResult:
-    """Validate offline, rehearse adapters, or run the paper-bound Taker."""
-    validate_live_taker_profile(profile)
+    """Validate offline, rehearse observations, or run the ordinary paper-bound Taker."""
+    return _run_live_entry(
+        profile, strategy_config=profile.strategy_config, node_builder=node_builder,
+        rehearse=rehearse, run_paper=run_paper, environment=environment,
+        env_file=env_file, rehearsal_runner=rehearsal_runner,
+        resume_held=resume_held, retry_rejected_hedge=retry_rejected_hedge,
+    )
+
+
+def run_live_maker_entry(
+    profile: LiveMakerProfile,
+    *,
+    rehearse: bool = False,
+    run_paper: bool = False,
+    resume_held: bool = False,
+    retry_rejected_hedge: str | None = None,
+    environment: Mapping[str, str] | None = None,
+    env_file: Path | None = None,
+    node_builder: LiveMakerNodeBuilder = build_live_maker_node,
+    rehearsal_runner: LiveTakerRehearsalRunner | None = None,
+) -> LiveTakerEntryResult:
+    """Use the same lifecycle with the ordinary Maker, never a canary strategy."""
+    return _run_live_entry(
+        profile, strategy_config=profile.strategy_config, node_builder=node_builder,
+        rehearse=rehearse, run_paper=run_paper, environment=environment,
+        env_file=env_file, rehearsal_runner=rehearsal_runner,
+        resume_held=resume_held, retry_rejected_hedge=retry_rejected_hedge,
+    )
+
+
+def _run_live_entry(
+    profile: _LiveProfile,
+    *,
+    strategy_config: _ConfigT,
+    node_builder: _LiveNodeBuilder[_ConfigT],
+    rehearse: bool,
+    run_paper: bool,
+    environment: Mapping[str, str] | None,
+    env_file: Path | None,
+    rehearsal_runner: LiveTakerRehearsalRunner | None,
+    resume_held: bool,
+    retry_rejected_hedge: str | None,
+) -> LiveTakerEntryResult:
+    _validate_live_profile(profile, strategy_config)
     if rehearse and run_paper:
         raise ValueError("rehearse and run_paper are mutually exclusive")
+    recovery = StartupRecoveryOptions(resume_held, retry_rejected_hedge)
+    if (resume_held or retry_rejected_hedge is not None) and not run_paper:
+        raise ValueError("recovery choices require --run-paper")
     if run_paper:
         _validate_paper_binding(profile)
     if rehearsal_runner is None:
@@ -190,33 +327,93 @@ def run_live_taker_entry(
     loop = asyncio.new_event_loop()
     node: TradingNode | None = None
     try:
-        node, strategy = node_builder(
+        node, built = node_builder(
             bitfinex_data_config=profile.bitfinex_data_config,
             bitfinex_exec_config=bitfinex_execution,
             mt5_data_config=profile.mt5_data_config,
             mt5_exec_config=profile.mt5_exec_config,
-            strategy_config=profile.strategy_config,
+            strategy_config=strategy_config,
+            cache_database=profile.cache_database if rehearse or run_paper else None,
             loop=loop,
             connection_timeout_seconds=float(profile.connection_timeout_seconds),
+            stop_timeout_seconds=float(profile.stop_timeout_seconds),
+            startup_recovery=recovery if resume_held else None,
         )
+        built_strategies = built if isinstance(built, tuple) else (built,)
+        if not built_strategies:
+            raise LiveTakerEntryError("runner requires the built strategy set")
+        strategy = built_strategies[0]
         if not rehearse and not run_paper:
-            return LiveTakerEntryResult("VALIDATED", "offline_composition_built")
+            reason = (
+                "offline_composition_built" if profile.cache_database is None
+                else "offline_composition_built_without_cache_database"
+            )
+            return LiveTakerEntryResult("VALIDATED", reason)
 
         if run_paper:
             strategies = node.trader.strategies()
-            if len(strategies) != 1 or strategies[0] is not strategy:
-                raise LiveTakerEntryError("paper runner requires exactly the built Taker strategy")
-            run_paper_node(node)
+            if strategies != list(built_strategies):
+                raise LiveTakerEntryError("paper runner requires exactly the built strategy set")
+            run_failure: str | None = None
+            try:
+                run_paper_node(node)
+            except Exception as exc:
+                if getattr(node, "drain_result", None) is None:
+                    raise
+                # Preserve the bounded drain evidence, never an exception's secret text.
+                run_failure = f"paper_runner_error:{type(exc).__name__}"
             if node.is_running():
                 raise LiveTakerEntryError("paper runner returned while the node was running")
-            return LiveTakerEntryResult("PAPER_STOPPED", "paper_strategy_stopped")
+            drain = cast("DrainResult | None", getattr(node, "drain_result", None))
+            # Reports read retained facts while the native cache still exists. They
+            # never reconnect, mutate Positions, or turn a pending drain into success.
+            accounting = None
+            accounting_failure = None
+            try:
+                clients = cast(
+                    dict[ClientId, LiveExecutionClient], node.kernel.exec_engine._clients,
+                )
+                source = clients[BITFINEX_CLIENT_ID]
+                hedge = clients[MT5_CLIENT_ID]
+                if (not isinstance(source, BitfinexV1ExecutionClient)
+                        or not isinstance(hedge, Mt5V1ExecutionClient)):
+                    raise LiveTakerEntryError("accounting requires configured execution clients")
+                accounting = build_run_accounting_report(
+                    node.cache, source, hedge,
+                    trader_id=node.trader.id, strategy_id=strategy.id,
+                    fx=strategy_config.economics.fx,
+                    strategy_ids=(tuple(item.id for item in built_strategies)
+                                  if len(built_strategies) > 1 else None),
+                )
+            except Exception as exc:
+                accounting_failure = f"accounting_report_error:{type(exc).__name__}"
+            if drain is None:
+                return LiveTakerEntryResult(
+                    "PAPER_INCOMPLETE", "drain_result_missing", accounting=accounting,
+                )
+            reason = drain.reason if run_failure is None else f"{run_failure}; {drain.reason}"
+            if accounting_failure is not None:
+                reason += f"; {accounting_failure}"
+            elif accounting is not None and accounting.status != "FINAL":
+                reason += "; accounting_pending"
+            return LiveTakerEntryResult(
+                "PAPER_STOPPED" if drain.complete is True and run_failure is None
+                and accounting is not None and accounting.status == "FINAL"
+                else "PAPER_INCOMPLETE",
+                reason, tuple(drain.pending), dict(drain.residuals),
+                drain_complete=drain.complete, accounting=accounting,
+            )
 
-        # Starting Taker itself is not read-only: its recovery path can persist state and
-        # its stop path can cancel an active source order. Rehearsal therefore starts only
-        # the exact four clients and Nautilus reconciliation/portfolio lifecycle.
-        node.trader.remove_strategy(strategy.id)
-        if node.trader.strategies():
-            raise LiveTakerEntryError("read-only rehearsal retained a trading strategy")
+        # Strategy callbacks and the bound startup Actor can mutate business state.
+        # Adapter observations (including CID fees/native persistence) remain permitted.
+        for strategy in built_strategies:
+            node.trader.remove_strategy(strategy.id)
+        for actor in node.trader.actors():
+            if isinstance(actor, SourceTerminalReconciler):
+                node.trader.remove_actor(actor.id)
+                actor.dispose()
+        if node.trader.strategies() or node.trader.actors():
+            raise LiveTakerEntryError("rehearsal retained a strategy or business Actor")
         rehearsal_runner(
             node,
             timeout_seconds=float(profile.connection_timeout_seconds),
@@ -231,7 +428,7 @@ def run_live_taker_entry(
             loop.close()
 
 
-def _validate_paper_binding(profile: LiveTakerProfile) -> None:
+def _validate_paper_binding(profile: _LiveProfile) -> None:
     execution = profile.bitfinex_exec_config
     if (
         profile.bitfinex_data_config.raw_symbol != PAPER_RAW_SYMBOL
@@ -256,8 +453,8 @@ def run_bounded_rehearsal(
     """Connect, reconcile, initialize the portfolio, then immediately stop."""
     if not 0 < timeout_seconds <= 60 or not math.isfinite(timeout_seconds):
         raise ValueError("rehearsal timeout must be finite and in (0, 60]")
-    if node.trader.strategies():
-        raise LiveTakerEntryError("read-only rehearsal cannot start a strategy")
+    if node.trader.strategies() or node.trader.actors():
+        raise LiveTakerEntryError("rehearsal cannot start a strategy or business Actor")
     probe = _rehearsal_ready if readiness_probe is None else readiness_probe
     loop = node.kernel.loop
     if loop.is_closed() or loop.is_running():
@@ -449,42 +646,109 @@ def main(
     node_builder: LiveTakerNodeBuilder = build_live_taker_node,
     rehearsal_runner: LiveTakerRehearsalRunner | None = None,
 ) -> int:
+    return _main(
+        argv, mode="taker", environment=environment,
+        node_builder=node_builder, rehearsal_runner=rehearsal_runner,
+    )
+
+
+def maker_main(
+    argv: Sequence[str] | None = None,
+    *,
+    environment: Mapping[str, str] | None = None,
+    node_builder: LiveMakerNodeBuilder = build_live_maker_node,
+    rehearsal_runner: LiveTakerRehearsalRunner | None = None,
+) -> int:
+    return _main(
+        argv, mode="maker", environment=environment,
+        node_builder=node_builder, rehearsal_runner=rehearsal_runner,
+    )
+
+
+def _main(
+    argv: Sequence[str] | None,
+    *,
+    mode: Literal["taker", "maker", "both"],
+    environment: Mapping[str, str] | None,
+    node_builder: LiveTakerNodeBuilder | LiveMakerNodeBuilder | LiveBothNodeBuilder,
+    rehearsal_runner: LiveTakerRehearsalRunner | None,
+) -> int:
     parser = argparse.ArgumentParser(
-        description="Validate, rehearse, or run the paper-bound PY000 Taker",
+        description=f"Validate, rehearse, or run the ordinary paper-bound PY000 {mode.title()}",
     )
     parser.add_argument("--profile", required=True, type=Path)
-    mode = parser.add_mutually_exclusive_group()
-    mode.add_argument(
+    operation = parser.add_mutually_exclusive_group()
+    operation.add_argument(
         "--rehearse",
         action="store_true",
-        help="connect and run one bounded adapter reconciliation without a strategy",
+        help="reconcile adapter observations without trading or business recovery",
     )
-    mode.add_argument(
+    operation.add_argument(
         "--run-paper",
         action="store_true",
-        help="run the existing Taker strategy on its bound Bitfinex paper account",
+        help=f"run the ordinary {mode.title()} on its bound Bitfinex paper account",
     )
+    operation.add_argument("--inspect-recovery", action="store_true",
+                           help="inspect existing local business state without connections")
+    parser.add_argument("--resume-held", action="store_true",
+                        help="review old pauses for this run; reconciliation still required")
+    parser.add_argument("--retry-rejected-hedge", metavar="OLD_CLIENT_ORDER_ID",
+                        help="with --resume-held, qualify one zero-fill rejection for a new ID")
     parser.add_argument("--env-file", type=Path, default=Path(".env"))
     args = parser.parse_args(argv)
     try:
-        profile = load_live_taker_profile(args.profile)
-        result = run_live_taker_entry(
-            profile,
-            rehearse=args.rehearse,
-            run_paper=args.run_paper,
-            environment=environment,
-            env_file=args.env_file,
-            node_builder=node_builder,
-            rehearsal_runner=rehearsal_runner,
-        )
+        if mode == "both":
+            from py000_nautilus.live_both_entry import (
+                inspect_both_recovery,
+                load_live_both_profile,
+                run_live_both_entry,
+            )
+        if args.inspect_recovery:
+            if args.resume_held or args.retry_rejected_hedge is not None:
+                raise ValueError("offline inspection cannot consume recovery choices")
+            if mode == "both":
+                inspected = inspect_both_recovery(load_live_both_profile(args.profile))
+            else:
+                profile = (load_live_taker_profile(args.profile) if mode == "taker"
+                           else load_live_maker_profile(args.profile))
+                inspected = inspect_profile_recovery(profile)
+            print(json.dumps(inspected, default=str))
+            return 0
+        if mode == "taker":
+            result = run_live_taker_entry(
+                load_live_taker_profile(args.profile),
+                rehearse=args.rehearse, run_paper=args.run_paper,
+                environment=environment, env_file=args.env_file,
+                node_builder=cast(LiveTakerNodeBuilder, node_builder),
+                rehearsal_runner=rehearsal_runner,
+                resume_held=args.resume_held, retry_rejected_hedge=args.retry_rejected_hedge,
+            )
+        elif mode == "maker":
+            result = run_live_maker_entry(
+                load_live_maker_profile(args.profile),
+                rehearse=args.rehearse, run_paper=args.run_paper,
+                environment=environment, env_file=args.env_file,
+                node_builder=cast(LiveMakerNodeBuilder, node_builder),
+                rehearsal_runner=rehearsal_runner,
+                resume_held=args.resume_held, retry_rejected_hedge=args.retry_rejected_hedge,
+            )
+        else:
+            result = run_live_both_entry(
+                load_live_both_profile(args.profile),
+                rehearse=args.rehearse, run_paper=args.run_paper,
+                environment=environment, env_file=args.env_file,
+                node_builder=cast("LiveBothNodeBuilder", node_builder),
+                rehearsal_runner=rehearsal_runner,
+                resume_held=args.resume_held, retry_rejected_hedge=args.retry_rejected_hedge,
+            )
     except Exception as exc:
         print(
             json.dumps({"outcome": "FAILED", "reason": type(exc).__name__}),
             file=sys.stderr,
         )
         return 1
-    print(json.dumps({"outcome": result.outcome, "reason": result.reason}))
-    return 0
+    print(json.dumps(asdict(result), default=str))
+    return 1 if result.outcome == "PAPER_INCOMPLETE" else 0
 
 
 if __name__ == "__main__":

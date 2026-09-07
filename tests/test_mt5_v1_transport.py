@@ -8,11 +8,15 @@ import pytest
 from py000_nautilus.mt5_v1_protocol import (
     ClosePositionRequest,
     ExecutionEventsRequest,
+    HelloRequest,
     Identity,
     JsonObject,
     Request,
+    SnapshotRequest,
     SubmitMarketDeltaRequest,
+    WireError,
     decode_json_object,
+    decode_response_for,
     encode_json,
     normalized_account_id,
 )
@@ -64,6 +68,25 @@ class RecordingTransport(Mt5V1Transport):
             "request_id": request.request_id,
             "version": 1,
         }
+
+
+@pytest.mark.parametrize("op", ["get_snapshot", "hello"])
+def test_snapshot_unavailable_is_a_closed_snapshot_only_error(op: str) -> None:
+    request: Request = (
+        SnapshotRequest("snapshot-1", identity().binding())
+        if op == "get_snapshot"
+        else HelloRequest("snapshot-1")
+    )
+    reply = encode_json({
+        "protocol": "py000.mt5", "version": 1, "request_id": request.request_id,
+        "op": op, "ok": False,
+        "error": {"code": "SNAPSHOT_UNAVAILABLE", "message": "incomplete native positions"},
+    })
+    if op == "get_snapshot":
+        assert decode_response_for(request, reply)["ok"] is False
+    else:
+        with pytest.raises(WireError, match="get_snapshot"):
+            decode_response_for(request, reply)
 
 
 class TimeoutReq:

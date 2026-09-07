@@ -1,6 +1,7 @@
 """Configuration for the bounded PY000 Taker and Maker vertical slices."""
 
 from decimal import Decimal
+from typing import Literal
 
 from nautilus_trader.common.config import NautilusConfig
 from nautilus_trader.model.identifiers import AccountId, ClientId, InstrumentId
@@ -112,6 +113,9 @@ class MakerStrategyConfig(StrategyConfig, frozen=True):
     hedge_accounts: tuple[HedgeAccountRoute, ...]
     economics: MakerEconomicsConfig
     store_path_prefix: str
+    residual_mode: Literal["strict", "bounded-carry"] = "strict"
+    residual_limit_ounces: Decimal = Decimal(0)
+    max_unhedged_ounces: Decimal | None = None
     fixed_amount: bool = False
     keep_last_accounts: bool = False
     cross_clamp_ticks: int = 2
@@ -128,3 +132,17 @@ class MakerStrategyConfig(StrategyConfig, frozen=True):
             raise ValueError("keep_last_accounts is not restart-safe and is unsupported")
         if self.cross_clamp_ticks <= 0:
             raise ValueError("cross_clamp_ticks must be positive")
+        limit, budget = self.residual_limit_ounces, self.max_unhedged_ounces
+        if self.residual_mode not in {"strict", "bounded-carry"}:
+            raise ValueError("unsupported Maker residual mode")
+        if (not isinstance(limit, Decimal) or not limit.is_finite()
+                or not 0 <= limit <= Decimal("0.5")):
+            raise ValueError("Maker residual limit must be finite and between zero and 0.5")
+        if self.residual_mode == "strict":
+            if limit != 0 or budget is not None:
+                raise ValueError("strict Maker requires zero residual limit and no carry budget")
+        elif (limit == 0 or not isinstance(budget, Decimal) or not budget.is_finite()
+              or budget <= 0):
+            raise ValueError("bounded-carry requires positive residual and exposure budgets")
+        elif len(self.source_accounts) != 1 or len(self.hedge_accounts) != 1:
+            raise ValueError("bounded-carry requires one explicit source and hedge account route")

@@ -15,6 +15,8 @@ from unicodedata import category
 PROTOCOL = "py000.mt5"
 VERSION = 1
 MAX_WIRE_BYTES = 64 * 1024
+# Host/EA clock-skew budget, not a claim about TimeGMT accuracy or a TTL extension.
+MAX_OBSERVATION_FUTURE_NS = 1_000_000_000
 MAX_TEXT_LENGTH = 256
 MAX_IDENTIFIER_LENGTH = 128
 MAX_EVENTS_LIMIT = 500
@@ -45,6 +47,7 @@ ERROR_CODES = frozenset(
         "MALFORMED",
         "RECOVERY_BLOCKED",
         "SCHEMA_MISMATCH",
+        "SNAPSHOT_UNAVAILABLE",
         "UNKNOWN_OP",
     }
 )
@@ -1158,6 +1161,8 @@ def _decode_response(raw: str | bytes) -> JsonObject:
         code = validated_identifier(error["code"], "error.code", max_length=64)
         if code not in ERROR_CODES:
             raise WireError("SCHEMA_MISMATCH", "unknown response error code")
+        if code == "SNAPSHOT_UNAVAILABLE" and op != "get_snapshot":
+            raise WireError("SCHEMA_MISMATCH", "SNAPSHOT_UNAVAILABLE requires get_snapshot")
         validated_text(error["message"], "error.message")
     return data
 

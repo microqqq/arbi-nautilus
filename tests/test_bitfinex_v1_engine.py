@@ -51,6 +51,9 @@ class _FakeTransport:
 
 
 class _FakeRest:
+    async def wallets(self) -> object:
+        return []
+
     async def user_info(self) -> object:
         row: list[object] = [None] * 22
         row[0] = 269_312
@@ -157,7 +160,7 @@ def _trade_frame(cid: int, *, trade_id: int, order_price: str) -> list[object]:
             "LIMIT",
             Decimal(order_price),
             1,
-            Decimal("-0.10"),
+            Decimal("-0.0049"),
             "USD",
             cid,
         ],
@@ -287,8 +290,14 @@ def test_private_frames_drive_real_execution_engine_order_fsm() -> None:
             client._consume_private_frame(
                 _trade_frame(cid, trade_id=1235, order_price="3926.80")
             )
+            client._consume_private_frame(
+                _trade_frame(cid, trade_id=1235, order_price="3926.80")
+            )
             assert cached.status == OrderStatus.CANCELED
             assert cached.filled_qty.as_decimal() == Decimal("2")
+            assert len(cached.commissions()) == 1
+            assert cached.commissions()[0].as_decimal() == Decimal(0)
+            assert cached.commissions()[0].currency.code == "USD"
             assert [str(trade_id) for trade_id in cached.trade_ids] == ["1234", "1235"]
             assert [type(event).__name__ for event in cached.events] == [
                 "OrderInitialized",

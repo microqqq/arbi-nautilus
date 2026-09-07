@@ -1884,6 +1884,203 @@ def test_ea_execution_surface_is_demo_only_and_bounded() -> None:
     assert "ea_source_sha256" not in source
 
 
+def test_ea_rejection_classifier_has_a_narrow_result_contract() -> None:
+    # Static contract only; the native script below exercises the actual MQL helper.
+    source = (EA_ROOT / "include" / "Py000Execution.mqh").read_text(encoding="utf-8")
+    helper = source.split("bool Py000ExecutionResultIsRejected(", 1)[1].split(
+        "string Py000ExecutionUint(", 1
+    )[0]
+    assert "const MqlTradeResult &result" in helper
+    for guard in (
+        "result.order != 0",
+        "result.deal != 0",
+        "!MathIsValidNumber(result.volume)",
+        "result.volume != 0.0",
+        "result.retcode_external != 0",
+    ):
+        assert guard in helper
+    for retcode in ("REJECT", "MARKET_CLOSED", "NO_MONEY", "REQUOTE", "PRICE_CHANGED", "PRICE_OFF"):
+        assert f"case TRADE_RETCODE_{retcode}:" in helper
+    assert helper.count("case TRADE_RETCODE_") == 6
+    assert "default:" in helper
+    assert "return false;" in helper.split("default:", 1)[1]
+    assert "sent" not in helper
+
+
+def test_ea_classifies_only_new_results_without_weakening_done_or_replay_checks() -> None:
+    source = (EA_ROOT / "include" / "Py000Execution.mqh").read_text(encoding="utf-8")
+    replay = source.index("Py000JournalOutcomeIndex(request.client_request_id)")
+    reservation = source.index("Py000JournalAppendReserved(")
+    send = source.index("bool sent = OrderSend(native_request, result);")
+    classify = source.index("if(Py000ExecutionResultIsRejected(result))")
+    uncertain = source.index("if(!sent || result.retcode != TRADE_RETCODE_DONE")
+    assert replay < reservation < send < classify < uncertain
+    assert '"order_rejected", "ORDER_SEND_REJECTED", retcode' in source[classify:uncertain]
+    assert "result.order == 0 || result.deal == 0" in source[uncertain:]
+    assert "!HistoryDealSelect(result.deal)" in source[uncertain:]
+    assert '"order_unknown", "ORDER_SEND_UNCERTAIN", retcode' in source[uncertain:]
+    assert "venue_order != result.order" in source
+    assert "MathAbs(filled - lots) > quantity_tolerance" in source
+    assert "Py000ExecutionClosePostStateValid(close_target, lots)" in source
+    assert source.count("OrderSend(") == 1
+
+
+def test_ea_retcode_native_entry_calls_actual_helper_without_execution_side_effects() -> None:
+    # This verifies wiring, not native compilation or execution.
+    source = (EA_ROOT / "tests" / "Py000ExecutionRetcodeTest.mq5").read_text(encoding="utf-8")
+    assert '#include "../include/Py000Execution.mqh"' in source
+    assert "Py000ExecutionResultIsRejected(result)" in source
+    assert "bool Py000ExecutionResultIsRejected(" not in source
+    assert "int OnStart()" in source
+    assert "PY000_RETCODE_TEST checks=%d failures=%d" in source
+    for retcode in (
+        "REJECT", "MARKET_CLOSED", "NO_MONEY", "REQUOTE", "PRICE_CHANGED", "PRICE_OFF",
+        "DONE", "DONE_PARTIAL", "TIMEOUT", "CONNECTION", "PLACED", "ERROR", "INVALID",
+    ):
+        assert f"TRADE_RETCODE_{retcode}" in source
+    for field in ("order", "deal", "volume", "retcode_external"):
+        assert f"result.{field} =" in source
+    assert "MathArcsin(2.0)" in source
+    assert "MathExp(1000.0)" in source
+    for forbidden in (
+        "OrderSend(", "OrderCheck(", "Py000ExecutionSubmit(", "Py000JournalAppend",
+        "Py000JournalOpen(", "OnInit(", "OnTick(", "OnTimer(", "FileOpen(",
+    ):
+        assert forbidden not in source
+
+
+def test_ea_positions_snapshot_requires_two_complete_native_samples() -> None:
+    # Static contract; native failure injection is exercised by Py000SnapshotTest.mq5.
+    source = (EA_ROOT / "include" / "Py000Protocol.mqh").read_text(encoding="utf-8")
+    collector = source.split("bool Py000CollectPositions(", 1)[1].split(
+        "bool Py000PositionSamplesMatch(", 1
+    )[0]
+    assert "if(ticket == 0)" in collector
+    assert collector.index("PY000_SNAPSHOT_STRING(POSITION_SYMBOL, symbol)") < collector.index(
+        "if(symbol != _Symbol)"
+    )
+    for property_name in ("TICKET", "IDENTIFIER", "MAGIC", "TYPE", "TIME_MSC"):
+        assert f"PY000_SNAPSHOT_INTEGER(POSITION_{property_name}," in collector
+    for property_name in ("VOLUME", "PRICE_OPEN", "PRICE_CURRENT", "SL", "TP", "PROFIT", "SWAP"):
+        assert f"PY000_SNAPSHOT_DOUBLE(POSITION_{property_name}," in collector
+    assert "PY000_SNAPSHOT_STRING(POSITION_COMMENT, comment)" in collector
+    assert "samples[previous].ticket == ticket" in collector
+    assert "samples[previous].identifier == row.identifier" in collector
+    assert collector.count("PY000_SNAPSHOT_TOTAL()") == 2
+    matcher = source.split("bool Py000PositionSamplesMatch(", 1)[1].split(
+        "bool Py000BuildPositionsJson(", 1
+    )[0]
+    for field in ("ticket", "identifier", "symbol", "magic", "side", "volume"):
+        assert f"first[index].{field}" in matcher
+    assert ".json" not in matcher
+    builder = source.split("bool Py000BuildPositionsJson(", 1)[1].split(
+        "bool Py000BuildSnapshotData(", 1
+    )[0]
+    assert builder.count("Py000CollectPositions(") == 2
+    assert "!Py000PositionSamplesMatch(first, second)" in builder
+    assert builder.index('json = "";') < builder.index("Py000CollectPositions(")
+    assert builder.index("Py000PositionSamplesMatch(") < builder.index('json = "[";')
+
+
+def test_ea_snapshot_unavailability_does_not_replace_other_schema_errors() -> None:
+    source = (EA_ROOT / "include" / "Py000Protocol.mqh").read_text(encoding="utf-8")
+    builder = source.split("bool Py000BuildSnapshotData(", 1)[1].split(
+        "bool Py000JournalEventJson(", 1
+    )[0]
+    assert 'error_code = "SCHEMA_MISMATCH";' in builder
+    assert "!Py000BuildPositionsJson(positions, error_code)" in builder
+    assert "!Py000BuildSnapshotData(data, error_code)" in builder
+    assert 'error_code == "SNAPSHOT_UNAVAILABLE"' in builder
+    assert '"native snapshot value cannot satisfy v1 grammar"' in builder
+
+
+def test_ea_snapshot_native_entry_injects_actual_getters_without_external_io() -> None:
+    source = (EA_ROOT / "tests" / "Py000SnapshotTest.mq5").read_text(encoding="utf-8")
+    assert '#include "../include/Py000Protocol.mqh"' in source
+    assert "Py000BuildPositionsJson(json, error_code)" in source
+    assert "bool Py000BuildPositionsJson(" not in source
+    for seam in ("TOTAL", "TICKET", "INTEGER", "STRING", "DOUBLE"):
+        assert f"#define PY000_SNAPSHOT_{seam} " in source
+    assert "PY000_SNAPSHOT_TEST checks=%d failures=%d" in source
+    for forbidden in (
+        "OrderSend(", "OrderCheck(", "Py000ExecutionSubmit(", "Py000JournalAppend",
+        "Py000JournalOpen(", "OnInit(", "OnTick(", "OnTimer(", "FileOpen(",
+    ):
+        assert forbidden not in source
+
+
+def test_ea_journal_writer_checks_native_seek_exact_bytes_and_flush_errors() -> None:
+    # Static contract only; the native script exercises the same writer with faults.
+    source = (EA_ROOT / "include" / "Py000Journal.mqh").read_text(encoding="utf-8")
+    writer = source.split("bool Py000JournalWriteLine(", 1)[1].split(
+        "bool Py000JournalVerifiedParts(", 1
+    )[0]
+    assert "FILE_READ | FILE_WRITE | FILE_TXT | FILE_ANSI | FILE_COMMON" in writer
+    assert "written == (uint)(encoded - 1)" in writer
+    assert 'string text = contents + "\\n";' in writer
+    assert 'StringReplace(wire_text, "\\r\\n", "\\n")' in writer
+    assert 'StringReplace(wire_text, "\\n", "\\r\\n")' in writer
+    assert "StringToCharArray(wire_text, bytes, 0, WHOLE_ARRAY, CP_UTF8)" in writer
+    assert "StringLen(" not in writer
+    seek = writer.index("PY000_JOURNAL_SEEK(handle, 0, SEEK_END)")
+    write = writer.index("PY000_JOURNAL_WRITE(handle, text)")
+    flush = writer.index("PY000_JOURNAL_FLUSH(handle)")
+    assert seek < writer.index("return false;", seek) < write < flush
+    assert "FileClose(handle);" in writer[seek:write]
+    assert "int write_error = GetLastError();" in writer[write:flush]
+    assert "ResetLastError();" in writer[write:flush]
+    assert "int flush_error = GetLastError();" in writer[flush:]
+    assert "write_error == 0 && flush_error == 0" in writer
+
+
+def test_ea_failed_journal_write_cannot_advance_execution_or_publish_terminal() -> None:
+    execution = (EA_ROOT / "include" / "Py000Execution.mqh").read_text(encoding="utf-8")
+    before_send = execution.split("if(!Py000JournalAppendReserved(", 1)[1].split(
+        "bool sent = OrderSend(native_request, result);", 1
+    )[0]
+    failure = before_send.split("double lots = 0.0;", 1)[0]
+    assert "g_py000_execution_recovery_ready = false;" in failure
+    assert 'error_code = "RECOVERY_BLOCKED";' in failure
+    assert "return false;" in failure
+    journal = (EA_ROOT / "include" / "Py000Journal.mqh").read_text(encoding="utf-8")
+    for function in ("Py000JournalAppendRejectedOrUnknown", "Py000JournalAppendFilled"):
+        terminal = journal.split(f"bool {function}(", 1)[1]
+        before_store = terminal.split("if(!Py000JournalWriteLine(", 1)[1].split(
+            "if(!Py000JournalStoreEvent(event)", 1
+        )[0]
+        assert "g_py000_execution_recovery_ready = false;" in before_store
+        assert "return false;" in before_store
+
+
+def test_ea_journal_native_entry_exercises_actual_writer_and_blocks_native_trading() -> None:
+    # Wiring only: MetaEditor/portable execution supplies the native evidence.
+    source = (EA_ROOT / "tests" / "Py000JournalWriteTest.mq5").read_text(encoding="utf-8")
+    assert '#include "../include/Py000Journal.mqh"' in source
+    assert '#include "../include/Py000Execution.mqh"' in source
+    assert "bool Py000JournalWriteLine(" not in source
+    assert "Py000JournalWriteLine(file_name, contents, append)" in source
+    for seam in ("SEEK", "WRITE", "FLUSH"):
+        assert f"#define PY000_JOURNAL_{seam} " in source
+    for fault in (
+        "SEEK_FALSE", "SEEK_ERROR", "SHORT_WRITE", "ZERO_WRITE", "WRITE_ERROR", "FLUSH_ERROR",
+    ):
+        assert fault in source
+    assert "#define OrderSend Py000TestNeverSend" in source
+    assert "#define OrderCheck Py000TestNeverCheck" in source
+    assert "Py000ExecutionSubmit(request," in source
+    assert "Py000JournalAppendFilled(" in source
+    assert "Py000JournalAppendRejectedOrUnknown(" in source
+    assert "Py000JournalLoadEvents()" in source
+    assert "!FileIsExist(file_name, FILE_COMMON)" in source
+    assert '"PRESERVED_FAILED_PROBE "' in source
+    assert '"PY000_W2C_PROBE_"' in source
+    assert "PY000_JOURNAL_WRITE_TEST checks=%d failures=%d" in source
+    for forbidden in (
+        "OrderSend(", "OrderCheck(", "Py000JournalOpen(", "OnInit(", "OnTick(", "OnTimer(",
+    ):
+        assert forbidden not in source
+
+
 def test_ea_open_journal_treats_null_close_fields_as_absent() -> None:
     journal_source = (EA_ROOT / "include" / "Py000Journal.mqh").read_text(encoding="utf-8")
 

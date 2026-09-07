@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass
 from decimal import Decimal
 from itertools import chain
 
@@ -26,6 +27,12 @@ from nautilus_trader.model.identifiers import (
 from nautilus_trader.model.instruments import Instrument
 from nautilus_trader.model.objects import Money, Price, Quantity
 
+from py000_nautilus.bitfinex_v1_cids import (
+    BitfinexFeeMetadata,
+    BitfinexFeeTrade,
+    BitfinexNativeFill,
+)
+from py000_nautilus.bitfinex_v1_data import PAPER_RAW_SYMBOL
 from py000_nautilus.bitfinex_v1_protocol import (
     POST_ONLY_FLAG,
     REDUCE_ONLY_FLAG,
@@ -40,6 +47,141 @@ type CidLookup = Callable[[int], ClientOrderId | None]
 
 class BitfinexV1ReportError(ValueError):
     """REST facts cannot be represented by the deliberately small v1 adapter."""
+
+
+def usd_commission(fee: Decimal) -> Money:
+    """Convert venue cash flow to USD cost, rounding each fill half-even.
+
+    The venue fee may include fractions of a cent; USD Money is its booked
+    representation, not a precision constraint on the original fee fact.
+    """
+    return Money.from_decimal(-fee, USD)
+
+
+@dataclass(frozen=True, slots=True)
+class BitfinexFeeCurrencySummary:
+    """Observed subtotals; corrections require both native coverage and final fees."""
+
+    raw_cost: Decimal
+    quantized_cost: Decimal
+    native_observed_cost: Decimal
+    native_coverage_complete: bool
+    final_fees_complete: bool
+
+    @property
+    def native_cost(self) -> Decimal | None:
+        return self.native_observed_cost if self.native_coverage_complete else None
+
+    @property
+    def rounding_delta(self) -> Decimal:
+        return self.raw_cost - self.quantized_cost
+
+    @property
+    def provisional_correction(self) -> Decimal | None:
+        booked = self.native_cost
+        if booked is None or not self.final_fees_complete:
+            return None
+        return self.quantized_cost - booked
+
+
+@dataclass(frozen=True, slots=True)
+class BitfinexFeeSummary:
+    """Per-currency observed fees, not a claim to have updated native PnL."""
+
+    currencies: dict[str, BitfinexFeeCurrencySummary]
+    pending_trades: int
+    unknown_orders: int
+    durable: bool
+
+    @property
+    def complete(self) -> bool:
+        return self.pending_trades == self.unknown_orders == 0 and self.durable
+
+
+def summarize_fees(
+    metadata: tuple[BitfinexFeeMetadata, ...], *, unknown_orders: int = 0, durable: bool = True,
+) -> BitfinexFeeSummary:
+    totals: dict[str, list[Decimal]] = {}
+    pending = 0
+    for order in metadata:
+        if not _fee_coverage_matches(order):
+            unknown_orders += 1
+        for native in order.native_fills:
+            totals.setdefault(native.commission_currency, [Decimal(0)] * 3)[2] += native.commission
+        for trade in order.venue_trades:
+            if trade.raw_fee is None:
+                pending += 1
+                continue
+            if trade.fee_currency != USD.code:
+                raise BitfinexV1ReportError("Bitfinex final fee currency must be USD")
+            amounts = totals.setdefault(USD.code, [Decimal(0)] * 3)
+            amounts[0] -= trade.raw_fee
+            amounts[1] += usd_commission(trade.raw_fee).as_decimal()
+    return BitfinexFeeSummary(
+        {
+            currency: BitfinexFeeCurrencySummary(
+                amounts[0], amounts[1], amounts[2], native_coverage_complete=unknown_orders == 0,
+                final_fees_complete=pending == 0,
+            )
+            for currency, amounts in totals.items()
+        },
+        pending, unknown_orders, durable,
+    )
+
+
+def native_fill_matches_trade(native: BitfinexNativeFill, trade: BitfinexFeeTrade) -> bool:
+    return (
+        native.trade_id == str(trade.trade_id)
+        and native.signed_quantity == trade.execution_qty
+        and native.price == trade.execution_price
+        and native.ts_event_ns == trade.ts_event_ms * 1_000_000
+        and native.liquidity_side == ("MAKER" if trade.maker else "TAKER")
+    )
+
+
+def _fee_coverage_matches(order: BitfinexFeeMetadata) -> bool:
+    if not order.native_fills or not order.venue_trades:
+        return False
+    native_sides = {fill.signed_quantity > 0 for fill in order.native_fills}
+    if len(native_sides) != 1 or native_sides != {
+        trade.execution_qty > 0 for trade in order.venue_trades
+    }:
+        return False
+    trades = {str(trade.trade_id): trade for trade in order.venue_trades}
+    inferred: list[BitfinexNativeFill] = []
+    for native in order.native_fills:
+        if native.native_fill_origin == "te_paper" and (
+            order.raw_symbol != PAPER_RAW_SYMBOL
+            or native.commission != 0 or native.commission_currency != USD.code
+        ):
+            return False
+        if native.native_fill_origin == "inferred":
+            inferred.append(native)
+            continue
+        trade = trades.pop(native.trade_id, None)
+        if trade is None or not native_fill_matches_trade(native, trade):
+            return False
+        if trade.raw_fee is not None and native.native_fill_origin != "te_paper" and (
+            native.commission_currency != trade.fee_currency
+            or native.commission != usd_commission(trade.raw_fee).as_decimal()
+        ):
+            return False
+    if not inferred:
+        return not trades
+    # An inferred aggregate never adopts a real trade ID. Its remaining real trade
+    # set must cover the signed quantity and price cost exactly before fees are final.
+    return bool(trades) and (
+        sum((fill.signed_quantity for fill in inferred), Decimal(0))
+        == sum((trade.execution_qty for trade in trades.values()), Decimal(0))
+        and sum((fill.signed_quantity * fill.price for fill in inferred), Decimal(0))
+        == sum(
+            (trade.execution_qty * trade.execution_price for trade in trades.values()), Decimal(0),
+        )
+        and all(
+            trade.ts_event_ms * 1_000_000 <= max(fill.ts_event_ns for fill in inferred)
+            for trade in trades.values()
+        )
+    )
 
 
 def map_order_status_reports(
@@ -98,6 +240,7 @@ def map_fill_reports(
     cid_lookup: CidLookup,
     fee_currency: str,
     ts_init: int,
+    trade_observations: list[TradeUpdate] | None = None,
 ) -> list[FillReport]:
     """Map final ``tu``-equivalent trade rows, ignoring unowned history."""
     _timestamp(ts_init, "ts_init")
@@ -138,12 +281,7 @@ def map_fill_reports(
             raise BitfinexV1ReportError(
                 f"Bitfinex trade fee currency must be {expected_fee_currency}"
             )
-        try:
-            commission = Money(-trade.fee, USD)
-        except ValueError as exc:
-            raise BitfinexV1ReportError("Bitfinex fee loses USD precision") from exc
-        if commission.as_decimal() != -trade.fee:
-            raise BitfinexV1ReportError("Bitfinex fee loses USD precision")
+        commission = usd_commission(trade.fee)
         reports.append(
             FillReport(
                 account_id=account_id,
@@ -163,6 +301,8 @@ def map_fill_reports(
                 ts_init=ts_init,
             )
         )
+        if trade_observations is not None:
+            trade_observations.append(trade)
     return reports
 
 
@@ -262,17 +402,18 @@ def _order_report(
     ts_init: int,
 ) -> OrderStatusReport:
     _exact_symbol(state.symbol, instrument)
-    if state.flags not in {0, POST_ONLY_FLAG, REDUCE_ONLY_FLAG}:
-        raise BitfinexV1ReportError(f"unsupported Bitfinex order flags {state.flags}")
+    flags = state.effective_flags
+    if flags not in {0, POST_ONLY_FLAG, REDUCE_ONLY_FLAG}:
+        raise BitfinexV1ReportError(f"unsupported Bitfinex order flags {flags}")
     if state.order_type == "LIMIT":
         time_in_force = TimeInForce.GTC
     elif state.order_type == "IOC":
         time_in_force = TimeInForce.IOC
     else:
         raise BitfinexV1ReportError(f"unsupported Bitfinex order type {state.order_type!r}")
-    if state.flags == POST_ONLY_FLAG and time_in_force != TimeInForce.GTC:
+    if flags == POST_ONLY_FLAG and time_in_force != TimeInForce.GTC:
         raise BitfinexV1ReportError("post-only Bitfinex order must be LIMIT/GTC")
-    if state.flags == REDUCE_ONLY_FLAG and time_in_force != TimeInForce.IOC:
+    if flags == REDUCE_ONLY_FLAG and time_in_force != TimeInForce.IOC:
         raise BitfinexV1ReportError("reduce-only Bitfinex order must be LIMIT/IOC")
     if state.tif_expiry_ms is not None:
         raise BitfinexV1ReportError("Bitfinex v1 does not support expiring orders")
@@ -320,8 +461,8 @@ def _order_report(
         filled_qty=filled_qty,
         price=price,
         avg_px=avg_px,
-        post_only=state.flags == POST_ONLY_FLAG,
-        reduce_only=state.flags == REDUCE_ONLY_FLAG,
+        post_only=flags == POST_ONLY_FLAG,
+        reduce_only=flags == REDUCE_ONLY_FLAG,
         cancel_reason=(
             state.status if order_status in {OrderStatus.CANCELED, OrderStatus.REJECTED} else None
         ),
@@ -437,4 +578,5 @@ __all__ = [
     "map_fill_reports",
     "map_order_status_reports",
     "map_position_status_reports",
+    "usd_commission",
 ]

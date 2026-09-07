@@ -1,15 +1,15 @@
-"""Offline-buildable live composition for the single PY000 Taker strategy."""
+"""Live Taker composition; building is offline unless a cache database is supplied."""
 
 from __future__ import annotations
 
 import asyncio
 from decimal import Decimal
+from functools import partial
 from pathlib import Path
 from typing import cast
 
 from msgspec.structs import replace as struct_replace
-from nautilus_trader.config import TradingNodeConfig
-from nautilus_trader.live.config import LiveExecEngineConfig
+from nautilus_trader.config import DatabaseConfig
 from nautilus_trader.live.execution_client import LiveExecutionClient
 from nautilus_trader.live.node import TradingNode
 from nautilus_trader.model.identifiers import ClientId, TraderId, Venue
@@ -17,25 +17,32 @@ from nautilus_trader.model.identifiers import ClientId, TraderId, Venue
 from py000_nautilus.bitfinex_v1_data import (
     BitfinexV1DataClient,
     BitfinexV1DataClientConfig,
-    BitfinexV1LiveDataClientFactory,
 )
 from py000_nautilus.bitfinex_v1_execution import (
     BitfinexV1ExecClientConfig,
     BitfinexV1ExecutionClient,
-    BitfinexV1LiveExecClientFactory,
 )
 from py000_nautilus.config import TakerStrategyConfig
+from py000_nautilus.live_cache import validate_native_cache
+from py000_nautilus.live_lifecycle import validate_stop_timeout
+from py000_nautilus.live_node import build_execution_node
+from py000_nautilus.live_runtime import SourceTerminalReconciler, bind_live_account_reader
 from py000_nautilus.models import SourceDirection
 from py000_nautilus.mt5_v1_data import (
     Mt5V1DataClient,
     Mt5V1DataClientConfig,
-    Mt5V1LiveDataClientFactory,
 )
 from py000_nautilus.mt5_v1_execution import (
     Mt5V1ExecClientConfig,
     Mt5V1ExecutionClient,
-    Mt5V1LiveExecClientFactory,
     mt5_v1_execution_account_id,
+)
+from py000_nautilus.restart_recovery import (
+    StartupRecoveryOptions,
+    capture_startup_receipt,
+    check_rejected_retry_execution,
+    has_business_history,
+    reconcile_startup,
 )
 from py000_nautilus.strategies.taker import TakerStrategy
 
@@ -55,18 +62,26 @@ def build_live_taker_node(
     mt5_data_config: Mt5V1DataClientConfig,
     mt5_exec_config: Mt5V1ExecClientConfig,
     strategy_config: TakerStrategyConfig,
+    cache_database: DatabaseConfig | None = None,
     loop: asyncio.AbstractEventLoop | None = None,
     connection_timeout_seconds: float = 10.0,
+    stop_timeout_seconds: float = 10.0,
     one_shot: bool = False,
     allowed_source_direction: SourceDirection | None = None,
     one_shot_expected_source_position: Decimal = Decimal(0),
     one_shot_close_existing: bool = False,
+    startup_recovery: StartupRecoveryOptions | None = None,
 ) -> tuple[TradingNode, TakerStrategy]:
-    """Build, but never connect or run, the exact two-leg live Taker node."""
+    """Build without trading connections; an explicit cache database connects on construction."""
     if type(one_shot_close_existing) is not bool:
         raise TypeError("one_shot_close_existing must be a bool")
     if one_shot_close_existing and not one_shot:
         raise ValueError("one_shot_close_existing requires one_shot execution")
+    if one_shot and cache_database is not None:
+        raise ValueError("one_shot execution cannot use a native cache database")
+    if one_shot and startup_recovery is not None:
+        raise ValueError("startup recovery options require the ordinary entry")
+    validate_stop_timeout(stop_timeout_seconds)
     _validate_composition(
         bitfinex_data_config,
         bitfinex_exec_config,
@@ -88,59 +103,37 @@ def build_live_taker_node(
         ),
     )
 
-    node = TradingNode(
-        config=TradingNodeConfig(
-            trader_id=LIVE_TAKER_TRADER_ID,
-            data_clients={
-                BITFINEX_CLIENT_NAME: bitfinex_data_config,
-                MT5_CLIENT_NAME: mt5_data_config,
-            },
-            exec_clients={
-                BITFINEX_CLIENT_NAME: runtime_bitfinex_exec_config,
-                MT5_CLIENT_NAME: mt5_exec_config,
-            },
-            exec_engine=LiveExecEngineConfig(
-                reconciliation=True,
-                reconciliation_lookback_mins=None,
-                reconciliation_instrument_ids=(
-                    [strategy_config.source_instrument_id, strategy_config.hedge_instrument_id]
-                    if one_shot_close_existing
-                    else None
-                ),
-                # A close canary starts with venue positions and a deliberately empty
-                # local cache. Let Nautilus materialize only those two reconciled
-                # positions as internal events; this never submits a venue order.
-                generate_missing_orders=one_shot_close_existing,
-                inflight_check_interval_ms=0,
-                open_check_interval_secs=None,
-                position_check_interval_secs=None,
-            ),
-            timeout_connection=connection_timeout_seconds,
-            timeout_reconciliation=connection_timeout_seconds,
-            timeout_portfolio=connection_timeout_seconds,
-            timeout_disconnection=connection_timeout_seconds,
-            timeout_post_stop=0.1,
-            timeout_shutdown=connection_timeout_seconds,
+    node = build_execution_node(
+        trader_id=LIVE_TAKER_TRADER_ID, bitfinex_data_config=bitfinex_data_config,
+        bitfinex_exec_config=runtime_bitfinex_exec_config, mt5_data_config=mt5_data_config,
+        mt5_exec_config=mt5_exec_config, cache_database=cache_database,
+        loop=loop, connection_timeout_seconds=connection_timeout_seconds,
+        cold_reconciliation_instruments=(
+            [strategy_config.source_instrument_id, strategy_config.hedge_instrument_id]
+            if one_shot_close_existing else None
         ),
-        loop=loop,
     )
     try:
-        node.add_data_client_factory(BITFINEX_CLIENT_NAME, BitfinexV1LiveDataClientFactory)
-        node.add_data_client_factory(MT5_CLIENT_NAME, Mt5V1LiveDataClientFactory)
-        node.add_exec_client_factory(BITFINEX_CLIENT_NAME, BitfinexV1LiveExecClientFactory)
-        node.add_exec_client_factory(MT5_CLIENT_NAME, Mt5V1LiveExecClientFactory)
-        node.build()
-
         bitfinex_data = _data_client(node, BITFINEX_VENUE, BitfinexV1DataClient)
         mt5_data = _data_client(node, MT5_VENUE, Mt5V1DataClient)
         bitfinex_exec = _exec_client(node, BITFINEX_CLIENT_ID, BitfinexV1ExecutionClient)
         mt5_exec = _exec_client(node, MT5_CLIENT_ID, Mt5V1ExecutionClient)
+        reconciler = SourceTerminalReconciler(
+            source_client=bitfinex_exec,
+            exec_engine=node.kernel.exec_engine,
+            source_instrument_id=strategy_config.source_instrument_id,
+            timeout_seconds=connection_timeout_seconds,
+        )
+        node.trader.add_actor(reconciler)
         strategy = TakerStrategy(
             runtime_strategy_config,
             live_submission_ready=lambda: (
-                bitfinex_data.is_connected
+                not reconciler.restart_pending
+                and bitfinex_data.is_connected
                 and bitfinex_data.book_is_actionable
                 and bitfinex_exec.execution_hold_reason is None
+                and (one_shot_close_existing or bitfinex_exec.accounting_ready)
+                and reconciler.source_submission_ready
                 and bitfinex_exec.get_account() is not None
                 and mt5_data.is_connected
                 and mt5_data.snapshot_refresh_healthy
@@ -158,11 +151,62 @@ def build_live_taker_node(
             ),
             hedge_quantity_ready=mt5_exec.can_execute_quantity,
             live_costs_from_adapters=True,
+            source_terminal_query=reconciler.query_source_terminal,
             one_shot=one_shot,
             allowed_source_direction=allowed_source_direction,
             hedge_must_reduce_only=one_shot_close_existing,
         )
         node.trader.add_strategy(strategy)
+        if not one_shot:
+            node.bind_strategy_drain(strategy, timeout_seconds=stop_timeout_seconds)
+        strategy.bind_restart_gate(lambda: reconciler.restart_pending)
+        if cache_database is not None:
+            validate_native_cache(
+                node.cache,
+                trader_id=LIVE_TAKER_TRADER_ID,
+                strategy_id=strategy.id,
+                routes={
+                    strategy_config.source_instrument_id: (
+                        strategy_config.source_accounts[0].account_id, BITFINEX_CLIENT_ID,
+                    ),
+                    strategy_config.hedge_instrument_id: (
+                        strategy_config.hedge_account_id, MT5_CLIENT_ID,
+                    ),
+                },
+            )
+        if not one_shot:
+            receipt = capture_startup_receipt(strategy.state_store, startup_recovery)
+
+            async def recover_startup() -> None:
+                await reconcile_startup(
+                    node.cache, strategy.state_store,
+                    trader_id=LIVE_TAKER_TRADER_ID, strategy_id=strategy.id,
+                    source=bitfinex_exec, hedge=mt5_exec,
+                    source_instrument_id=strategy_config.source_instrument_id,
+                    hedge_instrument_id=strategy_config.hedge_instrument_id,
+                    receipt=receipt,
+                    rejected_retry_check=partial(
+                        check_rejected_retry_execution, node.cache, mt5_exec,
+                        config=strategy_config, data=mt5_data,
+                    ),
+                )
+
+            reconciler.bind_restart_recovery(recover_startup, history_present=lambda: bool(
+                startup_recovery is not None or node.cache.orders() or node.cache.positions()
+                or bitfinex_exec._cid_store.bindings or has_business_history(strategy.state_store)
+            ))
+            if reconciler.restart_pending:
+                node.kernel.logger.warning(
+                    "native or business history; restart reconciliation pending",
+                )
+        bind_live_account_reader(
+            strategy, config=runtime_strategy_config,
+            source_data=bitfinex_data, source_client=bitfinex_exec,
+            hedge_data=mt5_data, hedge_client=mt5_exec,
+            wallet_currency=runtime_bitfinex_exec_config.wallet_currency,
+            hedge_symbol=mt5_exec_config.expected_symbol,
+            hedge_stream_id=mt5_exec_config.expected_stream_id,
+        )
         _verify_built_composition(
             node,
             strategy,

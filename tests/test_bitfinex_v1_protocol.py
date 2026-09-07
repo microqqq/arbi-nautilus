@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+from copy import deepcopy
 from decimal import Decimal
 
 import pytest
@@ -69,6 +70,53 @@ def position_row() -> list[object]:
         None,
         991,
     ]
+
+
+@pytest.mark.parametrize("flags,meta,expected_meta,effective", [
+    (0, None, None, 0), (POST_ONLY_FLAG, {}, None, POST_ONLY_FLAG),
+    (0, {"$F7": 0}, False, 0), (0, {"_$F7": 0}, False, 0),
+    (0, {"$F7": 1}, True, POST_ONLY_FLAG), (0, {"_$F7": 1}, True, POST_ONLY_FLAG),
+    (POST_ONLY_FLAG, {"$F7": 1, "_$F7": 1}, True, POST_ONLY_FLAG),
+    (0, {"$F7": 0, "_$F7": 0, "lev": 16}, False, 0),
+    (REDUCE_ONLY_FLAG, {"_$F7": 1}, True, REDUCE_ONLY_FLAG | POST_ONLY_FLAG),
+    (8192, {"$F7": 1}, True, 8192 | POST_ONLY_FLAG),
+])
+def test_order_metadata_preserves_raw_flags_and_explicit_post_only_semantics(
+    flags: int, meta: object, expected_meta: bool | None, effective: int,
+) -> None:
+    row = order_row()
+    row[12] = flags
+    row.extend([None] * (31 - len(row)))
+    row.append(meta)
+    original = deepcopy(row)
+    event = parse_private_message([0, "on", row])
+    assert isinstance(event, OrderEvent)
+    assert event.order.flags == flags and event.order.effective_flags == effective
+    assert event.order.post_only_meta is expected_meta
+    assert row == original
+
+
+@pytest.mark.parametrize("meta", [
+    [], "{}", False, 1, {"$F7": None}, {"_$F7": True}, {"$F7": False},
+    {"$F7": "1"}, {"$F7": 1.0}, {"$F7": Decimal(1)}, {"$F7": -1}, {"$F7": 2},
+    {"$F7": 0, "_$F7": 1}, {"$F7": 1, "_$F7": 0},
+])
+def test_order_metadata_rejects_malformed_or_conflicting_explicit_values(meta: object) -> None:
+    row = order_row()
+    row[12] = 0
+    row.extend([None] * (31 - len(row)))
+    row.append(meta)
+    with pytest.raises(BitfinexV1ProtocolError, match="order.meta"):
+        parse_private_message([0, "on", row])
+
+
+@pytest.mark.parametrize("key", ["$F7", "_$F7"])
+def test_explicit_post_only_denial_cannot_conflict_with_active_bit(key: str) -> None:
+    row = order_row()
+    row.extend([None] * (31 - len(row)))
+    row.append({key: 0})
+    with pytest.raises(BitfinexV1ProtocolError, match="conflicts with active flag"):
+        parse_private_message([0, "on", row])
 
 
 def test_auth_message_uses_hmac_sha384_and_does_not_expose_secret() -> None:
@@ -482,6 +530,32 @@ def test_position_snapshot_distinguishes_not_received_from_confirmed_empty() -> 
     event = parse_private_message([0, "ps", []])
 
     assert event == PositionEvent("ps", ())
+
+
+def test_position_margin_extension_preserves_raw_numbers_and_venue_time() -> None:
+    row = [*position_row(), 100, 200, None, 1, None, Decimal("150.125"), Decimal("15.0125")]
+    event = parse_private_message([0, "ps", [row]])
+    assert isinstance(event, PositionEvent)
+    position = event.positions[0]
+    assert position.ts_created_ms == 100
+    assert position.ts_updated_ms == 200
+    assert position.position_type == 1
+    assert position.collateral == Decimal("150.125")
+    assert position.collateral_min == Decimal("15.0125")
+
+
+@pytest.mark.parametrize("bad", [None, "bad", True, 1.25, Decimal("NaN")])
+def test_bad_optional_position_margin_extension_does_not_break_private_codec(bad: object) -> None:
+    row = [*position_row(), bad, bad, None, bad, None, bad, bad]
+    event = parse_private_message([0, "pu", row])
+    assert isinstance(event, PositionEvent)
+    position = event.positions[0]
+    assert position.ts_created_ms is None and position.ts_updated_ms is None
+    assert position.position_type is None
+    assert position.collateral is None and position.collateral_min is None
+    row[2] = True
+    with pytest.raises(BitfinexV1ProtocolError, match="position.amount"):
+        parse_private_message([0, "pu", row])
 
 
 @pytest.mark.parametrize(

@@ -1,0 +1,127 @@
+{
+  "metadata": {
+    "schema_version": 1,
+    "archive": {
+      "name": "arbi_main_1_0.zip",
+      "sha256": "3e50dcc625b1f78048622f3bb5e5ee2f94eb8e4c4635f39108fcb09f6e3d1892"
+    },
+    "members": {
+      "meta_api_trader_zmq.py": "901f7064608eb7bf85e5f4ebcbca5f4de96bcc454690f6c303fdf5a74c91f653",
+      "bfx_derivatives_trader.py": "d361ab814d968d4c5afb2dc6bc4733f5dbe1b7b5ca6dafbb51e4b3e2b2ae9425"
+    },
+    "methods": [
+      {
+        "member": "meta_api_trader_zmq.py",
+        "method": "FundRateCalculator.calculate_fund_rate",
+        "lines": [
+          302,
+          324
+        ],
+        "method_segment_sha256": "8736f6e6321e608c4c52d29ddd506a9851246fd576ca6d79ce12200b51c98824"
+      },
+      {
+        "member": "meta_api_trader_zmq.py",
+        "method": "FundRateCalculator._calculate_points_mode",
+        "lines": [
+          326,
+          342
+        ],
+        "method_segment_sha256": "95c9454486374fe3458a777f47f21dafe00d8ce283dba21b14f5fbefffe463f8"
+      },
+      {
+        "member": "meta_api_trader_zmq.py",
+        "method": "FundRateCalculator._calculate_currency_mode",
+        "lines": [
+          344,
+          358
+        ],
+        "method_segment_sha256": "582ec2393cf21f0d18c14fa52ec92a5e70eba0c8dc00f6c11146295a1ff6e97c"
+      },
+      {
+        "member": "meta_api_trader_zmq.py",
+        "method": "FundRateCalculator.get_daily_swap_rate",
+        "lines": [
+          360,
+          372
+        ],
+        "method_segment_sha256": "423b254ded101ec0d793a38d504b1e9de19ad4ac76c0409614e0292959469f8a"
+      },
+      {
+        "member": "meta_api_trader_zmq.py",
+        "method": "ZmqTrader._parse_swap_mode",
+        "lines": [
+          653,
+          658
+        ],
+        "method_segment_sha256": "f56ffa2d4df7c69485bdc2221ecaaa6adbeea2e96c8d9a39514e518a7f2465a0"
+      },
+      {
+        "member": "meta_api_trader_zmq.py",
+        "method": "ZmqTrader.get_fund_rate",
+        "lines": [
+          1014,
+          1023
+        ],
+        "method_segment_sha256": "59e570ecad56da9e5f62fffda4d5132b1aad23c231591b3becc82d5be9c06231"
+      },
+      {
+        "member": "bfx_derivatives_trader.py",
+        "method": "BitfinexDerivativesTrader.get_fund_rate",
+        "lines": [
+          603,
+          607
+        ],
+        "method_segment_sha256": "e31fcb41db329e7792fc445b4c1c01fadb615e65b89c7d2d55c08408d47d4fe1"
+      }
+    ],
+    "absolute_tolerance": "1e-15",
+    "vectors_sha256": "f026ef800791e3bff4d615de5216354d96bb93752c18aa2c31ae033b69cf3419",
+    "legacy_points_mode": 0,
+    "native_points_mode": 1,
+    "rates_mapping": "Complete string-key weekday dictionary to Sunday-first seven-vector.",
+    "funding_boundary": "Same explicit rate direction only: original margin_funding; current NEXT_FUNDING_ACCRUED. Missing original rate is not current zero.",
+    "wire_boundary": "Legacy enum POINTS=0/CURRENCY_SYMBOL=1 differs from native DISABLED=0/POINTS=1. ZIP has no EA; old wire numbering is unverified.",
+    "missing_boundary": "Original zero/default-one/Wednesday-three fallbacks are recorded as divergences; current missing inputs and unsupported modes reject.",
+    "output_boundary": "Original float strings from selected methods with synthetic inputs; not raw producer, account, realized cashflow, or live parity.",
+    "injected_dependencies": "FixedDateTime returns the explicit instant in injected pytz.timezone, matching the original initializer choice. Synthetic spec, price, logger, and reviewed enum only; no initializer or _load_symbol_spec executes. Native mode mapping occurs only on the current CI comparison side."
+  },
+  "defaults": {"utc":"2026-08-31T12:00:00+00:00","server_timezone":"Europe/Athens","swap_long":"-12.6","swap_short":"-4.6","point":"0.01","ask":"4000","contract_size":"100","rates":["0","1","1","3","1","1","0"]},
+  "points": [
+    {"id":"summer_before","utc":"2026-09-01T20:59:59.999999+00:00","expected":["-3.15e-05","-1.15e-05"],"local":"2026-09-01T23:59:59.999999+03:00","mql_weekday":2,"multiplier":"1"},
+    {"id":"summer_after","utc":"2026-09-01T21:00:00+00:00","expected":["-9.449999999999999e-05","-3.45e-05"],"local":"2026-09-02T00:00:00+03:00","mql_weekday":3,"multiplier":"3"},
+    {"id":"winter_before","utc":"2026-01-13T21:59:59.999999+00:00","expected":["-3.15e-05","-1.15e-05"],"local":"2026-01-13T23:59:59.999999+02:00","mql_weekday":2,"multiplier":"1"},
+    {"id":"winter_after","utc":"2026-01-13T22:00:00+00:00","expected":["-9.449999999999999e-05","-3.45e-05"],"local":"2026-01-14T00:00:00+02:00","mql_weekday":3,"multiplier":"3"},
+    {"id":"spring_before","utc":"2026-03-29T00:59:59.999999+00:00","expected":["-0.0","-0.0"],"local":"2026-03-29T02:59:59.999999+02:00","mql_weekday":0,"multiplier":"0"},
+    {"id":"spring_after","utc":"2026-03-29T01:00:00+00:00","expected":["-0.0","-0.0"],"local":"2026-03-29T04:00:00+03:00","mql_weekday":0,"multiplier":"0"},
+    {"id":"autumn_before","utc":"2026-10-25T00:59:59.999999+00:00","expected":["-0.0","-0.0"],"local":"2026-10-25T03:59:59.999999+03:00","mql_weekday":0,"multiplier":"0"},
+    {"id":"autumn_after","utc":"2026-10-25T01:00:00+00:00","expected":["-0.0","-0.0"],"local":"2026-10-25T03:00:00+02:00","mql_weekday":0,"multiplier":"0"},
+    {"id":"utc_day_differs","utc":"2026-09-01T21:00:00+00:00","server_timezone":"UTC","expected":["-3.15e-05","-1.15e-05"],"local":"2026-09-01T21:00:00+00:00","mql_weekday":2,"multiplier":"1"},
+    {"id":"sunday_zero","utc":"2026-09-06T12:00:00+00:00","expected":["-0.0","-0.0"],"local":"2026-09-06T15:00:00+03:00","mql_weekday":0,"multiplier":"0"},
+    {"id":"saturday_triple","utc":"2026-09-05T12:00:00+00:00","rates":["0","1","1","1","1","1","3"],"expected":["-9.449999999999999e-05","-3.45e-05"],"local":"2026-09-05T15:00:00+03:00","mql_weekday":6,"multiplier":"3"},
+    {"id":"friday_triple","utc":"2026-09-04T12:00:00+00:00","rates":["0","1","1","1","1","3","0"],"expected":["-9.449999999999999e-05","-3.45e-05"],"local":"2026-09-04T15:00:00+03:00","mql_weekday":5,"multiplier":"3"},
+    {"id":"positive_long","swap_long":"12.6","expected":["3.15e-05","-1.15e-05"],"local":"2026-08-31T15:00:00+03:00","mql_weekday":1,"multiplier":"1"},
+    {"id":"positive_short","swap_short":"4.6","expected":["-3.15e-05","1.15e-05"],"local":"2026-08-31T15:00:00+03:00","mql_weekday":1,"multiplier":"1"},
+    {"id":"positive_both","swap_long":"12.6","swap_short":"4.6","expected":["3.15e-05","1.15e-05"],"local":"2026-08-31T15:00:00+03:00","mql_weekday":1,"multiplier":"1"},
+    {"id":"zero_swaps","swap_long":"0","swap_short":"0","expected":["0.0","0.0"],"local":"2026-08-31T15:00:00+03:00","mql_weekday":1,"multiplier":"1"},
+    {"id":"different_point_price","point":"0.001","ask":"4478.21","expected":["-2.813624193595209e-06","-1.0271961341696794e-06"],"local":"2026-08-31T15:00:00+03:00","mql_weekday":1,"multiplier":"1"}
+  ],
+  "fallbacks": [
+    {"id":"same_raw_zero","raw_mode":0,"current":"disabled_zero","expected":["-3.15e-05","-1.15e-05"]},
+    {"id":"same_raw_one","raw_mode":1,"current":"points","current_reference":"summer_before","expected":["-0.126","-0.046"]},
+    {"id":"unknown_raw_mode","raw_mode":99,"current":"reject","expected":["-0.126","-0.046"]},
+    {"id":"missing_spec","absent":"spec","current":"reject","expected":["0.0","0.0"]},
+    {"id":"missing_price","absent":"price","current":"reject","expected":["0.0","0.0"]},
+    {"id":"missing_point","absent":"point","current":"reject","expected":["0.0","0.0"]},
+    {"id":"zero_ask","ask":"0","current":"reject","expected":["0.0","0.0"]},
+    {"id":"zero_point","point":"0","current":"reject","expected":["0.0","0.0"]},
+    {"id":"missing_rates_wednesday","utc":"2026-09-02T12:00:00+00:00","rates":null,"current":"reject","expected":["-9.449999999999999e-05","-3.45e-05"]},
+    {"id":"missing_rates_saturday","utc":"2026-09-05T12:00:00+00:00","rates":null,"current":"reject","expected":["-3.15e-05","-1.15e-05"]},
+    {"id":"missing_day_wednesday","utc":"2026-09-02T12:00:00+00:00","legacy_rates":{"1":"1"},"current":"reject","expected":["-3.15e-05","-1.15e-05"]}
+  ],
+  "funding": [
+    {"id":"positive","rate":"0.0007366","expected":["0.0007366","-0.0007366"]},
+    {"id":"negative","rate":"-0.0007366","expected":["-0.0007366","0.0007366"]},
+    {"id":"zero","rate":"0","expected":["0","0"]},
+    {"id":"missing","rate":null,"expected":["0","0"]}
+  ]
+}

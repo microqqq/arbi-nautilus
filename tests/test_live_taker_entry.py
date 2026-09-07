@@ -30,6 +30,8 @@ from py000_nautilus.config import (
     TakerEconomicsConfig,
     TakerStrategyConfig,
 )
+from py000_nautilus.live_lifecycle import DrainResult
+from py000_nautilus.live_runtime import SourceTerminalReconciler
 from py000_nautilus.live_taker import build_live_taker_node
 from py000_nautilus.live_taker_entry import (
     LiveTakerEntryError,
@@ -44,6 +46,7 @@ from py000_nautilus.live_taker_entry import (
 from py000_nautilus.mt5_v1_data import Mt5V1DataClientConfig
 from py000_nautilus.mt5_v1_execution import Mt5V1ExecClientConfig
 from py000_nautilus.mt5_v1_transport import Mt5V1Transport
+from py000_nautilus.store import JsonStateStore
 from py000_nautilus.strategies.taker import TakerStrategy
 
 SOURCE_ID = InstrumentId.from_str("XAUTUSDT-PERP.BITFINEX")
@@ -319,6 +322,50 @@ def test_rehearsal_injects_credentials_removes_strategy_and_delegates_once(
     assert not Path(profile.strategy_config.store_path).exists()
 
 
+def test_rehearsal_removes_bound_business_recovery_actor(tmp_path: Path) -> None:
+    profile = _profile(tmp_path)
+    state = JsonStateStore(profile.strategy_config.store_path)
+    state.freeze_source_submissions("operator hold")
+    previous = state.path.read_bytes()
+
+    def recording_builder(**kwargs: Any) -> tuple[TradingNode, TakerStrategy]:
+        node, strategy = build_live_taker_node(**kwargs)
+        assert any(
+            isinstance(actor, SourceTerminalReconciler) and actor.restart_pending
+            for actor in node.trader.actors()
+        )
+        return node, strategy
+
+    def runner(node: TradingNode, *, timeout_seconds: float) -> None:
+        assert timeout_seconds == 3.0
+        assert node.trader.strategies() == []
+        assert node.trader.actors() == []
+
+    result = run_live_taker_entry(
+        profile, rehearse=True, node_builder=recording_builder, rehearsal_runner=runner,
+        environment={
+            "BFX_TEST_API_KEY": "PAPER-KEY", "BFX_TEST_API_SECRET": "PAPER-SECRET",
+            "BFX_TEST_USER_ID": str(USER_ID),
+        },
+    )
+    assert result.outcome == "REHEARSED"
+    assert state.path.read_bytes() == previous
+
+
+def test_paper_runner_without_drain_result_is_not_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(TradingNode, "run", lambda _node, **_kwargs: None)
+    result = run_live_taker_entry(
+        _paper_profile(tmp_path), run_paper=True,
+        environment={
+            "BFX_TEST_API_KEY": "PAPER-KEY", "BFX_TEST_API_SECRET": "PAPER-SECRET",
+            "BFX_TEST_USER_ID": str(USER_ID),
+        },
+    )
+    assert result.outcome == "PAPER_INCOMPLETE"
+
+
 def test_run_paper_injects_credentials_keeps_one_strategy_and_runs_node_once(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -337,6 +384,7 @@ def test_run_paper_injects_credentials_keeps_one_strategy_and_runs_node_once(
         seen["raise_exception"] = raise_exception
         strategies = node.trader.strategies()
         assert len(strategies) == 1 and isinstance(strategies[0], TakerStrategy)
+        cast(Any, node).drain_result = DrainResult(True, "paper_strategy_stopped", (), {})
 
     monkeypatch.setattr(TradingNode, "run", fake_run)
     result = run_live_taker_entry(
@@ -435,6 +483,9 @@ class _FakeTrader:
         self.is_running = False
 
     def strategies(self) -> list[object]:
+        return []
+
+    def actors(self) -> list[object]:
         return []
 
 

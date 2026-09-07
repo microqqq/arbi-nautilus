@@ -23,11 +23,11 @@ SOURCES: tuple[tuple[str, str], ...] = (
     ),
     (
         "mt5_ea/include/Py000Execution.mqh",
-        "dd43173579ee794437f4e77da65933fc1b3dc1225c90d01d2dda9dcb4e768402",
+        "d32b6b95d28aa664c761363fbd71cc38cad725f63da801a4bfdabba3a89808c7",
     ),
     (
         "mt5_ea/include/Py000Journal.mqh",
-        "f39f0dc02838a2ef0599adbae546a75bf0ecc4648b6506e7e66b5a0f3cd60ca4",
+        "9baa2226ff1cb8c6a65ec431c74260cea41215a5fdf81f53878cca184e7343c3",
     ),
     (
         "mt5_ea/include/Py000Json.mqh",
@@ -35,7 +35,7 @@ SOURCES: tuple[tuple[str, str], ...] = (
     ),
     (
         "mt5_ea/include/Py000Protocol.mqh",
-        "9d56139d5a80368146d2644dd06c6574e5f4043b15ad979bd3367d07b2cc5fe2",
+        "6ae23cc49b782a99e1f8fcab3e8a94b126ce0af9a363549b7e1a461953f1a0c0",
     ),
     (
         "mt5_ea/include/Py000Zmq.mqh",
@@ -43,7 +43,7 @@ SOURCES: tuple[tuple[str, str], ...] = (
     ),
 )
 
-MANIFEST = "e8126bf3ef0b42d01facdd2ef30f048972062b5ca38c81b84717156fb74cad00"
+MANIFEST = "1ff6ce551b2f11c0876e5e0d4780d348da6a582d1eda9bb609371478a7f5daff"
 
 
 def _run(*args: str) -> subprocess.CompletedProcess[str]:

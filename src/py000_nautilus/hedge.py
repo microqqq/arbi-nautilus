@@ -21,6 +21,18 @@ class HedgePlanningError(RuntimeError):
     """Current MT5 ticket state cannot safely execute a planned hedge leg."""
 
 
+class HedgeLaneBusy(HedgePlanningError):
+    """An earlier obligation still owns the route; waiting is not a failed plan."""
+
+
+def hedge_order_params(leg: HedgeLeg) -> dict[str, object]:
+    """Carry the bound leg's prerequisite through native SubmitOrder routing."""
+    params: dict[str, object] = {"py000_hedge_plan": True}
+    if leg.is_close:
+        params["py000_expected_position_ounces"] = leg.expected_position_quantity_ounces
+    return params
+
+
 def plan_hedge_delta(
     positions: Sequence[Position],
     side: BusinessOrderSide,
@@ -160,6 +172,8 @@ class HedgeCoordinator:
     ) -> HedgeLeg:
         """Persist a plan once and revalidate its next exact ticket before submit."""
         intent = self._store.intent(intent_id)
+        if not self._store.hedge_dispatch_ready(intent_id):
+            raise HedgeLaneBusy("an earlier hedge obligation still owns the route")
         try:
             if not intent.hedge_plan:
                 remaining = intent.hedge_quantity_ounces - intent.hedge_filled_ounces

@@ -38,6 +38,7 @@ from py000_nautilus.config import (
     TakerEconomicsConfig,
     TakerStrategyConfig,
 )
+from py000_nautilus.maker_store import MakerStateStore
 from py000_nautilus.models import ObligationStatus
 from py000_nautilus.store import JsonStateStore
 from py000_nautilus.strategies.maker import MakerStrategy
@@ -126,7 +127,8 @@ def run_simulated_example(state_path: Path) -> SimulationResult:
     engine.add_strategy(TakerStrategy(_strategy_config(state_path)))
     engine.add_data(
         [
-            _book_snapshot(source, "2388.00", "2390.00", "5", 1_000_000_000),
+            # Keep the first pair neutral; the 3s book introduces this example's one opportunity.
+            _book_snapshot(source, "2402.00", "2403.00", "5", 1_000_000_000),
             _quote(hedge, "2404.00", "2405.00", "10.00", 2_000_000_000),
             _book_snapshot(source, "2398.00", "2400.00", "5", 3_000_000_000),
         ]
@@ -250,10 +252,7 @@ def run_maker_simulated_example(state_path_prefix: Path) -> MakerSimulationResul
     bid_order = next(order for order in source_orders if order.side.name == "BUY")
     ask_order = next(order for order in source_orders if order.side.name == "SELL")
     hedge_order = hedge_orders[0]
-    stores = (
-        JsonStateStore(f"{state_path_prefix}.bid.json"),
-        JsonStateStore(f"{state_path_prefix}.ask.json"),
-    )
+    stores = MakerStateStore(state_path_prefix, str(SOURCE_ID), str(HEDGE_ID)).stores.values()
     intents = tuple(intent for store in stores for intent in store.intents())
     result = MakerSimulationResult(
         orders=len(orders),

@@ -45,7 +45,9 @@ from py000_nautilus.config import MakerStrategyConfig
 from py000_nautilus.economics import expected_leverage
 from py000_nautilus.hedge import HedgePlanningError, plan_hedge_delta
 from py000_nautilus.live_maker import BITFINEX_CLIENT_ID, build_live_maker_node
+from py000_nautilus.live_runtime import get_source_terminal_reconciler
 from py000_nautilus.live_taker_entry import _dispose_node, load_bitfinex_test_credentials
+from py000_nautilus.maker_store import maker_legacy_paths, maker_state_path
 from py000_nautilus.models import (
     BookTop,
     BusinessOrderSide,
@@ -93,6 +95,7 @@ class MakerCanaryStrategy(MakerStrategy):
         hedge_quantity_ready: Callable[[Decimal], bool],
         live_costs_from_adapters: bool,
         source_terminal_query: SourceTerminalQuery,
+        source_quote_refresh_paused: Callable[[], bool] | None = None,
     ) -> None:
         super().__init__(
             config,
@@ -100,6 +103,7 @@ class MakerCanaryStrategy(MakerStrategy):
             hedge_quantity_ready=hedge_quantity_ready,
             live_costs_from_adapters=live_costs_from_adapters,
             source_terminal_query=source_terminal_query,
+            source_quote_refresh_paused=source_quote_refresh_paused,
         )
         self.armed: bool = False
         self.claimed: bool = False
@@ -272,10 +276,11 @@ class MakerCanaryStrategy(MakerStrategy):
 
     def _complete_source_terminal_query(
         self, direction: SourceDirection, event: OrderCanceled, report: OrderStatusReport | None
-    ) -> None:
-        super()._complete_source_terminal_query(direction, event, report)
+    ) -> bool:
+        confirmed = super()._complete_source_terminal_query(direction, event, report)
         if direction is SourceDirection.LONG and self.resume_ready:
             self.resumed.set()
+        return confirmed
 
     def on_order_filled(self, event: OrderFilled) -> None:
         if (event.instrument_id, event.client_order_id.value) != (
@@ -313,6 +318,7 @@ class MakerRoundtripStrategy(MakerStrategy):
         hedge_quantity_ready: Callable[[Decimal], bool],
         live_costs_from_adapters: bool,
         source_terminal_query: SourceTerminalQuery,
+        source_quote_refresh_paused: Callable[[], bool] | None = None,
     ) -> None:
         super().__init__(
             config,
@@ -320,6 +326,7 @@ class MakerRoundtripStrategy(MakerStrategy):
             hedge_quantity_ready=hedge_quantity_ready,
             live_costs_from_adapters=live_costs_from_adapters,
             source_terminal_query=source_terminal_query,
+            source_quote_refresh_paused=source_quote_refresh_paused,
         )
         self.direction = direction
         self.close_direction = (
@@ -653,18 +660,18 @@ def validate_maker_canary_profile(profile: LiveMakerCanaryProfile) -> None:
     ):
         raise ValueError("Maker canary connection timeout must be in [1, 60]")
     paths = _state_paths(profile)
-    if len({path.resolve(strict=False) for path in paths}) != 3:
+    if len({path.resolve(strict=False) for path in paths}) != len(paths):
         raise ValueError("Maker canary state paths must be distinct")
 
 
-def _state_paths(profile: LiveMakerCanaryProfile) -> tuple[Path, Path, Path]:
+def _state_paths(profile: LiveMakerCanaryProfile) -> tuple[Path, ...]:
     prefix = profile.strategy_config.store_path_prefix
     if not prefix or prefix != prefix.strip():
         raise ValueError("Maker canary state prefix must be non-empty and trimmed")
     return (
         Path(profile.bitfinex_exec_config.cid_store_path),
-        Path(f"{prefix}.bid.json"),
-        Path(f"{prefix}.ask.json"),
+        maker_state_path(prefix),
+        *maker_legacy_paths(prefix),
     )
 
 
@@ -892,10 +899,8 @@ async def _run_roundtrip_lifecycle(
         reason = await _wait_roundtrip_phase(strategy, strategy.direction, task, timeout, False)
         if reason:
             return _roundtrip_failure(strategy, output, reason, True)
-        reconciled = await asyncio.wait_for(
-            node.kernel.exec_engine.reconcile_execution_state(timeout_secs=connection_timeout),
-            connection_timeout,
-        )
+        reconciler = get_source_terminal_reconciler(node)
+        reconciled = await reconciler.reconcile(retry_failed=False)
         source = QUANTITY if strategy.direction is SourceDirection.LONG else -QUANTITY
         paired = await asyncio.wait_for(read_snapshot(rest), connection_timeout)
         _write(transcript, {"kind": "paired", **paired.record()})
@@ -914,10 +919,7 @@ async def _run_roundtrip_lifecycle(
         )
         if reason:
             return _roundtrip_failure(strategy, output, reason, True)
-        reconciled = await asyncio.wait_for(
-            node.kernel.exec_engine.reconcile_execution_state(timeout_secs=connection_timeout),
-            connection_timeout,
-        )
+        reconciled = await reconciler.reconcile(retry_failed=False)
         final = await asyncio.wait_for(read_snapshot(rest), connection_timeout)
         _write(transcript, {"kind": "final", **final.record()})
         await _wait_ready(node, strategy, task, connection_timeout * 4)

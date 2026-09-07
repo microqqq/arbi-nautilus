@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+from dataclasses import replace
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -13,6 +15,43 @@ from py000_nautilus.bitfinex_v1_cids import (
     BitfinexV1CidStore,
 )
 from py000_nautilus.durability import ParentDirectorySyncError
+
+
+def test_fee_metadata_v2_retains_native_origin_and_raw_fee_across_restart(tmp_path: Path) -> None:
+    path = tmp_path / "cids.json"
+    store = BitfinexV1CidStore(path, account_id="BITFINEX-001")
+    binding = store.allocate("O-FEE-1", epoch_ms=100)
+    native = cid_module.BitfinexNativeFill(
+        trade_id="1234", native_fill_origin="te_paper", signed_quantity=Decimal(2),
+        price=Decimal("3926.75"), ts_event_ns=123_000_000,
+        liquidity_side="TAKER", commission=Decimal(0), commission_currency="USD",
+    )
+    pending = cid_module.BitfinexFeeTrade(
+        trade_id=1234, ts_event_ms=123, execution_qty=Decimal(2),
+        execution_price=Decimal("3926.75"), order_type="IOC",
+        order_price=Decimal("4000"), maker=False, raw_fee=None, fee_currency=None,
+    )
+    scope = cid_module.BitfinexFeeMetadata(
+        cid=binding.cid, venue_order_id=987, instrument_id="XAUTUSDT.BITFINEX",
+        raw_symbol="tTESTXAUTF0:TESTUSDTF0",
+    )
+    store.record_native_fill(scope, native)
+    store.record_venue_trade(scope, pending)
+    final = replace(pending, raw_fee=Decimal("-0.061668"), fee_currency="USD")
+    store.record_venue_trade(scope, final)
+    store.record_venue_trade(scope, final)
+    store.allocate("O-FEE-2", epoch_ms=101)
+
+    restored = BitfinexV1CidStore(path, account_id="BITFINEX-001")
+    metadata = restored.fee_metadata_for_cid(binding.cid)
+    assert metadata is not None
+    assert metadata.native_fills == (native,)
+    assert metadata.venue_trades == (final,)
+    assert json.loads(path.read_text())["schema_version"] == 2
+    with pytest.raises(BitfinexV1CidError, match="trade ID changed"):
+        restored.record_venue_trade(
+            scope, replace(final, raw_fee=Decimal("-0.061669")),
+        )
 
 
 def test_binding_is_durable_and_bidirectional_across_restart(tmp_path: Path) -> None:
@@ -30,6 +69,36 @@ def test_binding_is_durable_and_bidirectional_across_restart(tmp_path: Path) -> 
     assert restarted.binding_for_cid(binding.cid) == binding
     after_restart = restarted.allocate("O-STRING-2", epoch_ms=binding.cid - 100)
     assert after_restart.cid == binding.cid + 1
+
+
+def test_accounting_conflict_is_one_way_and_survives_successful_allocation(tmp_path: Path) -> None:
+    path = tmp_path / "cids.json"
+    store = BitfinexV1CidStore(path, account_id="BITFINEX-001")
+    binding = store.allocate("O-1", epoch_ms=100)
+    assert not bool(store.accounting_conflict)
+    store.mark_accounting_conflict()
+    assert store.accounting_conflict and store.fees_durable
+    store.allocate("O-2", epoch_ms=101)
+    restarted = BitfinexV1CidStore(path, account_id="BITFINEX-001")
+    assert restarted.accounting_conflict and restarted.fees_durable
+    assert restarted.binding_for_cid(binding.cid) == binding
+    assert json.loads(path.read_text())["accounting_conflict"] is True
+
+
+@pytest.mark.parametrize("invalid", [None, 0, 1, "false", [], {}])
+def test_v2_accounting_conflict_requires_a_boolean(tmp_path: Path, invalid: object) -> None:
+    path = tmp_path / "cids.json"
+    store = BitfinexV1CidStore(path, account_id="BITFINEX-001")
+    store.allocate("O-1", epoch_ms=100)
+    raw = json.loads(path.read_text())
+    raw["accounting_conflict"] = invalid
+    path.write_text(json.dumps(raw))
+    with pytest.raises(BitfinexV1CidError, match="accounting_conflict"):
+        BitfinexV1CidStore(path, account_id="BITFINEX-001")
+    raw.pop("accounting_conflict")
+    path.write_text(json.dumps(raw))
+    with pytest.raises(BitfinexV1CidError, match="accounting_conflict"):
+        BitfinexV1CidStore(path, account_id="BITFINEX-001")
 
 
 def test_allocation_is_globally_monotonic_when_clock_repeats_or_moves_back(

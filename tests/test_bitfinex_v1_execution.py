@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+import json
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
+from copy import deepcopy
 from datetime import UTC, datetime
 from decimal import Decimal
+from decimal import Overflow as DecimalOverflow
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any, cast
 
+import msgspec
 import pytest
 from nautilus_trader.common.providers import InstrumentProvider
 from nautilus_trader.config import LiveExecClientConfig, RoutingConfig, TradingNodeConfig
@@ -20,6 +25,7 @@ from nautilus_trader.execution.messages import (
     GenerateOrderStatusReports,
     GeneratePositionStatusReports,
     ModifyOrder,
+    QueryAccount,
     QueryOrder,
     SubmitOrder,
 )
@@ -47,11 +53,14 @@ from nautilus_trader.model.identifiers import (
 )
 from nautilus_trader.model.objects import Money
 from nautilus_trader.model.orders import Order
+from nautilus_trader.model.orders.unpacker import OrderUnpacker
+from nautilus_trader.serialization.serializer import MsgSpecSerializer
 from nautilus_trader.test_kit.stubs.component import TestComponentStubs
 from nautilus_trader.test_kit.stubs.events import TestEventStubs
 from nautilus_trader.test_kit.stubs.execution import TestExecStubs
 
 import py000_nautilus.bitfinex_v1_execution as execution_module
+from py000_nautilus.bitfinex_v1_cids import BitfinexV1CidStore
 from py000_nautilus.bitfinex_v1_data import (
     INSTRUMENT_ID as SOURCE_ID,
 )
@@ -68,6 +77,10 @@ from py000_nautilus.bitfinex_v1_execution import (
     BitfinexV1LiveExecClientFactory,
 )
 from py000_nautilus.bitfinex_v1_protocol import POST_ONLY_FLAG, REDUCE_ONLY_FLAG
+from py000_nautilus.bitfinex_v1_reports import BitfinexV1ReportError
+from py000_nautilus.hedge import HedgeCoordinator
+from py000_nautilus.models import BusinessOrderSide
+from py000_nautilus.store import JsonStateStore
 
 RAW_SYMBOL = "tXAUTF0:USTF0"
 VENUE_ORDER_ID = 219_492_782_587
@@ -111,6 +124,9 @@ class _FakeRest:
         self.history: list[object] = []
         self.trades: list[object] = []
         self.position_rows: list[object] = []
+        self.wallet_rows: list[object] = []
+        self.wallet_calls = 0
+        self.position_calls = 0
 
     async def user_info(self) -> object:
         self.user_info_calls += 1
@@ -148,7 +164,12 @@ class _FakeRest:
         return self.trades
 
     async def positions(self) -> object:
+        self.position_calls += 1
         return self.position_rows
+
+    async def wallets(self) -> object:
+        self.wallet_calls += 1
+        return self.wallet_rows
 
 
 class _Harness:
@@ -164,6 +185,7 @@ class _Harness:
         instrument_raw_symbol: str | None = None,
         instrument_available: bool = True,
         allow_cold_position_reconciliation: bool = False,
+        rest_timeout_secs: int = 10,
     ) -> None:
         self._temporary = TemporaryDirectory() if cid_store_path is None else None
         if cid_store_path is None:
@@ -225,6 +247,7 @@ class _Harness:
                 cid_store_path=str(cid_store_path),
                 mutation_ack_timeout_ms=mutation_ack_timeout_ms,
                 allow_cold_position_reconciliation=allow_cold_position_reconciliation,
+                rest_timeout_secs=rest_timeout_secs,
             ),
             msgbus=self.msgbus,
             cache=self.cache,
@@ -440,6 +463,1273 @@ def _position_row(
 
 def _order_events(harness: _Harness) -> list[OrderEvent]:
     return [event for event in harness.events if isinstance(event, OrderEvent)]
+
+
+def _margin_info(harness: _Harness) -> dict[str, Any]:
+    account = next(event for event in reversed(harness.events)
+                   if type(event).__name__ == "AccountState")
+    return cast(dict[str, Any], account.info["bitfinex_margin"])
+
+
+def _margin_position(*, quantity: str = "-0.75", updated: int = 100, pid: int = 44) -> list[object]:
+    row = _position_row(Decimal(quantity), avg_px=Decimal("4050.1"))
+    row[11:14] = [pid, 50, updated]
+    return [*row, None, Decimal("150.125"), Decimal("15.0125")]
+
+
+def _position_command(harness: _Harness) -> GeneratePositionStatusReports:
+    return GeneratePositionStatusReports(
+        instrument_id=SOURCE_ID, start=None, end=None,
+        command_id=UUID4(), ts_init=harness.clock.timestamp_ns(),
+    )
+
+
+def _account_command(
+    harness: _Harness, *, account: AccountId | None = None, client: ClientId | None = None,
+) -> QueryAccount:
+    return QueryAccount(
+        trader_id=harness.msgbus.trader_id, account_id=account or harness.client.account_id,
+        client_id=client, command_id=UUID4(), ts_init=harness.clock.timestamp_ns(),
+    )
+
+
+def _query_account(harness: _Harness) -> asyncio.Task[None]:
+    harness.client.query_account(_account_command(harness))
+    task = harness.client._account_refresh_task
+    assert task is not None
+    return task
+
+
+async def _budget_harness() -> _Harness:
+    harness = _Harness()
+    harness.msgbus.deregister("ExecEngine.process", harness.events.append)
+    engine = ExecutionEngine(msgbus=harness.msgbus, cache=harness.cache, clock=harness.clock)
+    engine.register_client(harness.client)
+    harness.cache.add_instrument(harness.instrument)
+    harness.cache.add_account(TestExecStubs.margin_account(account_id=harness.client.account_id))
+    await harness.connect()
+    harness.client._set_connected(True)
+    harness.client._consume_private_frame([0, "ps", []])
+    harness.rest.wallet_rows = [["margin", "USTF0", Decimal(900), Decimal(0), Decimal(800)]]
+    return harness
+
+
+async def _budget_order(harness: _Harness, *, accepted: bool = True) -> tuple[Order, int]:
+    order = harness.order()
+    harness.cache.add_order(order, client_id=harness.client.id)
+    cid = await harness.submit(order)
+    if accepted:
+        harness.client._consume_private_frame(harness.order_frame("on", cid, order))
+        assert order.status == OrderStatus.ACCEPTED
+    return order, cid
+
+
+@pytest.mark.parametrize("action", ["submit", "modify", "cancel"])
+@pytest.mark.parametrize("blocked_read", ["queued", "wallet", "positions"])
+def test_account_budget_query_crossing_order_action_discards_late_sample(
+    action: str, blocked_read: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        harness = await _budget_harness()
+        entered, release = asyncio.Event(), asyncio.Event()
+        order: Order | None = None
+        cid = 0
+        try:
+            if action != "submit":
+                order, cid = await _budget_order(harness)
+            await _query_account(harness)
+            before = deepcopy(_margin_info(harness))
+
+            async def wallets() -> object:
+                if blocked_read == "wallet":
+                    entered.set()
+                    await release.wait()
+                return [["margin", "USTF0", Decimal(777), Decimal(0), Decimal(700)]]
+
+            async def positions() -> object:
+                if blocked_read == "positions":
+                    entered.set()
+                    await release.wait()
+                return []
+
+            monkeypatch.setattr(harness.rest, "wallets", wallets)
+            monkeypatch.setattr(harness.rest, "positions", positions)
+            task = _query_account(harness)
+            if blocked_read != "queued":
+                await asyncio.wait_for(entered.wait(), timeout=1)
+            if action == "submit":
+                order, cid = await _budget_order(harness)
+            elif action == "modify":
+                assert order is not None
+                await harness.modify(order, price="3930.00")
+                harness.client._consume_private_frame(
+                    harness.order_frame("ou", cid, order, price="3930.00"),
+                )
+                assert order.price.as_decimal() == Decimal("3930.00")
+            else:
+                assert order is not None
+                await harness.cancel(order)
+                harness.client._consume_private_frame(
+                    harness.order_frame("oc", cid, order, status="CANCELED"),
+                )
+                assert order.status == OrderStatus.CANCELED
+            release.set()
+            await task
+            # The old REST read really completes AFTER the native acknowledgment.
+            assert _margin_info(harness) == before
+            assert not bool(harness.client.account_budget_ready)
+            assert bool(harness.client.account_budget_refresh_ready)
+            assert harness.client.execution_hold_reason is None
+            await _query_account(harness)
+            assert bool(harness.client.account_budget_ready)
+            assert _margin_info(harness)["wallet"]["balance"] == "777"
+        finally:
+            release.set()
+            await harness.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("action", ["submit", "modify", "cancel"])
+def test_account_budget_pending_query_is_readable_but_cannot_authorize_new_orders(
+    action: str,
+) -> None:
+    async def scenario() -> None:
+        harness = await _budget_harness()
+        try:
+            assert bool(harness.client.account_budget_ready)
+            order, cid = await _budget_order(harness, accepted=action != "submit")
+            if action == "modify":
+                await harness.modify(order, price="3930.00")
+            elif action == "cancel":
+                await harness.cancel(order)
+            before = deepcopy(_margin_info(harness))
+            assert not bool(harness.client.account_budget_ready)
+            assert not bool(harness.client.account_budget_refresh_ready)
+            await _query_account(harness)  # Manual native QueryAccount retains its read-only role.
+            assert _margin_info(harness)["positions"]["complete"] is True
+            assert not bool(harness.client.account_budget_ready)
+            assert before["wallet"]["current"] is True
+            if action == "cancel":
+                frame = harness.order_frame("oc", cid, order, status="CANCELED")
+            else:
+                frame = harness.order_frame(
+                    "on" if action == "submit" else "ou", cid, order,
+                    price="3930.00" if action == "modify" else None,
+                )
+            harness.client._consume_private_frame(frame)
+            harness.client._consume_private_frame([0, "ws", harness.rest.wallet_rows])
+            harness.client._consume_private_frame([0, "ps", []])
+            assert bool(harness.client.account_budget_refresh_ready)
+            # WS freshness is not a joint query.
+            assert not bool(harness.client.account_budget_ready)
+            await _query_account(harness)
+            assert bool(harness.client.account_budget_ready)
+        finally:
+            await harness.close()
+    asyncio.run(scenario())
+
+
+def test_account_budget_initial_native_order_blocks_until_processed_and_refreshed() -> None:
+    async def scenario() -> None:
+        harness = await _budget_harness()
+        try:
+            assert bool(harness.client.account_budget_ready)
+            order = harness.order()
+            harness.cache.add_order(order, client_id=harness.client.id)
+            assert not bool(harness.client.account_budget_refresh_ready)
+            assert not bool(harness.client.account_budget_ready)
+            await _query_account(harness)
+            assert not bool(harness.client.account_budget_ready)
+            cid = await harness.submit(order)
+            harness.client._consume_private_frame(harness.order_frame("on", cid, order))
+            assert not bool(harness.client.account_budget_ready)
+            await _query_account(harness)
+            assert bool(harness.client.account_budget_ready)
+        finally:
+            await harness.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("action", ["submit", "modify", "cancel"])
+def test_account_budget_query_started_pending_does_not_become_post_ack_sample(
+    action: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        harness = await _budget_harness()
+        entered, release = asyncio.Event(), asyncio.Event()
+        try:
+            order, cid = await _budget_order(harness, accepted=action != "submit")
+            if action == "modify":
+                await harness.modify(order, price="3930.00")
+            elif action == "cancel":
+                await harness.cancel(order)
+            before = deepcopy(_margin_info(harness))
+
+            async def wallets() -> object:
+                entered.set()
+                await release.wait()
+                return harness.rest.wallet_rows
+
+            monkeypatch.setattr(harness.rest, "wallets", wallets)
+            task = _query_account(harness)
+            await asyncio.wait_for(entered.wait(), timeout=1)
+            frame = harness.order_frame(
+                {"submit": "on", "modify": "ou", "cancel": "oc"}[action], cid, order,
+                status="CANCELED" if action == "cancel" else "ACTIVE",
+                price="3930.00" if action == "modify" else None,
+            )
+            harness.client._consume_private_frame(frame)
+            release.set()
+            await task
+            assert _margin_info(harness) == before
+            assert bool(harness.client.account_budget_refresh_ready)
+            assert not bool(harness.client.account_budget_ready)
+            await _query_account(harness)
+            assert bool(harness.client.account_budget_ready)
+        finally:
+            release.set()
+            await harness.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("ending", ["cancel", "disconnect", "timeout"])
+def test_account_budget_failed_post_action_refresh_cannot_restore_old_qualification(
+    ending: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        harness = await _budget_harness()
+        entered = asyncio.Event()
+        try:
+            await _budget_order(harness)
+            before = deepcopy(_margin_info(harness))
+            original = harness.rest.wallets
+
+            async def wallets() -> object:
+                entered.set()
+                if ending == "timeout":
+                    raise TimeoutError("offline REST timeout")
+                await asyncio.Future[None]()
+                return []
+
+            monkeypatch.setattr(harness.rest, "wallets", wallets)
+            task = _query_account(harness)
+            await asyncio.wait_for(entered.wait(), timeout=1)
+            if ending == "disconnect":
+                await harness.client._disconnect()
+            elif ending == "cancel":
+                task.cancel()
+            with pytest.raises(TimeoutError if ending == "timeout" else asyncio.CancelledError):
+                await task
+            assert not bool(harness.client.account_budget_ready)
+            assert harness.client._account_refresh_task is None
+            assert before["wallet"]["current"] is True
+            if ending != "disconnect":
+                assert _margin_info(harness) == before
+                assert harness.client.execution_hold_reason is None
+                monkeypatch.setattr(harness.rest, "wallets", original)
+                await _query_account(harness)
+                assert bool(harness.client.account_budget_ready)
+        finally:
+            await harness.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("action", ["submit", "modify", "cancel"])
+def test_account_budget_explicit_rejection_needs_new_query_without_changing_facts(
+    action: str,
+) -> None:
+    async def scenario() -> None:
+        harness = await _budget_harness()
+        try:
+            order, cid = await _budget_order(harness, accepted=action != "submit")
+            if action == "modify":
+                await harness.modify(order, price="3930.00")
+            elif action == "cancel":
+                await harness.cancel(order)
+            before = deepcopy(_margin_info(harness))
+            operation = {"submit": "on-req", "modify": "ou-req", "cancel": "oc-req"}[action]
+            harness.client._consume_private_frame(_notification(
+                operation, cid=cid, venue_order_id=None if action == "submit" else VENUE_ORDER_ID,
+            ))
+            assert _margin_info(harness) == before
+            assert not bool(harness.client.account_budget_ready)
+            assert bool(harness.client.account_budget_refresh_ready)
+            await _query_account(harness)
+            assert bool(harness.client.account_budget_ready)
+        finally:
+            await harness.close()
+    asyncio.run(scenario())
+
+
+def test_account_budget_repeated_unchanged_order_observations_do_not_dirty_query() -> None:
+    async def scenario() -> None:
+        harness = await _budget_harness()
+        try:
+            order, cid = await _budget_order(harness)
+            await _query_account(harness)
+            assert bool(harness.client.account_budget_ready)
+            frame = harness.order_frame("on", cid, order)
+            for _ in range(3):
+                harness.client._consume_private_frame(frame)
+                harness.client._consume_private_frame([0, "os", [frame[2]]])
+                assert bool(harness.client.account_budget_ready)
+            await harness.cancel(order)
+            terminal = harness.order_frame("oc", cid, order, status="CANCELED")
+            harness.client._consume_private_frame(terminal)
+            await _query_account(harness)
+            harness.client._consume_private_frame(terminal)
+            assert bool(harness.client.account_budget_ready)
+        finally:
+            await harness.close()
+    asyncio.run(scenario())
+
+
+def test_account_budget_reconnect_does_not_reuse_previous_run_action_query() -> None:
+    async def scenario() -> None:
+        harness = await _budget_harness()
+        try:
+            order, cid = await _budget_order(harness)
+            await harness.cancel(order)
+            harness.client._consume_private_frame(
+                harness.order_frame("oc", cid, order, status="CANCELED"),
+            )
+            await _query_account(harness)
+            assert bool(harness.client.account_budget_ready)
+            await harness.client._disconnect()
+            assert not bool(harness.client.account_budget_ready)
+            assert not bool(harness.client.account_budget_refresh_ready)
+            await harness.connect()
+            harness.client._set_connected(True)
+            harness.client._consume_private_frame([0, "ps", []])
+            assert bool(harness.client.account_budget_refresh_ready)
+            assert not bool(harness.client.account_budget_ready)
+            await _query_account(harness)
+            assert bool(harness.client.account_budget_ready)
+        finally:
+            await harness.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("positioned", [False, True])
+@pytest.mark.parametrize("available", [None, Decimal(600)])
+def test_query_account_native_entry_publishes_one_joint_sample_without_pushes(
+    positioned: bool, available: Decimal | None, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        harness = _Harness()
+        harness.msgbus.deregister("ExecEngine.process", harness.events.append)
+        engine = ExecutionEngine(msgbus=harness.msgbus, cache=harness.cache, clock=harness.clock)
+        engine.register_client(harness.client)
+        harness.cache.add_instrument(harness.instrument)
+        await harness.connect()
+        harness.client._set_connected(True)
+        entered, release = asyncio.Event(), asyncio.Event()
+        try:
+            before = _margin_info(harness)
+            before_events = len(harness.events)
+            harness.rest.wallet_rows = [["margin", "USTF0", Decimal(900), Decimal(0), available]]
+            position_read_start = 0
+
+            async def positions() -> object:
+                nonlocal position_read_start
+                harness.rest.position_calls += 1
+                position_read_start = harness.clock.timestamp_ns()
+                entered.set()
+                await release.wait()
+                return [_margin_position()] if positioned else []
+
+            monkeypatch.setattr(harness.rest, "positions", positions)
+            for index in range(10):
+                engine.execute(_account_command(
+                    harness, client=harness.client.id if index % 2 else None,
+                ))
+            task = harness.client._account_refresh_task
+            assert task is not None
+            await entered.wait()
+            assert harness.rest.wallet_calls == harness.rest.position_calls == 1
+            assert len(harness.events) == before_events
+            assert _margin_info(harness) == before
+            assert not task.done()
+            position_read_end = harness.clock.timestamp_ns()
+            release.set()
+            await task
+            after = _margin_info(harness)
+            assert len(harness.events) == before_events + 1
+            assert after["wallet"]["balance"] == "900"
+            assert after["wallet"]["available_balance"] == (
+                None if available is None else str(available)
+            )
+            assert after["wallet"]["current"] is True
+            assert after["wallet"]["observed_ns"] <= position_read_start
+            assert after["positions"]["observed_ns"] >= position_read_end
+            assert after["positions"]["complete"] is True
+            assert after["positions"]["current"] is True
+            assert (after["positions"]["position"] is not None) is positioned
+            assert before["positions"]["complete"] is False
+            account_event = harness.events[-1]
+            assert account_event.balances[0].free.as_decimal() == (available or Decimal(0))
+            assert harness.client._account_refresh_task is None
+            assert harness.client.execution_hold_reason is None
+        finally:
+            await harness.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("bad", ["account", "client", "running", "connected", "authenticated"])
+def test_query_account_wrong_identity_or_lifecycle_does_not_start_io(bad: str) -> None:
+    async def scenario() -> None:
+        harness = _Harness()
+        await harness.connect()
+        harness.client._set_connected(True)
+        try:
+            command = _account_command(harness)
+            if bad == "account":
+                command = _account_command(harness, account=AccountId("BITFINEX-OTHER"))
+            elif bad == "client":
+                command = _account_command(harness, client=ClientId("OTHER"))
+            elif bad == "running":
+                harness.client._running = False
+            elif bad == "connected":
+                harness.client._set_connected(False)
+            else:
+                harness.client._account_ready = False
+            before = len(harness.events)
+            harness.client.query_account(command)
+            await asyncio.sleep(0)
+            assert harness.client._account_refresh_task is None
+            assert harness.rest.wallet_calls == harness.rest.position_calls == 0
+            assert len(harness.events) == before
+        finally:
+            await harness.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("change", ["same_wallet", "position", "roundtrip"])
+def test_query_account_joint_sample_drops_any_observed_revision_change(
+    monkeypatch: pytest.MonkeyPatch, change: str,
+) -> None:
+    async def scenario() -> None:
+        harness = _Harness()
+        await harness.connect()
+        harness.client._set_connected(True)
+        entered, release = asyncio.Event(), asyncio.Event()
+        try:
+            harness.client._consume_private_frame([0, "ps", []])
+            harness.rest.wallet_rows = [["margin", "USTF0", Decimal(900), Decimal(0), Decimal(500)]]
+
+            async def positions() -> object:
+                entered.set()
+                await release.wait()
+                return []
+
+            monkeypatch.setattr(harness.rest, "positions", positions)
+            task = _query_account(harness)
+            await entered.wait()
+            if change == "same_wallet":
+                harness.client._consume_private_frame(
+                    [0, "wu", ["margin", "USTF0", Decimal(1000), Decimal(0), Decimal(800)]],
+                )
+            elif change == "position":
+                harness.client._consume_private_frame([0, "ps", [_margin_position()]])
+            else:
+                harness.client._consume_private_frame([0, "pn", _margin_position()])
+                closed = _margin_position(quantity="0", updated=102)
+                closed[1] = "CLOSED"
+                harness.client._consume_private_frame([0, "pc", closed])
+            fresh = _margin_info(harness)
+            count = len(harness.events)
+            release.set()
+            await task
+            assert _margin_info(harness) == fresh and len(harness.events) == count
+            assert harness.client._account_refresh_task is None
+        finally:
+            await harness.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "failure", ["missing_wallet", "duplicate_wallet", "bad_wallet", "position"],
+)
+def test_query_account_bad_candidate_has_no_half_install_and_explicit_retry_recovers(
+    failure: str,
+) -> None:
+    async def scenario() -> None:
+        harness = _Harness()
+        await harness.connect()
+        harness.client._set_connected(True)
+        try:
+            harness.client._consume_private_frame([0, "ps", [_margin_position()]])
+            before = _margin_info(harness)
+            wallet: list[object] = ["margin", "USTF0", Decimal(900), Decimal(0), Decimal(500)]
+            harness.rest.wallet_rows = [wallet]
+            if failure == "missing_wallet":
+                harness.rest.wallet_rows = []
+            elif failure == "duplicate_wallet":
+                harness.rest.wallet_rows.append(wallet.copy())
+            elif failure == "bad_wallet":
+                wallet[4] = True
+            else:
+                harness.rest.position_rows = [_margin_position(), _margin_position(pid=99)]
+            with pytest.raises((ValueError, BitfinexV1ExecutionError)):
+                await _query_account(harness)
+            after = _margin_info(harness)
+            assert after["wallet"]["balance"] == before["wallet"]["balance"]
+            assert after["wallet"]["observed_ns"] == before["wallet"]["observed_ns"]
+            assert after["positions"]["position"] == before["positions"]["position"]
+            assert after["positions"]["observed_ns"] == before["positions"]["observed_ns"]
+            if failure == "position":
+                assert after["positions"]["complete"] is False
+            else:
+                assert after["wallet"]["current"] is False
+            assert harness.client.execution_hold_reason is None
+            harness.rest.wallet_rows = [["margin", "USTF0", Decimal(900), Decimal(0), None]]
+            harness.rest.position_rows = [_margin_position(updated=103)]
+            await _query_account(harness)
+            assert _margin_info(harness)["wallet"]["balance"] == "900"
+            assert _margin_info(harness)["positions"]["current"] is True
+        finally:
+            await harness.close()
+    asyncio.run(scenario())
+
+
+def test_query_account_decimal_wallet_arithmetic_overflow_revokes_only_wallet() -> None:
+    async def scenario() -> None:
+        harness = _Harness()
+        await harness.connect()
+        harness.client._set_connected(True)
+        try:
+            harness.client._consume_private_frame([0, "ps", [_margin_position()]])
+            before = _margin_info(harness)
+            # This value is finite but balance - available overflows Decimal's
+            # exponent range, before any native Money range conversion occurs.
+            available = Decimal("1e1000000")
+            assert available.is_finite()
+            harness.rest.wallet_rows = [["margin", "USTF0", Decimal(900), Decimal(0), available]]
+            with pytest.raises(DecimalOverflow):
+                await _query_account(harness)
+            after = _margin_info(harness)
+            assert after["wallet"]["current"] is False
+            assert after["wallet"]["balance"] == before["wallet"]["balance"]
+            assert after["wallet"]["available_balance"] == before["wallet"]["available_balance"]
+            assert after["wallet"]["observed_ns"] == before["wallet"]["observed_ns"]
+            assert after["positions"] == before["positions"]
+            assert before["wallet"]["current"] is True
+            assert harness.rest.position_calls == 0
+            assert harness.client.execution_hold_reason is None
+            assert harness.client._account_refresh_task is None
+        finally:
+            await harness.close()
+    asyncio.run(scenario())
+
+
+def test_query_account_decimal_position_arithmetic_overflow_revokes_only_positions() -> None:
+    async def scenario() -> None:
+        harness = _Harness()
+        await harness.connect()
+        harness.client._set_connected(True)
+        try:
+            harness.client._consume_private_frame([0, "ps", [_margin_position()]])
+            before = _margin_info(harness)
+            harness.rest.wallet_rows = [["margin", "USTF0", Decimal(900), Decimal(0), Decimal(500)]]
+            # The report mapper's Decimal abs(amount) overflows before native
+            # quantity conversion; this is not a native Quantity range failure.
+            harness.rest.position_rows = [_margin_position(quantity="1e1000000")]
+            with pytest.raises(DecimalOverflow):
+                await _query_account(harness)
+            after = _margin_info(harness)
+            assert after["positions"]["complete"] is False
+            assert after["positions"]["current"] is False
+            assert after["positions"]["position"] == before["positions"]["position"]
+            assert after["positions"]["observed_ns"] == before["positions"]["observed_ns"]
+            assert after["wallet"] == before["wallet"]
+            assert before["positions"]["current"] is True
+            assert harness.client.execution_hold_reason is None
+            assert harness.client._account_refresh_task is None
+        finally:
+            await harness.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("stage", ["queued", "wallet", "position", "fatal"])
+def test_query_account_disconnect_owns_pending_task_and_cannot_cross_reconnect(
+    monkeypatch: pytest.MonkeyPatch, stage: str,
+) -> None:
+    async def scenario() -> None:
+        harness = _Harness()
+        await harness.connect()
+        harness.client._set_connected(True)
+        entered, canceled = asyncio.Event(), asyncio.Event()
+        try:
+            harness.rest.wallet_rows = [["margin", "USTF0", Decimal(900), Decimal(0), None]]
+
+            async def blocked() -> object:
+                entered.set()
+                try:
+                    await asyncio.Event().wait()
+                    return []
+                finally:
+                    canceled.set()
+
+            if stage in {"wallet", "fatal"}:
+                monkeypatch.setattr(harness.rest, "wallets", blocked)
+            elif stage == "position":
+                monkeypatch.setattr(harness.rest, "positions", blocked)
+            task = _query_account(harness)
+            if stage != "queued":
+                await entered.wait()
+            if stage == "fatal":
+                await harness.fake.queue.put([0, "invalid", []])
+                reader = harness.client._reader_task
+                assert reader is not None
+                await asyncio.wait_for(asyncio.shield(reader), 1)
+            else:
+                await harness.client._disconnect()
+            assert task.done() and task.cancelled()
+            assert harness.client._account_refresh_task is None
+            if stage == "queued":
+                assert harness.rest.wallet_calls == harness.rest.position_calls == 0
+            else:
+                assert canceled.is_set()
+            monkeypatch.undo()
+            await harness.connect()
+            harness.client._set_connected(True)
+            await _query_account(harness)
+            assert _margin_info(harness)["wallet"]["balance"] == "900"
+            assert _margin_info(harness)["positions"]["current"] is True
+        finally:
+            await harness.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("changed", ["wallet", "position", "connection"])
+def test_query_account_watermarks_are_captured_before_task_start(changed: str) -> None:
+    async def scenario() -> None:
+        harness = _Harness()
+        await harness.connect()
+        harness.client._set_connected(True)
+        try:
+            task = _query_account(harness)
+            # No event-loop turn has run the queued query yet.
+            if changed == "wallet":
+                harness.client._consume_private_frame(
+                    [0, "wu", ["margin", "USTF0", Decimal(1000), Decimal(0), Decimal(800)]],
+                )
+            elif changed == "position":
+                harness.client._consume_private_frame([0, "ps", []])
+            else:
+                harness.client._invalidate_margin_facts(connection_changed=True)
+            fresh = _margin_info(harness)
+            await task
+            assert harness.rest.wallet_calls == harness.rest.position_calls == 0
+            assert _margin_info(harness) == fresh
+            assert harness.client._account_refresh_task is None
+        finally:
+            await harness.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("failure", ["timeout", "cancel"])
+def test_query_account_total_budget_and_cancel_do_not_install_partial_samples(
+    monkeypatch: pytest.MonkeyPatch, failure: str,
+) -> None:
+    async def scenario() -> None:
+        harness = _Harness(rest_timeout_secs=1)
+        await harness.connect()
+        harness.client._set_connected(True)
+        entered = asyncio.Event()
+        try:
+            harness.client._consume_private_frame([0, "ps", []])
+            before = _margin_info(harness)
+            count = len(harness.events)
+            wallet = ["margin", "USTF0", Decimal(900), Decimal(0), Decimal(500)]
+
+            async def wallets() -> object:
+                await asyncio.sleep(0.55 if failure == "timeout" else 0)
+                return [wallet]
+
+            async def positions() -> object:
+                entered.set()
+                await asyncio.sleep(0.55 if failure == "timeout" else 10)
+                return []
+
+            monkeypatch.setattr(harness.rest, "wallets", wallets)
+            monkeypatch.setattr(harness.rest, "positions", positions)
+            started = asyncio.get_running_loop().time()
+            task = _query_account(harness)
+            await entered.wait()
+            if failure == "timeout":
+                with pytest.raises(TimeoutError):
+                    await task
+                assert asyncio.get_running_loop().time() - started < 1.5
+            else:
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            assert _margin_info(harness) == before and len(harness.events) == count
+            assert harness.client._account_refresh_task is None
+            assert harness.client.execution_hold_reason is None
+            monkeypatch.undo()
+            harness.rest.wallet_rows = [wallet]
+            await _query_account(harness)
+            assert _margin_info(harness)["wallet"]["balance"] == "900"
+            assert _margin_info(harness)["positions"]["current"] is True
+        finally:
+            await harness.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("roundtrip", [False, True])
+def test_query_account_native_fills_invalidate_even_if_net_quantity_returns_to_zero(
+    monkeypatch: pytest.MonkeyPatch, roundtrip: bool,
+) -> None:
+    async def scenario() -> None:
+        harness = _Harness()
+        harness.msgbus.deregister("ExecEngine.process", harness.events.append)
+        engine = ExecutionEngine(msgbus=harness.msgbus, cache=harness.cache, clock=harness.clock)
+        engine.register_client(harness.client)
+        harness.cache.add_instrument(harness.instrument)
+        harness.cache.add_account(TestExecStubs.margin_account(account_id=harness.client.account_id))
+        await harness.connect()
+        harness.client._set_connected(True)
+        entered, release = asyncio.Event(), asyncio.Event()
+        try:
+            harness.client._consume_private_frame([0, "ps", []])
+            harness.rest.wallet_rows = [["margin", "USTF0", Decimal(900), Decimal(0), Decimal(500)]]
+
+            async def positions() -> object:
+                entered.set()
+                await release.wait()
+                return []
+
+            monkeypatch.setattr(harness.rest, "positions", positions)
+            task = _query_account(harness)
+            await entered.wait()
+            for index, side in enumerate(
+                [OrderSide.BUY, OrderSide.SELL] if roundtrip else [OrderSide.BUY],
+            ):
+                order = harness.order(side=side, tif=TimeInForce.IOC, post_only=False, quantity="1")
+                harness.cache.add_order(order)
+                venue_id = VenueOrderId(str(VENUE_ORDER_ID + index))
+                engine.process(TestEventStubs.order_submitted(
+                    order, account_id=harness.client.account_id,
+                ))
+                engine.process(TestEventStubs.order_accepted(
+                    order, account_id=harness.client.account_id, venue_order_id=venue_id,
+                ))
+                engine.process(TestEventStubs.order_filled(
+                    order=order, instrument=harness.instrument,
+                    account_id=harness.client.account_id, venue_order_id=venue_id,
+                    trade_id=TradeId(str(1234 + index)), commission=Money(0, USD),
+                    last_qty=harness.instrument.make_qty(Decimal(1)),
+                    last_px=harness.instrument.make_price(Decimal("3926.70")),
+                    ts_event=harness.clock.timestamp_ns(),
+                ))
+                assert order.filled_qty.as_decimal() == 1
+            net = sum(
+                (position.signed_decimal_qty() for position in harness.cache.positions_open()),
+                Decimal(0),
+            )
+            assert net == (0 if roundtrip else 1)
+            invalid = _margin_info(harness)
+            assert invalid["wallet"]["current"] is False
+            assert invalid["positions"]["current"] is False
+            count = len(harness.events)
+            release.set()
+            await task
+            assert _margin_info(harness) == invalid and len(harness.events) == count
+            assert harness.client.execution_hold_reason is None
+        finally:
+            await harness.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("stage", ["wallet", "position"])
+def test_query_account_late_bad_reply_cannot_revoke_a_newer_complete_sample(
+    monkeypatch: pytest.MonkeyPatch, stage: str,
+) -> None:
+    async def scenario() -> None:
+        harness = _Harness()
+        await harness.connect()
+        harness.client._set_connected(True)
+        entered, release = asyncio.Event(), asyncio.Event()
+        try:
+            harness.rest.wallet_rows = [["margin", "USTF0", Decimal(900), Decimal(0), None]]
+
+            async def delayed_bad_reply() -> object:
+                entered.set()
+                await release.wait()
+                return "not a snapshot"
+
+            monkeypatch.setattr(
+                harness.rest, "wallets" if stage == "wallet" else "positions", delayed_bad_reply,
+            )
+            task = _query_account(harness)
+            await entered.wait()
+            harness.client._consume_private_frame([0, "ps", [_margin_position(updated=103)]])
+            harness.client._consume_private_frame(
+                [0, "wu", ["margin", "USTF0", Decimal(1100), Decimal(0), Decimal(900)]],
+            )
+            fresh = _margin_info(harness)
+            count = len(harness.events)
+            release.set()
+            await task
+            assert _margin_info(harness) == fresh and len(harness.events) == count
+            assert fresh["wallet"]["current"] is True
+            assert fresh["positions"]["complete"] is True
+            assert fresh["positions"]["current"] is True
+        finally:
+            await harness.close()
+    asyncio.run(scenario())
+
+
+def test_margin_facts_distinguish_absence_flat_and_independent_observations() -> None:
+    async def scenario() -> None:
+        harness = _Harness()
+        await harness.connect(available=None)
+        try:
+            first = _margin_info(harness)
+            assert first["wallet"]["available_balance"] is None
+            assert first["wallet"]["current"] is True
+            assert first["positions"] == {
+                "complete": False, "current": False, "observed_ns": None, "position": None,
+            }
+            before_snapshot = harness.clock.timestamp_ns()
+            harness.client._consume_private_frame([0, "ps", []])
+            flat = _margin_info(harness)
+            assert flat["wallet"] == first["wallet"]
+            assert flat["positions"]["complete"] is True
+            assert flat["positions"]["current"] is True
+            assert flat["positions"]["position"] is None
+            assert before_snapshot <= flat["positions"]["observed_ns"]
+            assert flat["positions"]["observed_ns"] <= harness.clock.timestamp_ns()
+            harness.client._consume_private_frame([0, "pn", _margin_position()])
+            positioned = _margin_info(harness)
+            assert positioned["positions"]["position"]["quantity"] == "-0.75"
+            assert positioned["positions"]["position"]["collateral"] == "150.125"
+            assert positioned["positions"]["position"]["venue_update_ms"] == 100
+            before_wallet = harness.clock.timestamp_ns()
+            harness.client._consume_private_frame(
+                [0, "wu", ["margin", "USTF0", Decimal(900), Decimal(0), Decimal(600)]],
+            )
+            assert _margin_info(harness)["positions"] == positioned["positions"]
+            assert before_wallet <= _margin_info(harness)["wallet"]["observed_ns"]
+            # AccountState.info is not copied by Nautilus: old nested values must survive.
+            assert first["positions"]["complete"] is False
+            assert flat["positions"]["position"] is None
+            assert positioned["wallet"] == first["wallet"]
+        finally:
+            await harness.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("message_type", ["pn", "pu"])
+def test_margin_increment_without_full_snapshot_never_certifies_positions(
+    message_type: str,
+) -> None:
+    async def scenario() -> None:
+        harness = _Harness()
+        await harness.connect()
+        try:
+            harness.client._consume_private_frame([0, message_type, _margin_position()])
+            info = _margin_info(harness)["positions"]
+            assert info["complete"] is False and info["current"] is False
+            harness.client._consume_private_frame([0, "ps", [_margin_position()]])
+            assert _margin_info(harness)["positions"]["current"] is True
+        finally:
+            await harness.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "bad", ["old_time", "same_time_conflict", "wrong_id", "wrong_close", "duplicate"],
+)
+def test_margin_ambiguous_position_preserves_last_good_without_claiming_current(bad: str) -> None:
+    async def scenario() -> None:
+        harness = _Harness()
+        await harness.connect()
+        try:
+            good = _margin_position()
+            harness.client._consume_private_frame([0, "ps", [good]])
+            before = _margin_info(harness)["positions"]
+            row = _margin_position(quantity="-1", updated=101)
+            message_type = "pu"
+            if bad == "old_time":
+                row[13] = 99
+            elif bad == "same_time_conflict":
+                row[13] = 100
+            elif bad == "wrong_id":
+                row[11] = 99
+            elif bad == "wrong_close":
+                message_type = "pc"
+            frame: list[object] = [0, message_type, row]
+            if bad == "duplicate":
+                frame = [0, "ps", [good, row]]
+            harness.client._consume_private_frame(frame)
+            after = _margin_info(harness)["positions"]
+            assert after["position"] == before["position"]
+            assert after["observed_ns"] == before["observed_ns"]
+            assert after["current"] is False
+            assert harness.client.execution_hold_reason is None
+            harness.client._consume_private_frame([0, "ps", [_margin_position(updated=102)]])
+            assert _margin_info(harness)["positions"]["current"] is True
+        finally:
+            await harness.close()
+    asyncio.run(scenario())
+
+
+def test_margin_exact_close_does_not_allow_late_old_position_to_reappear() -> None:
+    async def scenario() -> None:
+        harness = _Harness()
+        await harness.connect()
+        try:
+            harness.client._consume_private_frame([0, "ps", [_margin_position()]])
+            closed = _margin_position(quantity="0", updated=101)
+            closed[1] = "CLOSED"
+            harness.client._consume_private_frame([0, "pc", closed])
+            flat = _margin_info(harness)["positions"]
+            assert flat["position"] is None and flat["current"] is True
+            harness.client._consume_private_frame([0, "pn", _margin_position()])
+            assert _margin_info(harness)["positions"]["position"] is None
+            assert _margin_info(harness)["positions"]["current"] is False
+            harness.client._consume_private_frame([0, "ps", []])
+            assert _margin_info(harness)["positions"]["current"] is True
+        finally:
+            await harness.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("race", ["position", "wallet", "disconnect", "cancel", "timeout", "none"])
+def test_margin_rest_observation_cannot_overwrite_newer_stream_or_connection(
+    monkeypatch: pytest.MonkeyPatch, race: str,
+) -> None:
+    async def scenario() -> None:
+        harness = _Harness()
+        await harness.connect()
+        entered, release = asyncio.Event(), asyncio.Event()
+        try:
+            harness.client._consume_private_frame([0, "ps", [_margin_position()]])
+            before = _margin_info(harness)["positions"]
+
+            async def positions() -> object:
+                entered.set()
+                await release.wait()
+                if race == "timeout":
+                    raise TimeoutError("synthetic positions timeout")
+                return []
+
+            monkeypatch.setattr(harness.rest, "positions", positions)
+            task = asyncio.create_task(harness.client.generate_position_status_reports(
+                _position_command(harness),
+            ))
+            await entered.wait()
+            before_release = harness.clock.timestamp_ns()
+            if race == "position":
+                harness.client._consume_private_frame([0, "pu", _margin_position(updated=102)])
+            elif race == "wallet":
+                harness.client._consume_private_frame(
+                    [0, "wu", ["margin", "USTF0", Decimal(900), Decimal(0), Decimal(600)]],
+                )
+            elif race == "disconnect":
+                await harness.client._disconnect()
+            elif race == "cancel":
+                task.cancel()
+            latest = _margin_info(harness)
+            release.set()
+            if race == "cancel":
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            elif race == "timeout":
+                with pytest.raises(TimeoutError, match="synthetic positions timeout"):
+                    await task
+            else:
+                reports = await task
+                assert len(reports) == 1 and reports[0].signed_decimal_qty == 0
+            after = _margin_info(harness)
+            if race in {"none", "wallet"}:
+                assert after["positions"]["position"] is None
+                assert after["positions"]["current"] is True
+                assert before_release <= after["positions"]["observed_ns"]
+                assert after["wallet"] == latest["wallet"]
+            else:
+                assert after == latest
+                if race == "position":
+                    assert after["positions"]["position"]["venue_update_ms"] == 102
+                else:
+                    assert after["positions"]["position"] == before["position"]
+            if race == "disconnect":
+                assert after["wallet"]["current"] is False
+                assert after["positions"]["current"] is False
+        finally:
+            await harness.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("bound", [False, True], ids=["no-fee-binding", "owned"])
+def test_margin_applied_native_fill_invalidates_once_even_during_rest_without_fee_binding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, bound: bool,
+) -> None:
+    async def scenario() -> None:
+        harness = _Harness()
+        harness.msgbus.deregister("ExecEngine.process", harness.events.append)
+        engine = ExecutionEngine(msgbus=harness.msgbus, cache=harness.cache, clock=harness.clock)
+        engine.register_client(harness.client)
+        harness.cache.add_instrument(harness.instrument)
+        harness.cache.add_account(TestExecStubs.margin_account(account_id=harness.client.account_id))
+        store = JsonStateStore(tmp_path / "margin-hedges.json")
+        hedges = HedgeCoordinator(SOURCE_ID, store)
+        await harness.connect()
+        try:
+            order = harness.order(tif=TimeInForce.IOC, post_only=False, quantity="2")
+            harness.cache.add_order(order)
+            store.begin_source(order.client_order_id.value, BusinessOrderSide.BUY, Decimal(2))
+
+            def on_order(event: OrderEvent) -> None:
+                if isinstance(event, OrderFilled):
+                    hedges.on_source_filled(event)
+
+            harness.msgbus.subscribe(f"events.order.{order.strategy_id}", on_order)
+            if bound:
+                cid = await harness.submit(order)
+                harness.client._consume_private_frame(harness.order_frame("on", cid, order))
+            else:
+                engine.process(TestEventStubs.order_submitted(
+                    order, account_id=harness.client.account_id,
+                ))
+                engine.process(TestEventStubs.order_accepted(
+                    order, account_id=harness.client.account_id,
+                    venue_order_id=VenueOrderId(str(VENUE_ORDER_ID)),
+                ))
+            assert (harness.client._cid_store.binding_for_client(
+                order.client_order_id.value,
+            ) is not None) is bound
+
+            # Bad optional data is delivered by the real reader, not only a codec call.
+            row = _margin_position()
+            row[17:19] = ["bad collateral", Decimal("NaN")]
+            await harness.fake.queue.put([0, "ps", [row]])
+            await asyncio.sleep(0)
+            before = _margin_info(harness)
+            assert before["positions"]["position"]["collateral"] is None
+            assert before["positions"]["position"]["collateral_min"] is None
+            assert before["positions"]["current"] is True
+
+            entered, release = asyncio.Event(), asyncio.Event()
+
+            async def positions() -> object:
+                entered.set()
+                await release.wait()
+                return []
+
+            monkeypatch.setattr(harness.rest, "positions", positions)
+            task = asyncio.create_task(harness.client.generate_position_status_reports(
+                _position_command(harness),
+            ))
+            await entered.wait()
+            fill = TestEventStubs.order_filled(
+                order=order, instrument=harness.instrument,
+                account_id=harness.client.account_id,
+                venue_order_id=VenueOrderId(str(VENUE_ORDER_ID)), trade_id=TradeId("1234"),
+                last_qty=harness.instrument.make_qty(Decimal(2)),
+                last_px=harness.instrument.make_price(Decimal("3926.70")),
+                commission=Money(0, USD), ts_event=harness.clock.timestamp_ns(),
+            )
+            # Merely calling the observer without cache application is not a mutation.
+            if not bound:
+                harness.client._capture_native_fee_evidence(fill)
+                assert _margin_info(harness) == before
+            engine.process(fill)
+            after = _margin_info(harness)
+            assert after["wallet"]["current"] is False
+            assert after["positions"]["current"] is False
+            assert after["wallet"]["observed_ns"] == before["wallet"]["observed_ns"]
+            assert after["positions"]["observed_ns"] == before["positions"]["observed_ns"]
+            assert before["wallet"]["current"] is True
+            assert len(store.intents()) == 1 and order.filled_qty.as_decimal() == 2
+            release.set()
+            assert (await task)[0].signed_decimal_qty == 0
+            assert _margin_info(harness) == after
+
+            harness.client._consume_private_frame([0, "ps", [_margin_position(updated=102)]])
+            harness.client._consume_private_frame(
+                [0, "wu", ["margin", "USTF0", Decimal(900), Decimal(0), Decimal(600)]],
+            )
+            refreshed = _margin_info(harness)
+            # Fee reconciliation also scans pre-existing cache events; it is not
+            # a new Engine publication, even without an in-process seen marker.
+            harness.client._margin_seen_fills.clear()
+            harness.client._capture_native_fee_evidence(fill)
+            harness.client._capture_native_fee_evidence(fill)
+            assert _margin_info(harness) == refreshed
+            assert refreshed["wallet"]["current"] is True
+            assert refreshed["positions"]["current"] is True
+            assert len(store.intents()) == 1
+            assert harness.client._reader_task is not None
+            assert not harness.client._reader_task.done()
+            assert harness.client.execution_hold_reason is None
+        finally:
+            await harness.close()
+    asyncio.run(scenario())
+
+
+def test_margin_rest_after_disconnect_cannot_restore_current_connection() -> None:
+    async def scenario() -> None:
+        harness = _Harness()
+        await harness.connect()
+        try:
+            harness.client._consume_private_frame([0, "ps", [_margin_position()]])
+            await harness.client._disconnect()
+            before = _margin_info(harness)
+            reports = await harness.client.generate_position_status_reports(
+                _position_command(harness),
+            )
+            assert reports[0].signed_decimal_qty == 0
+            assert _margin_info(harness) == before
+            await harness.connect()
+            harness.client._consume_private_frame([0, "pu", _margin_position(updated=102)])
+            assert _margin_info(harness)["positions"]["complete"] is False
+            harness.client._consume_private_frame([0, "ps", []])
+            assert _margin_info(harness)["positions"]["current"] is True
+        finally:
+            await harness.close()
+    asyncio.run(scenario())
+
+
+def test_margin_rest_enrichment_failure_keeps_existing_report_result_and_last_good() -> None:
+    async def scenario() -> None:
+        harness = _Harness()
+        await harness.connect()
+        try:
+            harness.client._consume_private_frame([0, "ps", [_margin_position()]])
+            before = _margin_info(harness)
+            # The existing position report does not consume funding/PL metadata.
+            row = _margin_position(updated=102)
+            row[6] = "bad auxiliary PL"
+            harness.rest.position_rows = [row]
+            reports = await harness.client.generate_position_status_reports(
+                _position_command(harness),
+            )
+            assert reports[0].signed_decimal_qty == Decimal("-0.75")
+            after = _margin_info(harness)
+            assert after["wallet"] == before["wallet"]
+            assert after["positions"]["position"] == before["positions"]["position"]
+            assert after["positions"]["observed_ns"] == before["positions"]["observed_ns"]
+            assert after["positions"]["current"] is False
+            assert harness.client.execution_hold_reason is None
+        finally:
+            await harness.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "failure", [
+        "ps_ambiguous", "rest_parse", "rest_report", "wrong_id", "pn_wrong_id", "time_conflict",
+    ],
+)
+@pytest.mark.parametrize("delta", ["pc", "pu", "pn"])
+def test_margin_rejected_projection_needs_full_sample_before_any_delta_can_recover(
+    failure: str, delta: str,
+) -> None:
+    async def scenario() -> None:
+        harness = _Harness()
+        await harness.connect()
+        try:
+            good = _margin_position()
+            harness.client._consume_private_frame([0, "ps", [good]])
+            before = _margin_info(harness)
+            if failure == "ps_ambiguous":
+                harness.client._consume_private_frame([0, "ps", [
+                    _margin_position(updated=101), _margin_position(pid=99, updated=101),
+                ]])
+            elif failure == "rest_parse":
+                invalid = _margin_position(updated=101)
+                invalid[6] = "bad auxiliary PL"
+                harness.rest.position_rows = [invalid]
+                reports = await harness.client.generate_position_status_reports(
+                    _position_command(harness),
+                )
+                assert reports[0].signed_decimal_qty == Decimal("-0.75")
+            elif failure == "rest_report":
+                harness.rest.position_rows = [
+                    _margin_position(updated=101), _margin_position(pid=99, updated=101),
+                ]
+                with pytest.raises(BitfinexV1ReportError, match="one NETTING position"):
+                    await harness.client.generate_position_status_reports(
+                        _position_command(harness),
+                    )
+            elif failure in {"wrong_id", "pn_wrong_id"}:
+                message_type = "pn" if failure == "pn_wrong_id" else "pu"
+                harness.client._consume_private_frame([0, message_type, _margin_position(
+                    pid=99, updated=101,
+                )])
+            else:
+                harness.client._consume_private_frame([0, "pu", _margin_position(quantity="-1")])
+            assert _margin_info(harness)["positions"]["current"] is False
+
+            # Each delta would be valid against the old single position, but none
+            # can exclude the missing/conflicting facts from the rejected sample.
+            update = _margin_position(updated=102)
+            if delta == "pc":
+                update[1:3] = ["CLOSED", Decimal(0)]
+            elif delta == "pn":
+                update = good
+            harness.client._consume_private_frame([0, delta, update])
+            after = _margin_info(harness)
+            assert after["positions"]["complete"] is False
+            assert after["positions"]["current"] is False
+            assert after["positions"]["position"] == before["positions"]["position"]
+            assert after["positions"]["observed_ns"] == before["positions"]["observed_ns"]
+            assert after["wallet"] == before["wallet"]
+
+            recovered = _margin_position(updated=103)
+            if failure == "ps_ambiguous":
+                harness.rest.position_rows = [recovered]
+                await harness.client.generate_position_status_reports(_position_command(harness))
+            else:
+                harness.client._consume_private_frame([0, "ps", [recovered]])
+            assert _margin_info(harness)["positions"]["complete"] is True
+            assert _margin_info(harness)["positions"]["current"] is True
+            closed = _margin_position(quantity="0", updated=104)
+            closed[1] = "CLOSED"
+            harness.client._consume_private_frame([0, "pc", closed])
+            assert _margin_info(harness)["positions"]["current"] is True
+            assert _margin_info(harness)["positions"]["position"] is None
+            assert harness.client.execution_hold_reason is None
+        finally:
+            await harness.close()
+    asyncio.run(scenario())
+
+
+def test_margin_late_rejected_rest_report_cannot_revoke_new_full_stream_sample(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        harness = _Harness()
+        await harness.connect()
+        entered, release = asyncio.Event(), asyncio.Event()
+        try:
+            harness.client._consume_private_frame([0, "ps", [_margin_position()]])
+
+            async def positions() -> object:
+                entered.set()
+                await release.wait()
+                return [_margin_position(updated=101), _margin_position(pid=99, updated=101)]
+
+            monkeypatch.setattr(harness.rest, "positions", positions)
+            task = asyncio.create_task(harness.client.generate_position_status_reports(
+                _position_command(harness),
+            ))
+            await entered.wait()
+            harness.client._consume_private_frame([0, "ps", [_margin_position(updated=103)]])
+            fresh = _margin_info(harness)
+            assert fresh["positions"]["complete"] is True
+            assert fresh["positions"]["current"] is True
+            release.set()
+            with pytest.raises(BitfinexV1ReportError, match="one NETTING position"):
+                await task
+            assert _margin_info(harness) == fresh
+        finally:
+            await harness.close()
+    asyncio.run(scenario())
 
 
 def test_connect_authenticates_and_uses_zero_free_when_wallet_available_is_unknown() -> None:
@@ -1897,6 +3187,12 @@ def test_wrong_submit_ack_price_fails_before_acceptance() -> None:
         ("-0.10", 1, Decimal("0.10"), LiquiditySide.MAKER),
         ("0.03", -1, Decimal("-0.03"), LiquiditySide.TAKER),
         ("0", -1, Decimal("0"), LiquiditySide.TAKER),
+        ("-0.061668", -1, Decimal("0.06"), LiquiditySide.TAKER),
+        ("-0.001", -1, Decimal("0.00"), LiquiditySide.TAKER),
+        ("-0.005", -1, Decimal("0.00"), LiquiditySide.TAKER),
+        ("0.005", 1, Decimal("0.00"), LiquiditySide.MAKER),
+        ("-0.015", -1, Decimal("0.02"), LiquiditySide.TAKER),
+        ("0.015", 1, Decimal("-0.02"), LiquiditySide.MAKER),
     ],
 )
 def test_production_tu_is_single_fill_authority_with_real_fee_liquidity_and_dedupe(
@@ -1984,9 +3280,28 @@ def test_tu_requires_usd_fee_currency_independently_of_wallet(
     asyncio.run(scenario())
 
 
-def test_tu_rejects_usd_fee_precision_loss_before_fill() -> None:
+@pytest.mark.parametrize("fail_first_conversion", [False, True])
+def test_subcent_tu_reaches_real_engine_and_reserves_one_hedge(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fail_first_conversion: bool,
+) -> None:
     async def scenario() -> None:
         harness = _Harness()
+        harness.msgbus.deregister("ExecEngine.process", harness.events.append)
+        engine = ExecutionEngine(
+            msgbus=harness.msgbus, cache=harness.cache, clock=harness.clock,
+        )
+        engine.register_client(harness.client)
+        harness.cache.add_instrument(harness.instrument)
+        harness.cache.add_account(TestExecStubs.margin_account(account_id=harness.client.account_id))
+        store = JsonStateStore(tmp_path / "hedges.json")
+        hedges = HedgeCoordinator(SOURCE_ID, store)
+
+        def on_order(event: OrderEvent) -> None:
+            if isinstance(event, OrderFilled):
+                hedges.on_source_filled(event)
+
         await harness.connect()
         try:
             order = harness.order(
@@ -1994,24 +3309,61 @@ def test_tu_rejects_usd_fee_precision_loss_before_fill() -> None:
                 post_only=False,
                 quantity="2",
             )
+            harness.cache.add_order(order)
+            store.begin_source(order.client_order_id.value, BusinessOrderSide.BUY, Decimal(2))
+            harness.msgbus.subscribe(f"events.order.{order.strategy_id}", on_order)
             cid = await harness.submit(order)
+            trade = harness.trade_frame(cid, order, quantity="2", fee="-0.061668", maker=-1)
             harness.client._consume_private_frame(harness.order_frame("on", cid, order))
-            event_count = len(harness.events)
+            if fail_first_conversion:
+                def fail_conversion(fee: Decimal) -> Money:
+                    raise ValueError("synthetic fee conversion failure")
 
-            with pytest.raises(BitfinexV1ExecutionError, match="fee loses USD precision"):
-                harness.client._consume_private_frame(
-                    harness.trade_frame(
-                        cid,
-                        order,
-                        quantity="2",
-                        fee="-0.001",
-                        maker=-1,
-                    )
-                )
-            assert len(harness.events) == event_count
-            assert 1234 not in harness.client._seen_trades
+                with monkeypatch.context() as patch:
+                    patch.setattr(execution_module, "usd_commission", fail_conversion)
+                    with pytest.raises(ValueError, match="synthetic fee conversion failure"):
+                        harness.client._consume_private_frame(trade)
+                assert harness.client._by_cid[cid].filled_qty == Decimal(0)
+                assert 1234 not in harness.client._seen_trades
+                assert 1234 not in harness.client._paper_interim_fills
+                assert order.status == OrderStatus.ACCEPTED
+                assert order.filled_qty.as_decimal() == Decimal(0)
+                assert not any(isinstance(event, OrderFilled) for event in order.events)
+                assert not harness.cache.positions_open()
+                assert not store.intents()
+
+            await harness.fake.queue.put(trade)
+            await harness.fake.queue.put(trade)
+            await asyncio.sleep(0)
+
+            assert harness.client.execution_hold_reason is None
+            assert order.status == OrderStatus.FILLED
+            assert order.filled_qty.as_decimal() == Decimal(2)
+            fills = [event for event in order.events if isinstance(event, OrderFilled)]
+            assert len(fills) == 1
+            assert fills[0].commission.as_decimal() == Decimal("0.06")
+            assert fills[0].info["bitfinex_fee"] == "-0.061668"
+            assert len(harness.cache.positions_open()) == 1
+            position = harness.cache.positions_open()[0]
+            assert position.signed_decimal_qty() == Decimal(2)
+            assert position.settlement_currency.code == "USDT"
+            assert position.commissions() == [Money.from_decimal(Decimal("0.06"), USD)]
+            # Nautilus keeps the USD cost; it does not invent a USD/USDT conversion.
+            assert position.realized_pnl is not None
+            assert position.realized_pnl.currency.code == "USDT"
+            assert position.realized_pnl.as_decimal() == Decimal(0)
+            assert len(store.intents()) == 1
+            assert store.intents()[0].hedge_quantity_ounces == Decimal(2)
+            assert store.intents()[0].source_trade_id == "1234"
+
+            changed_fee = cast(list[object], trade[2]).copy()
+            changed_fee[9] = Decimal("-0.061669")  # Same booked cents, different venue fact.
+            with pytest.raises(BitfinexV1ExecutionError, match="trade ID changed"):
+                harness.client._consume_private_frame([0, "tu", changed_fee])
+            assert len(store.intents()) == 1
         finally:
             await harness.close()
+            engine.dispose()
 
     asyncio.run(scenario())
 
@@ -2062,6 +3414,328 @@ def test_paper_tu_then_te_matches_full_execution_or_fails_closed() -> None:
             )
         finally:
             await harness.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("fee_write_fails", [False, True])
+@pytest.mark.parametrize("final_source", ["tu", "rest"])
+def test_paper_fee_metadata_waits_for_native_cache_and_never_blocks_deferred_hedge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fee_write_fails: bool, final_source: str,
+) -> None:
+    async def scenario() -> None:
+        path = tmp_path / "cids.json"
+        harness = _Harness(
+            cid_store_path=path, raw_symbol=PAPER_RAW_SYMBOL, wallet_currency="TESTUSDTF0",
+        )
+        harness.msgbus.deregister("ExecEngine.process", harness.events.append)
+        engine = LiveExecutionEngine(
+            loop=asyncio.get_running_loop(), msgbus=harness.msgbus,
+            cache=harness.cache, clock=harness.clock,
+            config=LiveExecEngineConfig(
+                load_cache=False, reconciliation=False, inflight_check_interval_ms=0,
+                open_check_interval_secs=None, position_check_interval_secs=None,
+            ),
+        )
+        engine.register_client(harness.client)
+        harness.cache.add_instrument(harness.instrument)
+        harness.cache.add_account(TestExecStubs.margin_account(account_id=harness.client.account_id))
+        obligations = JsonStateStore(tmp_path / "hedges.json")
+        hedges = HedgeCoordinator(SOURCE_ID, obligations)
+
+        def on_fill(event: OrderEvent) -> None:
+            if isinstance(event, OrderFilled):
+                hedges.on_source_filled(event)
+
+        await harness.connect()
+        engine.start()
+        try:
+            order = harness.order(tif=TimeInForce.IOC, post_only=False, quantity="4")
+            harness.cache.add_order(order)
+            obligations.begin_source(order.client_order_id.value, BusinessOrderSide.BUY, Decimal(4))
+            harness.msgbus.subscribe(f"events.order.{order.strategy_id}", on_fill)
+            cid = await harness.submit(order)
+            final = harness.trade_frame(cid, order, quantity="2", fee="-0.061668", maker=-1)
+            cast(list[object], final[2])[2] = harness.clock.timestamp_ns() // 1_000_000
+            interim = cast(list[object], final[2]).copy()
+            interim[9:11] = [None, None]
+            harness.client._consume_private_frame(harness.order_frame("on", cid, order))
+
+            with monkeypatch.context() as patch:
+                if fee_write_fails:
+                    def fail_write(*args: object) -> None:
+                        raise OSError("synthetic fee metadata failure")
+                    patch.setattr(harness.client._cid_store, "_persist", fail_write)
+                harness.client._consume_private_frame([0, "te", interim])
+                metadata = harness.client._cid_store.fee_metadata_for_cid(cid)
+                assert metadata is not None
+                assert metadata.native_fills == ()  # Enqueued is not booked.
+                assert metadata.venue_trades[0].fee_finality == "pending"
+                await harness.fake.queue.put([0, "te", interim])
+                for _ in range(20):
+                    await asyncio.sleep(0)
+                assert harness.client.execution_hold_reason is None
+                assert order.status == OrderStatus.PARTIALLY_FILLED
+                assert len([e for e in order.events if isinstance(e, OrderFilled)]) == 1
+                assert len(obligations.intents()) == 1
+                assert len(JsonStateStore(tmp_path / "hedges.json").intents()) == 1
+                assert harness.client.accounting_incomplete == fee_write_fails
+
+            if final_source == "tu":
+                await harness.fake.queue.put(final)
+                await harness.fake.queue.put(final)
+            else:
+                harness.rest.trades = [final[2], final[2]]
+                await harness.client.generate_fill_reports(GenerateFillReports(
+                    instrument_id=SOURCE_ID, venue_order_id=None, start=None, end=None,
+                    command_id=UUID4(), ts_init=0,
+                ))
+            for _ in range(20):
+                await asyncio.sleep(0)
+            assert not harness.client.accounting_incomplete
+            restored = BitfinexV1CidStore(path, account_id=harness.client.account_id.value)
+            metadata = restored.fee_metadata_for_cid(cid)
+            assert metadata is not None
+            assert len(metadata.native_fills) == len(metadata.venue_trades) == 1
+            assert metadata.native_fills[0].native_fill_origin == "te_paper"
+            assert metadata.native_fills[0].commission == Decimal(0)
+            assert metadata.venue_trades[0].raw_fee == Decimal("-0.061668")
+            summary = harness.client.fee_summary(order.client_order_id)
+            assert summary.complete
+            assert summary.currencies["USD"].provisional_correction == Decimal("0.06")
+            assert len(obligations.intents()) == 1
+            changed_fee = cast(list[object], final[2]).copy()
+            changed_fee[9] = Decimal("-0.061669")
+            second_interim = interim.copy()
+            second_interim[0] = 1235
+            with monkeypatch.context() as patch:
+                if fee_write_fails:
+                    patch.setattr(harness.client._cid_store, "_persist", fail_write)
+                await harness.fake.queue.put([0, "tu", changed_fee])
+                await harness.fake.queue.put([0, "te", second_interim])
+                for _ in range(20):
+                    await asyncio.sleep(0)
+                assert harness.client._cid_store.accounting_conflict
+                assert harness.client._cid_store.fees_durable != fee_write_fails
+                assert not harness.client.accounting_ready
+                assert harness.client.execution_hold_reason is None
+                assert order.status == OrderStatus.FILLED
+                assert len([e for e in order.events if isinstance(e, OrderFilled)]) == 2
+                assert len(JsonStateStore(tmp_path / "hedges.json").intents()) == 2
+            await harness.fake.queue.put(final)  # Ordinary replay retries dirty persistence only.
+            for _ in range(20):
+                await asyncio.sleep(0)
+            assert harness.client._cid_store.fees_durable
+            assert not harness.client.accounting_ready
+            assert BitfinexV1CidStore(
+                path, account_id=harness.client.account_id.value,
+            ).accounting_conflict
+        finally:
+            engine.stop()
+            await asyncio.sleep(0)
+            await harness.close()
+            engine.dispose()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("conflict_source", ["final_fee", "native_publication"])
+def test_accounting_conflict_survives_new_client_empty_history_and_old_value_replay(
+    tmp_path: Path, conflict_source: str,
+) -> None:
+    async def scenario() -> None:
+        path = tmp_path / "cids.json"
+        first = _Harness(
+            cid_store_path=path, raw_symbol=PAPER_RAW_SYMBOL, wallet_currency="TESTUSDTF0",
+        )
+        first.msgbus.deregister("ExecEngine.process", first.events.append)
+        engine = ExecutionEngine(msgbus=first.msgbus, cache=first.cache, clock=first.clock)
+        engine.register_client(first.client)
+        first.cache.add_instrument(first.instrument)
+        first.cache.add_account(TestExecStubs.margin_account(account_id=first.client.account_id))
+        await first.connect()
+        try:
+            order = first.order(tif=TimeInForce.IOC, post_only=False, quantity="2")
+            first.cache.add_order(order)
+            cid = await first.submit(order)
+            first.client._consume_private_frame(first.order_frame("on", cid, order))
+            final = first.trade_frame(cid, order, quantity="2", fee="-0.061668", maker=-1)
+            cast(list[object], final[2])[2] = first.clock.timestamp_ns() // 1_000_000
+            interim = cast(list[object], final[2]).copy()
+            interim[9:11] = [None, None]
+            first.client._consume_private_frame([0, "te", interim])
+            first.client._consume_private_frame(final)
+            assert order.status == OrderStatus.FILLED
+            assert bool(first.client.accounting_ready)
+            assert first.client.fee_summary().complete
+            original_metadata = first.client._cid_store.fee_metadata
+            if conflict_source == "final_fee":
+                changed = cast(list[object], final[2]).copy()
+                changed[9] = Decimal("-0.061669")
+                with pytest.raises(BitfinexV1ExecutionError, match="trade ID changed"):
+                    first.client._consume_private_frame([0, "tu", changed])
+            else:
+                applied = next(event for event in order.events if isinstance(event, OrderFilled))
+                changed_fill = OrderFilled.to_dict(applied)
+                changed_fill["commission"] = "1.00 USD"
+                first.client._capture_native_fee_evidence(OrderFilled.from_dict(changed_fill))
+            assert not first.client.accounting_ready
+            assert not first.client.fee_summary().complete
+            assert first.client._cid_store.fee_metadata == original_metadata
+            assert len([event for event in order.events if isinstance(event, OrderFilled)]) == 1
+        finally:
+            await first.close()
+            engine.dispose()
+
+        second = _Harness(
+            cid_store_path=path, raw_symbol=PAPER_RAW_SYMBOL, wallet_currency="TESTUSDTF0",
+        )
+        await second.connect()
+        try:
+            assert second.rest.active == second.rest.history == second.rest.trades == []
+            assert second.rest.position_rows == []
+            assert await second.client.generate_mass_status(lookback_mins=None) is not None
+            assert second.client.execution_hold_reason is None
+            assert not second.client.accounting_ready
+            assert not second.client.fee_summary().complete
+            second.rest.trades = [final[2]]
+            assert len(await second.client.generate_fill_reports(GenerateFillReports(
+                instrument_id=SOURCE_ID, venue_order_id=None, start=None, end=None,
+                command_id=UUID4(), ts_init=0,
+            ))) == 1
+            second.client._cid_store.allocate("O-AFTER-CONFLICT", epoch_ms=cid + 1)
+            assert second.client._cid_store.fee_metadata == original_metadata
+            assert second.client._cid_store.fees_durable
+            assert not second.client.accounting_ready
+            assert not second.client.fee_summary(order.client_order_id).complete
+            assert not any(isinstance(event, OrderFilled) for event in second.events)
+            assert BitfinexV1CidStore(
+                path, account_id=second.client.account_id.value,
+            ).accounting_conflict
+        finally:
+            await second.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("state_version, keep_marker", [(2, False), (1, True), (1, False)])
+def test_restart_fee_provenance_is_required_for_rest_commission_supplement(
+    tmp_path: Path, state_version: int, keep_marker: bool,
+) -> None:
+    async def scenario() -> None:
+        path = tmp_path / "cids.json"
+        first = _Harness(
+            cid_store_path=path, raw_symbol=PAPER_RAW_SYMBOL, wallet_currency="TESTUSDTF0",
+        )
+        first.msgbus.deregister("ExecEngine.process", first.events.append)
+        engine = ExecutionEngine(msgbus=first.msgbus, cache=first.cache, clock=first.clock)
+        engine.register_client(first.client)
+        first.cache.add_instrument(first.instrument)
+        first.cache.add_account(TestExecStubs.margin_account(account_id=first.client.account_id))
+        await first.connect()
+        try:
+            order = first.order(tif=TimeInForce.IOC, post_only=False, quantity="2")
+            first.cache.add_order(order)
+            cid = await first.submit(order)
+            first.client._consume_private_frame(first.order_frame("on", cid, order))
+            final = first.trade_frame(cid, order, quantity="1", fee="-0.061668", maker=-1)
+            cast(list[object], final[2])[2] = first.clock.timestamp_ns() // 1_000_000
+            interim = cast(list[object], final[2]).copy()
+            interim[9:11] = [None, None]
+            first.client._consume_private_frame([0, "te", interim])
+            assert order.filled_qty.as_decimal() == Decimal(1)
+            codec = MsgSpecSerializer(msgspec.msgpack, timestamps_as_str=True)
+            persisted = [codec.serialize(event) for event in order.events]
+        finally:
+            await first.close()
+            engine.dispose()
+
+        if state_version == 1:
+            old = json.loads(path.read_text())
+            old["schema_version"] = 1
+            old.pop("fee_metadata")
+            path.write_text(json.dumps(old))
+        restored = OrderUnpacker.from_init(codec.deserialize(persisted[0]))
+        for data in persisted[1:]:
+            event = codec.deserialize(data)
+            if isinstance(event, OrderFilled) and not keep_marker:
+                values = OrderFilled.to_dict(event)
+                values["info"] = {}
+                event = OrderFilled.from_dict(values)
+            restored.apply(event)
+        second = _Harness(
+            cid_store_path=path, raw_symbol=PAPER_RAW_SYMBOL, wallet_currency="TESTUSDTF0",
+        )
+        second.cache.add_order(restored)
+        await second.connect()
+        try:
+            accepted = second.order_frame("on", cid, restored, remaining="1")
+            row = cast(list[object], accepted[2])
+            row[13] = "PARTIALLY FILLED @ 3926.75(1)"
+            row[17] = Decimal("3926.75")
+            second.rest.active = [row]
+            second.rest.trades = [final[2]]
+            reports = await second.client.generate_order_status_reports(GenerateOrderStatusReports(
+                instrument_id=SOURCE_ID, start=None, end=None, open_only=True,
+                command_id=UUID4(), ts_init=0,
+            ))
+            fills = await second.client.generate_fill_reports(GenerateFillReports(
+                instrument_id=SOURCE_ID, venue_order_id=None, start=None, end=None,
+                command_id=UUID4(), ts_init=0,
+            ))
+            if state_version == 1 and not keep_marker:
+                unknown = second.client._cid_store.fee_metadata_for_cid(cid)
+                assert unknown is not None
+                assert unknown.native_fills[0].native_fill_origin == "unknown"
+                with pytest.raises(BitfinexV1ExecutionError, match="commission"):
+                    second.client._validate_cached_open_report(restored, reports[0], fills)
+                assert not second.client.fee_summary(restored.client_order_id).complete
+                return
+            second.client._validate_cached_open_report(restored, reports[0], fills)
+            assert second.client.fee_summary(restored.client_order_id).complete
+            second.client._consume_private_frame([0, "te", interim])
+            assert second.client._by_cid[cid].filled_qty == Decimal(1)
+            assert not any(isinstance(event, OrderFilled) for event in second.events)
+            changed = cast(list[object], final[2]).copy()
+            changed[9] = Decimal("-0.061669")
+            with pytest.raises(BitfinexV1ExecutionError, match="trade ID changed"):
+                second.client._consume_private_frame([0, "tu", changed])
+        finally:
+            await second.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("terminal_status", ["CANCELED", "INSUFFICIENT MARGIN"])
+def test_fee_summary_excludes_only_cached_proven_zero_fill_terminals(
+    terminal_status: str,
+) -> None:
+    async def scenario() -> None:
+        harness = _Harness()
+        harness.msgbus.deregister("ExecEngine.process", harness.events.append)
+        engine = ExecutionEngine(msgbus=harness.msgbus, cache=harness.cache, clock=harness.clock)
+        engine.register_client(harness.client)
+        harness.cache.add_instrument(harness.instrument)
+        harness.cache.add_account(TestExecStubs.margin_account(account_id=harness.client.account_id))
+        await harness.connect()
+        try:
+            order = harness.order(tif=TimeInForce.IOC, post_only=False, quantity="2")
+            harness.cache.add_order(order)
+            cid = await harness.submit(order)
+            assert not harness.client.fee_summary().complete
+            if terminal_status == "CANCELED":
+                harness.client._consume_private_frame(harness.order_frame("on", cid, order))
+            harness.client._consume_private_frame(
+                harness.order_frame("oc", cid, order, status=terminal_status),
+            )
+            assert order.is_closed and order.filled_qty.as_decimal() == Decimal(0)
+            assert harness.client._cid_store.fee_metadata_for_cid(cid) is None
+            assert harness.client.fee_summary().complete
+            harness.cache.reset()
+            assert not harness.client.fee_summary().complete  # Lost execution proof is not zero.
+        finally:
+            await harness.close()
+            engine.dispose()
 
     asyncio.run(scenario())
 
@@ -2674,9 +4348,13 @@ def test_unrelated_notification_cannot_clear_an_unknown_cancel() -> None:
     asyncio.run(scenario())
 
 
-def test_cancel_rejection_cannot_clear_an_earlier_unknown_modify() -> None:
+@pytest.mark.parametrize("paper", [False, True])
+def test_cancel_rejection_cannot_clear_an_earlier_unknown_modify(paper: bool) -> None:
     async def scenario() -> None:
-        harness = _Harness()
+        harness = _Harness(
+            raw_symbol=PAPER_RAW_SYMBOL if paper else RAW_SYMBOL,
+            wallet_currency="TESTUSDTF0" if paper else "USTF0",
+        )
         await harness.connect()
         try:
             order = harness.order()
@@ -3800,8 +5478,19 @@ def test_live_engine_reconciliation_requires_consistent_open_order_report() -> N
             conflicting_fill = second_trade_row.copy()
             conflicting_fill[5] = Decimal("3926.81")
             rest.trades = [conflicting_fill]
-            with pytest.raises(BitfinexV1ExecutionError, match="last_px"):
-                await harness.client.generate_mass_status(lookback_mins=None)
+            original_metadata = harness.client._cid_store.fee_metadata
+            with pytest.raises(BitfinexV1ExecutionError, match="trade ID changed"):
+                await harness.client.generate_fill_reports(GenerateFillReports(
+                    instrument_id=SOURCE_ID, venue_order_id=None, start=None, end=None,
+                    command_id=UUID4(), ts_init=0,
+                ))
+            # NT's parent mass-status boundary represents a failed component query
+            # as None; this is not a successful empty reconciliation.
+            assert await harness.client.generate_mass_status(lookback_mins=None) is None
+            assert harness.client._cid_store.fee_metadata == original_metadata
+            assert order.filled_qty.as_decimal() == Decimal(3)
+            assert len([event for event in order.events if isinstance(event, OrderFilled)]) == 2
+            assert not harness.client.accounting_ready
 
             regressed_frame = harness.order_frame("on", cid, order, remaining="2")
             cast(list[object], regressed_frame[2])[17] = Decimal("3926.78")
@@ -3816,7 +5505,10 @@ def test_live_engine_reconciliation_requires_consistent_open_order_report() -> N
     asyncio.run(scenario())
 
 
-def test_live_engine_recovers_executed_order_when_trade_history_is_empty() -> None:
+@pytest.mark.parametrize("late_tu_has_cid", [False, True])
+def test_live_engine_recovers_executed_order_when_trade_history_is_empty(
+    late_tu_has_cid: bool,
+) -> None:
     async def scenario() -> None:
         rest = _FakeRest(PAPER_RAW_SYMBOL)
         harness = _Harness(
@@ -3909,6 +5601,33 @@ def test_live_engine_recovers_executed_order_when_trade_history_is_empty() -> No
             harness.client.confirm_terminal_reconciliation()
             assert not bool(harness.client.terminal_reconciliation_required)
             assert harness.client.execution_hold_reason is None
+            before = harness.client.fee_summary(order.client_order_id)
+            assert not before.complete
+            metadata = harness.client._cid_store.fee_metadata_for_cid(cid)
+            assert metadata is not None
+            assert metadata.native_fills[0].native_fill_origin == "inferred"
+            native_id = metadata.native_fills[0].trade_id
+            assert not native_id.isdecimal()
+            for trade_id in (1234, 1235):
+                final = harness.trade_frame(
+                    cid, order, quantity="1", price="3926.75", fee="-0.0049", maker=-1,
+                )
+                cast(list[object], final[2])[0] = trade_id
+                cast(list[object], final[2])[2] = now_ms
+                if not late_tu_has_cid:
+                    cast(list[object], final[2])[11] = None
+                harness.client._consume_private_frame(final)
+                harness.client._consume_private_frame(final)
+                summary = harness.client.fee_summary(order.client_order_id)
+                assert summary.complete == (trade_id == 1235)
+            assert summary.currencies["USD"].raw_cost == Decimal("0.0098")
+            assert summary.currencies["USD"].quantized_cost == Decimal(0)
+            assert summary.currencies["USDT"].native_cost == Decimal(0)
+            assert len([event for event in order.events if isinstance(event, OrderFilled)]) == 1
+            changed = cast(list[object], final[2]).copy()
+            changed[9] = Decimal("-0.0048")
+            with pytest.raises(BitfinexV1ExecutionError, match="trade ID changed"):
+                harness.client._consume_private_frame([0, "tu", changed])
         finally:
             await harness.close()
             engine.dispose()
@@ -4306,11 +6025,11 @@ def test_silent_reduce_only_terminal_recovery_requires_exact_rest_evidence(
 @pytest.mark.parametrize(
     ("raw_symbol", "wallet_currency", "reduce_only"),
     [
-        (PAPER_RAW_SYMBOL, "TESTUSDTF0", False),
+        (RAW_SYMBOL, "USTF0", False),
         (RAW_SYMBOL, "USTF0", True),
     ],
 )
-def test_silent_terminal_recovery_does_not_widen_open_or_production_orders(
+def test_silent_terminal_recovery_does_not_widen_production_orders(
     raw_symbol: str,
     wallet_currency: str,
     reduce_only: bool,
@@ -4371,6 +6090,1383 @@ def test_terminal_confirmation_rejects_an_unreconciled_cache() -> None:
             assert harness.client.terminal_reconciliation_required
         finally:
             await harness.close()
+
+    asyncio.run(scenario())
+
+
+@asynccontextmanager
+async def _terminal_recovery_case(
+    tmp_path: Path, *, partial: bool, maker: bool = False, paper: bool = True,
+    request_cancel: bool = False, terminal_flags: int | None = None, rest_flags: int | None = None,
+    silent: bool = False, accepted: bool = True, zero: bool = False, reduce_only: bool = False,
+    working: bool = False,
+) -> AsyncIterator[tuple[_Harness, LiveExecutionEngine, JsonStateStore, Order, list[object]]]:
+    raw_symbol = PAPER_RAW_SYMBOL if paper else RAW_SYMBOL
+    harness = _Harness(
+        cid_store_path=tmp_path / "cids.json", raw_symbol=raw_symbol,
+        wallet_currency="TESTUSDTF0" if paper else "USTF0",
+        mutation_ack_timeout_ms=100 if silent else 10_000,
+    )
+    harness.msgbus.deregister("ExecEngine.process", harness.events.append)
+    engine = LiveExecutionEngine(
+        loop=asyncio.get_running_loop(), msgbus=harness.msgbus,
+        cache=harness.cache, clock=harness.clock,
+        config=LiveExecEngineConfig(
+            load_cache=False, reconciliation=True, generate_missing_orders=False,
+            inflight_check_interval_ms=0, open_check_interval_secs=None,
+            position_check_interval_secs=None,
+        ),
+    )
+    engine.register_client(harness.client)
+    harness.cache.add_instrument(harness.instrument)
+    harness.cache.add_account(TestExecStubs.margin_account(account_id=harness.client.account_id))
+    store = JsonStateStore(tmp_path / "hedges.json")
+    hedges = HedgeCoordinator(SOURCE_ID, store)
+
+    def observe(event: OrderEvent) -> None:
+        if isinstance(event, OrderFilled):
+            hedges.on_source_filled(event)
+        elif isinstance(event, OrderCanceled):
+            store.update_source_status(event.client_order_id.value, "CANCELED")
+
+    await harness.connect()
+    engine.start()
+    try:
+        order = harness.order(
+            tif=TimeInForce.GTC if maker else TimeInForce.IOC, post_only=maker,
+            quantity="4" if partial else "2", reduce_only=reduce_only,
+        )
+        harness.cache.add_order(order)
+        store.begin_source(
+            order.client_order_id.value, BusinessOrderSide.BUY, Decimal(str(order.quantity)),
+        )
+        harness.msgbus.subscribe(f"events.order.{order.strategy_id}", observe)
+        cid = await harness.submit(order)
+        if accepted:
+            harness.client._consume_private_frame(harness.order_frame("on", cid, order))
+        for _ in range(20):
+            await asyncio.sleep(0)
+        assert order.status == (OrderStatus.ACCEPTED if accepted else OrderStatus.SUBMITTED)
+        if request_cancel:
+            await harness.cancel(order)
+            for _ in range(20):
+                await asyncio.sleep(0)
+        now_ms = harness.clock.timestamp_ns() // 1_000_000
+        terminal = harness.order_frame(
+            "oc", cid, order, remaining=str(order.quantity) if zero else "2" if partial else "0",
+            status="IOC CANCELED" if zero else "CANCELED" if partial else "EXECUTED @ 3926.75(2)",
+        )
+        terminal_row = cast(list[object], terminal[2])
+        terminal_row[4:6] = [now_ms - 100, now_ms]
+        terminal_row[17] = Decimal(0) if zero else Decimal("3926.75")
+        if terminal_flags is not None:
+            terminal_row[12] = terminal_flags
+        final = harness.trade_frame(
+            cid, order, quantity="2", fee="-0.061668", maker=1 if maker else -1,
+        )
+        cast(list[object], final[2])[2] = now_ms
+        if not silent:
+            harness.client._consume_private_frame(terminal)
+        history = terminal_row.copy()
+        if rest_flags is not None:
+            history[12] = rest_flags
+        harness.rest.history = [history]
+        if working:
+            history[13] = "ACTIVE" if zero else "PARTIALLY FILLED @ 3926.75(2)"
+            harness.rest.active = [history]
+            harness.rest.history = []
+        harness.rest.trades = [] if zero else [final[2]]
+        harness.rest.position_rows = [] if zero else [_position_row(
+            Decimal(2), avg_px=Decimal("3926.75"), raw_symbol=raw_symbol,
+        )]
+        if silent:
+            await asyncio.sleep(0.11)
+        yield harness, engine, store, order, final
+    finally:
+        engine.stop()
+        await asyncio.sleep(0)
+        await harness.close()
+        engine.dispose()
+
+
+@pytest.mark.parametrize("state", ["unchanged", "opaque", "missing", "filled", "price"])
+def test_working_maker_observation_only_detects_differences(tmp_path: Path, state: str) -> None:
+    async def scenario() -> None:
+        async with _terminal_recovery_case(
+            tmp_path, partial=state == "filled", zero=state != "filled", maker=True,
+            silent=True, working=True,
+        ) as (harness, _, store, order, _):
+            assert harness.client.has_working_orders
+            if state == "missing":
+                harness.rest.active = []
+            elif state == "opaque":
+                cast(list[object], harness.rest.active[0])[12] = 0
+            elif state == "price":
+                cast(list[object], harness.rest.active[0])[16] = Decimal("3900")
+            assert await harness.client.check_working_orders() == (
+                state not in {"unchanged", "opaque"}
+            )
+            assert order.status == OrderStatus.ACCEPTED and order.filled_qty.as_decimal() == 0
+            assert not store.intents() and len(harness.fake.sent) == 2
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("operation", ["on", "ou", "oc", "os"])
+@pytest.mark.parametrize("post_only", [0, 1])
+def test_stream_metadata_is_used_consistently_and_explicit_denial_is_not_opaque(
+    operation: str, post_only: int,
+) -> None:
+    async def scenario() -> None:
+        harness = _Harness(raw_symbol=PAPER_RAW_SYMBOL, wallet_currency="TESTUSDTF0")
+        harness.msgbus.deregister("ExecEngine.process", harness.events.append)
+        engine = ExecutionEngine(msgbus=harness.msgbus, cache=harness.cache, clock=harness.clock)
+        engine.register_client(harness.client)
+        harness.cache.add_instrument(harness.instrument)
+        harness.cache.add_account(TestExecStubs.margin_account(account_id=harness.client.account_id))
+        await harness.connect()
+        try:
+            order = harness.order(quantity="2")
+            harness.cache.add_order(order)
+            cid = await harness.submit(order)
+            if operation != "on":
+                harness.client._consume_private_frame(harness.order_frame("on", cid, order))
+            if operation == "ou":
+                await harness.modify(order, price="3927.00")
+            elif operation == "oc":
+                await harness.cancel(order)
+            frame = harness.order_frame(
+                "on" if operation == "os" else operation, cid, order,
+                price="3927.00" if operation == "ou" else None,
+                status="CANCELED" if operation == "oc" else "ACTIVE",
+            )
+            row = cast(list[object], frame[2])
+            row[12] = 0
+            row.extend([None] * (31 - len(row)))
+            row.append({"_$F7": post_only})
+            if operation == "os":
+                frame = [0, "os", [row]]
+            original_events, sent = list(order.events), list(harness.fake.sent)
+            if post_only:
+                harness.client._consume_private_frame(frame)
+                live = harness.client._by_cid[cid]
+                assert live.venue_flags_verified
+                if operation == "oc":
+                    assert harness.client._terminal_report(live).post_only
+                    assert not harness.client._terminal_post_only_is_opaque(live)
+                assert order.status is (OrderStatus.CANCELED if operation == "oc"
+                                        else OrderStatus.ACCEPTED)
+            else:
+                with pytest.raises(BitfinexV1ExecutionError, match="differs from local submission"):
+                    harness.client._consume_private_frame(frame)
+                assert order.events == original_events
+            assert harness.fake.sent == sent and row[12] == 0 and row[31] == {"_$F7": post_only}
+        finally:
+            await harness.close()
+            engine.dispose()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("entry", ["single", "batch", "working", "mass"])
+@pytest.mark.parametrize("post_only", [0, 1])
+def test_rest_metadata_denial_cannot_inherit_same_run_opaque_permission(
+    tmp_path: Path, entry: str, post_only: int,
+) -> None:
+    async def scenario() -> None:
+        async with _terminal_recovery_case(
+            tmp_path, partial=False, zero=True, maker=True, silent=True, working=True,
+        ) as (harness, _, store, order, _):
+            row = cast(list[object], harness.rest.active[0])
+            row[12] = 0
+            row.extend([None] * (31 - len(row)))
+            row.append({"$F7": post_only})
+            original_events, sent = list(order.events), list(harness.fake.sent)
+            cid_bytes = (tmp_path / "cids.json").read_bytes()
+
+            async def query() -> object:
+                if entry == "single":
+                    return await harness.client.generate_order_status_report(
+                        GenerateOrderStatusReport(
+                            instrument_id=SOURCE_ID, client_order_id=order.client_order_id,
+                            venue_order_id=order.venue_order_id, command_id=UUID4(), ts_init=0,
+                        ),
+                    )
+                if entry == "batch":
+                    return await harness.client.generate_order_status_reports(
+                        GenerateOrderStatusReports(
+                            instrument_id=SOURCE_ID, start=None, end=None, open_only=True,
+                            command_id=UUID4(), ts_init=0,
+                        ),
+                    )
+                if entry == "working":
+                    return await harness.client.check_working_orders()
+                return await harness.client.generate_mass_status(None)
+
+            if post_only:
+                result = await query()
+                if entry == "single":
+                    assert result is None  # Original stream acceptance suppresses duplicate REST.
+                elif entry == "working":
+                    assert result is False  # No discrepancy in the still-working native order.
+                else:
+                    assert result is not None
+            elif entry == "mass":
+                assert await query() is None  # Native mass conversion reports the strict rejection.
+            else:
+                with pytest.raises(BitfinexV1ExecutionError, match="post_only metadata"):
+                    await query()
+            assert order.events == original_events and harness.fake.sent == sent
+            assert not store.intents() and (tmp_path / "cids.json").read_bytes() == cid_bytes
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("cold", [False, True], ids=["fully-retired", "native-cold-reload"])
+@pytest.mark.parametrize("post_only", [None, 0, 1], ids=["absent", "denied", "explicit"])
+def test_explicit_post_only_metadata_survives_terminal_retirement_and_native_reload(
+    tmp_path: Path, cold: bool, post_only: int | None,
+) -> None:
+    async def scenario() -> None:
+        async with _terminal_recovery_case(
+            tmp_path, partial=not cold, zero=cold, maker=True, request_cancel=True,
+            terminal_flags=0, rest_flags=0,
+        ) as (harness, engine, store, order, _):
+            assert await engine.reconcile_execution_state(timeout_secs=1)
+            harness.client.confirm_terminal_reconciliation()
+            assert order.status is OrderStatus.CANCELED
+            assert order.filled_qty.as_decimal() == (0 if cold else 2)
+            if not cold:
+                assert harness.client._live_for_client(order.client_order_id) is None
+            assert harness.client.fee_summary().complete
+            original_intents = store.intents()
+            row = cast(list[object], harness.rest.history[0])
+            row.extend([None] * (32 - len(row)))
+            row[31] = None if post_only is None else {"_$F7": post_only}
+            codec = MsgSpecSerializer(msgspec.msgpack, timestamps_as_str=True)
+            original = [codec.serialize(event) for event in order.events]
+            cid_bytes = (tmp_path / "cids.json").read_bytes()
+            selected = harness
+            if cold:
+                restored = OrderUnpacker.from_init(codec.deserialize(original[0]))
+                for data in original[1:]:
+                    restored.apply(codec.deserialize(data))
+                selected = _Harness(
+                    cid_store_path=tmp_path / "cids.json", raw_symbol=PAPER_RAW_SYMBOL,
+                    wallet_currency="TESTUSDTF0",
+                )
+                selected.cache.add_order(restored)
+                selected.rest.history = [row]
+                await selected.connect()
+            try:
+                assert selected.client._live_for_client(order.client_order_id) is None
+                mass = await selected.client.generate_mass_status(None)
+                if post_only == 1:
+                    assert mass is not None
+                    report = mass.order_reports[order.venue_order_id]
+                    assert report.post_only and report.order_status is OrderStatus.CANCELED
+                    assert bool(mass.fill_reports) is (not cold)
+                else:
+                    assert mass is None  # Neither explicit denial nor cold absence is permission.
+                cached = selected.cache.order(order.client_order_id)
+                assert cached is not None
+                assert [codec.serialize(event) for event in cached.events] == original
+                assert (tmp_path / "cids.json").read_bytes() == cid_bytes
+                assert store.intents() == original_intents
+            finally:
+                if cold:
+                    await selected.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("entry", ["single", "batch", "mass"])
+@pytest.mark.parametrize("fault", ["flags", "price", "filled", "average"])
+def test_returned_closed_order_conflict_is_rejected_without_live_table(
+    tmp_path: Path, entry: str, fault: str,
+) -> None:
+    async def scenario() -> None:
+        async with _terminal_recovery_case(tmp_path, partial=False) as case:
+            harness, engine, store, order, _ = case
+            assert await engine.reconcile_execution_state(timeout_secs=1)
+            harness.client.confirm_terminal_reconciliation()
+            assert order.status == OrderStatus.FILLED
+            assert harness.client._live_for_client(order.client_order_id) is None
+            events, intents = list(order.events), store.intents()
+            positions = [position.to_dict() for position in harness.cache.positions()]
+            sent = list(harness.fake.sent)
+            row = cast(list[object], harness.rest.history[0])
+            if fault == "filled":
+                row[6], row[13] = Decimal(1), "CANCELED"
+            else:
+                index = {"flags": 12, "price": 16, "average": 17}[fault]
+                row[index] = REDUCE_ONLY_FLAG if fault == "flags" else Decimal("3927.00")
+            if entry == "mass":
+                try:
+                    result = await harness.client.generate_mass_status(None)
+                except BitfinexV1ExecutionError:
+                    result = None
+                assert result is None
+            elif entry == "single":
+                with pytest.raises(BitfinexV1ExecutionError):
+                    await harness.client.generate_order_status_report(GenerateOrderStatusReport(
+                        instrument_id=SOURCE_ID, client_order_id=order.client_order_id,
+                        venue_order_id=order.venue_order_id, command_id=UUID4(), ts_init=0,
+                    ))
+            else:
+                with pytest.raises(BitfinexV1ExecutionError):
+                    await harness.client.generate_order_status_reports(GenerateOrderStatusReports(
+                        instrument_id=SOURCE_ID, start=None, end=None, open_only=False,
+                        command_id=UUID4(), ts_init=0,
+                    ))
+            assert order.events == events and store.intents() == intents
+            assert [position.to_dict() for position in harness.cache.positions()] == positions
+            assert harness.fake.sent == sent
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("fault", ["mass_missing_trade", "fill_unknown_trade"])
+def test_returned_closed_fill_identity_cannot_be_missing_or_replaced(
+    tmp_path: Path, fault: str,
+) -> None:
+    async def scenario() -> None:
+        async with _terminal_recovery_case(tmp_path, partial=False) as case:
+            harness, engine, store, order, _ = case
+            assert await engine.reconcile_execution_state(timeout_secs=1)
+            harness.client.confirm_terminal_reconciliation()
+            assert harness.client._live_for_client(order.client_order_id) is None
+            events, intents, sent = list(order.events), store.intents(), list(harness.fake.sent)
+            if fault == "mass_missing_trade":
+                harness.rest.trades = []
+                try:
+                    result = await harness.client.generate_mass_status(None)
+                except BitfinexV1ExecutionError:
+                    result = None
+                assert result is None
+            else:
+                cast(list[object], harness.rest.trades[0])[0] = 9999
+                with pytest.raises(BitfinexV1ExecutionError):
+                    await harness.client.generate_fill_reports(GenerateFillReports(
+                        instrument_id=SOURCE_ID, venue_order_id=order.venue_order_id,
+                        start=None, end=None, command_id=UUID4(), ts_init=0,
+                    ))
+            assert order.events == events and store.intents() == intents
+            assert harness.fake.sent == sent
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("entry", ["order", "fill"])
+@pytest.mark.parametrize("identity", ["missing", "unknown", "another_binding"])
+def test_returned_closed_venue_identity_survives_unowned_history_filter(
+    tmp_path: Path, entry: str, identity: str,
+) -> None:
+    async def scenario() -> None:
+        async with _terminal_recovery_case(tmp_path, partial=False) as case:
+            harness, engine, store, order, _ = case
+            assert await engine.reconcile_execution_state(timeout_secs=1)
+            harness.client.confirm_terminal_reconciliation()
+            assert harness.client._live_for_client(order.client_order_id) is None
+            assert harness.cache.client_order_id(order.venue_order_id) == order.client_order_id
+            events, intents, sent = list(order.events), store.intents(), list(harness.fake.sent)
+            row = cast(list[object], (
+                harness.rest.history[0] if entry == "order" else harness.rest.trades[0]
+            ))
+            cid_index = 2 if entry == "order" else 11
+            original_cid = cast(int, row[cid_index])
+            if identity == "another_binding":
+                row[cid_index] = harness.client._cid_store.allocate(
+                    "ANOTHER-ORDER", epoch_ms=original_cid + 1,
+                ).cid
+            else:
+                row[cid_index] = None if identity == "missing" else original_cid + 1000
+            with pytest.raises(BitfinexV1ExecutionError, match="CID identity"):
+                if entry == "order":
+                    await harness.client.generate_order_status_reports(GenerateOrderStatusReports(
+                        instrument_id=SOURCE_ID, start=None, end=None, open_only=False,
+                        command_id=UUID4(), ts_init=0,
+                    ))
+                else:
+                    await harness.client.generate_fill_reports(GenerateFillReports(
+                        instrument_id=SOURCE_ID, venue_order_id=order.venue_order_id,
+                        start=None, end=None, command_id=UUID4(), ts_init=0,
+                    ))
+            assert order.events == events and store.intents() == intents
+            assert harness.fake.sent == sent
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("fault", ["quantity", "price", "fee", "liquidity", "time"])
+def test_returned_closed_fill_immutable_fact_cannot_change(
+    tmp_path: Path, fault: str,
+) -> None:
+    async def scenario() -> None:
+        async with _terminal_recovery_case(tmp_path, partial=False) as case:
+            harness, engine, store, order, _ = case
+            assert await engine.reconcile_execution_state(timeout_secs=1)
+            harness.client.confirm_terminal_reconciliation()
+            events, intents = list(order.events), store.intents()
+            row = cast(list[object], harness.rest.trades[0])
+            if fault == "quantity":
+                row[4] = Decimal(1)
+            elif fault == "price":
+                row[5] = Decimal("3926.85")
+            elif fault == "fee":
+                row[9] = Decimal("-0.20")
+            elif fault == "liquidity":
+                row[8] = 1
+            else:
+                row[2] = cast(int, row[2]) - 1
+            with pytest.raises(BitfinexV1ExecutionError):
+                await harness.client.generate_fill_reports(GenerateFillReports(
+                    instrument_id=SOURCE_ID, venue_order_id=order.venue_order_id,
+                    start=None, end=None, command_id=UUID4(), ts_init=0,
+                ))
+            assert order.events == events and store.intents() == intents
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("selection", ["full", "suffix", "empty", "absent_history"])
+def test_closed_report_queries_preserve_window_and_missing_history_semantics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, selection: str,
+) -> None:
+    async def scenario() -> None:
+        async with _terminal_recovery_case(tmp_path, partial=False) as case:
+            harness, engine, store, order, final = case
+            first, second = cast(list[object], final[2]).copy(), cast(list[object], final[2]).copy()
+            first[2], first[4] = cast(int, first[2]) - 1, Decimal(1)
+            second[0], second[4] = 1235, Decimal(1)
+            harness.rest.trades = [first, second]
+            assert await engine.reconcile_execution_state(timeout_secs=1)
+            harness.client.confirm_terminal_reconciliation()
+            events, intents = list(order.events), store.intents()
+            positions = [position.to_dict() for position in harness.cache.positions()]
+            sent = list(harness.fake.sent)
+
+            async def no_trade_request(*args: object, **kwargs: object) -> object:
+                raise AssertionError("order-only query must not fetch trade history")
+
+            with monkeypatch.context() as patch:
+                patch.setattr(harness.rest, "trades_by_symbol", no_trade_request)
+                for _ in range(2):
+                    assert await harness.client.generate_order_status_report(
+                        GenerateOrderStatusReport(
+                            instrument_id=SOURCE_ID, client_order_id=order.client_order_id,
+                            venue_order_id=order.venue_order_id, command_id=UUID4(), ts_init=0,
+                        ),
+                    ) is not None
+                    assert len(await harness.client.generate_order_status_reports(
+                        GenerateOrderStatusReports(
+                            instrument_id=SOURCE_ID, start=None, end=None, open_only=False,
+                            command_id=UUID4(), ts_init=0,
+                        ),
+                    )) == 1
+            if selection == "absent_history":
+                harness.rest.history = harness.rest.trades = []
+                # A successful periodic mass does not certify unreturned closed history.
+                assert await harness.client.generate_mass_status(None) is not None
+            else:
+                selected = {"full": [first, second], "suffix": [second], "empty": []}[selection]
+                harness.rest.trades = list(selected)
+                start = datetime.fromtimestamp(cast(int, second[2]) / 1000, tz=UTC)
+                reports = await harness.client.generate_fill_reports(GenerateFillReports(
+                    instrument_id=SOURCE_ID, venue_order_id=order.venue_order_id,
+                    start=None if selection == "full" else start, end=None,
+                    command_id=UUID4(), ts_init=0,
+                ))
+                assert {report.trade_id.value for report in reports} == {
+                    str(row[0]) for row in selected
+                }
+                harness.rest.trades = [first, second]
+                assert await harness.client.generate_mass_status(None) is not None
+                assert await engine.reconcile_execution_state(timeout_secs=1)
+            assert order.events == events and store.intents() == intents
+            assert [position.to_dict() for position in harness.cache.positions()] == positions
+            assert harness.fake.sent == sent
+    asyncio.run(scenario())
+
+
+def test_closed_paper_first_rest_fee_supplement_keeps_native_fill_unchanged(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        async with _terminal_recovery_case(tmp_path, partial=False) as case:
+            harness, engine, store, order, final = case
+            interim = cast(list[object], final[2]).copy()
+            interim[9:11] = [None, None]
+            harness.client._consume_private_frame([0, "te", interim])
+            for _ in range(20):
+                await asyncio.sleep(0)
+            assert order.status == OrderStatus.FILLED
+            event = next(event for event in order.events if isinstance(event, OrderFilled))
+            assert event.commission == Money(0, USD)
+            events, intents = list(order.events), store.intents()
+            assert not harness.client.fee_summary(order.client_order_id).complete
+            reports = await harness.client.generate_fill_reports(GenerateFillReports(
+                instrument_id=SOURCE_ID, venue_order_id=order.venue_order_id,
+                start=None, end=None, command_id=UUID4(), ts_init=0,
+            ))
+            assert len(reports) == 1 and reports[0].commission == Money("0.06", USD)
+            assert harness.client.fee_summary(order.client_order_id).complete
+            assert await engine.reconcile_execution_state(timeout_secs=1)
+            assert order.events == events and store.intents() == intents
+            assert event.commission == Money(0, USD)
+    asyncio.run(scenario())
+
+
+def test_closed_inferred_fill_fee_closure_does_not_certify_real_trade_identity(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        async with _terminal_recovery_case(tmp_path, partial=False) as case:
+            harness, engine, store, order, final = case
+            harness.rest.trades = []
+            assert await engine.reconcile_execution_state(timeout_secs=1)
+            harness.client.confirm_terminal_reconciliation()
+            event = next(event for event in order.events if isinstance(event, OrderFilled))
+            assert event.trade_id.value != "1234"  # NT's inferred aggregate keeps its own ID.
+            harness.client._consume_private_frame(final)
+            assert harness.client.fee_summary(order.client_order_id).complete
+            events, intents = list(order.events), store.intents()
+            harness.rest.trades = [final[2]]
+            with pytest.raises(BitfinexV1ExecutionError, match="unknown fill"):
+                await harness.client.generate_fill_reports(GenerateFillReports(
+                    instrument_id=SOURCE_ID, venue_order_id=order.venue_order_id,
+                    start=None, end=None, command_id=UUID4(), ts_init=0,
+                ))
+            assert not await engine.reconcile_execution_state(timeout_secs=1)
+            assert order.events == events and store.intents() == intents
+            assert harness.client.fee_summary(order.client_order_id).complete
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("terminal", ["zero", "partial", "full", "working"])
+def test_working_maker_mass_registers_exact_applied_quantities(
+    tmp_path: Path, terminal: str,
+) -> None:
+    async def scenario() -> None:
+        async with _terminal_recovery_case(
+            tmp_path, partial=terminal in {"partial", "working"}, zero=terminal == "zero",
+            maker=True, silent=True, working=terminal == "working",
+        ) as (harness, engine, store, order, final):
+            assert await engine.reconcile_execution_state(timeout_secs=1)
+            live = harness.client._live_for_client(order.client_order_id)
+            assert live is not None
+            assert live.filled_qty == order.filled_qty.as_decimal()
+            harness.client.confirm_terminal_reconciliation()
+            if terminal == "working":
+                assert harness.client._live_for_client(order.client_order_id) is live
+            else:
+                assert harness.client._live_for_client(order.client_order_id) is None
+            if terminal != "zero":
+                harness.client._consume_private_frame(final)
+                harness.client._consume_private_frame(final)
+            await asyncio.sleep(0)
+            assert len(store.intents()) == (terminal != "zero")
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("action", ["fill", "cancel", "modify", "unknown_modify"])
+def test_working_maker_observation_rechecks_live_authority_after_await(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, action: str,
+) -> None:
+    async def scenario() -> None:
+        async with _terminal_recovery_case(
+            tmp_path, partial=True, zero=True, maker=True, silent=True, working=True,
+        ) as (harness, _, store, order, final):
+            entered, release = asyncio.Event(), asyncio.Event()
+            snapshot = [cast(list[object], harness.rest.active[0]).copy()]
+
+            async def delayed_active(_symbol: str) -> object:
+                entered.set()
+                await release.wait()
+                return snapshot
+
+            monkeypatch.setattr(harness.rest, "active_orders_by_symbol", delayed_active)
+            observed = asyncio.create_task(harness.client.check_working_orders())
+            await entered.wait()
+            live = harness.client._live_for_client(order.client_order_id)
+            assert live is not None
+            if action == "fill":
+                harness.client._consume_private_frame(final)
+            elif action == "cancel":
+                await harness.cancel(order)
+            elif action == "unknown_modify":
+                harness.fake.fail_next_send = True
+                with pytest.raises(ConnectionError):
+                    await harness.modify(order, price="3900")
+            else:
+                await harness.modify(order, price="3900")
+                harness.client._consume_private_frame(harness.order_frame(
+                    "ou", live.cid, order, price="3900",
+                ))
+            for _ in range(20):
+                await asyncio.sleep(0)
+            sent = len(harness.fake.sent)
+            release.set()
+            assert await observed == (action == "modify")
+            assert len(harness.fake.sent) == sent
+            assert live.reconciled_working is None and live.reconciled_terminal is None
+            assert order.filled_qty.as_decimal() == (Decimal(2) if action == "fill" else 0)
+            assert len(store.intents()) == (action == "fill")
+            if action == "unknown_modify":
+                assert "modify" in live.unknown_operations
+                assert harness.client.execution_hold_reason is not None
+            elif action == "modify":
+                assert order.price.as_decimal() == live.current_price == Decimal(3900)
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("boundary", ["production", "unaccepted", "cold", "ioc"])
+def test_working_maker_observation_excludes_unowned_or_out_of_scope_orders(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, boundary: str,
+) -> None:
+    async def scenario() -> None:
+        async with _terminal_recovery_case(
+            tmp_path, partial=False, zero=True, maker=boundary != "ioc", silent=True,
+            paper=boundary != "production", accepted=boundary != "unaccepted", working=True,
+        ) as (harness, _, _, order, _):
+            live = harness.client._live_for_client(order.client_order_id)
+            assert live is not None
+            if boundary == "cold":
+                live.submitted_in_process = False  # Deliberately remove same-run authority.
+
+            async def unexpected(_symbol: str) -> object:
+                pytest.fail("out-of-scope order must not start an active-list observation")
+
+            monkeypatch.setattr(harness.rest, "active_orders_by_symbol", unexpected)
+            assert not harness.client.has_working_orders
+            assert not await harness.client.check_working_orders()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("working", [False, True])
+@pytest.mark.parametrize("fault", ["missing", "type", "price", "time"])
+def test_working_maker_mass_never_infers_missing_or_inconsistent_fills(
+    tmp_path: Path, working: bool, fault: str,
+) -> None:
+    async def scenario() -> None:
+        async with _terminal_recovery_case(
+            tmp_path, partial=working, maker=True, silent=True, working=working,
+        ) as (harness, engine, store, order, final):
+            if fault == "missing":
+                harness.rest.trades = []
+            else:
+                row = cast(list[object], final[2])
+                if fault == "type":
+                    row[6] = "IOC"
+                elif fault == "price":
+                    row[7] = Decimal("3900")
+                else:
+                    row[2] = cast(int, row[2]) - 1000
+            assert not await engine.reconcile_execution_state(timeout_secs=1)
+            assert order.filled_qty.as_decimal() == 0 and not store.intents()
+    asyncio.run(scenario())
+
+
+def test_working_maker_native_fill_then_new_tu_counts_actual_cumulative_once(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        async with _terminal_recovery_case(
+            tmp_path, partial=True, maker=True, silent=True, working=True,
+        ) as (harness, engine, store, order, final):
+            assert await engine.reconcile_execution_state(timeout_secs=1)
+            live = harness.client._live_for_client(order.client_order_id)
+            assert live is not None and live.filled_qty == Decimal(2)
+            next_trade = cast(list[object], final[2]).copy()
+            next_trade[0] = 1235
+            next_trade[4] = Decimal(1)
+            harness.client._consume_private_frame([0, "tu", next_trade])
+            harness.client._consume_private_frame([0, "tu", next_trade])
+            for _ in range(20):
+                await asyncio.sleep(0)
+            assert live.filled_qty == order.filled_qty.as_decimal() == Decimal(3)
+            assert len(store.intents()) == 2
+            row = cast(list[object], harness.rest.active[0])
+            row[6] = Decimal(1)
+            harness.rest.trades.append(next_trade)
+            harness.rest.position_rows = [_position_row(
+                Decimal(3), avg_px=Decimal("3926.75"), raw_symbol=PAPER_RAW_SYMBOL,
+            )]
+            assert await engine.reconcile_execution_state(timeout_secs=1)
+            harness.client.confirm_terminal_reconciliation()
+            assert live.filled_qty == Decimal(3) and len(store.intents()) == 2
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("first_source", ["ws", "rest"])
+@pytest.mark.parametrize("evidence", ["complete", "missing_old", "changed_old"])
+def test_working_maker_complete_trade_set_covers_previously_applied_fills(
+    tmp_path: Path, first_source: str, evidence: str,
+) -> None:
+    async def scenario() -> None:
+        async with _terminal_recovery_case(
+            tmp_path, partial=True, maker=True, silent=True, working=True,
+        ) as (harness, engine, store, order, final):
+            active = cast(list[object], harness.rest.active[0])
+            first = cast(list[object], final[2])
+            active[6], active[13] = Decimal(3), "PARTIALLY FILLED @ 3926.75(1)"
+            first[4] = Decimal(1)
+            harness.rest.position_rows = [_position_row(
+                Decimal(1), avg_px=Decimal("3926.75"), raw_symbol=PAPER_RAW_SYMBOL,
+            )]
+            if first_source == "ws":
+                harness.client._consume_private_frame(final)
+                for _ in range(20):
+                    await asyncio.sleep(0)
+            else:
+                assert await engine.reconcile_execution_state(timeout_secs=1)
+                harness.client.confirm_terminal_reconciliation()
+            live = harness.client._live_for_client(order.client_order_id)
+            assert live is not None and live.filled_qty == order.filled_qty.as_decimal() == 1
+            assert len(store.intents()) == 1
+            # Active-only observation intentionally has no trades; this remains healthy.
+            assert not await harness.client.check_working_orders()
+
+            second = first.copy()
+            second[0] = 1235
+            active[6], active[13] = Decimal(2), "PARTIALLY FILLED @ 3926.75(2)"
+            if evidence == "missing_old":
+                second[4] = Decimal(2)
+                harness.rest.trades = [second]
+            elif evidence == "changed_old":
+                altered = first.copy()
+                altered[4], second[4] = Decimal("0.5"), Decimal("1.5")
+                harness.rest.trades = [altered, second]
+            else:
+                harness.rest.trades = [first, second]
+            harness.rest.position_rows = [_position_row(
+                Decimal(2), avg_px=Decimal("3926.75"), raw_symbol=PAPER_RAW_SYMBOL,
+            )]
+            assert await engine.reconcile_execution_state(timeout_secs=1) == (
+                evidence == "complete"
+            )
+            expected = Decimal(2) if evidence == "complete" else Decimal(1)
+            assert live.filled_qty == order.filled_qty.as_decimal() == expected
+            assert len(store.intents()) == int(expected)
+            if evidence == "missing_old":
+                with pytest.raises(BitfinexV1ExecutionError, match="previously applied"):
+                    await harness.client.generate_mass_status(15)
+            elif evidence == "complete":
+                harness.client.confirm_terminal_reconciliation()
+                for trade in (first, second, first, second):
+                    harness.client._consume_private_frame([0, "tu", trade])
+                assert live.filled_qty == Decimal(2) and len(store.intents()) == 2
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("repeat_mass", [False, True])
+def test_working_maker_real_cancel_before_native_confirmation_retires_exactly(
+    tmp_path: Path, repeat_mass: bool,
+) -> None:
+    async def scenario() -> None:
+        async with _terminal_recovery_case(
+            tmp_path, partial=True, maker=True, silent=True, working=True,
+        ) as (harness, engine, store, order, final):
+            assert await engine.reconcile_execution_state(timeout_secs=1)
+            live = harness.client._live_for_client(order.client_order_id)
+            assert live is not None and live.reconciled_working is not None
+            await harness.cancel(order)
+            row = cast(list[object], harness.rest.active[0]).copy()
+            row[13] = "CANCELED"
+            harness.rest.active, harness.rest.history = [], [row]
+            harness.client._consume_private_frame([0, "oc", row])
+            for _ in range(20):
+                await asyncio.sleep(0)
+            assert order.status == OrderStatus.CANCELED and live.terminal_emitted
+            if repeat_mass:
+                assert await engine.reconcile_execution_state(timeout_secs=1)
+            harness.client.confirm_terminal_reconciliation()
+            assert harness.client._live_for_client(order.client_order_id) is None
+            harness.client._consume_private_frame(final)
+            assert len(store.intents()) == 1
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("fault", ["quantity", "trade", "missing_trade"])
+def test_working_maker_closed_before_confirmation_rechecks_latest_real_facts(
+    tmp_path: Path, fault: str,
+) -> None:
+    async def scenario() -> None:
+        async with _terminal_recovery_case(
+            tmp_path, partial=True, maker=True, silent=True, working=True,
+        ) as (harness, engine, store, order, _):
+            assert await engine.reconcile_execution_state(timeout_secs=1)
+            await harness.cancel(order)
+            row = cast(list[object], harness.rest.active[0]).copy()
+            row[13] = "CANCELED"
+            harness.rest.active, harness.rest.history = [], [row]
+            harness.client._consume_private_frame([0, "oc", row.copy()])
+            for _ in range(20):
+                await asyncio.sleep(0)
+            if fault == "quantity":
+                row[6], row[7] = Decimal(3), Decimal(5)
+            elif fault == "trade":
+                cast(list[object], harness.rest.trades[0])[0] = 9999
+            else:
+                harness.rest.trades = []
+            assert not await engine.reconcile_execution_state(timeout_secs=1)
+            assert order.filled_qty.as_decimal() == 2 and len(store.intents()) == 1
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("kind", ["unacked_ioc", "accepted_ioc", "cancel_maker"])
+@pytest.mark.parametrize("terminal", ["zero", "partial", "full"])
+def test_same_run_paper_silent_terminal_requires_native_confirmation(
+    tmp_path: Path, kind: str, terminal: str,
+) -> None:
+    async def scenario() -> None:
+        maker = kind == "cancel_maker"
+        async with _terminal_recovery_case(
+            tmp_path, partial=terminal == "partial", zero=terminal == "zero",
+            maker=maker, request_cancel=maker, accepted=kind != "unacked_ioc", silent=True,
+        ) as (harness, engine, store, order, final):
+            assert bool(harness.client.terminal_reconciliation_required)
+            assert bool(harness.client.execution_hold_reason)
+            sent = len(harness.fake.sent)
+            assert await engine.reconcile_execution_state(timeout_secs=1)
+            for _ in range(20):
+                await asyncio.sleep(0)
+            assert order.status == (OrderStatus.FILLED if terminal == "full"
+                                    else OrderStatus.CANCELED)
+            expected = Decimal(0) if terminal == "zero" else Decimal(2)
+            assert order.filled_qty.as_decimal() == expected
+            assert bool(harness.client.terminal_reconciliation_required)
+            if expected:
+                # Native reconciliation won; a late real TU before adapter retirement is inert.
+                harness.client._consume_private_frame(final)
+            harness.client.confirm_terminal_reconciliation()
+            assert not harness.client.terminal_reconciliation_required
+            assert harness.client.execution_hold_reason is None
+            if expected:
+                harness.client._consume_private_frame(final)
+            for _ in range(20):
+                await asyncio.sleep(0)
+            assert len([event for event in order.events if isinstance(event, OrderFilled)]) == bool(
+                expected,
+            )
+            assert len(store.intents()) == bool(expected)
+            assert len(harness.fake.sent) == sent  # Recovery never resends submit/cancel.
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("kind", ["unacked_ioc", "reduce_ioc", "cancel_maker"])
+@pytest.mark.parametrize("fault", ["type", "order_price", "before_order", "after_order", "missing"])
+def test_silent_full_terminal_requires_complete_raw_trade_terms(
+    tmp_path: Path, kind: str, fault: str,
+) -> None:
+    async def scenario() -> None:
+        maker = kind == "cancel_maker"
+        async with _terminal_recovery_case(
+            tmp_path, partial=False, maker=maker, request_cancel=maker,
+            accepted=maker, reduce_only=kind == "reduce_ioc", silent=True,
+        ) as (harness, engine, store, order, final):
+            trade = cast(list[object], final[2])
+            row = cast(list[object], harness.rest.history[0])
+            if fault == "type":
+                trade[6] = "IOC" if maker else "LIMIT"
+            elif fault == "order_price":
+                trade[7] = Decimal("3800")
+            elif fault == "before_order":
+                trade[2] = cast(int, row[4]) - 1
+            elif fault == "after_order":
+                trade[2] = cast(int, row[5]) + 1
+            else:
+                harness.rest.trades = []
+            with pytest.raises(BitfinexV1ExecutionError, match="trade|quantity evidence"):
+                await harness.client.generate_mass_status(15)
+            assert not await engine.reconcile_execution_state(timeout_secs=1)
+            assert order.filled_qty.as_decimal() == 0 and not store.intents()
+            live = harness.client._live_for_client(order.client_order_id)
+            assert live is not None and live.reconciled_terminal is None
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("maker", [False, True])
+@pytest.mark.parametrize("history", ["missing", "active"])
+def test_silent_terminal_needs_a_terminal_not_empty_or_active_history(
+    tmp_path: Path, maker: bool, history: str,
+) -> None:
+    async def scenario() -> None:
+        async with _terminal_recovery_case(
+            tmp_path, partial=False, zero=True, maker=maker, request_cancel=maker,
+            silent=True,
+        ) as (harness, engine, store, order, _):
+            row = cast(list[object], harness.rest.history[0])
+            harness.rest.history = []
+            if history == "active":
+                row[13] = "ACTIVE"
+                harness.rest.active = [row]
+            if history == "missing":
+                assert not await engine.reconcile_execution_state(timeout_secs=1)
+            else:
+                assert await engine.reconcile_execution_state(timeout_secs=1)
+            harness.client.confirm_terminal_reconciliation()
+            assert harness.client.terminal_reconciliation_required
+            live = harness.client._live_for_client(order.client_order_id)
+            assert live is not None and live.reconciled_terminal is None
+            assert not order.is_closed and not store.intents()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("boundary", ["production", "cold", "working_maker", "unknown_modify"])
+def test_silent_deadline_does_not_expand_outside_current_paper_actions(
+    tmp_path: Path, boundary: str,
+) -> None:
+    async def scenario() -> None:
+        maker = boundary in {"working_maker", "unknown_modify"}
+        async with _terminal_recovery_case(
+            tmp_path, partial=False, zero=True, maker=maker, paper=boundary != "production",
+            request_cancel=boundary == "unknown_modify", silent=True,
+        ) as (harness, _, _, order, _final):
+            live = harness.client._live_for_client(order.client_order_id)
+            assert live is not None
+            if boundary == "cold":
+                live.submitted_in_process = False
+            elif boundary == "unknown_modify":
+                live.unknown_operations.add("modify")
+                live.pending_modify_price = Decimal("3900")
+            assert not harness.client.terminal_reconciliation_required
+            await harness.client.generate_mass_status(15)
+            # W4d explicitly allows an exact full mass to recover a working Maker;
+            # its order age still does not manufacture a silent mutation deadline.
+            assert (live.reconciled_terminal is not None) == (boundary == "working_maker")
+            if boundary == "unknown_modify":
+                assert "modify" in live.unknown_operations
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("complete_trade", [False, True])
+def test_paper_ioc_terminal_deadline_survives_ack_during_send(complete_trade: bool) -> None:
+    async def scenario() -> None:
+        harness = _Harness(
+            raw_symbol=PAPER_RAW_SYMBOL, wallet_currency="TESTUSDTF0",
+            mutation_ack_timeout_ms=100,
+        )
+        await harness.connect()
+        try:
+            order = harness.order(tif=TimeInForce.IOC, post_only=False, quantity="2")
+
+            def accept_during_send(_payload: object) -> None:
+                live = harness.client._live_for_client(order.client_order_id)
+                assert live is not None
+                harness.client._consume_private_frame(harness.order_frame("on", live.cid, order))
+
+            harness.fake.after_send = accept_during_send
+            cid = await harness.submit(order)
+            live = harness.client._by_cid[cid]
+            assert live.accepted and (cid, "submit") not in harness.client._ack_deadlines
+            deadline = live.terminal_reconciliation_deadline
+            assert deadline is not None and not harness.client.terminal_reconciliation_required
+            if complete_trade:
+                harness.client._consume_private_frame(
+                    harness.trade_frame(cid, order, quantity="2", maker=-1),
+                )
+            await asyncio.sleep(0.11)
+            assert harness.client.terminal_reconciliation_required == (not complete_trade)
+            assert (harness.client.execution_hold_reason is None) == complete_trade
+            assert live.terminal_reconciliation_deadline == deadline
+            assert len(harness.fake.sent) == 2
+        finally:
+            await harness.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("partial", [False, True])
+def test_silent_maker_terminal_does_not_inherit_stream_post_only_omission(
+    tmp_path: Path, partial: bool,
+) -> None:
+    async def scenario() -> None:
+        async with _terminal_recovery_case(
+            tmp_path, partial=partial, maker=True, request_cancel=True, silent=True, rest_flags=0,
+        ) as (harness, engine, store, order, _):
+            with pytest.raises(BitfinexV1ExecutionError, match="post_only"):
+                await harness.client.generate_mass_status(15)
+            assert not await engine.reconcile_execution_state(timeout_secs=1)
+            assert order.filled_qty.as_decimal() == 0 and not store.intents()
+            assert harness.client.terminal_reconciliation_required
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("maker", [False, True])
+def test_definitive_cancel_rejection_ends_only_its_maker_terminal_wait(maker: bool) -> None:
+    async def scenario() -> None:
+        harness = _Harness(
+            raw_symbol=PAPER_RAW_SYMBOL, wallet_currency="TESTUSDTF0",
+            mutation_ack_timeout_ms=100,
+        )
+        await harness.connect()
+        try:
+            order = harness.order(
+                tif=TimeInForce.GTC if maker else TimeInForce.IOC, post_only=maker,
+            )
+            cid = await harness.submit(order)
+            harness.client._consume_private_frame(harness.order_frame("on", cid, order))
+            await harness.cancel(order)
+            live = harness.client._by_cid[cid]
+            first_deadline = live.terminal_reconciliation_deadline
+            assert first_deadline is not None
+            harness.client._consume_private_frame(
+                _notification("oc-req", cid=cid, venue_order_id=VENUE_ORDER_ID),
+            )
+            assert not live.pending_cancel and not live.unknown_operations
+            await asyncio.sleep(0.11)
+            if maker:
+                assert not bool(harness.client.terminal_reconciliation_required)
+                await harness.cancel(order)  # A new explicit command, never an automatic resend.
+                assert not bool(harness.client.terminal_reconciliation_required)
+                assert live.terminal_reconciliation_deadline is not None
+                assert live.terminal_reconciliation_deadline > first_deadline
+                assert (cid, "cancel") in harness.client._ack_deadlines
+                await asyncio.sleep(0.11)
+                assert harness.client.terminal_reconciliation_required
+                assert len(harness.fake.sent) == 4
+            else:
+                assert live.terminal_reconciliation_deadline == first_deadline
+                assert harness.client.terminal_reconciliation_required
+                assert len(harness.fake.sent) == 3
+        finally:
+            await harness.close()
+    asyncio.run(scenario())
+
+
+def test_zero_terminal_confirmation_does_not_ignore_nonzero_average(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        async with _terminal_recovery_case(
+            tmp_path, partial=False, zero=True, silent=True,
+        ) as (harness, engine, _, order, _):
+            assert await engine.reconcile_execution_state(timeout_secs=1)
+            live = harness.client._live_for_client(order.client_order_id)
+            assert live is not None and live.reconciled_terminal is not None
+            live.reconciled_terminal.avg_px = Decimal("3926.75")
+            with pytest.raises(BitfinexV1ExecutionError, match="cache does not prove"):
+                harness.client.confirm_terminal_reconciliation()
+            assert harness.client.terminal_reconciliation_required
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("fault", [None, "cold", "accepted", "venue_binding", "cid_binding"])
+def test_silent_rejected_ioc_confirms_native_missing_venue_id_only_from_exact_owned_rest(
+    tmp_path: Path, fault: str | None,
+) -> None:
+    async def scenario() -> None:
+        async with _terminal_recovery_case(
+            tmp_path, partial=False, zero=True, silent=True, accepted=False,
+        ) as (harness, engine, store, order, _):
+            cast(list[object], harness.rest.history[0])[13] = "INSUFFICIENT MARGIN"
+            assert await engine.reconcile_execution_state(timeout_secs=1)
+            assert order.status == OrderStatus.REJECTED and order.venue_order_id is None
+            assert order.filled_qty.as_decimal() == 0 and not store.intents()
+            live = harness.client._live_for_client(order.client_order_id)
+            assert live is not None and live.reconciled_terminal is not None
+            assert not live.accepted
+            if fault == "cold":
+                live.submitted_in_process = False
+            elif fault == "accepted":
+                live.accepted = True
+            elif fault == "venue_binding":
+                harness.client._cid_by_venue[VENUE_ORDER_ID] = live.cid + 1
+            elif fault == "cid_binding":
+                harness.client._cid_store._by_cid.pop(live.cid)
+            if fault is None:
+                harness.client.confirm_terminal_reconciliation()
+                assert not harness.client.terminal_reconciliation_required
+                assert harness.client.execution_hold_reason is None
+                assert order.venue_order_id is None  # Do not invent a native acceptance/ID.
+                assert not any(isinstance(event, OrderAccepted | OrderFilled)
+                               for event in order.events)
+                assert len(harness.fake.sent) == 2
+            else:
+                with pytest.raises(BitfinexV1ExecutionError, match="cache does not prove"):
+                    harness.client.confirm_terminal_reconciliation()
+                assert harness.client.terminal_reconciliation_required
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("terminal, fault", [
+    (terminal, fault)
+    for terminal in ("rejected", "partial", "full")
+    for fault in (None, "missing_report", "quantity", "flags", "missing_trade", "trade_id")
+    if terminal != "rejected" or fault not in {"missing_trade", "trade_id"}
+])
+def test_silent_terminal_retry_revalidates_closed_native_order_before_adapter_retirement(
+    tmp_path: Path, terminal: str, fault: str | None,
+) -> None:
+    async def scenario() -> None:
+        async with _terminal_recovery_case(
+            tmp_path, partial=terminal == "partial", zero=terminal == "rejected",
+            silent=True, accepted=False,
+        ) as (harness, engine, store, order, _):
+            row = cast(list[object], harness.rest.history[0])
+            if terminal == "rejected":
+                row[13] = "INSUFFICIENT MARGIN"
+            assert await engine.reconcile_execution_state(timeout_secs=1)
+            assert order.is_closed
+            live = harness.client._live_for_client(order.client_order_id)
+            assert live is not None and live.reconciled_terminal is not None
+            original_report = live.reconciled_terminal
+            original_events = list(order.events)
+            original_intents = store.intents()
+            if fault == "missing_report":
+                harness.rest.history = []
+            elif fault == "quantity":
+                row[6:8] = [cast(Decimal, row[6]) + 1, cast(Decimal, row[7]) + 1]
+            elif fault == "flags":
+                row[12] = REDUCE_ONLY_FLAG
+            elif fault == "missing_trade":
+                harness.rest.trades = []
+            elif fault == "trade_id":
+                trade = cast(list[object], harness.rest.trades[0])
+                trade[0] = cast(int, trade[0]) + 1
+            if fault is None:
+                assert await engine.reconcile_execution_state(timeout_secs=1)
+                harness.client.confirm_terminal_reconciliation()
+                assert not harness.client.terminal_reconciliation_required
+                assert harness.client.execution_hold_reason is None
+            else:
+                try:
+                    result = await harness.client.generate_mass_status(15)
+                except BitfinexV1ExecutionError:
+                    result = None
+                assert result is None  # The native parent returns None on report conversion errors.
+                assert not await engine.reconcile_execution_state(timeout_secs=1)
+                assert live.reconciled_terminal is original_report
+                assert harness.client.terminal_reconciliation_required
+                assert harness.client.execution_hold_reason is not None
+            assert list(order.events) == original_events
+            assert store.intents() == original_intents
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("stream_flags, rest_flags", [
+    (0, POST_ONLY_FLAG), (0, 0), (POST_ONLY_FLAG, POST_ONLY_FLAG), (POST_ONLY_FLAG, 0),
+])
+def test_partial_maker_terminal_normalizes_only_its_authenticated_opaque_post_only_bit(
+    tmp_path: Path, stream_flags: int, rest_flags: int,
+) -> None:
+    async def scenario() -> None:
+        async with _terminal_recovery_case(
+            tmp_path, partial=True, maker=True, request_cancel=True,
+            terminal_flags=stream_flags, rest_flags=rest_flags,
+        ) as case:
+            harness, engine, store, order, _ = case
+            allowed = stream_flags == 0 or rest_flags == POST_ONLY_FLAG
+            assert await engine.reconcile_execution_state(timeout_secs=1.0) == allowed
+            if allowed:
+                assert order.status == OrderStatus.CANCELED
+                assert order.filled_qty.as_decimal() == Decimal(2)
+                assert len(store.intents()) == 1
+                cid = harness.client._cid_by_client[order.client_order_id]
+                terminal = harness.client._by_cid[cid].terminal
+                assert terminal is not None and terminal.flags == stream_flags
+                assert cast(list[object], harness.rest.history[0])[12] == rest_flags
+                harness.client.confirm_terminal_reconciliation()
+                assert harness.client.execution_hold_reason is None
+            else:
+                assert order.filled_qty.as_decimal() == 0
+                assert not order.is_closed
+                assert not store.intents()
+                assert harness.client.terminal_reconciliation_required
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("paper, request_cancel", [(False, True), (True, False)])
+def test_partial_maker_terminal_rejects_post_only_omission_without_prior_authority(
+    tmp_path: Path, paper: bool, request_cancel: bool,
+) -> None:
+    async def scenario() -> None:
+        with pytest.raises(BitfinexV1ExecutionError, match="differs from local submission"):
+            async with _terminal_recovery_case(
+                tmp_path, partial=True, maker=True, paper=paper, request_cancel=request_cancel,
+                terminal_flags=0, rest_flags=POST_ONLY_FLAG,
+            ):
+                raise AssertionError("unauthorized omission reached reconciliation")
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("field, changed", [
+    (12, REDUCE_ONLY_FLAG), (17, Decimal("3926.85")), (16, Decimal("3926.85")),
+])
+def test_authenticated_opaque_post_only_does_not_relax_other_terminal_facts(
+    tmp_path: Path, field: int, changed: object,
+) -> None:
+    async def scenario() -> None:
+        async with _terminal_recovery_case(
+            tmp_path, partial=True, maker=True, request_cancel=True,
+            terminal_flags=0, rest_flags=POST_ONLY_FLAG,
+        ) as case:
+            harness, engine, store, order, _ = case
+            cast(list[object], harness.rest.history[0])[field] = changed
+            assert not await engine.reconcile_execution_state(timeout_secs=1.0)
+            assert order.filled_qty.as_decimal() == 0
+            assert not order.is_closed and not store.intents()
+            assert harness.client.terminal_reconciliation_required
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("maker", [False, True])
+@pytest.mark.parametrize("fault", [
+    "missing", "quantity", "side", "price", "order_price", "trade_venue", "trade_time",
+    "report_side", "report_quantity", "report_average", "report_price",
+])
+def test_partial_cancel_rejects_incomplete_or_conflicting_trades_before_native_close(
+    tmp_path: Path, maker: bool, fault: str,
+) -> None:
+    async def scenario() -> None:
+        async with _terminal_recovery_case(tmp_path, partial=True, maker=maker) as case:
+            harness, engine, store, order, final = case
+            row = cast(list[object], final[2])
+            if fault == "missing":
+                harness.rest.trades = []
+            elif fault == "quantity":
+                row[4] = Decimal(1)
+            elif fault == "side":
+                row[4] = Decimal(-2)
+            elif fault == "price":
+                row[5] = Decimal("3926.85")
+            elif fault == "order_price":
+                row[7] = Decimal("3926.85")
+            elif fault == "trade_venue":
+                row[3] = VENUE_ORDER_ID + 1
+            elif fault == "trade_time":
+                row[2] = cast(int, row[2]) + 1
+            else:
+                terminal = cast(list[object], harness.rest.history[0]).copy()
+                if fault == "report_side":
+                    terminal[6:8] = [Decimal(-2), Decimal(-4)]
+                elif fault == "report_quantity":
+                    terminal[6:8] = [Decimal(3), Decimal(5)]
+                elif fault == "report_average":
+                    terminal[17] = Decimal("3926.85")
+                elif fault == "report_price":
+                    terminal[16] = Decimal("3926.85")
+                harness.rest.history = [terminal]
+            assert not await engine.reconcile_execution_state(timeout_secs=1.0)
+            assert order.status == OrderStatus.ACCEPTED
+            assert order.filled_qty.as_decimal() == 0
+            assert not store.intents()
+            assert harness.client.terminal_reconciliation_required
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("partial, maker", [(False, False), (True, False), (True, True)])
+def test_terminal_reconciliation_releases_exact_cache_without_republishing_late_trades(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, partial: bool, maker: bool,
+) -> None:
+    async def scenario() -> None:
+        async with _terminal_recovery_case(tmp_path, partial=partial, maker=maker) as case:
+            harness, engine, store, order, final = case
+            if not partial:
+                harness.rest.trades = []  # Preserve the existing full inferred rule.
+            assert await engine.reconcile_execution_state(timeout_secs=1.0)
+            assert order.status == (OrderStatus.CANCELED if partial else OrderStatus.FILLED)
+            assert order.filled_qty.as_decimal() == Decimal(2)
+            assert len(store.intents()) == 1
+
+            def no_republication(*args: object, **kwargs: object) -> None:
+                raise AssertionError("already applied native fill must never be republished")
+
+            monkeypatch.setattr(harness.client, "generate_order_filled", no_republication)
+            # Hit the window before the runner gets to explicit adapter confirmation.
+            harness.client._consume_private_frame(final)
+            harness.client._consume_private_frame(final)
+            interim = cast(list[object], final[2]).copy()
+            interim[9:11] = [None, None]
+            harness.client._consume_private_frame([0, "te", interim])
+            harness.client.confirm_terminal_reconciliation()
+            assert not harness.client.terminal_reconciliation_required
+            assert harness.client.execution_hold_reason is None
+            assert len([event for event in order.events if isinstance(event, OrderFilled)]) == 1
+            assert len(JsonStateStore(tmp_path / "hedges.json").intents()) == 1
+            assert harness.client.fee_summary(order.client_order_id).complete
+            assert not store.can_submit_source()  # Adapter readiness cannot erase the hedge.
+            changed = cast(list[object], final[2]).copy()
+            changed[5] = Decimal("3926.85")
+            with pytest.raises(BitfinexV1ExecutionError, match="trade ID changed"):
+                harness.client._consume_private_frame([0, "tu", changed])
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("maker", [False, True])
+@pytest.mark.parametrize("first_fill_streamed", [False, True])
+def test_partial_cancel_retry_applies_complete_trade_set_once_before_cancel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, maker: bool, first_fill_streamed: bool,
+) -> None:
+    async def scenario() -> None:
+        async with _terminal_recovery_case(tmp_path, partial=True, maker=maker) as case:
+            harness, engine, store, order, final = case
+            first = cast(list[object], final[2]).copy()
+            second = first.copy()
+            first[4:6] = [Decimal(1), Decimal("3926.70")]
+            second[0] = 1235
+            second[4:6] = [Decimal(1), Decimal("3926.80")]
+            if first_fill_streamed:
+                harness.client._consume_private_frame([0, "tu", first])
+                for _ in range(20):
+                    await asyncio.sleep(0)
+            harness.rest.trades = []
+            assert not await engine.reconcile_execution_state(timeout_secs=1.0)
+            assert order.filled_qty.as_decimal() == int(first_fill_streamed)
+            assert not order.is_closed
+            harness.rest.trades = [first, first, second]  # Preserve requested REST sort order.
+            assert await engine.reconcile_execution_state(timeout_secs=1.0)
+            assert order.status == OrderStatus.CANCELED
+            assert order.filled_qty.as_decimal() == Decimal(2)
+            events = [event for event in order.events
+                      if isinstance(event, OrderFilled | OrderCanceled)]
+            assert [type(event) for event in events] == [OrderFilled, OrderFilled, OrderCanceled]
+            assert len(store.intents()) == 2
+
+            def no_republication(*args: object, **kwargs: object) -> None:
+                raise AssertionError("late duplicate must not publish a native fill")
+
+            monkeypatch.setattr(harness.client, "generate_order_filled", no_republication)
+            for row in (first, second):
+                harness.client._consume_private_frame([0, "tu", row])
+            harness.client.confirm_terminal_reconciliation()
+            assert harness.client.execution_hold_reason is None
+            assert not store.can_submit_source()
+            assert len(JsonStateStore(tmp_path / "hedges.json").intents()) == 2
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("fault", [None, "excess_quantity", "wrong_price", "future_trade"])
+def test_inferred_terminal_covers_late_real_trade_set_without_publishing_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: str | None,
+) -> None:
+    async def scenario() -> None:
+        async with _terminal_recovery_case(tmp_path, partial=False) as case:
+            harness, engine, store, order, final = case
+            harness.rest.trades = []
+            assert await engine.reconcile_execution_state(timeout_secs=1.0)
+
+            def no_republication(*args: object, **kwargs: object) -> None:
+                raise AssertionError("inferred fill must cover real trades without republishing")
+
+            monkeypatch.setattr(harness.client, "generate_order_filled", no_republication)
+            first = cast(list[object], final[2]).copy()
+            first[4] = Decimal(1)
+            harness.client._consume_private_frame([0, "tu", first])
+            assert not harness.client.fee_summary(order.client_order_id).complete
+            second = first.copy()
+            second[0] = 1235
+            if fault == "excess_quantity":
+                second[4] = Decimal(2)
+            elif fault == "wrong_price":
+                second[5] = Decimal("3926.85")
+            elif fault == "future_trade":
+                second[2] = harness.clock.timestamp_ns() // 1_000_000 + 1000
+            if fault is None:
+                harness.client._consume_private_frame([0, "tu", second])
+                harness.client.confirm_terminal_reconciliation()
+                assert harness.client.fee_summary(order.client_order_id).complete
+                assert harness.client.execution_hold_reason is None
+            else:
+                with pytest.raises(BitfinexV1ExecutionError, match="conflicts with native fills"):
+                    harness.client._consume_private_frame([0, "tu", second])
+                assert harness.client.terminal_reconciliation_required
+            assert len([event for event in order.events if isinstance(event, OrderFilled)]) == 1
+            assert len(store.intents()) == 1
 
     asyncio.run(scenario())
 

@@ -238,6 +238,9 @@ class _RoundtripReadinessProbe:
         self._config = profile.strategy_config
         self.now_ns = 10_000_000_000
         self.is_running = True
+        self._live_costs_from_adapters = True
+        self._hedge_instrument_valid = True
+        self._hedge_instrument = SimpleNamespace(ts_event=self.now_ns)
         self._cost_snapshot_valid = True
         self._cost_ts_ns = self.now_ns
         self._session_ts_ns = self.now_ns
@@ -250,6 +253,9 @@ class _RoundtripReadinessProbe:
         self.cache = SimpleNamespace(quote_tick=self.ticks.get)
         self.clock = SimpleNamespace(timestamp_ns=lambda: self.now_ns)
         self._live_submission_ready = lambda: True
+
+    def _required_hedge_instrument(self) -> Any:
+        return self._hedge_instrument
 
     def _inputs_are_fresh(
         self,
@@ -351,7 +357,7 @@ def _two_leg_inflight_hedge(
         hedge_client_id=hedge_route.client_id.value if hedge_route.client_id else None,
     )
     intent = store.reserve_source_fill(
-        fill_key="O-CLEANUP-HEDGE|V|T",
+        fill_key="O-CLEANUP-HEDGE|V|T-CLEANUP-HEDGE",
         client_order_id="O-CLEANUP-HEDGE",
         trade_id="T-CLEANUP-HEDGE",
         source_side=BusinessOrderSide.BUY,
@@ -445,7 +451,7 @@ class _CachedTriggerProbe(canary.MakerCanaryStrategy):
     ) -> CarryConfig:
         return CarryConfig()
 
-    def _try_release_cycle(self) -> bool:
+    def _try_release_cycle(self, *, inputs_fresh: bool = False) -> bool:
         return False
 
     def _global_obligation_block(self) -> bool:
@@ -530,12 +536,53 @@ def test_validator_rejects_non_1x_or_non_expressible_quantity(tmp_path: Path) ->
         )
 
 
-def test_transcript_cannot_overlap_state_path_before_creation(tmp_path: Path) -> None:
+@pytest.mark.parametrize("suffix", ["cid", "maker", "bid", "ask"])
+def test_transcript_cannot_overlap_state_path_before_creation(
+    tmp_path: Path, suffix: str,
+) -> None:
     profile = _profile(tmp_path)
-    output = Path(profile.bitfinex_exec_config.cid_store_path)
+    output = (
+        Path(profile.bitfinex_exec_config.cid_store_path) if suffix == "cid" else
+        Path(f"{profile.strategy_config.store_path_prefix}.{suffix}.json")
+    )
     with pytest.raises(ValueError, match="transcript and state paths"):
         canary.run_maker_canary(profile, output)
     assert not output.exists()
+
+
+def test_canary_tracks_new_and_legacy_maker_state_paths(tmp_path: Path) -> None:
+    profile = _profile(tmp_path)
+    prefix = profile.strategy_config.store_path_prefix
+    assert set(canary._state_paths(profile)) == {
+        Path(profile.bitfinex_exec_config.cid_store_path),
+        *(Path(f"{prefix}.{suffix}.json") for suffix in ("maker", "bid", "ask")),
+    }
+
+
+@pytest.mark.parametrize("suffix", ["maker", "bid", "ask"])
+def test_existing_maker_state_stops_canary_before_credentials_or_node(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, suffix: str,
+) -> None:
+    profile = _profile(tmp_path)
+    state = Path(f"{profile.strategy_config.store_path_prefix}.{suffix}.json")
+    state.write_text("existing state must be preserved")
+    lock = StringIO()
+    monkeypatch.setattr(canary, "_lock_canary", lambda _user_id: lock)
+    monkeypatch.setattr(
+        canary, "load_bitfinex_test_credentials",
+        lambda **_kwargs: pytest.fail("state check must precede credential loading"),
+    )
+
+    def unexpected_node(**_kwargs: Any) -> Any:
+        pytest.fail("state check must precede node construction")
+
+    result = canary.run_maker_canary(
+        profile, tmp_path / "existing-state.jsonl", execute=True,
+        environment={}, node_builder=unexpected_node,
+    )
+    assert result.outcome == "HOLD" and result.reason == "state_not_fresh"
+    assert state.read_text() == "existing state must be preserved"
+    assert lock.closed
 
 
 def test_one_shot_latch_calls_base_submission_only_once(
@@ -733,7 +780,7 @@ def test_cancel_holds_until_query_then_resumes_without_replacement(tmp_path: Pat
     assert strategy.hold_before_rest and not strategy.resume_ready
     assert store.active_source_order_id == "O-CANARY" and store.halt_reason
     complete: Any = completions[0]
-    complete(object())
+    assert complete(object()) is True
     observed: Any = strategy
     if not observed.resumed.is_set() or not observed.resume_ready:
         pytest.fail("exact REST completion did not resume the Maker")
@@ -1615,6 +1662,13 @@ def test_roundtrip_final_gate_requires_external_exact_flat(
         async def reconcile_execution_state(self, **_kwargs: object) -> bool:
             return True
 
+    class Runtime:
+        last_failure = None
+
+        async def reconcile(self, *, retry_failed: bool = True) -> bool:
+            assert retry_failed is False
+            return True  # Only final-evidence classification is in this unit test.
+
     class Node:
         kernel = SimpleNamespace(exec_engine=ExecEngine())
 
@@ -1648,6 +1702,7 @@ def test_roundtrip_final_gate_requires_external_exact_flat(
         return True
 
     monkeypatch.setattr(canary, "_wait_ready", wait_ready)
+    monkeypatch.setattr(canary, "get_source_terminal_reconciler", lambda _node: Runtime())
     monkeypatch.setattr(canary, "_wait_roundtrip_arm_ready", wait_ready)
     monkeypatch.setattr(canary, "read_snapshot", read_next)
     monkeypatch.setattr(canary, "_wait_roundtrip_phase", phase)

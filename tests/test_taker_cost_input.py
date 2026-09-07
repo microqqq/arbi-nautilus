@@ -41,6 +41,8 @@ class _FundingHarness:
             max_session_age_ns=10,
         )
         self._live_costs_from_adapters = True
+        self._hedge_instrument_valid = True
+        self._hedge_instrument = SimpleNamespace(ts_event=now_ns - 1)
         self._live_submission_ready = None
         self._one_shot = False
         self._one_shot_armed = False
@@ -56,6 +58,9 @@ class _FundingHarness:
         self._hedge_tick = SimpleNamespace(ts_event=now_ns - 1)
         self.cache = SimpleNamespace(quote_tick=lambda _instrument_id: self._hedge_tick)
         self.log = _Log()
+
+    def _required_hedge_instrument(self) -> Any:
+        return self._hedge_instrument
 
     def update_cost_snapshot(
         self,
@@ -133,6 +138,7 @@ def test_funding_freshness_ages_out_without_fabricating_refreshes() -> None:
 
     harness.clock.now_ns = 110
     harness._session_ts_ns = 109
+    harness._hedge_instrument.ts_event = 109
     assert not harness.inputs_are_fresh(109, 109)
 
     harness.on_funding_rate(_funding("0.0002", 109))
@@ -233,7 +239,7 @@ def test_book_decision_captures_now_once_for_freshness_and_swap_day(
 
     clock = _CountingClock()
     observed: list[tuple[str, int]] = []
-    source_book = object()
+    source_book = SimpleNamespace(ts_last=123_456_788)
     hedge_tick = SimpleNamespace(
         bid_price=Decimal(3999),
         ask_price=Decimal(4000),
@@ -251,13 +257,17 @@ def test_book_decision_captures_now_once_for_freshness_and_swap_day(
         return CarryConfig()
 
     harness = SimpleNamespace(
+        _draining=False,
         _config=SimpleNamespace(
             source_instrument_id=SOURCE_ID,
             hedge_instrument_id=HEDGE_ID,
             economics=SimpleNamespace(base_book_quantity=Decimal(1)),
         ),
         _allowed_source_direction=None,
-        state_store=SimpleNamespace(can_submit_source=lambda: True),
+        _live_account_reader=None,
+        state_store=SimpleNamespace(
+            can_submit_source=lambda: True, release_completed_cycle=lambda: False,
+        ),
         cache=SimpleNamespace(
             order_book=lambda instrument_id: source_book,
             quote_tick=lambda instrument_id: hedge_tick,
@@ -270,6 +280,7 @@ def test_book_decision_captures_now_once_for_freshness_and_swap_day(
         _hedge_account=lambda: object(),
         _submit_source=lambda opportunity: None,
         _source_book_callback_count=0,
+        _last_source_attempt_market_ts_ns=None,
         _last_decision_gate="not_started",
     )
     monkeypatch.setattr(
@@ -280,6 +291,7 @@ def test_book_decision_captures_now_once_for_freshness_and_swap_day(
         "py000_nautilus.strategies.taker.evaluate_taker",
         lambda **kwargs: None,
     )
+    harness._evaluate_and_submit = lambda: TakerStrategy._evaluate_and_submit(cast(Any, harness))
 
     TakerStrategy.on_order_book_deltas(
         cast(Any, harness),

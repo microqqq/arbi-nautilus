@@ -1,53 +1,57 @@
-"""Offline-buildable live composition for the single PY000 Maker strategy."""
+"""Live Maker composition; building is offline unless a cache database is supplied."""
 
 from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
 from decimal import Decimal
+from functools import partial
 from pathlib import Path
 from typing import Protocol, cast
 
-from nautilus_trader.config import TradingNodeConfig
-from nautilus_trader.core.uuid import UUID4
-from nautilus_trader.execution.messages import GenerateOrderStatusReport
-from nautilus_trader.live.config import LiveExecEngineConfig
+from nautilus_trader.config import DatabaseConfig
 from nautilus_trader.live.execution_client import LiveExecutionClient
 from nautilus_trader.live.node import TradingNode
 from nautilus_trader.model.identifiers import (
     ClientId,
-    ClientOrderId,
     TraderId,
     Venue,
-    VenueOrderId,
 )
+from nautilus_trader.trading.strategy import Strategy
 
 from py000_nautilus.bitfinex_v1_data import (
     BitfinexV1DataClient,
     BitfinexV1DataClientConfig,
-    BitfinexV1LiveDataClientFactory,
 )
 from py000_nautilus.bitfinex_v1_execution import (
     BitfinexV1ExecClientConfig,
     BitfinexV1ExecutionClient,
-    BitfinexV1LiveExecClientFactory,
 )
 from py000_nautilus.config import MakerStrategyConfig
+from py000_nautilus.live_cache import validate_native_cache
+from py000_nautilus.live_lifecycle import validate_stop_timeout
+from py000_nautilus.live_node import build_execution_node
+from py000_nautilus.live_runtime import SourceTerminalReconciler, bind_live_account_reader
+from py000_nautilus.maker_store import maker_legacy_paths, maker_state_path
 from py000_nautilus.mt5_v1_data import (
     Mt5V1DataClient,
     Mt5V1DataClientConfig,
-    Mt5V1LiveDataClientFactory,
 )
 from py000_nautilus.mt5_v1_execution import (
     Mt5V1ExecClientConfig,
     Mt5V1ExecutionClient,
-    Mt5V1LiveExecClientFactory,
     mt5_v1_execution_account_id,
+)
+from py000_nautilus.restart_recovery import (
+    StartupRecoveryOptions,
+    capture_startup_receipt,
+    check_rejected_retry_execution,
+    has_business_history,
+    reconcile_startup,
 )
 from py000_nautilus.strategies.maker import (
     MakerStrategy,
     SourceTerminalQuery,
-    SourceTerminalResult,
 )
 
 BITFINEX_CLIENT_NAME = "BITFINEX"
@@ -68,6 +72,7 @@ class MakerStrategyFactory(Protocol):
         hedge_quantity_ready: Callable[[Decimal], bool],
         live_costs_from_adapters: bool,
         source_terminal_query: SourceTerminalQuery,
+        source_quote_refresh_paused: Callable[[], bool] | None = None,
     ) -> MakerStrategy: ...
 
 
@@ -78,11 +83,17 @@ def build_live_maker_node(
     mt5_data_config: Mt5V1DataClientConfig,
     mt5_exec_config: Mt5V1ExecClientConfig,
     strategy_config: MakerStrategyConfig,
+    cache_database: DatabaseConfig | None = None,
     loop: asyncio.AbstractEventLoop | None = None,
     connection_timeout_seconds: float = 10.0,
+    stop_timeout_seconds: float = 10.0,
     strategy_factory: MakerStrategyFactory = MakerStrategy,
+    startup_recovery: StartupRecoveryOptions | None = None,
 ) -> tuple[TradingNode, MakerStrategy]:
-    """Build, but never connect or run, the exact two-leg live Maker node."""
+    """Build without trading connections; an explicit cache database connects on construction."""
+    validate_stop_timeout(stop_timeout_seconds)
+    if startup_recovery is not None and strategy_factory is not MakerStrategy:
+        raise ValueError("startup recovery options require the ordinary Maker")
     _validate_composition(
         bitfinex_data_config,
         bitfinex_exec_config,
@@ -93,81 +104,38 @@ def build_live_maker_node(
     if connection_timeout_seconds <= 0:
         raise ValueError("live Maker connection timeout must be positive")
 
-    node = TradingNode(
-        config=TradingNodeConfig(
-            trader_id=LIVE_MAKER_TRADER_ID,
-            data_clients={
-                BITFINEX_CLIENT_NAME: bitfinex_data_config,
-                MT5_CLIENT_NAME: mt5_data_config,
-            },
-            exec_clients={
-                BITFINEX_CLIENT_NAME: bitfinex_exec_config,
-                MT5_CLIENT_NAME: mt5_exec_config,
-            },
-            exec_engine=LiveExecEngineConfig(
-                reconciliation=True,
-                reconciliation_lookback_mins=None,
-                generate_missing_orders=False,
-                inflight_check_interval_ms=0,
-                open_check_interval_secs=None,
-                position_check_interval_secs=None,
-            ),
-            timeout_connection=connection_timeout_seconds,
-            timeout_reconciliation=connection_timeout_seconds,
-            timeout_portfolio=connection_timeout_seconds,
-            timeout_disconnection=connection_timeout_seconds,
-            timeout_post_stop=0.1,
-            timeout_shutdown=connection_timeout_seconds,
-        ),
-        loop=loop,
+    node = build_execution_node(
+        trader_id=LIVE_MAKER_TRADER_ID, bitfinex_data_config=bitfinex_data_config,
+        bitfinex_exec_config=bitfinex_exec_config, mt5_data_config=mt5_data_config,
+        mt5_exec_config=mt5_exec_config, cache_database=cache_database,
+        loop=loop, connection_timeout_seconds=connection_timeout_seconds,
     )
     try:
-        node.add_data_client_factory(BITFINEX_CLIENT_NAME, BitfinexV1LiveDataClientFactory)
-        node.add_data_client_factory(MT5_CLIENT_NAME, Mt5V1LiveDataClientFactory)
-        node.add_exec_client_factory(BITFINEX_CLIENT_NAME, BitfinexV1LiveExecClientFactory)
-        node.add_exec_client_factory(MT5_CLIENT_NAME, Mt5V1LiveExecClientFactory)
-        node.build()
-
         bitfinex_data = _data_client(node, BITFINEX_VENUE, BitfinexV1DataClient)
         mt5_data = _data_client(node, MT5_VENUE, Mt5V1DataClient)
         bitfinex_exec = _exec_client(node, BITFINEX_CLIENT_ID, BitfinexV1ExecutionClient)
         mt5_exec = _exec_client(node, MT5_CLIENT_ID, Mt5V1ExecutionClient)
 
-        def query_source_terminal(
-            client_order_id: ClientOrderId,
-            venue_order_id: VenueOrderId,
-            complete: SourceTerminalResult,
-        ) -> None:
-            async def run_query() -> None:
-                try:
-                    report = await bitfinex_exec.generate_order_status_report(
-                        GenerateOrderStatusReport(
-                            instrument_id=strategy_config.source_instrument_id,
-                            client_order_id=client_order_id,
-                            venue_order_id=venue_order_id,
-                            command_id=UUID4(),
-                            ts_init=cast(int, node.kernel.clock.timestamp_ns()),
-                        )
-                    )
-                except asyncio.CancelledError:
-                    complete(None)
-                    raise
-                except Exception:
-                    complete(None)
-                    raise
-                complete(report)
-
-            bitfinex_exec.create_task(
-                run_query(),
-                log_msg="maker-source-terminal-query",
-            )
+        reconciler = SourceTerminalReconciler(
+            source_client=bitfinex_exec,
+            exec_engine=node.kernel.exec_engine,
+            source_instrument_id=strategy_config.source_instrument_id,
+            timeout_seconds=connection_timeout_seconds,
+        )
+        node.trader.add_actor(reconciler)
 
         strategy = strategy_factory(
             strategy_config,
             live_submission_ready=lambda: (
-                bitfinex_data.is_connected
+                not reconciler.restart_pending
+                and bitfinex_data.is_connected
                 and bitfinex_data.book_is_actionable
                 and bitfinex_exec.execution_hold_reason is None
+                and bitfinex_exec.accounting_ready
+                and (
+                    reconciler.source_submission_ready
+                    or reconciler.working_observation_in_progress
+                )
                 and bitfinex_exec.get_account() is not None
                 and mt5_data.is_connected
                 and mt5_data.snapshot_refresh_healthy
@@ -176,9 +144,57 @@ def build_live_maker_node(
             ),
             hedge_quantity_ready=mt5_exec.can_execute_quantity,
             live_costs_from_adapters=True,
-            source_terminal_query=query_source_terminal,
+            source_terminal_query=reconciler.query_source_terminal,
+            source_quote_refresh_paused=lambda: reconciler.busy,
         )
         node.trader.add_strategy(strategy)
+        if strategy_factory is MakerStrategy:
+            node.bind_strategy_drain(strategy, timeout_seconds=stop_timeout_seconds)
+        strategy.bind_restart_gate(lambda: reconciler.restart_pending)
+        if cache_database is not None:
+            validate_native_cache(
+                node.cache,
+                trader_id=LIVE_MAKER_TRADER_ID,
+                strategy_id=strategy.id,
+                routes={
+                    strategy_config.source_instrument_id: (
+                        strategy_config.source_accounts[0].account_id, BITFINEX_CLIENT_ID,
+                    ),
+                    strategy_config.hedge_instrument_id: (
+                        strategy_config.hedge_accounts[0].account_id, MT5_CLIENT_ID,
+                    ),
+                },
+            )
+        receipt = capture_startup_receipt(strategy._state_store, startup_recovery)
+
+        async def recover_startup() -> None:
+            await reconcile_startup(
+                node.cache, strategy._state_store,
+                trader_id=LIVE_MAKER_TRADER_ID, strategy_id=strategy.id,
+                source=bitfinex_exec, hedge=mt5_exec,
+                source_instrument_id=strategy_config.source_instrument_id,
+                hedge_instrument_id=strategy_config.hedge_instrument_id,
+                receipt=receipt,
+                rejected_retry_check=partial(
+                    check_rejected_retry_execution, node.cache, mt5_exec,
+                    config=strategy_config, data=mt5_data,
+                ),
+            )
+
+        reconciler.bind_restart_recovery(recover_startup, history_present=lambda: bool(
+            startup_recovery is not None or node.cache.orders() or node.cache.positions()
+            or bitfinex_exec._cid_store.bindings or has_business_history(strategy._state_store)
+        ))
+        if reconciler.restart_pending:
+            node.kernel.logger.warning("native or business history; restart reconciliation pending")
+        bind_live_account_reader(
+            strategy, config=strategy_config,
+            source_data=bitfinex_data, source_client=bitfinex_exec,
+            hedge_data=mt5_data, hedge_client=mt5_exec,
+            wallet_currency=bitfinex_exec_config.wallet_currency,
+            hedge_symbol=mt5_exec_config.expected_symbol,
+            hedge_stream_id=mt5_exec_config.expected_stream_id,
+        )
         _verify_built_composition(
             node,
             strategy,
@@ -295,10 +311,10 @@ def _validate_composition(
     state_prefix = _required_path(strategy.store_path_prefix, "Maker state store prefix")
     paths = {
         _required_path(bitfinex_exec.cid_store_path, "Bitfinex CID store"),
-        _required_path(f"{state_prefix}.bid.json", "Maker bid state store"),
-        _required_path(f"{state_prefix}.ask.json", "Maker ask state store"),
+        maker_state_path(state_prefix).resolve(strict=False),
+        *(path.resolve(strict=False) for path in maker_legacy_paths(state_prefix)),
     }
-    if len(paths) != 3:
+    if len(paths) != 4:
         raise ValueError("Bitfinex CID and Maker state stores must use distinct paths")
 
 
@@ -338,6 +354,7 @@ def _verify_built_composition(
     bitfinex_exec: BitfinexV1ExecutionClient,
     mt5_data: Mt5V1DataClient,
     mt5_exec: Mt5V1ExecutionClient,
+    *, other_strategies: tuple[Strategy, ...] = (),
 ) -> None:
     data_engine = node.kernel.data_engine
     exec_engine = node.kernel.exec_engine
@@ -365,7 +382,8 @@ def _verify_built_composition(
         or exec_engine.open_check_interval_secs is not None
         or exec_engine.position_check_interval_secs is not None
         or strategy.config.external_order_claims is not None
-        or node.trader.strategies() != [strategy]
+        or any(other.config.external_order_claims for other in other_strategies)
+        or node.trader.strategies() != [strategy, *other_strategies]
     ):
         raise RuntimeError("live Maker node did not build the exact offline composition")
 
