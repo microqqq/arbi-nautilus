@@ -2,7 +2,7 @@
 
 日期：2026-09-05。设计基线：`7d0d4766c62b98c3e4b950da1d61e789d140e2c5`。
 
-状态（2026-09-08）：**W1–W8本地实现及下文限定的离线/原生验收收尾；W9现场验收尚未完成，不能称完整迁移或可上线。** 当前分支为 `codex/audit-remediation`。匹配EA已重挂；普通Taker、Maker的实际生命周期、Maker带仓重启及显式切换归零已有证据，Both首轮只有Maker成交、Taker未覆盖。1oz配置被本机RiskEngine正确拒绝；其暴露的本地DENIED无venue CID启动缺口已完成限定修复、独立复核、3326项全量及安装普通进程验证。真实账户仍保留+2/−2，合法2oz Taker共享持仓接续尚待现场执行。剩余为该场景、真实在线跨日及最终交付包；跨日一次性跟进已安排。历史绿色不覆盖新失败，不自动发布或恢复旧canary。
+状态（2026-09-08）：**W1–W8本地实现及下文限定的离线/原生验收收尾；W9现场验收尚未完成，不能称完整迁移或可上线。** 当前分支为 `codex/audit-remediation`。匹配EA已重挂；普通Taker、Maker的实际生命周期、Maker带仓重启及显式切换归零已有证据。本地DENIED恢复缺口已修复并完成3326项全量及安装普通进程验证；随后合法2oz Taker共享持仓接续实际成交/按票对冲完成、两端归零，但暴露账户减仓与策略原生NETTING reduce_only语义冲突，源native Position缺失、会计PENDING，未通过验收。当前不再发单，保留48订单原始缓存和全部失败历史；先按下文限定修复与恢复方案推进，再处理真实在线跨日和最终交付包。不自动发布或恢复旧canary。
 
 提交节奏（2026-09-05，按用户本轮要求）：每个可独立验证的小包在测试与独立复核通过后形成本地提交，不是每改一处就提交。此前累积且相互依赖的已验收修复先作为完整检查点提交；之后新包单独提交。提交说明标明实际完成边界，不把W1–W9全部完成作为检查点含义；推送、PR、合并和部署不由本地提交自动触发。
 
@@ -821,6 +821,14 @@ Both首轮获独立只读限定RECOMMEND-ACCEPT：前置距启动13.588/10.765�
 冻结后 `local-denied-frozen-full` **3326 passed /133既有Pandas警告 /566.33秒**，Ruff全仓、Mypy123文件与diff-check通过；测前后冻结SHA不变，专用临时Redis已移除。`/tmp/py000-w9-local-denial-install-c8SSmr`的wheel SHA `29e595e64f7f44092e5fa6f5b6b03e8e11963ad45815d21efcba4b7122430123`、sdist SHA `32b13eef2ff4e855b392dae6bd363414ffe8d2a27768c11f67d5a11fa2309050`：145项sdist内容、49生产模块与候选逐字一致，两隔离安装各18检查通过。安装wheel普通进程 **25 passed /15 deselected /213.86秒**，93观测/52子进程/25零事件冷加载、25临时Redis全部回收；另15共享控制通过。这是离线合成venue的资格，不冒称现场2oz或最终文档交付包已验收。
 
 中间失败亦保留：第一次full与最后一条测试断言收紧重叠，主agent发出的TERM/INT被普通节点当停止信号，日志两处Received SIGTERM/SIGINT对应两场中断失败；不用于验收，随后以上完整冻结全量重新执行。首次安装进程矩阵25项在测试辅助模块导入时因新环境缺pytest失败，补pytest9.0.2；第二次遇首次macOS原生库加载延迟而主动停止，未计绿色。待两安装18检查完整结束后才执行上述process-ready成功矩阵。以上均未触及真实账户/历史，不通过改产品门槛处理工具环境问题。
+
+**合法2oz Taker接续实际RED（02:57:53Z）：** 冻结runner `3854067a…`、profile `db3af149…`、readonly wrapper `fbe8b183…`经安装包66控制及独立复核，前置距启动87.434/67.480秒。普通启动保留5旧源及本机DENIED，Taker新SELL2 `O-20260908-025804-001-T-1`，Bitfinex订单243614628122、trade1970163292，TAKER@4419.7真实成交；T-2在MT5按原ticket10391391111 BUY2@4424.18，order10391866251/deal10110259741完成。02:58:18Z独立双端读取确认两端flat、无活动/其它仓位/未决，EA104。gross峰值2oz/最长2.558秒，业务旧历史保留、新1源/1完成，总6源/4完成，shared SHA `1f6e3b4b3bf010eff43dc97a31dac453a081cd15e9a8f8bb7876e764387b8873`。
+
+但NT在源fill时明确ERROR：不能从reduce-only fill新开`XAUTUSDT-PERP.BITFINEX-TakerStrategy-T`；现有反向position归Maker。源Order已记录fill并向策略发布，native Position却未更新。runner因此正常SIGTERM并等义务完成，13.989秒exit1/PAPER_INCOMPLETE，冷热会计均PENDING/native_position_history_incomplete；cold48订单的Taker源PID缺失，不能普通重启。程序停止与实际flat不等于现场通过；不会重试交易或将该轮标绿。前置/结果/日志/native-after-both-taker-resume完整保留。新Both冷测试确实走了reduce_only，却只核对venue净仓、MT5及业务完成，未核对源native/ERROR/最终会计，故曾PASS；独立只读重跑已复现同样错误，撤回这一部分“完整跨策略接续”的覆盖含义，不影响前一本地DENIED判据已证的零发送恢复边界。
+
+**下一窄修（doc-first，尚未实施）：** 固定NT NETTING PID按instrument-strategy确定，不能直接把Maker PID交给Taker；改HEDGING/统一策略身份会扩张已有恢复与会计契约，本轮不做。保留既有shared native_virtual语义：Taker仅在本单同时减少真实账户净仓、且减少本策略确有且足额的原生NETTING仓位时置reduce_only；跨owner的账户减仓在本策略是开反向virtual仓，使用普通IOC，如现有Maker减仓一样由专用单节点的共享账户准入/最坏成交净仓上限限制。明确该笔不再带venue reduce-only标记，不能冒称该额外venue保护仍存在；既有账户净仓2oz、共享leaves、MT5按票/.02、经济数量及UNKNOWN规则均不改。不得只按本策略仓位决定flag（账户flat时会错误阻止合法新增）。
+
+限定写集为既有`taker.py`和既有shared/startup相关测试。先在当前普通双adapter载体补源native Position、完整恢复资格及FINAL会计断言得到真实RED；再改flag谓词，覆盖同owner/跨owner、LONG/SHORT、部分/穿零、账户flat但策略虚拟仓非零、后续反向以及restart全部完整历史。测试不能只因义务完成就PASS。独立审查、冻结全量/静态与新安装资格后本地提交。当前失败的48单native/business/CID/EA历史不得删除、改fill、造Position或原地修索引；只读评估合法恢复方式，若需隔离旧namespace并从已证flat建立新测试namespace，先明确提出操作范围和历史保留方式，不偷偷清缓存或把新场景当旧场景恢复通过。此时不发单。
 
 建议初始会话预算为每模式 30 分钟、最多 10 次源订单；这是待运行 profile 确认的测试预算，不是立即执行命令。不得为了达到次数忽略市场关闭或不断重跑失败会话。跨日能力另外运行一个覆盖真实 broker rollover 的有界会话，结束时间按实际时区/市场时段设置；不伪称 30 分钟已证明跨日。
 
