@@ -2,7 +2,7 @@
 
 日期：2026-09-05。设计基线：`7d0d4766c62b98c3e4b950da1d61e789d140e2c5`。
 
-状态（2026-09-08）：**W1–W8本地实现及下文限定的离线/原生验收收尾；W9现场验收尚未完成，不能称完整迁移或可上线。** 当前分支为 `codex/audit-remediation`。用户已重挂匹配EA；当前版本普通Taker、Maker已有实际成交/对冲及重启证据，Maker最新带仓重启又完成两次机会，账户/原生历史/费用一致。下一步是显式场景切换归零、同节点Both及真实在线rollover，最终交付包仍须更新。历史计划和阶段性结果不覆盖后来的反例；最新结果见 W9。未据局部通过关闭现场阶段，也未自动发布或恢复旧canary。
+状态（2026-09-08）：**W1–W8本地实现及下文限定的离线/原生验收收尾；W9现场验收尚未完成，不能称完整迁移或可上线。** 当前分支为 `codex/audit-remediation`。匹配EA已重挂；普通Taker、Maker的实际生命周期、Maker带仓重启及显式切换归零已有证据，Both首轮只有Maker成交、Taker未覆盖。1oz配置被本机RiskEngine正确拒绝；其暴露的本地DENIED无venue CID启动缺口已完成限定修复、独立复核、3326项全量及安装普通进程验证。真实账户仍保留+2/−2，合法2oz Taker共享持仓接续尚待现场执行。剩余为该场景、真实在线跨日及最终交付包；跨日一次性跟进已安排。历史绿色不覆盖新失败，不自动发布或恢复旧canary。
 
 提交节奏（2026-09-05，按用户本轮要求）：每个可独立验证的小包在测试与独立复核通过后形成本地提交，不是每改一处就提交。此前累积且相互依赖的已验收修复先作为完整检查点提交；之后新包单独提交。提交说明标明实际完成边界，不把W1–W9全部完成作为检查点含义；推送、PR、合并和部署不由本地提交自动触发。
 
@@ -815,6 +815,12 @@ Both首轮获独立只读限定RECOMMEND-ACCEPT：前置距启动13.588/10.765�
 写集限既有`restart_recovery.py`与相关既有启动/普通组合测试文件。仅对完整、身份一致、零成交且无account/venue/position/trade及无adapter CID绑定的原生Initialized→Denied发送前终态，允许其不参与venue CID/report覆盖集合；它仍留在完整native/business核验及历史中。任何Submitted/Accepted/Fill、未知状态、额外/缺失绑定、伪造或不完整Denied事件、业务不一致及报告冲突继续拒绝。复用既有恢复/费用/原生校验，不改EA、adapter发单路径、RiskEngine品种最小量、schema、持久账或UNKNOWN规则。先用实际原生订单及当前5/4形状复现旧集合错误；覆盖Maker/Taker/shared正常启动、所有旧事实不变/零恢复交易及合格下一机会，另加已发送/异常证据负控。冻结后定向/全量/静态、独立复核及安装普通进程验证，单独本地提交；真实账户保持当前对冲库存，完成该前置后才准备合法2oz的Taker接续。
 
 先做不发单连接/对账，再单独 Taker、Maker，最后同节点 both；均使用普通策略。每一轮都事先记录最大时长、最多源订单数、每单/累计净仓上限、最大未对冲量与超时、停止方式，使用已有两测试账户，不申请每一步重复授权。
+
+**本地DENIED恢复前置已接受（2026-09-08）：** 原普通Maker/Taker冷启动在保留Initialized→Denied完整历史后均复现启动失败（`/tmp/py000-local-denied-cold-baseline-red.xml`，2失败）。生产只新增精确发送前拒单判据并接入CID/report集合；原完整native/business输入不变，额外绑定/report、错误event身份、account/venue/PID含副索引、fill/trade及非DENIED均不获豁免。三路径冻结SHA为生产`a259948b…`、reconciliation测试`2aa810e3…`、startup测试`1539f764…`，新增40项测试。独立审核121项通过，分别恢复旧CID或report输入两反事实重新RED，并原样重放真实M-8事件及绑定/PID反控；主agent限定接受这个恢复缺口。
+
+冻结后 `local-denied-frozen-full` **3326 passed /133既有Pandas警告 /566.33秒**，Ruff全仓、Mypy123文件与diff-check通过；测前后冻结SHA不变，专用临时Redis已移除。`/tmp/py000-w9-local-denial-install-c8SSmr`的wheel SHA `29e595e64f7f44092e5fa6f5b6b03e8e11963ad45815d21efcba4b7122430123`、sdist SHA `32b13eef2ff4e855b392dae6bd363414ffe8d2a27768c11f67d5a11fa2309050`：145项sdist内容、49生产模块与候选逐字一致，两隔离安装各18检查通过。安装wheel普通进程 **25 passed /15 deselected /213.86秒**，93观测/52子进程/25零事件冷加载、25临时Redis全部回收；另15共享控制通过。这是离线合成venue的资格，不冒称现场2oz或最终文档交付包已验收。
+
+中间失败亦保留：第一次full与最后一条测试断言收紧重叠，主agent发出的TERM/INT被普通节点当停止信号，日志两处Received SIGTERM/SIGINT对应两场中断失败；不用于验收，随后以上完整冻结全量重新执行。首次安装进程矩阵25项在测试辅助模块导入时因新环境缺pytest失败，补pytest9.0.2；第二次遇首次macOS原生库加载延迟而主动停止，未计绿色。待两安装18检查完整结束后才执行上述process-ready成功矩阵。以上均未触及真实账户/历史，不通过改产品门槛处理工具环境问题。
 
 建议初始会话预算为每模式 30 分钟、最多 10 次源订单；这是待运行 profile 确认的测试预算，不是立即执行命令。不得为了达到次数忽略市场关闭或不断重跑失败会话。跨日能力另外运行一个覆盖真实 broker rollover 的有界会话，结束时间按实际时区/市场时段设置；不伪称 30 分钟已证明跨日。
 
