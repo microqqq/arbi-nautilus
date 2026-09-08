@@ -860,6 +860,8 @@ Both首轮获独立只读限定RECOMMEND-ACCEPT：前置距启动13.588/10.765�
 
 准备位置 `runtime/w9-fresh-both-20260908-GJWsS0`；新Redis `a890a1244c2d47fe07908f73e22e2b7db05bcf38865edfb7779d295b93963f9e`、127.0.0.1:61137，独立目录保存AOF；profile SHA `bbd7e89c495c6795d4b5cafe2b1fcd78d8a1314001ad8f49d46d6b82b61d4d33`，薄观察器 SHA `3edb24ae58520a72488b3cff8d6fb0f3b5f559e01d9fba331626a0c72502b195`。与原profile反向规范化路径/端口后逐字段完全相同；安装CLI离线构建及观察器self-test通过，均未连接场馆。`preflight.py`、`commission_both_diagnostic.py`逐字复用原只读脚本，空缓存探针仅改新container/port。此记录不预先宣称已运行/通过。
 
+**第一段接受，仅限Maker实际场景：** 独立预审的9项native负控和8项停止控制通过后，05:14:22.917653Z启动，前置两端flat/零活动未决及新namespace空均在90秒内。65.676秒exit0/PAPER_STOPPED，Maker4源单（3成交、1取消）和3义务完成，实际BUY2→SELL2→BUY2；Taker正常启停但零交易。gross峰值2oz、最长3.312607秒，正常drain，无运行ERROR。05:15:41Z后置BFX+2（position193875738，4431.2）、MT5 SELL.02票10393341912（4427.05），无活动/未决，EA104旧前缀完整保留并新增6条；中间票10393327438已精确关闭。冷缓存49单＝42历史EXTERNAL＋7Maker，native完整性和普通恢复校验通过，与场馆持仓一致。冷热FINAL金融字段完全同值USD−0.48、USDT−16.20，合计−16.68限定native_virtual已实现口径；唯cold重建计数1/hot0不同。root最初整dict比较因这一诊断计数失败，随后逐金融/身份字段核验通过，未改生产或数据。独立后置复核接受这一限定场景。业务SHA `37d1c9667a36baa0054d09050f9958d1e2dbdc8bbdfdd12614d28acef209fa7c`，冷证据SHA `564cffdcadd06aeb4058a7276ad399210655845e60bf3497335559dc0f32e2f1`。本段不认证Taker接续、Both双策略或跨日；持仓保留，不为了测完自动清仓。
+
 保留当前单 MT5 指令上限 0.02 lots。已有 2oz 净仓上限与“2oz 同向连续开两次”的场景不兼容：后者先在离线 4oz 容量场景验证；需要在线验证时，必须在会话开始前明确提高累计净仓上限（例如 4oz），不能顺手调高，也不能拿两个先开后平的 2oz 测试冒充连续加仓。
 
 平仓是场景结束时的显式收尾，不是每个机会的策略规则。测试阈值可以降低以触发交易，但正式经济计算、事件处理和仓位逻辑必须保留。
