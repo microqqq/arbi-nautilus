@@ -804,6 +804,12 @@ Taker无成交是覆盖不足，不是已定位故障。现有共同准入允许
 
 Both首轮获独立只读限定RECOMMEND-ACCEPT：前置距启动13.588/10.765秒、EA96旧前缀不变，三新对冲及末真实/native/shared仓位逐项对应；两Strategy均RUNNING→STOPPED，但全部4源/3fill/3义务归Maker。以真实成交重算源−21USDT、MT5+1.40USD，匹配上述native_virtual范围。只接受本轮同节点/Maker生命周期及正常停止，不把Taker等待、未覆盖的成交或后续准备写成已通过。
 
+**1oz场景实际失败，撤回其可执行资格：** `0301b5d1c2d4effb78965f3e426f78a220e3279c01843930a613bcddd3dbf286`runner、`93c65fb7…`profile经78离线控制及独立审核后，02:22:17Z普通启动；7.717秒内新Maker CID `O-20260908-022224-001-M-8`在原生RiskEngine被拒绝：`quantity 1.00000000 invalid (< minimum trade size of 2)`。准备及复核只检查了MT5 min/step1oz，漏掉原Bitfinex profile/Instrument min_quantity=2，是本次测试配置方案错误，不是产品最小量门应放宽。订单只有Initialized→Denied，无Submitted/Accepted/Fill，Bitfinex CID绑定仍旧4条、不含该CID，EA102事件全数组不变。后置仍原+2/−2、无活动/未决，native46中旧45完整orders/events和全部positions/accounting不变，冷热FINAL仍−19.60。普通入口正常drain/exit0只说明停止完成，不把这轮算成功成交。保留DENIED及全部失败产物，新shared SHA `5ce8a1e21307d998b34fe208afcd1764cd39f5e5b6b6e12b5ab9cd19302ef1b2`；不改品种min、不删除历史、不重跑1oz。
+
+**纠正后的窄场景：** 现有Maker spread是报价公式，调高只会挂更远订单且继续占容量，不能当禁用开关。下一普通Both配置从原2oz profile出发，仅Maker bid/ask的open_quantity_ounces改0；Taker仍原2oz、base_book_quantity2、SHORT-first/−0.02，总risk/route2及其余身份/经济/EA不变。两Strategy仍在同一节点，零Maker量沿现有maker_quote返回None而非提交零数量订单；由Taker按现有共同持仓规划处理Maker留下的+2/−2，目标是跨策略接续，不冒称双方同时发单或公平调度已认证。先离线证明真实source min2不被修改、Maker无工作报价、Taker2满足两端min/step。新runner精确保留5旧源/3义务、46native和上述一个发送前DENIED；仅该不可变/已证零发送历史不触发新异常计数，任何当前halt/freeze或新DENIED/UNKNOWN仍停，不写生产状态或加resume-held豁免。fresh90秒同票/账户与cold核验，1800秒、最多10新源，Taker1项新完成或6新源早停；gross2oz/20秒/MT5≤.02lot/10秒drain/90秒正常停止不变。独立窄审后才运行，终场实读数量/按票归属及shared费用范围判断，不据程序exit0收口。
+
+**跨日衔接已安排而非验收完成：** 使用本任务的一次性heartbeat `arbi-nautilus-2`，北京时间2026-09-09 04:30承接最新停点，在真实Athens日期边界前准备剩余W9；须先核对当前资格、账户/缓存及运行预算，不重放旧脚本。两个旧heartbeat继续PAUSED。电脑、Codex、Docker和MT5需运行；错过窗口或只有EA/仓位单独跨日不得称普通节点跨日通过。最终交付包仍待真实剩余项和最后文档收齐，旧`dist/closeout-20260907`不代表当前提交。
+
 先做不发单连接/对账，再单独 Taker、Maker，最后同节点 both；均使用普通策略。每一轮都事先记录最大时长、最多源订单数、每单/累计净仓上限、最大未对冲量与超时、停止方式，使用已有两测试账户，不申请每一步重复授权。
 
 建议初始会话预算为每模式 30 分钟、最多 10 次源订单；这是待运行 profile 确认的测试预算，不是立即执行命令。不得为了达到次数忽略市场关闭或不断重跑失败会话。跨日能力另外运行一个覆盖真实 broker rollover 的有界会话，结束时间按实际时区/市场时段设置；不伪称 30 分钟已证明跨日。
