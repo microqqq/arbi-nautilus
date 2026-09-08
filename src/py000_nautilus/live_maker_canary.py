@@ -25,6 +25,7 @@ from nautilus_trader.model.events import OrderAccepted, OrderCanceled, OrderFill
 from nautilus_trader.model.identifiers import AccountId, ClientId, ClientOrderId, VenueOrderId
 from nautilus_trader.model.orders import Order
 
+from py000_nautilus.account_lock import lock_mt5_account
 from py000_nautilus.bitfinex_v1_cids import BitfinexV1CidStore
 from py000_nautilus.bitfinex_v1_data import PAPER_RAW_SYMBOL, BitfinexV1DataClientConfig
 from py000_nautilus.bitfinex_v1_execution import BitfinexV1ExecClientConfig
@@ -711,6 +712,7 @@ def run_maker_canary(
     strategy: MakerCanaryStrategy | MakerRoundtripStrategy | None = None
     rest: BitfinexV1RestClient | None = None
     lock: TextIO | None = None
+    hedge_lock: TextIO | None = None
     evidence_attempted = False
     result = MakerCanaryResult("FAILED", "canary_not_started", output)
     started_ms = time.time_ns() // 1_000_000
@@ -728,6 +730,7 @@ def run_maker_canary(
     try:
         if execute:
             lock = _lock_canary(profile.bitfinex_exec_config.user_id)
+            hedge_lock = lock_mt5_account(profile.mt5_exec_config.expected_account_id)
             if any(path.exists() for path in _state_paths(profile)):
                 raise PaperCanaryError("state_not_fresh")
             credentials = load_bitfinex_test_credentials(
@@ -852,6 +855,8 @@ def run_maker_canary(
                 )
             )
             result = MakerCanaryResult(outcome, "node_cleanup_failed", output, _order_id(strategy))
+        if hedge_lock is not None:
+            hedge_lock.close()
         if lock is not None:
             lock.close()
     finished: dict[str, object] = {

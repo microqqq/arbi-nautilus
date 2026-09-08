@@ -9,7 +9,7 @@ import inspect
 import json
 from collections.abc import Callable
 from copy import deepcopy
-from decimal import Decimal
+from decimal import ROUND_UP, Decimal, Inexact, localcontext
 from pathlib import Path
 from typing import Any, cast
 
@@ -27,6 +27,47 @@ from py000_nautilus.margin import bitfinex_margin_capacity, mt5_margin_capacity
 from py000_nautilus.models import HedgeAccount, MakerAccount, SourceAccount
 
 D = Decimal
+
+
+@pytest.mark.parametrize("precision", [6, 28, 50])
+@pytest.mark.parametrize("trap_inexact", [False, True])
+@pytest.mark.parametrize("equity, expected", [
+    ("183.999999", "0"), ("184", "1"), ("184.000001", "1"),
+])
+def test_mt5_capacity_owns_decimal_policy(
+    precision: int, equity: str, expected: str, trap_inexact: bool,
+) -> None:
+    with localcontext() as ambient:
+        ambient.prec = precision
+        ambient.rounding = ROUND_UP
+        ambient.traps[Inexact] = trap_inexact
+        ambient.clear_flags()
+        before = str(ambient)
+        result = mt5_margin_capacity(
+            margin_target=D(400), base_margin_level=D(60), position_ounces=D(0),
+            ask=D(4000), equity=D(equity),
+        )
+        assert result == (D(expected), D(expected))
+        assert str(ambient) == before
+
+
+@pytest.mark.parametrize("precision", [6, 28, 50])
+def test_bitfinex_capacity_owns_decimal_policy(precision: int) -> None:
+    with localcontext() as ambient:
+        ambient.prec = precision
+        ambient.rounding = ROUND_UP
+        ambient.traps[Inexact] = True
+        ambient.clear_flags()
+        before = str(ambient)
+        result = bitfinex_margin_capacity(
+            margin_target=D(400), base_margin_level=D(60), position_ounces=D(0),
+            reference_price=D(4000), collateral=D(184), unrealized_pnl=D(0),
+            available_balance=D(0), free_margin=D(184),
+        )
+        assert result == (D(0), D(0))  # floor(10000 / 460) remains 21, not 21.739...
+        assert str(ambient) == before
+
+
 _FIXTURE = Path(__file__).parent / "fixtures" / "legacy_margin_vectors.json"
 _COLUMNS = (
     "expect", "base_ml", "vol", "price", "dur", "equity", "free_margin", "collateral",

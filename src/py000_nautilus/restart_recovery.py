@@ -23,7 +23,7 @@ from typing import cast
 from nautilus_trader.cache.cache import Cache
 from nautilus_trader.execution.reports import ExecutionMassStatus, PositionStatusReport
 from nautilus_trader.model.enums import OrderStatus, PositionSide
-from nautilus_trader.model.events import OrderFilled
+from nautilus_trader.model.events import OrderDenied, OrderFilled, OrderInitialized
 from nautilus_trader.model.identifiers import (
     ClientOrderId,
     InstrumentId,
@@ -320,6 +320,34 @@ def _observed(cache: Cache, source: BitfinexV1ExecutionClient,
             hedge.pending_client_order_ids)
 
 
+def _wire_source_orders(cache: Cache, orders: list[Order], bound_ids: set[str]) -> list[Order]:
+    """Only a proven native pre-send denial has no venue CID or terminal report."""
+    wire_orders = []
+    for order in orders:
+        if order.status != OrderStatus.DENIED:
+            wire_orders.append(order)
+            continue
+        events = order.events
+        if (
+            len(events) != 2 or not isinstance(events[0], OrderInitialized)
+            or not isinstance(events[1], OrderDenied) or events[0].id == events[1].id
+            or events[1].ts_init < events[0].ts_init
+            or order.client_order_id.value in bound_ids
+            or order.account_id is not None or order.venue_order_id is not None
+            or order.position_id is not None or cache.position_id(order.client_order_id) is not None
+            or order.filled_qty.as_decimal() != 0 or order.trade_ids
+            or any(
+                event.trader_id != order.trader_id or event.strategy_id != order.strategy_id
+                or event.instrument_id != order.instrument_id
+                or event.client_order_id != order.client_order_id or event.reconciliation
+                or event.account_id is not None or event.venue_order_id is not None
+                for event in events
+            )
+        ):
+            raise ValueError("startup local source denial lacks complete pre-send evidence")
+    return wire_orders
+
+
 def _complete_orders(mass: ExecutionMassStatus, orders: list[Order],
                      instrument_id: InstrumentId, *,
                      rejected_venue_ids: dict[str, str] | None = None) -> None:
@@ -605,11 +633,13 @@ async def reconcile_startup(
     }, business_owners=shared_owners)
     source_orders = cast(list[Order], cache.orders(instrument_id=source_instrument_id))
     hedge_orders = cast(list[Order], cache.orders(instrument_id=hedge_instrument_id))
-    if {binding.client_order_id for binding in source._cid_store.bindings} != {
-        order.client_order_id.value for order in source_orders
+    bound_ids = {binding.client_order_id for binding in source._cid_store.bindings}
+    wire_source_orders = _wire_source_orders(cache, source_orders, bound_ids)
+    if bound_ids != {
+        order.client_order_id.value for order in wire_source_orders
     } or not source.fee_summary().complete:
         raise ValueError("startup source CID history or final fee evidence is incomplete")
-    _complete_orders(source_mass, source_orders, source_instrument_id)
+    _complete_orders(source_mass, wire_source_orders, source_instrument_id)
     _complete_orders(hedge_mass, hedge_orders, hedge_instrument_id, rejected_venue_ids={
         order.client_order_id.value:
             hedge._synthetic_rejected_venue_order_id(order.client_order_id.value).value

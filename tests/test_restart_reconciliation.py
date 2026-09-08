@@ -17,22 +17,27 @@ import pytest
 import test_bitfinex_v1_execution as bfx
 import test_mt5_v1_execution as mt5
 import test_restart_ownership as q3
+from nautilus_trader.cache.cache import Cache
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.model.currencies import USD
 from nautilus_trader.model.enums import OrderSide, OrderStatus, TimeInForce
-from nautilus_trader.model.events import OrderFilled, OrderInitialized
+from nautilus_trader.model.events import OrderDenied, OrderFilled, OrderInitialized
 from nautilus_trader.model.identifiers import (
     AccountId,
     ClientId,
     ClientOrderId,
+    InstrumentId,
+    PositionId,
     StrategyId,
     TradeId,
+    TraderId,
     VenueOrderId,
 )
 from nautilus_trader.model.objects import Money
-from nautilus_trader.model.orders import LimitOrder, MarketOrder
+from nautilus_trader.model.orders import LimitOrder, MarketOrder, Order
 from nautilus_trader.model.orders.unpacker import OrderUnpacker
 from nautilus_trader.test_kit.stubs.events import TestEventStubs
+from nautilus_trader.test_kit.stubs.execution import TestExecStubs
 from nautilus_trader.test_kit.stubs.identifiers import TestIdStubs
 from restart_replay_worker import _engine, _summary
 
@@ -42,9 +47,108 @@ from py000_nautilus.live_cache import validate_native_cache
 from py000_nautilus.maker_store import MakerStateStore
 from py000_nautilus.models import BusinessOrderSide, ObligationStatus, SourceDirection
 from py000_nautilus.mt5_v1_protocol import JsonObject
+from py000_nautilus.restart_recovery import _wire_source_orders
 from py000_nautilus.store import JsonStateStore
 from py000_nautilus.strategies.maker import MakerStrategy
 from py000_nautilus.strategies.taker import TakerStrategy
+
+
+@pytest.mark.parametrize("fault", [
+    None, "binding", "same-uuid", "trader", "strategy", "instrument",
+    "older-denial", "position-index",
+])
+def test_only_exact_native_presend_denial_is_absent_from_wire_history(fault: str | None) -> None:
+    cache = Cache()
+    order = TestExecStubs.limit_order()
+    denied = OrderDenied(
+        trader_id=TraderId("FOREIGN-001") if fault == "trader" else order.trader_id,
+        strategy_id=StrategyId("FOREIGN-001") if fault == "strategy" else order.strategy_id,
+        instrument_id=InstrumentId.from_str("EUR/USD.SIM")
+        if fault == "instrument" else order.instrument_id,
+        client_order_id=order.client_order_id, reason="native risk denial",
+        event_id=order.init_id if fault == "same-uuid" else UUID4(), ts_init=1,
+    )
+    if fault == "older-denial":
+        values = OrderInitialized.to_dict(order.init_event)
+        values["ts_init"] = 2
+        order = OrderUnpacker.from_init(OrderInitialized.from_dict(values))
+    order.apply(denied)  # NT itself accepts these event-owner/UUID counterexamples.
+    cache.add_order(order, client_id=ClientId("SIM"), position_id=(
+        PositionId("UNEXPECTED-POSITION") if fault == "position-index" else None
+    ))
+    bound = {order.client_order_id.value} if fault == "binding" else set()
+    before = tuple(order.events)
+    if fault is None:
+        assert _wire_source_orders(cache, [order], bound) == []
+    else:
+        with pytest.raises(ValueError, match="complete pre-send evidence"):
+            _wire_source_orders(cache, [order], bound)
+    assert tuple(order.events) == before
+
+
+@pytest.mark.parametrize("fault", [
+    "missing-init", "extra-submitted", "reconciled-event", "account", "venue", "position",
+    "trade", "filled", "client",
+])
+def test_corrupt_denied_observation_cannot_claim_native_presend_evidence(fault: str) -> None:
+    order = TestExecStubs.limit_order()
+    order.apply(OrderDenied(
+        trader_id=order.trader_id, strategy_id=order.strategy_id,
+        instrument_id=order.instrument_id, client_order_id=order.client_order_id,
+        reason="native risk denial", event_id=UUID4(), ts_init=1,
+    ))
+    # Deliberately contradictory observation, not an alternative native engine:
+    # native FSM cannot normally produce DENIED after submission/fill.
+    values = {name: getattr(order, name) for name in (
+        "status", "events", "trader_id", "strategy_id", "instrument_id", "client_order_id",
+        "account_id", "venue_order_id", "position_id", "trade_ids", "filled_qty",
+    )}
+    if fault == "missing-init":
+        values["events"] = order.events[1:]
+    elif fault == "extra-submitted":
+        values["events"] = [order.init_event, TestEventStubs.order_submitted(order),
+                            order.last_event]
+    elif fault == "client":
+        values["events"] = [order.init_event, OrderDenied(
+            trader_id=order.trader_id, strategy_id=order.strategy_id,
+            instrument_id=order.instrument_id, client_order_id=ClientOrderId("FOREIGN-CID"),
+            reason="foreign native event", event_id=UUID4(), ts_init=1,
+        )]
+    elif fault == "reconciled-event":
+        class ReconciledDenial(OrderDenied):
+            @property
+            def reconciliation(self) -> bool:
+                return True
+
+        values["events"] = [order.init_event, ReconciledDenial(
+            trader_id=order.trader_id, strategy_id=order.strategy_id,
+            instrument_id=order.instrument_id, client_order_id=order.client_order_id,
+            reason="synthetic reconciliation", event_id=UUID4(), ts_init=1,
+        )]
+    else:
+        field, value = {
+            "account": ("account_id", AccountId("SIM-001")),
+            "venue": ("venue_order_id", VenueOrderId("V-001")),
+            "position": ("position_id", PositionId("P-001")),
+            "trade": ("trade_ids", [TradeId("T-001")]),
+            "filled": ("filled_qty", order.quantity),
+        }[fault]
+        values[field] = value
+    with pytest.raises(ValueError, match="complete pre-send evidence"):
+        _wire_source_orders(Cache(), [cast(Order, SimpleNamespace(**values))], set())
+
+
+@pytest.mark.parametrize("status", ["INITIALIZED", "SUBMITTED", "ACCEPTED", "REJECTED"])
+def test_non_denied_source_still_requires_wire_coverage(status: str) -> None:
+    order = TestExecStubs.limit_order()
+    if status != "INITIALIZED":
+        order.apply(TestEventStubs.order_submitted(order))
+    if status == "ACCEPTED":
+        order.apply(TestEventStubs.order_accepted(order))
+    elif status == "REJECTED":
+        order.apply(TestEventStubs.order_rejected(order))
+    assert order.status.name == status
+    assert _wire_source_orders(Cache(), [order], set()) == [order]
 
 
 @pytest.mark.parametrize("swapped", [False, True], ids=["correct-targets", "swapped-targets"])

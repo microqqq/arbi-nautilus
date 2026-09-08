@@ -11,9 +11,10 @@ import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from copy import deepcopy
-from dataclasses import replace
+from dataclasses import asdict, replace
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
@@ -23,8 +24,9 @@ from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.execution.reports import ExecutionMassStatus, PositionStatusReport
 from nautilus_trader.model.data import FundingRateUpdate
 from nautilus_trader.model.enums import OmsType, OrderSide, OrderStatus, PositionSide
-from nautilus_trader.model.events import OrderFilled
+from nautilus_trader.model.events import OrderDenied, OrderFilled
 from nautilus_trader.model.identifiers import AccountId, ClientId, ClientOrderId, VenueOrderId
+from nautilus_trader.model.orders import Order
 from nautilus_trader.model.orders.unpacker import OrderUnpacker
 from nautilus_trader.model.position import Position
 from nautilus_trader.test_kit.stubs.events import TestEventStubs
@@ -47,7 +49,7 @@ from py000_nautilus.bitfinex_v1_reports import map_position_status_reports
 from py000_nautilus.durability import ParentDirectorySyncError, replace_and_sync_parent
 from py000_nautilus.live_runtime import get_source_terminal_reconciler
 from py000_nautilus.maker_store import MakerStateStore
-from py000_nautilus.models import HedgeIntent, ObligationStatus
+from py000_nautilus.models import BusinessOrderSide, HedgeIntent, ObligationStatus
 from py000_nautilus.mt5_v1_protocol import JsonObject
 from py000_nautilus.restart_recovery import _positions, reconcile_startup
 
@@ -59,6 +61,35 @@ async def _check(h: _OrdinaryStrategy) -> None:
         source=h.source, hedge=h.hedge,
         source_instrument_id=h.source_instrument.id, hedge_instrument_id=h.hedge_instrument.id,
     )
+
+
+def _local_denied(h: Any, side: OrderSide = OrderSide.BUY) -> Order:
+    """Native pre-send risk denial, with its complete business record but no adapter CID."""
+    order = h.strategy.order_factory.limit(
+        h.source_instrument.id, side,
+        h.source_instrument.make_qty(1), h.source_instrument.make_price(3900),
+    )
+    h.store.begin_source(
+        order.client_order_id.value, BusinessOrderSide[side.name], Decimal(1),
+        source_account_id=str(h.source.account_id), source_client_id=str(h.source.id),
+        hedge_account_id=str(h.hedge.account_id), hedge_client_id=str(h.hedge.id),
+    )
+    h.node.cache.add_order(order, client_id=h.source.id)
+    order.apply(OrderDenied(
+        trader_id=order.trader_id, strategy_id=order.strategy_id,
+        instrument_id=order.instrument_id, client_order_id=order.client_order_id,
+        reason="quantity 1 invalid (< minimum trade size of 2)", event_id=UUID4(),
+        ts_init=h.node.kernel.clock.timestamp_ns(),
+    ))
+    h.node.cache.update_order(order)
+    h.store.update_source_status(order.client_order_id.value, "DENIED")
+    assert order.account_id is None and order.venue_order_id is None
+    assert order.position_id is None and not order.trade_ids and order.filled_qty == 0
+    assert h.node.cache.position_id(order.client_order_id) is None
+    assert order.client_order_id.value not in {
+        binding.client_order_id for binding in h.source._cid_store.bindings
+    }
+    return order
 
 
 def test_first_valid_maker_funding_after_receipt_does_not_create_a_startup_pause(
@@ -300,23 +331,230 @@ def test_settled_ordinary_history_passes_complete_startup_check(
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("fault", [
+    None, "denied-binding", "extra-binding", "missing-binding", "extra-report",
+    "missing-report", "business-quantity", "business-missing", "business-unknown",
+    "position-index",
+])
+def test_local_denial_only_changes_venue_coverage_not_complete_business_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: str | None,
+) -> None:
+    async def scenario() -> None:
+        async with _settled(tmp_path, monkeypatch, maker=False) as (h, source, wire):
+            denied = _local_denied(h)
+            cid = denied.client_order_id.value
+            if fault in {"denied-binding", "extra-binding"}:
+                h.source._cid_store.allocate(
+                    cid if fault == "denied-binding" else "UNEXPECTED-CID", epoch_ms=1,
+                )
+            elif fault == "missing-binding":
+                del h.source._cid_store._by_client[source.order(next(iter(source.rows)))
+                                                 .client_order_id.value]
+            elif fault == "business-quantity":
+                h.store._state.source_orders[cid] = replace(
+                    h.store._state.source_orders[cid], quantity_ounces=Decimal(2),
+                )
+            elif fault == "business-missing":
+                del h.store._state.source_orders[cid]
+            elif fault == "business-unknown":
+                h.store.update_source_status(cid, "UNKNOWN")
+            elif fault == "position-index":
+                position, = h.node.cache.positions(instrument_id=h.source_instrument.id)
+                h.node.cache.add_position_id(position.id, denied.venue,
+                                             denied.client_order_id, denied.strategy_id)
+                assert h.node.cache.check_integrity()
+            if fault in {"extra-report", "missing-report"}:
+                original = h.source.generate_mass_status
+
+                async def conflicting(lookback: int | None = None) -> ExecutionMassStatus:
+                    mass = await original(lookback)
+                    assert mass is not None
+                    if fault == "missing-report":
+                        mass._order_reports.pop(next(iter(mass.order_reports)))
+                    else:
+                        report = deepcopy(next(iter(mass.order_reports.values())))
+                        report.client_order_id = denied.client_order_id
+                        report.venue_order_id = VenueOrderId("UNEXPECTED-VENUE")
+                        mass.add_order_reports([report])
+                    return cast(ExecutionMassStatus, mass)
+
+                monkeypatch.setattr(h.source, "generate_mass_status", conflicting)
+            business = deepcopy(h.store._to_payload())
+            history = {order.client_order_id: tuple(order.events)
+                       for order in h.node.cache.orders()}
+            sent = deepcopy((source.rows, wire.submit_calls, wire.close_calls,
+                             h.source_cancel_commands))
+            if fault is None:
+                await _check(h)
+            else:
+                with pytest.raises(ValueError):
+                    await _check(h)
+            assert h.store._to_payload() == business
+            assert history == {order.client_order_id: tuple(order.events)
+                               for order in h.node.cache.orders()}
+            assert sent == (source.rows, wire.submit_calls, wire.close_calls,
+                            h.source_cancel_commands)
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("maker_delta,fill_quantity", [(2, 2), (-2, 2), (2, 1)],
+                         ids=["long-maker", "short-maker", "partial-ioc"])
+def test_both_cold_start_preserves_local_denial_and_taker_can_continue_maker_inventory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capfd: pytest.CaptureFixture[str],
+    maker_delta: int, fill_quantity: int,
+) -> None:
+    # Local import reuses the ordinary Both fixture without its reverse import
+    # of _History creating a module-initialization cycle.
+    from ordinary_restart_worker import _native
+    from test_shared_strategy import _Joint
+
+    async def qualified(h: _Joint) -> dict[str, Any]:
+        assert await h.node.kernel.exec_engine.reconcile_execution_state(timeout_secs=2)
+        await _pump()
+        h.source.confirm_terminal_reconciliation()
+        await reconcile_startup(
+            h.node.cache, h.owner, trader_id=h.node.trader.id, strategy_id=h.maker.id,
+            source=h.source, hedge=h.hedge, source_instrument_id=h.source_instrument.id,
+            hedge_instrument_id=h.hedge_instrument.id,
+        )
+        report = build_run_accounting_report(
+            h.node.cache, h.source, h.hedge, trader_id=h.node.trader.id,
+            strategy_id=h.maker.id, strategy_ids=(h.maker.id, h.taker.id),
+            fx=h.maker_config.economics.fx,
+        )
+        assert report.status == "FINAL", report.pending_reasons
+        return asdict(report)
+
+    async def scenario() -> None:
+        sign = 1 if maker_delta > 0 else -1
+        maker_side = OrderSide.BUY if sign > 0 else OrderSide.SELL
+        taker_side = OrderSide.SELL if sign > 0 else OrderSide.BUY
+        first = _Joint(tmp_path, monkeypatch, limit=2,
+                       maker_quantity=2 if sign > 0 else 0, maker_ask=2 if sign < 0 else 0)
+        try:
+            await first.start()
+            first.quote_order("maker")
+            await first.until(lambda: bool(first.active(first.maker, maker_side)), direction=sign)
+            source_cid, = first.active(first.maker, maker_side)
+            first.venue.fill(source_cid, Decimal(2))
+            await first.settled(1)
+            for strategy, view in ((first.maker, first.owner.all_views()[1]),
+                                   (first.taker, first.owner.taker_store)):
+                _local_denied(SimpleNamespace(
+                    strategy=strategy, store=view, node=first.node,
+                    source_instrument=first.source_instrument, source=first.source,
+                    hedge=first.hedge,
+                ), OrderSide.SELL)
+            history = (_History(cast(Any, first), first.venue, first.wire),
+                       first.source_instrument, first.hedge_instrument)
+            business = deepcopy(first.owner._to_payload())
+            native = deepcopy(_native(first.node))
+        finally:
+            await first.close()
+        second = _Joint(tmp_path, monkeypatch, limit=2, maker_quantity=0)
+        try:
+            await second.start(history)
+            actor = get_source_terminal_reconciler(second.node)
+            await second.until(lambda: not actor.restart_pending or actor.last_failure is not None)
+            assert not actor.restart_pending, actor.last_failure
+            assert second.owner._to_payload() == business and _native(second.node) == native
+            assert not second.venue.attempts
+            assert not second.wire.submit_calls and not second.wire.close_calls
+            completed = 1
+            for index in range(2 // fill_quantity):
+                await second.until(lambda: bool(second.active(second.taker, taker_side)),
+                                   direction=-sign)
+                cid, = second.active(second.taker, taker_side)
+                assert not second.venue.order(cid).is_reduce_only
+                second.venue.fill(cid, Decimal(fill_quantity))
+                completed += 1
+                await second.settled(completed)
+                expected_net = maker_delta - sign * fill_quantity * (index + 1)
+                assert second.venue.net == expected_net
+                assert sum(position.signed_decimal_qty() for position in
+                           second.node.cache.positions_open(
+                               instrument_id=second.source_instrument.id,
+                           )) == expected_net
+                await qualified(second)
+            assert len(second.wire.close_calls) == 2 // fill_quantity
+            assert not second.wire.submit_calls
+            assert second.venue.net == 0
+            assert not second.node.cache.positions_open(instrument_id=second.hedge_instrument.id)
+            source_positions = second.node.cache.positions_open(
+                instrument_id=second.source_instrument.id,
+            )
+            assert {position.strategy_id: position.signed_decimal_qty()
+                    for position in source_positions} == {
+                second.maker.id: Decimal(maker_delta), second.taker.id: Decimal(-maker_delta),
+            }
+            # Account is flat while Taker has the opposite virtual position:
+            # its next own-position close must NOT carry venue reduce-only.
+            for side, direction in ((maker_side, sign), (taker_side, -sign)):
+                def active_for_side(side: OrderSide = side) -> bool:
+                    return bool(second.active(second.taker, side))
+
+                await second.until(active_for_side, direction=direction)
+                cid, = second.active(second.taker, side)
+                assert not second.venue.order(cid).is_reduce_only
+                second.venue.fill(cid, Decimal(2))
+                completed += 1
+                await second.settled(completed)
+                hot_report = await qualified(second)
+            for view, old in zip(second.owner.all_views(), first.owner.all_views(), strict=True):
+                for record in old.source_orders():
+                    assert view.source_order(record.client_order_id) == record
+            history = (_History(cast(Any, second), second.venue, second.wire),
+                       second.source_instrument, second.hedge_instrument)
+            business, native = deepcopy(second.owner._to_payload()), deepcopy(_native(second.node))
+        finally:
+            await second.close()
+        third = _Joint(tmp_path, monkeypatch, limit=2, maker_quantity=0)
+        try:
+            await third.start(history)
+            actor = get_source_terminal_reconciler(third.node)
+            await third.until(lambda: not actor.restart_pending or actor.last_failure is not None)
+            assert not actor.restart_pending, actor.last_failure
+            assert third.owner._to_payload() == business and _native(third.node) == native
+            assert not third.venue.attempts and not third.wire.submit_calls
+            assert not third.wire.close_calls
+            cold_report = await qualified(third)
+            assert {key: value for key, value in hot_report.items()
+                    if key != "reconstructed_closed_cycles"} == {
+                key: value for key, value in cold_report.items()
+                if key != "reconstructed_closed_cycles"
+            }
+        finally:
+            await third.close()
+    asyncio.run(scenario())
+    assert "[ERROR]" not in capfd.readouterr().out
+
+
 @pytest.mark.parametrize("maker", [False, True], ids=["taker", "maker"])
 @pytest.mark.parametrize("deltas", [(2, 2), (2, -2), (2, -2, 2), (2, -2, 2, -2)],
                          ids=["same-way", "flat", "reopened", "flat-again"])
+@pytest.mark.parametrize("local_denied", [False, True], ids=["wire-only", "local-denied"])
 def test_new_ordinary_node_resumes_native_netting_history_without_repairing_indexes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, maker: bool, deltas: tuple[int, ...],
+    local_denied: bool,
 ) -> None:
     async def scenario() -> None:
         async with _settled(tmp_path, monkeypatch, maker=maker, deltas=deltas) as (
             first, source, wire,
         ):
+            if local_denied:
+                _local_denied(first)
+                if not maker and len(deltas) == 4:
+                    assert len(first.node.cache.orders(
+                        instrument_id=first.source_instrument.id,
+                    )) == 5 and len(first.source._cid_store.bindings) == 4
             cache = first.node.cache
             indexes = {order.client_order_id: cache.position_id(order.client_order_id)
                        for order in cache.orders()}
             assert cache.check_integrity()
             assert any(order.position_id is not None and indexes[order.client_order_id] is None
                        for order in cache.orders(instrument_id=first.source_instrument.id))
-            await _check(first)  # The original live-cache guard rejected the real close here.
+            if not local_denied:
+                await _check(first)  # The original live-cache guard rejected the real close here.
             assert indexes == {order.client_order_id: cache.position_id(order.client_order_id)
                                for order in cache.orders()}
             history = _History(first, source, wire)

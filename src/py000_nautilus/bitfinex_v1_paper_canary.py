@@ -4,11 +4,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import fcntl
 import json
 import os
 import sys
-import tempfile
 import time
 from contextlib import suppress
 from dataclasses import dataclass
@@ -36,6 +34,7 @@ from nautilus_trader.model.orders import Order
 from nautilus_trader.trading.config import StrategyConfig
 from nautilus_trader.trading.strategy import Strategy
 
+from py000_nautilus.account_lock import lock_bitfinex_account
 from py000_nautilus.bitfinex_v1_cids import BitfinexV1CidStore
 from py000_nautilus.bitfinex_v1_data import (
     INSTRUMENT_ID,
@@ -1067,16 +1066,10 @@ def _new_transcript(path: Path) -> TextIO:
 
 
 def _lock_canary(user_id: int) -> TextIO:
-    lock_path = Path(tempfile.gettempdir()) / f"py000-bitfinex-paper-{user_id}.lock"
-    descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
-    os.fchmod(descriptor, 0o600)
-    stream = os.fdopen(descriptor, "a+", encoding="utf-8")
     try:
-        fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return lock_bitfinex_account(user_id)
     except BlockingIOError:
-        stream.close()
         raise PaperCanaryError("another paper canary holds the account lock") from None
-    return stream
 
 
 def _write(stream: TextIO, record: Record) -> None:

@@ -9,6 +9,7 @@ import math
 import os
 import sys
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import ExitStack
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol, TypeVar, cast
@@ -21,6 +22,7 @@ from nautilus_trader.live.node import TradingNode
 from nautilus_trader.model.identifiers import ClientId
 from nautilus_trader.trading.strategy import Strategy
 
+from py000_nautilus.account_lock import lock_bitfinex_account, lock_mt5_account
 from py000_nautilus.accounting_report import RunAccountingReport, build_run_accounting_report
 from py000_nautilus.bitfinex_v1_data import PAPER_RAW_SYMBOL, BitfinexV1DataClientConfig
 from py000_nautilus.bitfinex_v1_execution import (
@@ -326,7 +328,11 @@ def _run_live_entry(
     )
     loop = asyncio.new_event_loop()
     node: TradingNode | None = None
+    locks = ExitStack()
     try:
+        if rehearse or run_paper:
+            locks.enter_context(lock_bitfinex_account(bitfinex_execution.user_id))
+            locks.enter_context(lock_mt5_account(profile.mt5_exec_config.expected_account_id))
         node, built = node_builder(
             bitfinex_data_config=profile.bitfinex_data_config,
             bitfinex_exec_config=bitfinex_execution,
@@ -422,10 +428,13 @@ def _run_live_entry(
             raise LiveTakerEntryError("read-only rehearsal runner did not stop the node")
         return LiveTakerEntryResult("REHEARSED", "adapter_startup_rehearsed")
     finally:
-        if node is not None:
-            _dispose_node(node)
-        elif not loop.is_closed():
-            loop.close()
+        try:
+            if node is not None:
+                _dispose_node(node)
+            elif not loop.is_closed():
+                loop.close()
+        finally:
+            locks.close()
 
 
 def _validate_paper_binding(profile: _LiveProfile) -> None:
