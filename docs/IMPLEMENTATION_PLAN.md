@@ -794,6 +794,10 @@ P05 最终原生与loopback证据：两处EA窄修先取得14项中7项失败，
 
 Maker上述结果已获独立只读限定RECOMMEND-ACCEPT：旧46完整订单及事件、旧业务/EA90前缀不变，实际两次源MAKER fill与按票close/new-open逐笔对应；独立以真实价格重算本次+36.60USDT−54.20USD=−17.60USDT，与累计变化一致。期间两次正常终态查询暂存halt分别约1.810/1.684秒并自行清除，因此只称最终无HOLD，不称全程无任何暂停。根据实际结果接受Maker带仓重启及后续机会范围，不外推Both、跨日或实盘盈利。
 
+**2026-09-08 / Maker显式场景归零已完成：** 新runner `550ee5b627b0809401a682feea59cd4724bbaf2b75971eb51a2edefdbb8959ff`、profile `bb54c4f011deae51715fa0f9624cf9da9d5cc8d2b90fc4d9a92d9dd8dc6e4618`经独立小diff、真实已安装容量/报价和61控制复跑接受；profile相对普通配置只有共同source/hedge max_abs两字段2→0，账户路由仍2。旧过期preflight保留为initial，02:06:56Z重读后启动；11.108秒仅新增源SELL2 `O-20260908-020718-001-000-21`与MT5 BUY2 `…020719…-22`（按ticket10391174129 close，order10391354465/deal10109732205）。一项新义务完成、exit0/PAPER_STOPPED/正常drain，无新错误/暂停，未对冲最长0.927秒。
+
+02:07:27Z两端实际flat、无活动/其它仓位/未决请求，EA96事件。只读native54中原52完整事件不变，旧15源/5义务及allocation前缀保留，全部Position闭合、cache/restart有效、每项MT5终态核验通过。冷热报告逐字段一致、owned历史累计FINAL −50.72USDT（USD−39.12/USDT−11.6），本次已实现变化−16.56USDT，排除项不变。`check_maker_flat.py`首跑PASS，业务SHA `ad84d7cbce81ecda5379fe209868279b0ec8f6400dbcc86bffd8131d94efe53a`。此次仅为切换场景主动归零，不把零上限写回普通Maker profile，也不删除任何历史。下一步按已冻结Both预算与fresh双端flat/空namespace证据启动。
+
 先做不发单连接/对账，再单独 Taker、Maker，最后同节点 both；均使用普通策略。每一轮都事先记录最大时长、最多源订单数、每单/累计净仓上限、最大未对冲量与超时、停止方式，使用已有两测试账户，不申请每一步重复授权。
 
 建议初始会话预算为每模式 30 分钟、最多 10 次源订单；这是待运行 profile 确认的测试预算，不是立即执行命令。不得为了达到次数忽略市场关闭或不断重跑失败会话。跨日能力另外运行一个覆盖真实 broker rollover 的有界会话，结束时间按实际时区/市场时段设置；不伪称 30 分钟已证明跨日。
