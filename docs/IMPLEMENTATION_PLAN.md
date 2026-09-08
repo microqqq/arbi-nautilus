@@ -2,7 +2,7 @@
 
 日期：2026-09-05。设计基线：`7d0d4766c62b98c3e4b950da1d61e789d140e2c5`。
 
-状态（2026-09-08）：**W1–W8本地实现及下文限定的离线/原生验收收尾；W9现场验收尚未完成，不能称完整迁移或可上线。** 当前分支为 `codex/audit-remediation`。匹配EA已重挂；普通Taker、Maker的实际生命周期、Maker带仓重启及显式切换归零已有证据。本地DENIED恢复缺口已修复并完成3326项全量及安装普通进程验证；随后合法2oz Taker共享持仓接续实际成交/按票对冲完成、两端归零，但暴露账户减仓与策略原生NETTING reduce_only语义冲突，源native Position缺失、会计PENDING，未通过验收。当前不再发单，保留48订单原始缓存和全部失败历史；先按下文限定修复与恢复方案推进，再处理真实在线跨日和最终交付包。不自动发布或恢复旧canary。
+状态（2026-09-08）：**W1–W8本地实现及下文限定的离线/原生验收收尾；W9现场验收尚未完成，不能称完整迁移或可上线。** 当前分支为 `codex/audit-remediation`。本地DENIED恢复缺口及随后现场暴露的Taker跨策略reduce_only错误均已窄修、独立复核并完成最终3340项全量及安装验证。最后真实场景已成交并将两端平仓，但原48单运行的源native Position缺失、会计PENDING仍是失败记录，不能靠未来代码修复原样重启。原Redis/业务/CID/EA历史全部不动，当前不发单。下一停点：向用户明确提出保留旧运行、另用独立namespace从已证flat开始新验收的方案，未确认前不自动换缓存；之后仍有真实在线跨日及最终交付包。不自动推送、发布或恢复旧canary。
 
 提交节奏（2026-09-05，按用户本轮要求）：每个可独立验证的小包在测试与独立复核通过后形成本地提交，不是每改一处就提交。此前累积且相互依赖的已验收修复先作为完整检查点提交；之后新包单独提交。提交说明标明实际完成边界，不把W1–W9全部完成作为检查点含义；推送、PR、合并和部署不由本地提交自动触发。
 
@@ -831,6 +831,12 @@ Both首轮获独立只读限定RECOMMEND-ACCEPT：前置距启动13.588/10.765�
 限定写集为既有`taker.py`和既有shared/startup相关测试。先在当前普通双adapter载体补源native Position、完整恢复资格及FINAL会计断言得到真实RED；再改flag谓词，覆盖同owner/跨owner、LONG/SHORT、部分/穿零、账户flat但策略虚拟仓非零、后续反向以及restart全部完整历史。测试不能只因义务完成就PASS。独立审查、冻结全量/静态与新安装资格后本地提交。当前失败的48单native/business/CID/EA历史不得删除、改fill、造Position或原地修索引；只读评估合法恢复方式，若需隔离旧namespace并从已证flat建立新测试namespace，先明确提出操作范围和历史保留方式，不偷偷清缓存或把新场景当旧场景恢复通过。此时不发单。
 
 **reduce-only候选全量停点（2026-09-08）：** 原三个文件冻结后定向15、独立145及安装wheel25进程均通过，但主agent单次全量为3334通过/6失败；六项均在既有`test_taker_hedge_planning.py`手工`_SubmitHarness`调用新增`_source_reduce_only`时AttributeError，未执行到原交易断言。当前全量不接受。写集仅额外纳入这个既有测试文件：补真实谓词及所需原生source Position/cache事实接线，保持原断言，不用常量返回值伪装新语义、不改生产绕过。修后先该完整模块和相关15项，独立复核第四文件，再全量重新取证；原生产三SHA不变时不重复冒称新的生产变更，仍核对安装wheel内容和最终sdist测试内容。旧失败运行48单及实际flat状态保持不变，未再次发单。
+
+**reduce-only窄修最终接受（2026-09-08）：** 生产仅`taker.py`增加两个减少域同时成立的谓词，18行增加/9行删除，不改经济数量、adapter、EA、原生OMS或持久历史。四文件冻结SHA分别为`taker.py 9968115e…`、startup测试`beaacbce…`、shared测试`b3319714…`、旧harness测试`92d00fc6…`，四路径diff `bfd225ebba463b659a36181e55bbcd0b90e8b005ff29a421e1f52ec645028a38`，测前后不变。新增12原生Position控制及由1扩为3的普通Both多轮场景，完整检查双向/partial、后续账户flat的反向、源native合计、冷热FINAL、第三普通节点原事件恢复和零恢复交易。独立145项通过；旧account-only规则实际成交后重现原生缺仓、native-only规则在两个账户flat情形错误置flag，共3个反事实RED。第四测试载体另获独立完整31项通过，原六断言及真实Backtest source flags `[False, True]`保持。
+
+最终 `reduce-only-final-full` **3340 passed /133既有Pandas警告 /573.21秒**，无failure/error/skip，专用临时Redis已回收；Ruff全仓、Mypy123文件、diff-check通过。`/tmp/py000-w9-reduce-only-install-KtWbIL`中最终测试内容sdist SHA `56195c9e715c65fde078af227a564abc024c5f0da2655366c1faed2d97ba5c84`；wheel仍为`1579a879ee3f8731d91c42958d6dc2b194f425d8c58c24afd1d4bbac85f15723`，49生产模块、145项sdist内容与冻结候选逐字核对，两种重新安装各18检查通过。同一wheel字节的普通跨进程25项通过（212.64秒），93观测/52进程/25零事件冷加载与25临时Redis回收均核验；另15共享控制通过。该sdist含冻结时文档/测试，不冒称后续最终交付包或新现场已通过。早先六项harness失败保留为未接受的中间全量，不用定向绿覆盖。
+
+**旧运行恢复边界：** 两位独立核对均确认NT普通load仅读已有Position，已记TradeId的报告重放会去重，不能从现有48单原样补出缺失Position；开启合成差额订单也不符合不造事件/改历史约束。源native旧Maker+2与缺失Taker PID不会因本包变更自动修复。最后真实只读02:58:18Z两端flat/零活动/未决、EA104，旧46orders/events、旧业务记录与EA102前缀逐项不变；当前业务SHA `1f6e3b4b3bf010eff43dc97a31dac453a081cd15e9a8f8bb7876e764387b8873`，cold后置SHA `e8d9de1eaeedf6506cd63567b064a94efc238e37fb0756f22dee527ea879da49`。建议旧namespace、业务/CID和EA journal原地完整保留，用明确独立的Trader/业务/CID路径从新鲜确认的flat开始新测试；这不是旧运行恢复成功，新namespace也须接受正常历史导入及完整启动校验，不能承诺缓存为空或省略前置。此操作尚未执行，等待用户明确选择。跨日heartbeat已更新：没有该选择和最新修复资格时，不会自动改旧数据、换namespace或交易；跨日与最终交付仍未完成。
 
 建议初始会话预算为每模式 30 分钟、最多 10 次源订单；这是待运行 profile 确认的测试预算，不是立即执行命令。不得为了达到次数忽略市场关闭或不断重跑失败会话。跨日能力另外运行一个覆盖真实 broker rollover 的有界会话，结束时间按实际时区/市场时段设置；不伪称 30 分钟已证明跨日。
 

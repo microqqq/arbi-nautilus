@@ -12,6 +12,7 @@ from typing import Any, cast
 
 import pytest
 from nautilus_trader.backtest.engine import BacktestEngine
+from nautilus_trader.cache.cache import Cache
 from nautilus_trader.common.config import LoggingConfig
 from nautilus_trader.config import BacktestEngineConfig
 from nautilus_trader.model.currencies import USD, USDT
@@ -29,8 +30,13 @@ from nautilus_trader.model.identifiers import (
     ClientOrderId,
     InstrumentId,
     PositionId,
+    StrategyId,
 )
 from nautilus_trader.model.objects import Money, Quantity
+from nautilus_trader.model.position import Position
+from nautilus_trader.test_kit.stubs.events import TestEventStubs
+from nautilus_trader.test_kit.stubs.execution import TestExecStubs
+from nautilus_trader.test_kit.stubs.identifiers import TestIdStubs
 
 from py000_nautilus.app import (
     BITFINEX,
@@ -67,8 +73,13 @@ class _Position:
 class _Cache:
     def __init__(self, positions: list[_Position]) -> None:
         self.positions = positions
+        self.source_native = Cache()
+        self.source_native.add_instrument(_source_instrument())
         hedge = _hedge_instrument()
         self.tick: QuoteTick | None = _quote(hedge, "2400", "2401", "10", 1)
+
+    def position(self, position_id: PositionId) -> Position | None:
+        return cast(Position | None, self.source_native.position(position_id))
 
     def quote_tick(self, instrument_id: InstrumentId) -> QuoteTick | None:
         assert instrument_id == _hedge_instrument().id
@@ -124,6 +135,8 @@ class _SubmitHarness:
     ) -> None:
         self._draining = False
         self._source_admission = None
+        self.id = StrategyId("TakerStrategy-T")
+        self.trader_id = TestIdStubs.trader_id()
         hedge = _hedge_instrument()
         self._config = SimpleNamespace(
             source_instrument_id=_source_instrument().id,
@@ -186,6 +199,11 @@ class _SubmitHarness:
 
     def _claim_one_shot(self) -> bool:
         return TakerStrategy._claim_one_shot(cast(Any, self))
+
+    def _source_reduce_only(
+        self, side: OrderSide, quantity: Decimal, account: SourceAccount,
+    ) -> bool:
+        return TakerStrategy._source_reduce_only(cast(Any, self), side, quantity, account)
 
     def _submit_next_pending_hedge(self) -> None:
         TakerStrategy._submit_next_pending_hedge(cast(Any, self))
@@ -369,6 +387,19 @@ def test_exit_hedge_never_opens_when_bound_mt5_ticket_changes_after_source_fill(
         net_return=Decimal("0.001"),
         leverage=10,
     )
+    # An exit is both an account reduction and a reduction of this strategy's
+    # actual native source position; MT5 ticket fixtures do not imply the latter.
+    instrument = _source_instrument()
+    native_order = TestExecStubs.limit_order(
+        instrument=instrument, strategy_id=harness.id, order_side=OrderSide.BUY,
+        quantity=instrument.make_qty(2), price=instrument.make_price(2400),
+    )
+    native_position = Position(instrument, TestEventStubs.order_filled(
+        native_order, instrument, account_id=opportunity.source_account.account_id,
+        position_id=PositionId(f"{instrument.id}-{harness.id}"),
+    ))
+    harness.cache.source_native.add_position(native_position, OmsType.NETTING)
+    harness.cache.source_native.update_position(native_position)
     TakerStrategy.arm_one_shot(cast(Any, harness))
 
     TakerStrategy._submit_source(cast(Any, harness), opportunity)

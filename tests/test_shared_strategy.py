@@ -19,11 +19,23 @@ import pytest
 from continuous_mt5_wire import ContinuousMt5Wire
 from msgspec.structs import replace
 from nautilus_trader.accounting.accounts.margin import MarginAccount
+from nautilus_trader.cache.cache import Cache
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.model.currencies import USD, USDT
-from nautilus_trader.model.enums import AccountType, OrderSide, OrderStatus
-from nautilus_trader.model.events import AccountState
-from nautilus_trader.model.identifiers import AccountId, ClientId, ClientOrderId, Venue
+from nautilus_trader.model.enums import AccountType, OmsType, OrderSide, OrderStatus
+from nautilus_trader.model.events import AccountState, OrderFilled
+from nautilus_trader.model.identifiers import (
+    AccountId,
+    ClientId,
+    ClientOrderId,
+    PositionId,
+    StrategyId,
+    TraderId,
+    Venue,
+)
+from nautilus_trader.model.position import Position
+from nautilus_trader.test_kit.stubs.events import TestEventStubs
+from nautilus_trader.test_kit.stubs.execution import TestExecStubs
 from ordinary_restart_worker import _native
 from test_adapter_continuity import _SourceWire
 from test_bitfinex_v1_execution import _FakeRest, _FakeTransport, _Harness
@@ -34,17 +46,58 @@ from test_mt5_v1_execution import _identity, _snapshot
 from test_startup_recovery import _History
 from test_strategy_continuity import _pump
 
-from py000_nautilus.app import _book_snapshot, _quote
+from py000_nautilus.app import _book_snapshot, _quote, _source_instrument
 from py000_nautilus.bitfinex_v1_transport import BitfinexV1Transport
 from py000_nautilus.live_both import build_live_both_node
 from py000_nautilus.live_lifecycle import DrainingTradingNode
 from py000_nautilus.live_runtime import get_source_terminal_reconciler
-from py000_nautilus.models import BookTop, ObligationStatus
+from py000_nautilus.models import BookTop, ObligationStatus, SourceAccount
 from py000_nautilus.mt5_v1_data import instrument_from_snapshot
 from py000_nautilus.mt5_v1_protocol import JsonObject
 from py000_nautilus.mt5_v1_transport import Mt5V1Transport
+from py000_nautilus.strategies.taker import TakerStrategy
 
 D = Decimal
+
+
+@pytest.mark.parametrize("sign", [-1, 1], ids=["buy-close-short", "sell-close-long"])
+@pytest.mark.parametrize("venue_qty,own_qty,quantity,expected", [
+    (2, 2, 2, True), (2, 2, 1, True), (2, 0, 2, False),
+    (0, 2, 2, False), (2, 1, 2, False), (1, 2, 2, False),
+], ids=["same-owner", "partial", "other-owner", "venue-flat", "native-flip", "venue-flip"])
+def test_taker_reduce_only_requires_both_reduction_domains(
+    sign: int, venue_qty: int, own_qty: int, quantity: int, expected: bool,
+) -> None:
+    instrument, cache = _source_instrument(), Cache()
+    trader, owner = TraderId("SHARED-001"), StrategyId("TakerStrategy-T")
+    account_id = AccountId("BITFINEX-shared")
+    position = None
+    if own_qty:
+        order = TestExecStubs.limit_order(
+            instrument=instrument, strategy_id=owner,
+            order_side=OrderSide.BUY if sign > 0 else OrderSide.SELL,
+            quantity=instrument.make_qty(own_qty), price=instrument.make_price(4400),
+        )
+        event = TestEventStubs.order_filled(
+            order, instrument, account_id=account_id,
+            position_id=PositionId(f"{instrument.id}-{owner}"),
+        )
+        raw = OrderFilled.to_dict(event)
+        raw["trader_id"] = str(trader)
+        position = Position(instrument, OrderFilled.from_dict(raw))
+        cache.add_position(position, OmsType.NETTING)
+        cache.update_position(position)
+    strategy = SimpleNamespace(
+        cache=cache, id=owner, trader_id=trader,
+        _config=SimpleNamespace(source_instrument_id=instrument.id),
+    )
+    account = SourceAccount(account_id, ClientId("BITFINEX"), D(sign * venue_qty),
+                            D(10), D(10), D(500))
+    before = None if position is None else Position.to_dict(position)
+    assert TakerStrategy._source_reduce_only(
+        cast(Any, strategy), OrderSide.SELL if sign > 0 else OrderSide.BUY, D(quantity), account,
+    ) is expected
+    assert (None if position is None else Position.to_dict(position)) == before
 
 
 class _JointSource(_SourceWire):

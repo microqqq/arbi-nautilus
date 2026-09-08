@@ -11,7 +11,7 @@ import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from copy import deepcopy
-from dataclasses import replace
+from dataclasses import asdict, replace
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -397,21 +397,45 @@ def test_local_denial_only_changes_venue_coverage_not_complete_business_history(
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("maker_delta,fill_quantity", [(2, 2), (-2, 2), (2, 1)],
+                         ids=["long-maker", "short-maker", "partial-ioc"])
 def test_both_cold_start_preserves_local_denial_and_taker_can_continue_maker_inventory(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capfd: pytest.CaptureFixture[str],
+    maker_delta: int, fill_quantity: int,
 ) -> None:
     # Local import reuses the ordinary Both fixture without its reverse import
     # of _History creating a module-initialization cycle.
     from ordinary_restart_worker import _native
     from test_shared_strategy import _Joint
 
+    async def qualified(h: _Joint) -> dict[str, Any]:
+        assert await h.node.kernel.exec_engine.reconcile_execution_state(timeout_secs=2)
+        await _pump()
+        h.source.confirm_terminal_reconciliation()
+        await reconcile_startup(
+            h.node.cache, h.owner, trader_id=h.node.trader.id, strategy_id=h.maker.id,
+            source=h.source, hedge=h.hedge, source_instrument_id=h.source_instrument.id,
+            hedge_instrument_id=h.hedge_instrument.id,
+        )
+        report = build_run_accounting_report(
+            h.node.cache, h.source, h.hedge, trader_id=h.node.trader.id,
+            strategy_id=h.maker.id, strategy_ids=(h.maker.id, h.taker.id),
+            fx=h.maker_config.economics.fx,
+        )
+        assert report.status == "FINAL", report.pending_reasons
+        return asdict(report)
+
     async def scenario() -> None:
-        first = _Joint(tmp_path, monkeypatch, limit=2)
+        sign = 1 if maker_delta > 0 else -1
+        maker_side = OrderSide.BUY if sign > 0 else OrderSide.SELL
+        taker_side = OrderSide.SELL if sign > 0 else OrderSide.BUY
+        first = _Joint(tmp_path, monkeypatch, limit=2,
+                       maker_quantity=2 if sign > 0 else 0, maker_ask=2 if sign < 0 else 0)
         try:
             await first.start()
             first.quote_order("maker")
-            await first.until(lambda: bool(first.active(first.maker)), direction=1)
-            source_cid, = first.active(first.maker)
+            await first.until(lambda: bool(first.active(first.maker, maker_side)), direction=sign)
+            source_cid, = first.active(first.maker, maker_side)
             first.venue.fill(source_cid, Decimal(2))
             await first.settled(1)
             for strategy, view in ((first.maker, first.owner.all_views()[1]),
@@ -436,20 +460,73 @@ def test_both_cold_start_preserves_local_denial_and_taker_can_continue_maker_inv
             assert second.owner._to_payload() == business and _native(second.node) == native
             assert not second.venue.attempts
             assert not second.wire.submit_calls and not second.wire.close_calls
-            await second.until(lambda: bool(second.active(second.taker, OrderSide.SELL)),
-                               direction=-1)
-            cid, = second.active(second.taker, OrderSide.SELL)
-            second.venue.fill(cid, Decimal(2))
-            await second.settled(2)
-            assert len(second.wire.close_calls) == 1 and not second.wire.submit_calls
+            completed = 1
+            for index in range(2 // fill_quantity):
+                await second.until(lambda: bool(second.active(second.taker, taker_side)),
+                                   direction=-sign)
+                cid, = second.active(second.taker, taker_side)
+                assert not second.venue.order(cid).is_reduce_only
+                second.venue.fill(cid, Decimal(fill_quantity))
+                completed += 1
+                await second.settled(completed)
+                expected_net = maker_delta - sign * fill_quantity * (index + 1)
+                assert second.venue.net == expected_net
+                assert sum(position.signed_decimal_qty() for position in
+                           second.node.cache.positions_open(
+                               instrument_id=second.source_instrument.id,
+                           )) == expected_net
+                await qualified(second)
+            assert len(second.wire.close_calls) == 2 // fill_quantity
+            assert not second.wire.submit_calls
             assert second.venue.net == 0
             assert not second.node.cache.positions_open(instrument_id=second.hedge_instrument.id)
+            source_positions = second.node.cache.positions_open(
+                instrument_id=second.source_instrument.id,
+            )
+            assert {position.strategy_id: position.signed_decimal_qty()
+                    for position in source_positions} == {
+                second.maker.id: Decimal(maker_delta), second.taker.id: Decimal(-maker_delta),
+            }
+            # Account is flat while Taker has the opposite virtual position:
+            # its next own-position close must NOT carry venue reduce-only.
+            for side, direction in ((maker_side, sign), (taker_side, -sign)):
+                def active_for_side(side: OrderSide = side) -> bool:
+                    return bool(second.active(second.taker, side))
+
+                await second.until(active_for_side, direction=direction)
+                cid, = second.active(second.taker, side)
+                assert not second.venue.order(cid).is_reduce_only
+                second.venue.fill(cid, Decimal(2))
+                completed += 1
+                await second.settled(completed)
+                hot_report = await qualified(second)
             for view, old in zip(second.owner.all_views(), first.owner.all_views(), strict=True):
                 for record in old.source_orders():
                     assert view.source_order(record.client_order_id) == record
+            history = (_History(cast(Any, second), second.venue, second.wire),
+                       second.source_instrument, second.hedge_instrument)
+            business, native = deepcopy(second.owner._to_payload()), deepcopy(_native(second.node))
         finally:
             await second.close()
+        third = _Joint(tmp_path, monkeypatch, limit=2, maker_quantity=0)
+        try:
+            await third.start(history)
+            actor = get_source_terminal_reconciler(third.node)
+            await third.until(lambda: not actor.restart_pending or actor.last_failure is not None)
+            assert not actor.restart_pending, actor.last_failure
+            assert third.owner._to_payload() == business and _native(third.node) == native
+            assert not third.venue.attempts and not third.wire.submit_calls
+            assert not third.wire.close_calls
+            cold_report = await qualified(third)
+            assert {key: value for key, value in hot_report.items()
+                    if key != "reconstructed_closed_cycles"} == {
+                key: value for key, value in cold_report.items()
+                if key != "reconstructed_closed_cycles"
+            }
+        finally:
+            await third.close()
     asyncio.run(scenario())
+    assert "[ERROR]" not in capfd.readouterr().out
 
 
 @pytest.mark.parametrize("maker", [False, True], ids=["taker", "maker"])

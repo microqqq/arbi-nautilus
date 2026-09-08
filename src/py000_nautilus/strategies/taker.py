@@ -604,6 +604,22 @@ class TakerStrategy(Strategy):
             if applied:
                 self._submit_next_pending_hedge()
 
+    def _source_reduce_only(
+        self, side: OrderSide, quantity: Decimal, account: SourceAccount,
+    ) -> bool:
+        # Venue netting and NT's per-strategy NETTING are different in Both.
+        # A cross-owner account reduction opens this strategy's virtual position.
+        position = self.cache.position(PositionId(f"{self._config.source_instrument_id}-{self.id}"))
+        return (
+            ((side is OrderSide.SELL and account.position_ounces >= quantity)
+             or (side is OrderSide.BUY and -account.position_ounces >= quantity))
+            and position is not None and not position.is_closed
+            and position.trader_id == self.trader_id and position.strategy_id == self.id
+            and position.instrument_id == self._config.source_instrument_id
+            and position.account_id == account.account_id
+            and position.is_opposite_side(side) and quantity <= position.quantity.as_decimal()
+        )
+
     def _submit_source(self, opportunity: Opportunity, *, market_ts_ns: int | None = None) -> bool:
         if _restart_blocked(self) or self._draining:
             return False
@@ -628,15 +644,8 @@ class TakerStrategy(Strategy):
         if not self._claim_one_shot():
             return False
         side = OrderSide.BUY if opportunity.direction is SourceDirection.LONG else OrderSide.SELL
-        source_before = opportunity.source_account.position_ounces
-        source_reduction = (
-            side is OrderSide.SELL
-            and source_before > 0
-            and Decimal(str(source_quantity)) <= source_before
-        ) or (
-            side is OrderSide.BUY
-            and source_before < 0
-            and Decimal(str(source_quantity)) <= abs(source_before)
+        source_reduction = self._source_reduce_only(
+            side, source_quantity.as_decimal(), opportunity.source_account,
         )
         order = self.order_factory.limit(
             instrument_id=self._config.source_instrument_id,
