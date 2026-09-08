@@ -2,7 +2,7 @@
 
 日期：2026-09-05。设计基线：`7d0d4766c62b98c3e4b950da1d61e789d140e2c5`。
 
-状态：**W1–W8本地实现及下文限定的离线/原生验收收尾；W9当前版本现场验收尚未完成，不能称完整迁移或可上线。** 当前分支为 `codex/audit-remediation`。历史计划和阶段性结果不覆盖后来的反例；最新结果见第10节及 W9。用户已重挂匹配EA，普通Taker已有一组完整对冲成交；现场闭合外部历史的费用/重启兼容缺口正按下文窄修，未据单轮成交关闭W9。未推送或恢复旧自动canary。
+状态（2026-09-08）：**W1–W8本地实现及下文限定的离线/原生验收收尾；W9现场验收尚未完成，不能称完整迁移或可上线。** 当前分支为 `codex/audit-remediation`。用户已重挂匹配EA；当前版本普通Taker、Maker已有实际成交/对冲及重启证据，Maker最新带仓重启又完成两次机会，账户/原生历史/费用一致。下一步是显式场景切换归零、同节点Both及真实在线rollover，最终交付包仍须更新。历史计划和阶段性结果不覆盖后来的反例；最新结果见 W9。未据局部通过关闭现场阶段，也未自动发布或恢复旧canary。
 
 提交节奏（2026-09-05，按用户本轮要求）：每个可独立验证的小包在测试与独立复核通过后形成本地提交，不是每改一处就提交。此前累积且相互依赖的已验收修复先作为完整检查点提交；之后新包单独提交。提交说明标明实际完成边界，不把W1–W9全部完成作为检查点含义；推送、PR、合并和部署不由本地提交自动触发。
 
@@ -785,6 +785,14 @@ P05 最终原生与loopback证据：两处EA窄修先取得14项中7项失败，
 恢复后的独立只读cold Cache报告`native-resume-20260908-after-cache.json`确认native46订单、所有原生事件及持仓与昨天完全相同、cache/restart验证通过、projection无hold、佣金无错误，FINAL仍−16.56USDT且已闭周期重构1。两新runner候选SHA：Both`5ce2805260843ef78f60b44fc0ceaa828f71eb874645078e42f23c98e354d594`、Maker带仓`1adfcfa48be71fb38b2bc0a8e90e693f6e8510ff518075c274d29a1b936746af`；Ruff/格式检查通过，正交独立复核。新的发单前账户快照须在复核完成后重新采样，未用中断前快照或离线结果放行。
 
 上述两个冻结runner已获独立限定RECOMMEND-ACCEPT：Both74项及独立actual schema9/AST29项、Maker131项及独立actual owner/AST16项通过；另外原真实NativeEngine/双adapter的迟到ACK正常drain及无ACK超时两例通过。完整hash前后不变，新的测试全部无账户/真实Redis连接或交易。根接受薄观察准备，进入已定Maker带仓单次有限场景；Both仍须后续flat和空namespace前置。两只读Both诊断helper亦经独立静态核对，没有TradingNode/订单发送或业务/CID/数据库写路径，只有新证据报告；cold报告必须检查具体cache/ownership/佣金字段，不能仅凭进程exit0判通过。
+
+**2026-09-08 / Maker带仓普通重启现场完成：** `b03c47d`干净树、上述安装版和冻结观察器，01:49:39.584Z启动，不传`--resume-held`。40.732秒达到2项新完成而正常早停：新增4源（2全成交、2零成交取消），`PAPER_STOPPED/obligations_settled`、drain完成且pending/residual为空。SELL2源`O-20260908-014948-001-000-15`后，MT5 BUY2请求`…014949…-16`明确绑定旧ticket10373366524并按票平仓（order10391165898/deal10109540591）；随后新机会BUY2源`…015018…-19`，MT5 SELL2请求`…015018…-20`新开ticket10391174129（deal10109549373）。两项新义务均COMPLETED，没有靠重启或人工改状态在两次机会间推进。
+
+01:54:55Z独立只读两端为BFX唯一+2/position193874614/open4444.1、MT5唯一SELL .02/ticket10391174129/open4439.51；无活动源单、其它仓位或未决请求，EA94事件。native52订单中原46完整事件不变，业务11→15源、3→5义务，旧11源/3义务及allocation前缀不变；cache/restart验证通过，旧MT5 Position闭合、新票与源NETTING Position为−2/+2。未对冲观测峰值2oz、最长1.672秒，正常停止后保留对冲库存。冷热owned历史累计已实现交易/佣金金额均FINAL −34.16USDT（USD −50.56、USDT +16.4，FX1），本次新增已实现为−17.60USDT，无pending/unknown；冷热重构已闭周期分别1/2，差异来自冷重建又一个已闭周期，不是金额差异。funding/swap/未实现盈亏仍明确排除。`check_maker_inventory.py`和`maker-inventory-postflight.json`记录只读逐项核对，当前业务SHA `76fe793bd272b99473208200acad098e0f8ccee5f58bd6a69e2541d47e43e842`；探针初版把allocations列表当mapping，修正探针后通过，未修改产品或账户。
+
+**下一场景切换预算：** 通过原Maker普通入口、同Trader/业务/CID/native显式结束上述新库存；不使用旧Taker namespace或手改状态。新`maker-flat.profile.json`仅把既有共同source/hedge绝对净仓上限收至0，账户路由仍2oz，原2oz双侧参数、低阈值和被动clamp不变。现有容量/报价函数须离线证明+2/−2仅允许SELL2、flat后双侧均无容量，再由独立审核接受薄观察器。最长180秒、1项新完成或6笔新源早停、最终最多10笔，gross2oz/20秒、各端净仓2oz、单MT5 .02lot、原10秒drain及外层90秒保留，不强杀。发单前重取fresh90秒精确票据/账户证据；后置必须实读两端flat/无活动未知/native历史和费用吻合。清仓仅用于切换Both测试，不改每次机会的持仓规则。Both与真实在线rollover、最终交付包仍未完成。
+
+Maker上述结果已获独立只读限定RECOMMEND-ACCEPT：旧46完整订单及事件、旧业务/EA90前缀不变，实际两次源MAKER fill与按票close/new-open逐笔对应；独立以真实价格重算本次+36.60USDT−54.20USD=−17.60USDT，与累计变化一致。期间两次正常终态查询暂存halt分别约1.810/1.684秒并自行清除，因此只称最终无HOLD，不称全程无任何暂停。根据实际结果接受Maker带仓重启及后续机会范围，不外推Both、跨日或实盘盈利。
 
 先做不发单连接/对账，再单独 Taker、Maker，最后同节点 both；均使用普通策略。每一轮都事先记录最大时长、最多源订单数、每单/累计净仓上限、最大未对冲量与超时、停止方式，使用已有两测试账户，不申请每一步重复授权。
 

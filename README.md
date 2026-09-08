@@ -5,7 +5,7 @@ NautilusTrader 1.231.0. Both are Nautilus `Strategy` implementations using
 native limit orders, order/fill events, clock custody, cache, portfolio,
 execution routing, and `BacktestEngine`.
 
-Current remediation design (updated 2026-09-07):
+Current remediation design (updated 2026-09-08):
 [doc-first implementation plan](docs/IMPLEMENTATION_PLAN.md).
 It separates implemented local capabilities from remaining release and DEMO qualification.
 The checkpoints below include historical validation results; old EA hashes are not
