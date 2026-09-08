@@ -798,6 +798,12 @@ Maker上述结果已获独立只读限定RECOMMEND-ACCEPT：旧46完整订单及
 
 02:07:27Z两端实际flat、无活动/其它仓位/未决请求，EA96事件。只读native54中原52完整事件不变，旧15源/5义务及allocation前缀保留，全部Position闭合、cache/restart有效、每项MT5终态核验通过。冷热报告逐字段一致、owned历史累计FINAL −50.72USDT（USD−39.12/USDT−11.6），本次已实现变化−16.56USDT，排除项不变。`check_maker_flat.py`首跑PASS，业务SHA `ad84d7cbce81ecda5379fe209868279b0ec8f6400dbcc86bffd8131d94efe53a`。此次仅为切换场景主动归零，不把零上限写回普通Maker profile，也不删除任何历史。下一步按已冻结Both预算与fresh双端flat/空namespace证据启动。
 
+**2026-09-08 / Both首轮及下一1oz带仓场景：** 按原冻结runner/profile和02:08:34Z双端flat、02:08:37Z独立namespace为空前置启动。89.091秒按3项完成早停，4笔源单均Maker（1零成交取消、3全成交），Taker 0单；原普通路径依次BUY2/SELL2/BUY2并全部对冲完成，正常drain/exit0，不能据聚合3完成称双方成交均已覆盖。02:10:56Z两端为+2/−2，MT5唯一ticket10391391111/open4429.7、BFX position193874616/open4437.1，EA102事件，无活动/其它仓位/未决请求。cold native45为38项闭合EXTERNAL MT5历史及7项本次Maker订单，cache/restart及各MT5终态有效；冷热shared native-virtual已实现交易/佣金金额均FINAL −19.60USDT，重构周期0/1，明确不是venue已实现现金流。观测gross峰值2oz、最长3.272秒，当前shared业务SHA `d4309eb0a19837353d31b9ffa4bf6d9cbd21396261b1430043923a2024b0919d`。
+
+Taker无成交是覆盖不足，不是已定位故障。现有共同准入允许上述库存SELL2减仓，但Maker先占SELL2时不能再叠加同向Taker2；完整每次Taker深度/经济/账户新鲜度决策未落日志，不能反推所有未成交均由抢占引起。不增加公平调度或4oz上限。下一次普通Both续跑仅将Maker bid/ask开仓量、Taker long/short开仓量及base_book_quantity五字段2→1，余下阈值、SHORT-first、被动规则、风险/route2oz、身份及原shared/CID/native全部保持；沿当前持仓重启，不清空或搬移历史。离线现有容量/共同准入应证明同向1+1可容纳、第三个1拒绝，并核对真实MT5最小/步长允许1oz。新观察器从精确旧4源/3义务作set-difference分策略计数，fresh90秒账户/原ticket和readonly cold-cache前置，1800秒、最终最多10新源、8新源或双方分别至少1项新完成早停；gross2oz/20秒、各端净仓2oz、MT5单笔≤.02lot、10秒drain/90秒外层SIGTERM无kill。任何新错误/UNKNOWN/外因HOLD仍停，旧记录不改；独立窄审后才执行，终场逐策略核对实际覆盖。
+
+Both首轮获独立只读限定RECOMMEND-ACCEPT：前置距启动13.588/10.765秒、EA96旧前缀不变，三新对冲及末真实/native/shared仓位逐项对应；两Strategy均RUNNING→STOPPED，但全部4源/3fill/3义务归Maker。以真实成交重算源−21USDT、MT5+1.40USD，匹配上述native_virtual范围。只接受本轮同节点/Maker生命周期及正常停止，不把Taker等待、未覆盖的成交或后续准备写成已通过。
+
 先做不发单连接/对账，再单独 Taker、Maker，最后同节点 both；均使用普通策略。每一轮都事先记录最大时长、最多源订单数、每单/累计净仓上限、最大未对冲量与超时、停止方式，使用已有两测试账户，不申请每一步重复授权。
 
 建议初始会话预算为每模式 30 分钟、最多 10 次源订单；这是待运行 profile 确认的测试预算，不是立即执行命令。不得为了达到次数忽略市场关闭或不断重跑失败会话。跨日能力另外运行一个覆盖真实 broker rollover 的有界会话，结束时间按实际时区/市场时段设置；不伪称 30 分钟已证明跨日。
