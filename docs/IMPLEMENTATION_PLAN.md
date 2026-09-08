@@ -810,6 +810,10 @@ Both首轮获独立只读限定RECOMMEND-ACCEPT：前置距启动13.588/10.765�
 
 **跨日衔接已安排而非验收完成：** 使用本任务的一次性heartbeat `arbi-nautilus-2`，北京时间2026-09-09 04:30承接最新停点，在真实Athens日期边界前准备剩余W9；须先核对当前资格、账户/缓存及运行预算，不重放旧脚本。两个旧heartbeat继续PAUSED。电脑、Codex、Docker和MT5需运行；错过窗口或只有EA/仓位单独跨日不得称普通节点跨日通过。最终交付包仍待真实剩余项和最后文档收齐，旧`dist/closeout-20260907`不代表当前提交。
 
+**上述下一场景先暂停发单：发现本地DENIED的启动历史缺口。** 当前5笔native源单/4个Bitfinex CID均是正确事实；`reconcile_startup`却要求两集合相等，后续`_complete_orders`亦要求所有native源单都有venue报告。本机RiskEngine的Initialized→Denied零发送订单本来就不应拥有venue CID/report，不能伪造绑定、删历史或传resume-held绕过。这是独立于1oz测试配置错误的恢复边界，先离线反例再窄修。
+
+写集限既有`restart_recovery.py`与相关既有启动/普通组合测试文件。仅对完整、身份一致、零成交且无account/venue/position/trade及无adapter CID绑定的原生Initialized→Denied发送前终态，允许其不参与venue CID/report覆盖集合；它仍留在完整native/business核验及历史中。任何Submitted/Accepted/Fill、未知状态、额外/缺失绑定、伪造或不完整Denied事件、业务不一致及报告冲突继续拒绝。复用既有恢复/费用/原生校验，不改EA、adapter发单路径、RiskEngine品种最小量、schema、持久账或UNKNOWN规则。先用实际原生订单及当前5/4形状复现旧集合错误；覆盖Maker/Taker/shared正常启动、所有旧事实不变/零恢复交易及合格下一机会，另加已发送/异常证据负控。冻结后定向/全量/静态、独立复核及安装普通进程验证，单独本地提交；真实账户保持当前对冲库存，完成该前置后才准备合法2oz的Taker接续。
+
 先做不发单连接/对账，再单独 Taker、Maker，最后同节点 both；均使用普通策略。每一轮都事先记录最大时长、最多源订单数、每单/累计净仓上限、最大未对冲量与超时、停止方式，使用已有两测试账户，不申请每一步重复授权。
 
 建议初始会话预算为每模式 30 分钟、最多 10 次源订单；这是待运行 profile 确认的测试预算，不是立即执行命令。不得为了达到次数忽略市场关闭或不断重跑失败会话。跨日能力另外运行一个覆盖真实 broker rollover 的有界会话，结束时间按实际时区/市场时段设置；不伪称 30 分钟已证明跨日。
