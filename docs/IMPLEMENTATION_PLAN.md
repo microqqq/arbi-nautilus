@@ -776,6 +776,16 @@ P05 最终原生与loopback证据：两处EA窄修先取得14项中7项失败，
 
 下一有界场景用该精确业务/CID/native及新鲜账户/票据证据做普通Maker带仓重启，无旧HOLD故不传`--resume-held`；30分钟/最多10新源，8新源或2新完成早停，保留每端2oz/未对冲gross2oz与20秒/.02lot/原10秒drain，不为成交改阈值或额度。新观察器仍只观察/发一次SIGTERM，不注入订单或抹状态；先独立复核再运行。新Both observer已离线准备，要求同账户flat及独立新namespace为空的两份fresh90秒证据，schema9三view与每策略实际进度分别统计、同向leaves沿原风险计算；须Maker场景合格且明确场景切换收尾后才执行，不能拿准备或其它策略成交代替Both现场证据。真实rollover与最终交付包仍未完成。
 
+**2026-09-08 / 中断后恢复停点，未先发单：** 当前`5449648`tracked tree干净，49个生产模块与已资格wheel仍逐字节相同；业务仍`bfc41e…`、无策略进程。01:32:59Z只读两账户仍原BFX+2/position193855867与MT5 SELL .02/ticket10373366524，EA仍90事件且无活动/未知请求，原boot/stream不变。MT5现仓swap已从0变为−0.09；这只证明EA/仓位跨过日期，不是普通策略在线跨rollover验收，原报告明确排除swap/funding，不把它当已实现交易佣金。
+
+上轮额度中断前两个新ignored runner尚未合格：Both独立反例证明首个归零sample已锁存`observed_unhedged_timeout`却清掉计时起点、main因此漏停。现仅在两新runner的停止决策中消费已有锁存；原20秒、数量判断及生产不改。旧已跑父观察器`803ca2…`原样保留，上一真实运行最大1.605秒未触及此反例，不重复使用其旧run循环。Maker新131控制、Both74控制及原独立actual-owner/AST29反例回归通过，含精确超时归零RED→GREEN；不将它们累加成新的生产全量结果。
+
+原测试Redis容器`f89235…`在09-07 13:59:57Z正常exit0，原AOF bind仍在；首次旧端口只读连接未返回，根终止唯一诊断进程并保留未完成log，没有运行交易。根恢复同一容器/同一原数据，PING成功，但Docker动态宿主端口由61613重分配为63900。仅将当前Maker/Both profile的`cache_database.port`改63900，旧完整profile分别保留为`maker-ordinary-port61613.profile.json`（SHA a9864e…）与`both-ordinary-port61613.profile.json`（SHA aaffcac…），逐字段证明除port外完全相同。新profile SHA分别`914676ee76fd0e64ac70bb5aea8997f888dc999c4b2e18a2647c1fe7c7766294`与`8bf4cc915582bed2bce993c49af5e3eab1a102b3559eb9d146d01e352de1e3fd`；父803脚本、策略/限额、EA、真实业务/CID/native均未改。两新runner以完整新profile SHA重新绑定，Both只读namespace证据亦匹配63900。
+
+恢复后的独立只读cold Cache报告`native-resume-20260908-after-cache.json`确认native46订单、所有原生事件及持仓与昨天完全相同、cache/restart验证通过、projection无hold、佣金无错误，FINAL仍−16.56USDT且已闭周期重构1。两新runner候选SHA：Both`5ce2805260843ef78f60b44fc0ceaa828f71eb874645078e42f23c98e354d594`、Maker带仓`1adfcfa48be71fb38b2bc0a8e90e693f6e8510ff518075c274d29a1b936746af`；Ruff/格式检查通过，正交独立复核。新的发单前账户快照须在复核完成后重新采样，未用中断前快照或离线结果放行。
+
+上述两个冻结runner已获独立限定RECOMMEND-ACCEPT：Both74项及独立actual schema9/AST29项、Maker131项及独立actual owner/AST16项通过；另外原真实NativeEngine/双adapter的迟到ACK正常drain及无ACK超时两例通过。完整hash前后不变，新的测试全部无账户/真实Redis连接或交易。根接受薄观察准备，进入已定Maker带仓单次有限场景；Both仍须后续flat和空namespace前置。两只读Both诊断helper亦经独立静态核对，没有TradingNode/订单发送或业务/CID/数据库写路径，只有新证据报告；cold报告必须检查具体cache/ownership/佣金字段，不能仅凭进程exit0判通过。
+
 先做不发单连接/对账，再单独 Taker、Maker，最后同节点 both；均使用普通策略。每一轮都事先记录最大时长、最多源订单数、每单/累计净仓上限、最大未对冲量与超时、停止方式，使用已有两测试账户，不申请每一步重复授权。
 
 建议初始会话预算为每模式 30 分钟、最多 10 次源订单；这是待运行 profile 确认的测试预算，不是立即执行命令。不得为了达到次数忽略市场关闭或不断重跑失败会话。跨日能力另外运行一个覆盖真实 broker rollover 的有界会话，结束时间按实际时区/市场时段设置；不伪称 30 分钟已证明跨日。
