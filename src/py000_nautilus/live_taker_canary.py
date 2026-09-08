@@ -4,12 +4,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import fcntl
 import json
 import math
 import os
 import sys
-import tempfile
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from decimal import Decimal
@@ -22,6 +20,7 @@ from nautilus_trader.live.node import TradingNode
 from nautilus_trader.model.enums import OrderSide, OrderType, TimeInForce
 from nautilus_trader.model.identifiers import ClientId, ClientOrderId
 
+from py000_nautilus.account_lock import lock_bitfinex_account, lock_mt5_account
 from py000_nautilus.bitfinex_v1_data import PAPER_RAW_SYMBOL, BitfinexV1DataClient
 from py000_nautilus.bitfinex_v1_execution import BitfinexV1ExecutionClient
 from py000_nautilus.live_runtime import get_source_terminal_reconciler
@@ -161,8 +160,11 @@ def run_taker_canary(
     node: TradingNode | None = None
     strategy: TakerStrategy | None = None
     result: TakerCanaryResult | None = None
+    hedge_lock: TextIO | None = None
     expected_source_position = _initial_source_position(direction, close_existing)
     try:
+        if execute:
+            hedge_lock = lock_mt5_account(profile.mt5_exec_config.expected_account_id)
         node, strategy = node_builder(
             bitfinex_data_config=profile.bitfinex_data_config,
             bitfinex_exec_config=struct_replace(
@@ -209,6 +211,8 @@ def run_taker_canary(
                 result = _failure(strategy, f"node_disposal_failed:{type(exc).__name__}")
         elif not loop.is_closed():
             loop.close()
+        if hedge_lock is not None:
+            hedge_lock.close()
         if lock is not None:
             lock.close()
     if result is None:
@@ -863,16 +867,7 @@ def _failure(strategy: TakerStrategy | None, reason: str) -> TakerCanaryResult:
 
 
 def _lock_paper_account(user_id: int) -> TextIO:
-    path = Path(tempfile.gettempdir()) / f"py000-bitfinex-paper-{user_id}.lock"
-    descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
-    os.fchmod(descriptor, 0o600)
-    stream = os.fdopen(descriptor, "a+", encoding="utf-8")
-    try:
-        fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        stream.close()
-        raise
-    return stream
+    return lock_bitfinex_account(user_id)
 
 
 def _direction(value: str) -> SourceDirection:
